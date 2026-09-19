@@ -1,6 +1,6 @@
 # Meta and Claude Agent SDK compatibility contract
 
-Research date: 2026-09-19. Resolves the documentary question in [issue #2](https://github.com/lbacik/simple-coding-agent/issues/2). No credentials were read, no model requests were sent, and no runtime compatibility has been demonstrated.
+Research date: 2026-09-19. Resolves the documentary question in [Establish the Meta and Agent SDK compatibility contract](https://github.com/lbacik/simple-coding-agent/issues/2). No credentials were read, no model requests were sent, and no runtime compatibility has been demonstrated.
 
 ## Recommendation
 
