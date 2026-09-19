@@ -1,6 +1,6 @@
 # Upstream skills and installer contract
 
-Research for issue #3, inspected 2026-09-19. This is source research, not a successful runtime integration test or an approved implementation design. No upstream installer or skill scripts were executed.
+Research for [Establish the upstream skills and installer contract](https://github.com/lbacik/simple-coding-agent/issues/3), inspected 2026-09-19. This is source research, not a successful runtime integration test or an approved implementation design. No upstream installer or skill scripts were executed.
 
 ## Finding
 
