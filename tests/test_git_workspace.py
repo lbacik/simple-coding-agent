@@ -103,6 +103,55 @@ def test_cleanup_retains_unpublished_commits_when_requested(tmp_path: Path) -> N
     assert [commit.subject for commit in workspace.commits_added(reused)] == ["Retain me"]
 
 
+def test_pushes_with_an_explicit_empty_lease_only_after_confirming_remote_absence(
+    tmp_path: Path,
+) -> None:
+    remote, _ = repository_with_main(tmp_path)
+    commands: list[tuple[str, ...]] = []
+
+    def recording_run(command: tuple[str, ...], cwd: Path | None, env: dict[str, str]) -> str:
+        commands.append(command)
+        return run_command(command, cwd=cwd, env=env)
+
+    workspace = GitWorkspace(
+        tmp_path / "clone", str(remote), token_provider=lambda: "token", run=recording_run
+    )
+    prepared = workspace.prepare_attempt(base_branch="main", issue_number=23)
+    write_and_commit(tmp_path / "clone", "feature.txt", "done", "Implement feature")
+
+    workspace.push_attempt_branch(prepared.branch, max_retries=1)
+
+    push = next(command for command in commands if command[1] == "push")
+    assert push[2] == "--force-with-lease=agent/issue-23:"
+    assert ("git", "fetch", "origin", "agent/issue-23") in commands
+    assert ("git", "ls-remote", "--heads", "origin", "refs/heads/agent/issue-23") in commands
+
+
+def test_verifies_an_ambiguous_push_before_retrying(tmp_path: Path) -> None:
+    remote, _ = repository_with_main(tmp_path)
+    push_calls = 0
+
+    def ambiguous_run(command: tuple[str, ...], cwd: Path | None, env: dict[str, str]) -> str:
+        nonlocal push_calls
+        result = run_command(command, cwd=cwd, env=env)
+        if command[1] == "push":
+            push_calls += 1
+            raise subprocess.CalledProcessError(1, command)
+        return result
+
+    workspace = GitWorkspace(
+        tmp_path / "clone", str(remote), token_provider=lambda: "token", run=ambiguous_run,
+        sleeper=lambda _: None,
+    )
+    prepared = workspace.prepare_attempt(base_branch="main", issue_number=23)
+    write_and_commit(tmp_path / "clone", "feature.txt", "done", "Implement feature")
+
+    pushed = workspace.push_attempt_branch(prepared.branch, max_retries=3)
+
+    assert pushed == git(tmp_path / "clone", "rev-parse", "HEAD")
+    assert push_calls == 1
+
+
 def test_git_operations_resolve_credentials_with_askpass_without_persisting_them(
     tmp_path: Path,
 ) -> None:

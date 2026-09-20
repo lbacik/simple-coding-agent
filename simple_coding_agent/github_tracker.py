@@ -8,6 +8,8 @@ import json
 from typing import Any, Protocol
 from urllib.request import Request, urlopen
 
+from simple_coding_agent.publication import PullRequest
+
 
 READY_FOR_AGENT = "ready-for-agent"
 
@@ -211,6 +213,114 @@ class GitHubGraphQLTransport:
         )
         return Assignment(issue_id=issue_id, assignee_id=assignee_id)
 
+    def find_pull_request(self, repository: str, head: str) -> PullRequest | None:
+        """Return an existing open PR for an attempt branch, if any."""
+
+        owner, name = _repository_parts(repository)
+        data = self._execute(
+            """
+            query PullRequest($owner: String!, $name: String!, $head: String!) {
+              repository(owner: $owner, name: $name) {
+                pullRequests(first: 1, states: OPEN, headRefName: $head) {
+                  nodes { number url }
+                }
+              }
+            }
+            """,
+            {"owner": owner, "name": name, "head": head},
+        )
+        try:
+            nodes = data["repository"]["pullRequests"]["nodes"]
+            return None if not nodes else _pull_request_from_graphql(nodes[0])
+        except (KeyError, TypeError, ValueError) as error:
+            raise GitHubTrackerError("GitHub returned an invalid pull request") from error
+
+    def create_pull_request(
+        self, repository: str, head: str, base: str, title: str, body: str
+    ) -> PullRequest:
+        """Create the single human-reviewable PR for a verified complete attempt."""
+
+        owner, name = _repository_parts(repository)
+        data = self._execute(
+            """
+            mutation CreatePullRequest(
+              $repositoryId: ID!, $head: String!, $base: String!, $title: String!, $body: String!
+            ) {
+              createPullRequest(input: {
+                repositoryId: $repositoryId, headRefName: $head, baseRefName: $base, title: $title, body: $body
+              }) { pullRequest { number url } }
+            }
+            """,
+            {
+                "repositoryId": self._repository_id(owner, name),
+                "head": head,
+                "base": base,
+                "title": title,
+                "body": body,
+            },
+        )
+        try:
+            return _pull_request_from_graphql(data["createPullRequest"]["pullRequest"])
+        except (KeyError, TypeError, ValueError) as error:
+            raise GitHubTrackerError("GitHub returned an invalid created pull request") from error
+
+    def find_attempt_comment(self, repository: str, issue_number: int, marker: str) -> bool:
+        """Find a result only when it carries this attempt's durable marker."""
+
+        owner, name = _repository_parts(repository)
+        data = self._execute(
+            """
+            query AttemptComments($owner: String!, $name: String!, $number: Int!) {
+              repository(owner: $owner, name: $name) {
+                issue(number: $number) { comments(last: 100) { nodes { body } } }
+              }
+            }
+            """,
+            {"owner": owner, "name": name, "number": issue_number},
+        )
+        try:
+            comments = data["repository"]["issue"]["comments"]["nodes"]
+            return any(
+                "Agent Attempt Result" in comment["body"] and marker in comment["body"]
+                for comment in comments
+            )
+        except (KeyError, TypeError) as error:
+            raise GitHubTrackerError("GitHub returned invalid issue comments") from error
+
+    def add_comment(self, repository: str, issue_number: int, body: str) -> None:
+        """Post a concise result comment without exposing local execution data."""
+
+        owner, name = _repository_parts(repository)
+        issue_id = self._issue_id(owner, name, issue_number)
+        self._execute(
+            """
+            mutation AddComment($subjectId: ID!, $body: String!) {
+              addComment(input: {subjectId: $subjectId, body: $body}) { commentEdge { node { id } } }
+            }
+            """,
+            {"subjectId": issue_id, "body": body},
+        )
+
+    def _repository_id(self, owner: str, name: str) -> str:
+        data = self._execute(
+            "query RepositoryId($owner: String!, $name: String!) { repository(owner: $owner, name: $name) { id } }",
+            {"owner": owner, "name": name},
+        )
+        try:
+            return data["repository"]["id"]
+        except (KeyError, TypeError) as error:
+            raise GitHubTrackerError("GitHub returned an invalid repository") from error
+
+    def _issue_id(self, owner: str, name: str, number: int) -> str:
+        data = self._execute(
+            "query IssueId($owner: String!, $name: String!, $number: Int!) { repository(owner: $owner, name: $name) { issue(number: $number) { id } } }",
+            {"owner": owner, "name": name, "number": number},
+        )
+        try:
+            return data["repository"]["issue"]["id"]
+        except (KeyError, TypeError) as error:
+            raise GitHubTrackerError("GitHub returned an invalid issue") from error
+
     def _execute(self, query: str, variables: dict[str, object]) -> dict[str, Any]:
         request = Request(
             self._endpoint,
@@ -257,3 +367,11 @@ def _issue_from_graphql(value: dict[str, Any]) -> TrackerIssue:
         assignee_logins=tuple(assignee["login"] for assignee in value["assignees"]["nodes"]),
         blocked_by=value["issueDependenciesSummary"]["blockedBy"],
     )
+
+
+def _pull_request_from_graphql(value: dict[str, Any]) -> PullRequest:
+    number = value["number"]
+    url = value["url"]
+    if isinstance(number, bool) or not isinstance(number, int) or not isinstance(url, str) or not url:
+        raise ValueError("invalid pull request")
+    return PullRequest(number, url)

@@ -12,6 +12,7 @@ from simple_coding_agent.github_tracker import (
     IssuePage,
     TrackerIssue,
 )
+from simple_coding_agent.publication import PullRequest
 
 
 def test_lists_only_eligible_open_issues() -> None:
@@ -105,6 +106,43 @@ def test_does_not_assign_an_issue_that_changes_before_claim(
 
     assert GitHubTracker(transport, "octo/example").claim_next() is None
     assert transport.assignments == []
+
+
+def test_publication_transport_uses_attempt_marker_and_reuses_an_existing_pr() -> None:
+    transport = RecordingGraphQLTransport(
+        [
+            {"repository": {"pullRequests": {"nodes": [{"number": 8, "url": "https://example.test/8"}]}}},
+            {"repository": {"issue": {"comments": {"nodes": [
+                {"body": "## Agent Attempt Result: complete\n<!-- agent-attempt: now -->"},
+                {"body": "## Agent Attempt Result: complete\n<!-- agent-attempt: earlier -->"},
+            ]}}}},
+        ]
+    )
+
+    assert transport.find_pull_request("octo/example", "agent/issue-23") == PullRequest(8, "https://example.test/8")
+    assert transport.find_attempt_comment("octo/example", 23, "<!-- agent-attempt: now -->")
+    assert "headRefName" in transport.queries[0]
+    assert "comments(last: 100)" in transport.queries[1]
+
+
+class RecordingGraphQLTransport:
+    def __init__(self, responses: list[dict]) -> None:
+        from simple_coding_agent.github_tracker import GitHubGraphQLTransport
+
+        self._delegate = GitHubGraphQLTransport("token")
+        self._responses = iter(responses)
+        self.queries: list[str] = []
+        self._delegate._execute = self._execute  # type: ignore[method-assign]
+
+    def _execute(self, query: str, variables: dict[str, object]) -> dict:
+        self.queries.append(query)
+        return next(self._responses)
+
+    def find_pull_request(self, repository: str, head: str):
+        return self._delegate.find_pull_request(repository, head)
+
+    def find_attempt_comment(self, repository: str, issue_number: int, marker: str):
+        return self._delegate.find_attempt_comment(repository, issue_number, marker)
 
 
 def issue(
