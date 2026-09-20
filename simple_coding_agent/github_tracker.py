@@ -132,6 +132,15 @@ class GitHubTracker:
             return Claim(issue=current, assignment=assignment)
         return None
 
+    def recover_claim(self, issue_number: int) -> Claim | None:
+        """Reconstruct this agent's claim for checkpoint-based cleanup only."""
+
+        current = self._transport.get_issue(self._target_repo, issue_number)
+        if current is None:
+            return None
+        identity = self._transport.viewer()
+        return Claim(current, Assignment(issue_id=current.id, assignee_id=identity.id))
+
     def release_attempt(self, issue_number: int, label: str, assignee_id: str) -> None:
         """Idempotently release only this agent's assignment and queue label.
 
