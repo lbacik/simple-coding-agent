@@ -1,9 +1,9 @@
 # Simple Coding Agent
 
 An unattended Python agent that attempts eligible GitHub implementation issues
-for one configured repository. This initial slice provides the validated runtime
-configuration and target-repository profile boundary; it does not start an SDK
-session, call GitHub, or publish changes.
+for one configured repository. It provides validated runtime configuration,
+the target-repository profile boundary, and a model-execution boundary. The
+driving process still owns GitHub calls and all publication.
 
 ## GitHub issue trust boundary
 
@@ -43,6 +43,29 @@ repository.
 Review findings of severity `must-fix` block by default. Set
 `REVIEW_BLOCKING_SEVERITIES` explicitly to an empty value to select the
 test-only review gate; `suggestion` remains advisory unless explicitly added.
+
+## Model execution
+
+The execution boundary dispatches `/implement` with the issue body as its
+specification through `ClaudeSDKClient`. It uses the pinned upstream
+`implement`, `tdd`, `code-review`, and `codebase-design` skills, with
+`max_turns=60`, `max_budget_usd=5`, and `MODEL_TIMEOUT`. The dollar limit is a
+non-authoritative circuit breaker for Meta. A timeout interrupts the client and
+drains the stream before teardown; `CLAUDE_STREAM_IDLE_TIMEOUT_MS=60000` is a
+separate stalled-stream control.
+
+The model runs with `bypassPermissions`, but an SDK `PreToolUse` guard denies
+model-side `git push`, `gh pr merge`, and `gh issue close`, including compound
+shell commands and `git -C`. It records `Skill` pre/post events with the skill
+name, subagent ID, and timestamp. Model mismatch, abort, and timeout are
+infrastructure errors; `max_turns_exceeded` is incomplete. The pinned SDK's
+observed `ResultMessage` fields are `is_error`, `model_usage`, and
+`stop_reason`; this differs from the current SDK reference field names.
+
+`tests/test_model_execution_smoke.py` is opt-in and makes a paid request only
+when `RUN_MODEL_SMOKE=1` is set. It requires `MODEL_SMOKE_REPOSITORY` (the
+disposable fixture path) and `MODEL_SMOKE_ISSUE_BODY`, in addition to the
+normal operator environment.
 
 ## Repository profile
 
