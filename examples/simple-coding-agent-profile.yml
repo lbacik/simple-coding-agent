@@ -1,0 +1,12 @@
+# Required: a shell command or a non-empty list of shell commands.
+setup: "pip install -e '.[dev]'"
+check:
+  - "pytest"
+  - "ruff check ."
+
+# Optional repository-controlled execution settings.
+base_branch: main
+timeout: 300
+setup_timeout: 120
+env:
+  APP_ENV: test
