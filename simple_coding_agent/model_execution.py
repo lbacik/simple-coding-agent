@@ -20,11 +20,11 @@ _SKILLS = ["implement", "tdd", "code-review", "codebase-design"]
 _META_BASE_URL = "https://api.meta.ai"
 
 
-class ExecutionOutcome(StrEnum):
-    """Classification supplied to the completion evaluator."""
+class ModelExecutionStatus(StrEnum):
+    """Status of the SDK stream; the evaluator maps it to an attempt outcome."""
 
-    COMPLETE = "complete"
-    INCOMPLETE = "incomplete"
+    SUCCEEDED = "succeeded"
+    MODEL_LIMIT_REACHED = "model_limit_reached"
     INFRASTRUCTURE_ERROR = "infrastructure_error"
 
 
@@ -42,7 +42,7 @@ class SkillEvent:
 class ModelExecution:
     """Structured execution evidence; publication remains outside this boundary."""
 
-    outcome: ExecutionOutcome
+    status: ModelExecutionStatus
     explanation: str
     stop_reason: str | None
     model_usage: Mapping[str, Any] | None
@@ -106,7 +106,7 @@ class ModelExecutor:
                     await client.interrupt()
                     await self._drain(client)
                     return self._evidence(
-                        ExecutionOutcome.INFRASTRUCTURE_ERROR,
+                        ModelExecutionStatus.INFRASTRUCTURE_ERROR,
                         "Model execution exceeded MODEL_TIMEOUT and was interrupted.",
                         None,
                         None,
@@ -114,7 +114,7 @@ class ModelExecutor:
                     )
         except Exception as error:
             return self._evidence(
-                ExecutionOutcome.INFRASTRUCTURE_ERROR,
+                ModelExecutionStatus.INFRASTRUCTURE_ERROR,
                 f"Claude SDK execution failed: {type(error).__name__}.",
                 None,
                 None,
@@ -123,7 +123,7 @@ class ModelExecutor:
 
         if terminal is None:
             return self._evidence(
-                ExecutionOutcome.INFRASTRUCTURE_ERROR,
+                ModelExecutionStatus.INFRASTRUCTURE_ERROR,
                 "Claude SDK stream ended without a terminal ResultMessage.",
                 None,
                 None,
@@ -192,7 +192,7 @@ class ModelExecutor:
         stop_reason = getattr(terminal, "stop_reason", None)
         if mismatches:
             return self._evidence(
-                ExecutionOutcome.INFRASTRUCTURE_ERROR,
+                ModelExecutionStatus.INFRASTRUCTURE_ERROR,
                 f"Observed model mismatch: {', '.join(mismatches)}.",
                 stop_reason,
                 model_usage,
@@ -200,7 +200,7 @@ class ModelExecutor:
             )
         if stop_reason == "max_turns_exceeded":
             return self._evidence(
-                ExecutionOutcome.INCOMPLETE,
+                ModelExecutionStatus.MODEL_LIMIT_REACHED,
                 "Model execution reached max_turns.",
                 stop_reason,
                 model_usage,
@@ -208,7 +208,7 @@ class ModelExecutor:
             )
         if stop_reason == "timeout" or (isinstance(stop_reason, str) and stop_reason.startswith("aborted_")):
             return self._evidence(
-                ExecutionOutcome.INFRASTRUCTURE_ERROR,
+                ModelExecutionStatus.INFRASTRUCTURE_ERROR,
                 f"Model execution stopped with {stop_reason}.",
                 stop_reason,
                 model_usage,
@@ -216,14 +216,14 @@ class ModelExecutor:
             )
         if getattr(terminal, "is_error", True):
             return self._evidence(
-                ExecutionOutcome.INCOMPLETE,
+                ModelExecutionStatus.MODEL_LIMIT_REACHED,
                 "Claude SDK returned an error result.",
                 stop_reason,
                 model_usage,
                 all_models,
             )
         return self._evidence(
-            ExecutionOutcome.COMPLETE,
+            ModelExecutionStatus.SUCCEEDED,
             "Claude SDK completed the implementation workflow.",
             stop_reason,
             model_usage,
@@ -232,14 +232,14 @@ class ModelExecutor:
 
     def _evidence(
         self,
-        outcome: ExecutionOutcome,
+        status: ModelExecutionStatus,
         explanation: str,
         stop_reason: str | None,
         model_usage: Mapping[str, Any] | None,
         observed_models: tuple[str, ...],
     ) -> ModelExecution:
         return ModelExecution(
-            outcome=outcome,
+            status=status,
             explanation=explanation,
             stop_reason=stop_reason,
             model_usage=model_usage,
@@ -265,7 +265,7 @@ class ModelExecutor:
     async def _record_skill_event(
         self, phase: str, hook_input: Any, tool_use_id: str | None, context: Any
     ) -> dict[str, Any]:
-        if getattr(hook_input, "tool_name", None) != "Skill":
+        if _hook_field(hook_input, "tool_name") != "Skill":
             return {}
         name = _skill_name(hook_input)
         if not isinstance(name, str):
@@ -274,7 +274,7 @@ class ModelExecutor:
             SkillEvent(
                 phase=phase,
                 name=name,
-                agent_id=getattr(hook_input, "agent_id", None),
+                agent_id=_hook_field(hook_input, "agent_id"),
                 timestamp=_timestamp(self._clock()),
             )
         )
@@ -284,9 +284,9 @@ class ModelExecutor:
 async def publication_guard(hook_input: Any, tool_use_id: str | None, context: Any) -> dict[str, Any]:
     """Deny model-side publication while allowing the driving process to publish."""
 
-    if getattr(hook_input, "tool_name", None) != "Bash":
+    if _hook_field(hook_input, "tool_name") != "Bash":
         return {}
-    tool_input = getattr(hook_input, "tool_input", {})
+    tool_input = _hook_field(hook_input, "tool_input", {})
     command = tool_input.get("command") if isinstance(tool_input, Mapping) else None
     if not isinstance(command, str) or not _is_publication_command(command):
         return {}
@@ -329,9 +329,17 @@ def _looks_like_result(message: object) -> bool:
 
 
 def _skill_name(hook_input: object) -> str | None:
-    tool_input = getattr(hook_input, "tool_input", {})
+    tool_input = _hook_field(hook_input, "tool_input", {})
     name = tool_input.get("skill") if isinstance(tool_input, Mapping) else None
     return name if isinstance(name, str) else None
+
+
+def _hook_field(hook_input: object, name: str, default: Any = None) -> Any:
+    """Read both SDK TypedDict hooks and test doubles without losing provenance."""
+
+    if isinstance(hook_input, Mapping):
+        return hook_input.get(name, default)
+    return getattr(hook_input, name, default)
 
 
 def _is_publication_command(command: str) -> bool:

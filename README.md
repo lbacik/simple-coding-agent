@@ -58,7 +58,8 @@ The model runs with `bypassPermissions`, but an SDK `PreToolUse` guard denies
 model-side `git push`, `gh pr merge`, and `gh issue close`, including compound
 shell commands and `git -C`. It records `Skill` pre/post events with the skill
 name, subagent ID, and timestamp. Model mismatch, abort, and timeout are
-infrastructure errors; `max_turns_exceeded` is incomplete. The pinned SDK's
+infrastructure errors; `max_turns_exceeded` is reported to the completion
+evaluator as a model-limit status, which maps to an incomplete attempt. The pinned SDK's
 observed `ResultMessage` fields are `is_error`, `model_usage`, and
 `stop_reason`; this differs from the current SDK reference field names.
 

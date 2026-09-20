@@ -11,8 +11,8 @@ import pytest
 
 from simple_coding_agent.config import RuntimeConfig
 from simple_coding_agent.model_execution import (
-    ExecutionOutcome,
     ModelExecutor,
+    ModelExecutionStatus,
     publication_guard,
 )
 
@@ -89,7 +89,7 @@ def test_dispatches_the_issue_body_to_the_pinned_sdk_and_returns_execution_evide
         )
     )
 
-    assert execution.outcome is ExecutionOutcome.COMPLETE
+    assert execution.status is ModelExecutionStatus.SUCCEEDED
     assert execution.stop_reason == "end_turn"
     assert execution.model_usage == {"muse-spark-1.3-contributor": {"input_tokens": 12}}
     assert execution.observed_models == ("muse-spark-1.3-contributor",)
@@ -139,14 +139,14 @@ def test_enables_project_settings_only_when_the_operator_explicitly_trusts_them(
 @pytest.mark.parametrize(
     ("terminal", "expected"),
     [
-        (result(stop_reason="max_turns_exceeded"), ExecutionOutcome.INCOMPLETE),
-        (result(stop_reason="aborted_by_user"), ExecutionOutcome.INFRASTRUCTURE_ERROR),
-        (result(stop_reason="timeout"), ExecutionOutcome.INFRASTRUCTURE_ERROR),
-        (result(is_error=True), ExecutionOutcome.INCOMPLETE),
+        (result(stop_reason="max_turns_exceeded"), ModelExecutionStatus.MODEL_LIMIT_REACHED),
+        (result(stop_reason="aborted_by_user"), ModelExecutionStatus.INFRASTRUCTURE_ERROR),
+        (result(stop_reason="timeout"), ModelExecutionStatus.INFRASTRUCTURE_ERROR),
+        (result(is_error=True), ModelExecutionStatus.MODEL_LIMIT_REACHED),
     ],
 )
 def test_classifies_terminal_results_without_claiming_success(
-    tmp_path: Path, terminal: object, expected: ExecutionOutcome
+    tmp_path: Path, terminal: object, expected: ModelExecutionStatus
 ) -> None:
     execution = asyncio.run(
         ModelExecutor(
@@ -154,7 +154,7 @@ def test_classifies_terminal_results_without_claiming_success(
         ).execute(issue_body="Fix it.", working_directory=tmp_path)
     )
 
-    assert execution.outcome is expected
+    assert execution.status is expected
 
 
 def test_treats_an_observed_model_mismatch_as_an_infrastructure_error(tmp_path: Path) -> None:
@@ -167,7 +167,7 @@ def test_treats_an_observed_model_mismatch_as_an_infrastructure_error(tmp_path: 
         ).execute(issue_body="Fix it.", working_directory=tmp_path)
     )
 
-    assert execution.outcome is ExecutionOutcome.INFRASTRUCTURE_ERROR
+    assert execution.status is ModelExecutionStatus.INFRASTRUCTURE_ERROR
     assert "unexpected-model" in execution.explanation
 
 
@@ -191,7 +191,7 @@ def test_interrupts_and_drains_a_stalled_stream_after_model_timeout(tmp_path: Pa
         ).execute(issue_body="Fix it.", working_directory=tmp_path)
     )
 
-    assert execution.outcome is ExecutionOutcome.INFRASTRUCTURE_ERROR
+    assert execution.status is ModelExecutionStatus.INFRASTRUCTURE_ERROR
     assert captured[0].interrupted is True
 
 
@@ -208,7 +208,7 @@ def test_interrupts_and_drains_a_stalled_stream_after_model_timeout(tmp_path: Pa
 def test_publication_guard_denies_model_publication_commands_in_bypass_mode(command: str) -> None:
     decision = asyncio.run(
         publication_guard(
-            SimpleNamespace(tool_name="Bash", tool_input={"command": command}), None, {}
+            {"tool_name": "Bash", "tool_input": {"command": command}}, None, {}
         )
     )
 
@@ -218,7 +218,7 @@ def test_publication_guard_denies_model_publication_commands_in_bypass_mode(comm
 def test_publication_guard_allows_non_publication_commands() -> None:
     decision = asyncio.run(
         publication_guard(
-            SimpleNamespace(tool_name="Bash", tool_input={"command": "git commit -m 'work'"}),
+            {"tool_name": "Bash", "tool_input": {"command": "git commit -m 'work'"}},
             None,
             {},
         )
@@ -242,14 +242,14 @@ def test_captures_skill_provenance_from_pre_and_post_tool_hooks(tmp_path: Path) 
 
     asyncio.run(
         pre_hook(
-            SimpleNamespace(tool_name="Skill", tool_input={"skill": "code-review"}, agent_id="review-1"),
+            {"tool_name": "Skill", "tool_input": {"skill": "code-review"}, "agent_id": "review-1"},
             None,
             {},
         )
     )
     asyncio.run(
         post_hook(
-            SimpleNamespace(tool_name="Skill", tool_input={"skill": "code-review"}, agent_id="review-1"),
+            {"tool_name": "Skill", "tool_input": {"skill": "code-review"}, "agent_id": "review-1"},
             None,
             {},
         )
@@ -273,7 +273,7 @@ def test_blocks_a_third_repair_cycle_after_three_code_reviews(tmp_path: Path) ->
     executor = ModelExecutor(runtime_config(tmp_path), client_factory=client_factory)
     asyncio.run(executor.execute(issue_body="Fix it.", working_directory=tmp_path))
     pre_hook = captured[0].options.hooks["PreToolUse"][0].hooks[0]
-    review = SimpleNamespace(tool_name="Skill", tool_input={"skill": "code-review"})
+    review = {"tool_name": "Skill", "tool_input": {"skill": "code-review"}}
 
     decisions = [asyncio.run(pre_hook(review, None, {})) for _ in range(4)]
 

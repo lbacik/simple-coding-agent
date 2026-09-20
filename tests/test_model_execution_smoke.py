@@ -9,7 +9,7 @@ from pathlib import Path
 import pytest
 
 from simple_coding_agent.config import load_runtime_config
-from simple_coding_agent.model_execution import ExecutionOutcome, ModelExecutor
+from simple_coding_agent.model_execution import ModelExecutor, ModelExecutionStatus
 
 
 pytestmark = pytest.mark.skipif(
@@ -31,7 +31,7 @@ def test_dispatches_the_upstream_skills_with_review_subagent_provenance() -> Non
         )
     )
 
-    assert execution.outcome is ExecutionOutcome.COMPLETE
+    assert execution.status is ModelExecutionStatus.SUCCEEDED
     assert execution.observed_models == ("muse-spark-1.3-contributor",)
     assert any(event.name == "implement" for event in execution.skill_events)
     assert any(event.name == "code-review" for event in execution.skill_events)
