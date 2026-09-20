@@ -42,6 +42,17 @@ and `setup_timeout` to 120 seconds. `env` maps environment-variable names to
 string values. Missing or invalid profiles are infrastructure errors for the
 lifecycle, never silent success.
 
+## Durable attempt state
+
+While an implementation attempt is active, its checkpoint is stored at
+`$DATA_DIR/state/attempt.json`. It contains the issue number, branch, current
+lifecycle phase, and UTC `started_at`/`updated_at` timestamps. Checkpoints are
+written by replacing a temporary file, so an interrupted write leaves the last
+valid checkpoint intact. The checkpoint is removed only after lifecycle cleanup;
+an absent file means there is no active attempt, while malformed content is an
+infrastructure error. `started_at` remains stable for the whole attempt and is
+the attempt-specific key used when deduplicating its result comment.
+
 ## Development
 
 ```shell
