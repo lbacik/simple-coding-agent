@@ -101,6 +101,17 @@ an absent file means there is no active attempt, while malformed content is an
 infrastructure error. `started_at` remains stable for the whole attempt and is
 the attempt-specific key used when deduplicating its result comment.
 
+At process startup, before a new issue can be claimed, the lifecycle reconciles
+one active checkpoint. A checkpoint from `claimed` or `setup` becomes an
+`infrastructure_error` with the standard comment and cleanup. A
+`model_running` checkpoint never resumes the SDK session: committed work is
+pushed as incomplete work without a pull request; no commits becomes an
+infrastructure error. `pushing` and `publishing` retry the idempotent
+publication path, which verifies the branch and existing pull request before
+writing a result comment. Cleanup remains ordered as comment, queue label,
+agent assignee, then checkpoint deletion, so a later restart can finish an
+interrupted cleanup without duplicating a result.
+
 ## Development
 
 ```shell

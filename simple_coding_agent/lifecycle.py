@@ -58,6 +58,8 @@ class AttemptTracker(Protocol):
 
     def claim_next(self) -> Claim | None: ...
 
+    def recover_claim(self, issue_number: int) -> Claim | None: ...
+
     def release_attempt(self, issue_number: int, label: str, assignee_id: str) -> None: ...
 
 
@@ -175,9 +177,16 @@ class AgentLifecycle:
         self._attempt_runner = attempt_runner
         self._poll_interval = poll_interval
         self._sleeper = sleeper
+        self._startup_reconciled = False
 
     def run_once(self) -> LifecycleResult:
         """Claim and process one issue, or sleep once when the queue is empty."""
+
+        if not self._startup_reconciled:
+            self._startup_reconciled = True
+            recovered = self._reconcile_startup()
+            if recovered is not None:
+                return LifecycleResult(LifecycleStatus.ATTEMPTED, recovered)
 
         claim = self._tracker.claim_next()
         if claim is None:
@@ -258,6 +267,98 @@ class AgentLifecycle:
                         self._attempt_state.delete()
         return LifecycleResult(LifecycleStatus.ATTEMPTED, outcome)
 
+    def _reconcile_startup(self) -> AttemptOutcome | None:
+        """Finish one durable attempt without recreating its SDK execution context."""
+
+        checkpoint = self._attempt_state.read()
+        if checkpoint is None:
+            return None
+        claim = self._tracker.recover_claim(checkpoint.issue_number)
+        if claim is None:
+            raise RuntimeError("Interrupted attempt issue is unavailable for recovery")
+
+        prepared: object | None = None
+        profile: RepositoryProfile | None = None
+        outcome = AttemptOutcome.INFRASTRUCTURE_ERROR
+        comment_posted = True
+        retain_branch = False
+        has_commits = False
+        try:
+            prepared = self._workspace.prepare_attempt(base_branch="main", issue_number=claim.issue.number)
+            profile = self._profile_loader(self._workspace.working_directory)
+            if profile.base_branch != "main":
+                self._workspace.cleanup(base_branch="main", prepared=prepared, retain_branch=False)
+                prepared = self._workspace.prepare_attempt(
+                    base_branch=profile.base_branch, issue_number=claim.issue.number
+                )
+            if checkpoint.phase is AttemptPhase.MODEL_RUNNING:
+                commits = getattr(self._workspace, "commits_added")(prepared)
+                has_commits = bool(commits)
+                if commits:
+                    self._attempt_state.transition(AttemptPhase.PUSHING)
+                    decision = CompletionDecision(
+                        AttemptOutcome.INCOMPLETE, False, PublicationPath.PARTIAL,
+                        ("Model execution was interrupted; preserved committed work.",),
+                    )
+                else:
+                    decision = _infrastructure_decision("Model execution was interrupted without commits.")
+            elif checkpoint.phase in (AttemptPhase.PUSHING, AttemptPhase.PUBLISHING):
+                has_commits = bool(getattr(self._workspace, "commits_added")(prepared))
+                decision = CompletionDecision(
+                    None, True, PublicationPath.COMPLETE,
+                    ("Recovered previously completed local evidence for publication.",),
+                )
+            else:
+                decision = _infrastructure_decision("Attempt was interrupted before model execution.")
+            published = self._publisher.publish(
+                PublicationRequest(
+                    issue_number=claim.issue.number,
+                    issue_title=claim.issue.title,
+                    branch=getattr(prepared, "branch", checkpoint.branch),
+                    started_at=checkpoint.started_at,
+                    decision=decision,
+                    check_command="not rerun during startup recovery",
+                    check_exit_code=None,
+                    review_cycles=0,
+                    review_findings="not rerun during startup recovery",
+                    details=decision.reasons[0],
+                    base_branch=profile.base_branch,
+                )
+            )
+            outcome = published.outcome
+            comment_posted = getattr(published, "comment_posted", True)
+            retain_branch = (
+                outcome is AttemptOutcome.INFRASTRUCTURE_ERROR
+                and getattr(published, "branch_url", None) is None
+                and has_commits
+            )
+        except Exception:
+            published = self._publish_terminal(
+                claim, checkpoint.started_at, prepared, profile, AttemptOutcome.INFRASTRUCTURE_ERROR
+            )
+            outcome = AttemptOutcome.INFRASTRUCTURE_ERROR
+            comment_posted = getattr(published, "comment_posted", True)
+        finally:
+            remote_cleanup_complete = False
+            try:
+                if comment_posted:
+                    self._tracker.release_attempt(
+                        claim.issue.number, "ready-for-agent", claim.assignment.assignee_id
+                    )
+                    remote_cleanup_complete = True
+            finally:
+                try:
+                    if prepared is not None:
+                        self._workspace.cleanup(
+                            base_branch=profile.base_branch if profile is not None else "main",
+                            prepared=prepared,
+                            retain_branch=retain_branch or not comment_posted,
+                        )
+                finally:
+                    if remote_cleanup_complete:
+                        self._attempt_state.delete()
+        return outcome
+
     def run_forever(self, *, stop: Callable[[], bool]) -> None:
         """Poll sequentially until the injected deterministic stop boundary fires."""
 
@@ -306,4 +407,10 @@ def _attempt_evidence(
         review_cycles=review_cycles,
         review_findings=review_findings,
         details=details,
+    )
+
+
+def _infrastructure_decision(reason: str) -> CompletionDecision:
+    return CompletionDecision(
+        AttemptOutcome.INFRASTRUCTURE_ERROR, False, PublicationPath.NONE, (reason,)
     )
