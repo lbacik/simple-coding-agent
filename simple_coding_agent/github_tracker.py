@@ -1,0 +1,259 @@
+"""GitHub boundary for selecting and claiming implementation issues."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from datetime import datetime
+import json
+from typing import Any, Protocol
+from urllib.request import Request, urlopen
+
+
+READY_FOR_AGENT = "ready-for-agent"
+
+
+class GitHubTrackerError(RuntimeError):
+    """Raised when the GitHub tracker cannot complete an API operation."""
+
+
+@dataclass(frozen=True)
+class TrackerIssue:
+    """The GitHub fields needed to determine issue eligibility."""
+
+    id: str
+    number: int
+    title: str
+    body: str
+    created_at: datetime
+    state: str
+    labels: frozenset[str]
+    assignee_logins: tuple[str, ...]
+    blocked_by: int
+
+    @property
+    def is_eligible(self) -> bool:
+        """Whether this issue belongs in the runnable queue."""
+
+        return (
+            self.state == "OPEN"
+            and READY_FOR_AGENT in self.labels
+            and not self.assignee_logins
+            and bool(self.body.strip())
+            and self.blocked_by == 0
+        )
+
+
+@dataclass(frozen=True)
+class IssuePage:
+    """One cursor page of issues from the configured repository."""
+
+    issues: tuple[TrackerIssue, ...]
+    next_cursor: str | None
+
+
+@dataclass(frozen=True)
+class GitHubIdentity:
+    """The authenticated identity used to claim an issue."""
+
+    id: str
+    login: str
+
+
+@dataclass(frozen=True)
+class Assignment:
+    """The successful GitHub assignment that constitutes a claim."""
+
+    issue_id: str
+    assignee_id: str
+
+
+@dataclass(frozen=True)
+class Claim:
+    """The selected issue snapshot and its successful claim result."""
+
+    issue: TrackerIssue
+    assignment: Assignment
+
+
+class GitHubTransport(Protocol):
+    """Transport seam; tests can provide a deterministic fake."""
+
+    def list_issues(self, repository: str, cursor: str | None) -> IssuePage: ...
+
+    def get_issue(self, repository: str, number: int) -> TrackerIssue | None: ...
+
+    def viewer(self) -> GitHubIdentity: ...
+
+    def assign_issue(self, issue_id: str, assignee_id: str) -> Assignment: ...
+
+
+class GitHubTracker:
+    """Select and claim one eligible issue within exactly one repository."""
+
+    def __init__(self, transport: GitHubTransport, target_repo: str) -> None:
+        self._transport = transport
+        self._target_repo = target_repo
+
+    def runnable_queue(self) -> tuple[TrackerIssue, ...]:
+        """Return all eligible issues in FIFO creation order."""
+
+        issues: list[TrackerIssue] = []
+        cursor: str | None = None
+        while True:
+            page = self._transport.list_issues(self._target_repo, cursor)
+            issues.extend(issue for issue in page.issues if issue.is_eligible)
+            if page.next_cursor is None:
+                break
+            cursor = page.next_cursor
+        return tuple(sorted(issues, key=lambda issue: (issue.created_at, issue.number)))
+
+    def claim_next(self) -> Claim | None:
+        """Claim the first issue that remains eligible at assignment time.
+
+        This deliberately uses a check-then-set operation. The configured agent
+        is a single process, so it is not presented as a distributed lock.
+        """
+
+        queue = self.runnable_queue()
+        if not queue:
+            return None
+        identity = self._transport.viewer()
+        for candidate in queue:
+            current = self._transport.get_issue(self._target_repo, candidate.number)
+            if current is None or not current.is_eligible:
+                continue
+            assignment = self._transport.assign_issue(current.id, identity.id)
+            return Claim(issue=current, assignment=assignment)
+        return None
+
+
+class GitHubGraphQLTransport:
+    """GitHub GraphQL transport used by the tracker in production."""
+
+    _endpoint = "https://api.github.com/graphql"
+
+    def __init__(self, token: str) -> None:
+        self._token = token
+
+    def list_issues(self, repository: str, cursor: str | None) -> IssuePage:
+        owner, name = _repository_parts(repository)
+        data = self._execute(
+            """
+            query Queue($owner: String!, $name: String!, $cursor: String) {
+              repository(owner: $owner, name: $name) {
+                issues(first: 100, after: $cursor, states: OPEN, orderBy: {field: CREATED_AT, direction: ASC}) {
+                  nodes { ...IssueFields }
+                  pageInfo { hasNextPage endCursor }
+                }
+              }
+            }
+            fragment IssueFields on Issue {
+              id number title body createdAt state
+              labels(first: 100) { nodes { name } }
+              assignees(first: 1) { nodes { login } }
+              issueDependenciesSummary { blockedBy }
+            }
+            """,
+            {"owner": owner, "name": name, "cursor": cursor},
+        )
+        try:
+            connection = data["repository"]["issues"]
+            page_info = connection["pageInfo"]
+            return IssuePage(
+                issues=tuple(_issue_from_graphql(value) for value in connection["nodes"]),
+                next_cursor=page_info["endCursor"] if page_info["hasNextPage"] else None,
+            )
+        except (KeyError, TypeError, ValueError) as error:
+            raise GitHubTrackerError("GitHub returned an invalid issue page") from error
+
+    def get_issue(self, repository: str, number: int) -> TrackerIssue | None:
+        owner, name = _repository_parts(repository)
+        data = self._execute(
+            """
+            query Issue($owner: String!, $name: String!, $number: Int!) {
+              repository(owner: $owner, name: $name) {
+                issue(number: $number) { ...IssueFields }
+              }
+            }
+            fragment IssueFields on Issue {
+              id number title body createdAt state
+              labels(first: 100) { nodes { name } }
+              assignees(first: 1) { nodes { login } }
+              issueDependenciesSummary { blockedBy }
+            }
+            """,
+            {"owner": owner, "name": name, "number": number},
+        )
+        try:
+            value = data["repository"]["issue"]
+            return None if value is None else _issue_from_graphql(value)
+        except (KeyError, TypeError, ValueError) as error:
+            raise GitHubTrackerError("GitHub returned an invalid issue") from error
+
+    def viewer(self) -> GitHubIdentity:
+        data = self._execute("query Viewer { viewer { id login } }", {})
+        try:
+            viewer = data["viewer"]
+            return GitHubIdentity(id=viewer["id"], login=viewer["login"])
+        except (KeyError, TypeError) as error:
+            raise GitHubTrackerError("GitHub returned an invalid viewer") from error
+
+    def assign_issue(self, issue_id: str, assignee_id: str) -> Assignment:
+        self._execute(
+            """
+            mutation Assign($issueId: ID!, $assigneeId: ID!) {
+              addAssigneesToAssignable(input: {assignableId: $issueId, assigneeIds: [$assigneeId]}) {
+                assignable { id }
+              }
+            }
+            """,
+            {"issueId": issue_id, "assigneeId": assignee_id},
+        )
+        return Assignment(issue_id=issue_id, assignee_id=assignee_id)
+
+    def _execute(self, query: str, variables: dict[str, object]) -> dict[str, Any]:
+        request = Request(
+            self._endpoint,
+            data=json.dumps({"query": query, "variables": variables}).encode(),
+            headers={
+                "Accept": "application/json",
+                "Authorization": f"Bearer {self._token}",
+                "Content-Type": "application/json",
+            },
+            method="POST",
+        )
+        try:
+            with urlopen(request) as response:  # noqa: S310 -- fixed GitHub endpoint
+                response_data = json.load(response)
+        except (OSError, ValueError) as error:
+            raise GitHubTrackerError("GitHub request failed") from error
+        if not isinstance(response_data, dict) or response_data.get("errors"):
+            raise GitHubTrackerError("GitHub GraphQL request was rejected")
+        data = response_data.get("data")
+        if not isinstance(data, dict):
+            raise GitHubTrackerError("GitHub response has no data")
+        return data
+
+
+def _repository_parts(repository: str) -> tuple[str, str]:
+    try:
+        owner, name = repository.split("/", 1)
+    except ValueError as error:
+        raise GitHubTrackerError("TARGET_REPO must use the owner/repo format") from error
+    if not owner or not name or "/" in name:
+        raise GitHubTrackerError("TARGET_REPO must use the owner/repo format")
+    return owner, name
+
+
+def _issue_from_graphql(value: dict[str, Any]) -> TrackerIssue:
+    return TrackerIssue(
+        id=value["id"],
+        number=value["number"],
+        title=value["title"],
+        body=value["body"],
+        created_at=datetime.fromisoformat(value["createdAt"].replace("Z", "+00:00")),
+        state=value["state"],
+        labels=frozenset(label["name"] for label in value["labels"]["nodes"]),
+        assignee_logins=tuple(assignee["login"] for assignee in value["assignees"]["nodes"]),
+        blocked_by=value["issueDependenciesSummary"]["blockedBy"],
+    )
