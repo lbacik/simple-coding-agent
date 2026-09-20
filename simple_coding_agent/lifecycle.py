@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
 import time
@@ -23,6 +24,8 @@ from simple_coding_agent.completion import (
 from simple_coding_agent.config import RepositoryProfile
 from simple_coding_agent.github_tracker import Claim
 from simple_coding_agent.model_execution import ModelExecutionStatus, ModelExecutor
+from simple_coding_agent.observability import AttemptArchive
+from simple_coding_agent.operating import ConsecutiveErrorStore
 from simple_coding_agent.publication import PublicationRequest
 
 
@@ -91,6 +94,7 @@ class ModelAttemptRunner:
         evaluator: CompletionEvaluator,
         model_executor: ModelExecutor,
         acceptance_criteria_satisfied: Callable[[Claim], bool] = lambda claim: True,
+        attempt_archive_factory: Callable[[int, str], AttemptArchive] | None = None,
     ) -> None:
         self._attempt_state = attempt_state
         self._workspace = workspace
@@ -98,11 +102,21 @@ class ModelAttemptRunner:
         self._evaluator = evaluator
         self._model_executor = model_executor
         self._acceptance_criteria_satisfied = acceptance_criteria_satisfied
+        self._attempt_archive_factory = attempt_archive_factory
 
     def __call__(self, claim: Claim, profile: RepositoryProfile, prepared: object) -> AttemptEvidence:
         """Run the local evidence gates in their mandated phase order."""
 
+        checkpoint = self._attempt_state.read()
+        archive = (
+            self._attempt_archive_factory(claim.issue.number, checkpoint.started_at)
+            if checkpoint is not None and self._attempt_archive_factory is not None
+            else None
+        )
         preparation = self._verifier.prepare(profile, getattr(self._workspace, "working_directory"))
+        _archive_commands(archive, "setup", preparation.setup)
+        if preparation.baseline is not None:
+            _archive_commands(archive, "baseline_check", preparation.baseline)
         if not preparation.setup.succeeded or preparation.baseline is None or not preparation.baseline.succeeded:
             decision = self._evaluator.evaluate(
                 setup=preparation.setup, baseline=preparation.baseline, model_status=None,
@@ -117,6 +131,14 @@ class ModelAttemptRunner:
                 issue_body=claim.issue.body, working_directory=getattr(self._workspace, "working_directory")
             )
         )
+        if archive is not None:
+            archive.write_attempt(
+                {
+                    "model_usage": execution.model_usage,
+                    "skill_events": [event.__dict__ for event in execution.skill_events],
+                    "model_stop_reason": execution.stop_reason,
+                }
+            )
         commits = getattr(self._workspace, "commits_added")(prepared)
         review_count = sum(
             event.name == "code-review" and event.phase == "PreToolUse"
@@ -133,6 +155,8 @@ class ModelAttemptRunner:
                 final_check = self._verifier.final_check(profile, getattr(self._workspace, "working_directory"))
             except VerificationOrderError:
                 final_check = None
+        if final_check is not None:
+            _archive_commands(archive, "check", final_check)
         decision = self._evaluator.evaluate(
             setup=preparation.setup,
             baseline=preparation.baseline,
@@ -168,6 +192,10 @@ class AgentLifecycle:
         attempt_runner: Callable[[Claim, RepositoryProfile, object], AttemptEvidence] | None = None,
         poll_interval: int = 60,
         sleeper: Callable[[float], None] = time.sleep,
+        error_store: ConsecutiveErrorStore | None = None,
+        max_consecutive_errors: int = 3,
+        event_log: Callable[[str], None] = lambda event: None,
+        attempt_archive_factory: Callable[[int, str], AttemptArchive] | None = None,
     ) -> None:
         self._tracker = tracker
         self._attempt_state = attempt_state
@@ -177,6 +205,10 @@ class AgentLifecycle:
         self._attempt_runner = attempt_runner
         self._poll_interval = poll_interval
         self._sleeper = sleeper
+        self._error_store = error_store
+        self._max_consecutive_errors = max_consecutive_errors
+        self._event_log = event_log
+        self._attempt_archive_factory = attempt_archive_factory
         self._startup_reconciled = False
 
     def run_once(self) -> LifecycleResult:
@@ -196,6 +228,7 @@ class AgentLifecycle:
         checkpoint = self._attempt_state.start(
             issue_number=claim.issue.number, branch=f"agent/issue-{claim.issue.number}"
         )
+        archive = self._archive_for(claim.issue.number, checkpoint.started_at)
         prepared: object | None = None
         profile: RepositoryProfile | None = None
         outcome = AttemptOutcome.INFRASTRUCTURE_ERROR
@@ -265,6 +298,8 @@ class AgentLifecycle:
                 finally:
                     if remote_cleanup_complete:
                         self._attempt_state.delete()
+        self._write_outcome(archive, outcome, checkpoint.started_at)
+        self._record_terminal_outcome(outcome, checkpoint.started_at)
         return LifecycleResult(LifecycleStatus.ATTEMPTED, outcome)
 
     def _reconcile_startup(self) -> AttemptOutcome | None:
@@ -276,6 +311,7 @@ class AgentLifecycle:
         claim = self._tracker.recover_claim(checkpoint.issue_number)
         if claim is None:
             raise RuntimeError("Interrupted attempt issue is unavailable for recovery")
+        archive = self._archive_for(claim.issue.number, checkpoint.started_at)
 
         prepared: object | None = None
         profile: RepositoryProfile | None = None
@@ -357,6 +393,8 @@ class AgentLifecycle:
                 finally:
                     if remote_cleanup_complete:
                         self._attempt_state.delete()
+        self._write_outcome(archive, outcome, checkpoint.started_at)
+        self._record_terminal_outcome(outcome, checkpoint.started_at)
         return outcome
 
     def run_forever(self, *, stop: Callable[[], bool]) -> None:
@@ -391,6 +429,39 @@ class AgentLifecycle:
             )
         )
 
+    def _record_terminal_outcome(self, outcome: AttemptOutcome, attempt_id: str) -> None:
+        """Advance the process-wide guard only after attempt cleanup is complete."""
+
+        if self._error_store is None:
+            return
+        count = self._error_store.record(outcome, attempt_id)
+        if count >= self._max_consecutive_errors:
+            self._event_log("consecutive_error_limit_reached")
+            raise SystemExit(1)
+
+    def _archive_for(self, issue_number: int, started_at: str) -> AttemptArchive | None:
+        return (
+            self._attempt_archive_factory(issue_number, started_at)
+            if self._attempt_archive_factory is not None
+            else None
+        )
+
+    @staticmethod
+    def _write_outcome(
+        archive: AttemptArchive | None, outcome: AttemptOutcome, started_at: str
+    ) -> None:
+        if archive is not None:
+            completed_at = datetime.now(UTC)
+            started = datetime.fromisoformat(started_at.removesuffix("Z") + "+00:00")
+            archive.write_attempt(
+                {
+                    "outcome": outcome.value,
+                    "started_at": started_at,
+                    "completed_at": completed_at.isoformat().replace("+00:00", "Z"),
+                    "duration_seconds": (completed_at - started).total_seconds(),
+                }
+            )
+
 
 def _attempt_evidence(
     decision: CompletionDecision,
@@ -408,6 +479,18 @@ def _attempt_evidence(
         review_findings=review_findings,
         details=details,
     )
+
+
+def _archive_commands(archive: AttemptArchive | None, name: str, result: object) -> None:
+    """Keep setup, baseline, and final-check evidence in distinct artifacts."""
+
+    if archive is None:
+        return
+    commands = getattr(result, "commands", ())
+    stdout = "".join(getattr(command, "stdout", "") for command in commands)
+    stderr = "".join(getattr(command, "stderr", "") for command in commands)
+    archive.write_text(f"{name}_stdout.log", stdout)
+    archive.write_text(f"{name}_stderr.log", stderr)
 
 
 def _infrastructure_decision(reason: str) -> CompletionDecision:

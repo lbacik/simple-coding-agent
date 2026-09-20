@@ -5,7 +5,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime
 import json
+import time
 from typing import Any, Protocol
+from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 from simple_coding_agent.publication import PullRequest
@@ -167,8 +169,9 @@ class GitHubGraphQLTransport:
 
     _endpoint = "https://api.github.com/graphql"
 
-    def __init__(self, token: str) -> None:
+    def __init__(self, token: str, *, max_retries: int = 3) -> None:
         self._token = token
+        self._max_retries = max_retries
 
     def list_issues(self, repository: str, cursor: str | None) -> IssuePage:
         owner, name = _repository_parts(repository)
@@ -406,17 +409,47 @@ class GitHubGraphQLTransport:
             },
             method="POST",
         )
-        try:
-            with urlopen(request) as response:  # noqa: S310 -- fixed GitHub endpoint
-                response_data = json.load(response)
-        except (OSError, ValueError) as error:
-            raise GitHubTrackerError("GitHub request failed") from error
+        response_data: object | None = None
+        last_error: Exception | None = None
+        for attempt in range(self._max_retries):
+            try:
+                with urlopen(request) as response:  # noqa: S310 -- fixed GitHub endpoint
+                    response_data = json.load(response)
+                break
+            except HTTPError as error:
+                if error.code != 429 and not 500 <= error.code < 600:
+                    raise GitHubTrackerError("GitHub request was rejected") from error
+                last_error = error
+                if attempt + 1 == self._max_retries:
+                    raise GitHubTrackerError("GitHub request failed") from error
+                time.sleep(_retry_delay(error, attempt))
+            except (URLError, TimeoutError) as error:
+                last_error = error
+                if attempt + 1 == self._max_retries:
+                    raise GitHubTrackerError("GitHub request failed") from error
+                time.sleep(_retry_delay(error, attempt))
+            except (OSError, ValueError) as error:
+                raise GitHubTrackerError("GitHub request failed") from error
+        if response_data is None:
+            raise GitHubTrackerError("GitHub request failed") from last_error
         if not isinstance(response_data, dict) or response_data.get("errors"):
             raise GitHubTrackerError("GitHub GraphQL request was rejected")
         data = response_data.get("data")
         if not isinstance(data, dict):
             raise GitHubTrackerError("GitHub response has no data")
         return data
+
+
+def _retry_delay(error: Exception, attempt: int) -> float:
+    """Honor GitHub's bounded Retry-After signal before normal backoff."""
+
+    if isinstance(error, HTTPError):
+        retry_after = error.headers.get("Retry-After") if error.headers is not None else None
+        try:
+            return min(float(retry_after), 300) if retry_after is not None else min(2 * 2**attempt, 30)
+        except ValueError:
+            return min(2 * 2**attempt, 30)
+    return min(2 * 2**attempt, 30)
 
 
 def _repository_parts(repository: str) -> tuple[str, str]:

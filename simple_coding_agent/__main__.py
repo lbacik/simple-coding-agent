@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import sys
+from pathlib import Path
+
 from simple_coding_agent.attempt_state import AttemptStateStore
 from simple_coding_agent.command_runner import CommandRunner
 from simple_coding_agent.completion import CompletionEvaluator, VerificationRunner
@@ -10,14 +13,39 @@ from simple_coding_agent.git_workspace import GitWorkspace
 from simple_coding_agent.github_tracker import GitHubGraphQLTransport, GitHubTracker
 from simple_coding_agent.lifecycle import AgentLifecycle, ModelAttemptRunner
 from simple_coding_agent.model_execution import ModelExecutor
+from simple_coding_agent.observability import AttemptArchive, JsonEventLogger
+from simple_coding_agent.operating import ConsecutiveErrorStore
 from simple_coding_agent.publication import Publisher
+from simple_coding_agent.provenance import ProvenanceError, ProvenanceVerifier
 
 
 def main() -> None:
     """Run sequential attempts forever for the one operator-configured repository."""
 
     config = load_runtime_config()
-    github = GitHubGraphQLTransport(config.github_token)
+    logger = JsonEventLogger(
+        sys.stdout, redactions=(config.github_token, config.meta_api_key)
+    )
+    try:
+        provenance = ProvenanceVerifier(home=Path.home()).verify()
+    except ProvenanceError as error:
+        logger.emit("provenance_verification_failed", phase="startup", detail=str(error), level="ERROR")
+        raise SystemExit(1) from error
+    logger.emit(
+        "provenance_verified",
+        phase="startup",
+        detail=(
+            f"skills={provenance.skill_commit}; sdk={provenance.sdk_version}; "
+            f"cli={provenance.cli_version}"
+        ),
+    )
+    github = GitHubGraphQLTransport(config.github_token, max_retries=config.max_retries)
+    archive_factory = lambda issue_number, started_at: AttemptArchive(
+        config.data_dir,
+        issue_number=issue_number,
+        started_at=started_at,
+        redactions=(config.github_token, config.meta_api_key),
+    )
     workspace = GitWorkspace(
         config.clone_dir,
         f"https://github.com/{config.target_repo}.git",
@@ -32,6 +60,7 @@ def main() -> None:
         ),
         evaluator=CompletionEvaluator(config.review_blocking_severities),
         model_executor=ModelExecutor(config),
+        attempt_archive_factory=archive_factory,
     )
     lifecycle = AgentLifecycle(
         tracker=GitHubTracker(github, config.target_repo),
@@ -43,10 +72,15 @@ def main() -> None:
             github,
             config.target_repo,
             max_retries=config.max_retries,
+            publish_timeout=config.publish_timeout,
             attempt_state=attempt_state,
         ),
         attempt_runner=runner,
         poll_interval=config.poll_interval,
+        error_store=ConsecutiveErrorStore(config.data_dir),
+        max_consecutive_errors=config.max_consecutive_errors,
+        event_log=lambda event: logger.emit(event, phase="polling", level="ERROR"),
+        attempt_archive_factory=archive_factory,
     )
     lifecycle.run_forever(stop=lambda: False)
 

@@ -110,7 +110,9 @@ class GitWorkspace:
         if not retain_branch:
             self._git("branch", "-D", prepared.branch)
 
-    def push_attempt_branch(self, branch: str, *, max_retries: int) -> str:
+    def push_attempt_branch(
+        self, branch: str, *, max_retries: int, deadline: float | None = None
+    ) -> str:
         """Push an attempt branch using an explicit, observed force-with-lease.
 
         The operation is independently callable during recovery.  A failed
@@ -123,6 +125,8 @@ class GitWorkspace:
         local_revision = self._revision(branch, remote=False)
         last_error: GitWorkspaceError | None = None
         for attempt in range(max_retries):
+            if deadline is not None and time.monotonic() >= deadline:
+                raise GitWorkspaceError("PUBLISH_TIMEOUT exceeded while pushing")
             try:
                 observed = self._fetch_remote_branch(branch)
                 expected = observed or ""
@@ -143,7 +147,10 @@ class GitWorkspace:
                 except GitWorkspaceError:
                     pass
                 if attempt + 1 < max_retries:
-                    self._sleeper(2**attempt)
+                    delay = min(2 * 2**attempt, 30)
+                    if deadline is not None and time.monotonic() + delay >= deadline:
+                        raise GitWorkspaceError("PUBLISH_TIMEOUT exceeded while retrying push") from error
+                    self._sleeper(delay)
         raise GitWorkspaceError("Attempt branch could not be pushed safely") from last_error
 
     def _fetch_remote_branch(self, branch: str) -> str | None:

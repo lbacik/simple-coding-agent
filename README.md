@@ -55,6 +55,32 @@ removes only its `ready-for-agent` label and assignment, then removes the
 checkpoint. If the queue is empty, it sleeps for `POLL_INTERVAL` before polling
 again.
 
+## Operating limits and evidence
+
+Transient GitHub and push operations use `MAX_RETRIES` attempts with exponential
+backoff (2 seconds, capped at 30 seconds). GitHub `Retry-After` values are
+honoured up to five minutes. `PUBLISH_TIMEOUT` is a single deadline covering
+the push and pull-request path. Model implementation work is never replayed as
+a retry; an exhausted transient failure is an `infrastructure_error`.
+
+The process persists `$DATA_DIR/state/consecutive_errors.json`. Each distinct
+attempt that ends in `infrastructure_error` increments its count; every other
+outcome resets it. The attempt identity makes startup reconciliation idempotent.
+At `MAX_CONSECUTIVE_ERRORS` the process emits a structured error and exits with
+status 1. A restart alone does not reset this guard. After correcting the
+underlying infrastructure problem, an operator may remove that state file to
+reset the guard, or allow a later non-infrastructure outcome to reset it.
+
+Before model execution, the agent verifies `agent-installer list --json` for
+the pinned upstream skill commit, installed skill hashes, and valid HOME links,
+plus the exact pinned SDK and CLI versions. Any mismatch blocks model execution.
+The process emits credential-redacted JSON Lines with `timestamp`, `level`,
+`event`, `issue_number`, `phase`, and `detail`. Attempt evidence is retained
+without automatic cleanup under `$DATA_DIR/logs/<issue>/<timestamp>/`, including
+outcome metadata and separate setup, baseline-check, and final-check output.
+Available SDK skill provenance and token metadata are archived too; any SDK
+dollar estimate is explicitly non-authoritative.
+
 ## Model execution
 
 The execution boundary dispatches `/implement` with the issue body as its
