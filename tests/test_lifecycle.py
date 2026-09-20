@@ -10,6 +10,7 @@ from simple_coding_agent.attempt_state import AttemptPhase, AttemptStateStore
 from simple_coding_agent.completion import AttemptOutcome, CompletionDecision, PublicationPath
 from simple_coding_agent.github_tracker import Assignment, Claim, TrackerIssue
 from simple_coding_agent.lifecycle import AgentLifecycle, AttemptEvidence, LifecycleStatus
+from simple_coding_agent.operating import ConsecutiveErrorStore
 
 
 def test_setup_failure_posts_result_then_releases_only_the_agent_claim(
@@ -54,6 +55,27 @@ def test_empty_queue_sleeps_once_without_attempting_work(tmp_path: Path) -> None
 
     assert result.status is LifecycleStatus.IDLE
     assert sleeps == [17]
+
+
+def test_stops_after_the_persisted_consecutive_infrastructure_error_limit(tmp_path: Path) -> None:
+    events: list[str] = []
+    lifecycle = AgentLifecycle(
+        tracker=FakeTracker(Claim(issue(24), Assignment("issue-24", "agent-id"))),
+        attempt_state=AttemptStateStore(tmp_path),
+        workspace=FakeWorkspace(),
+        profile_loader=lambda _: (_ for _ in ()).throw(OSError("profile is missing")),
+        publisher=FakePublisher(),
+        error_store=ConsecutiveErrorStore(tmp_path),
+        max_consecutive_errors=1,
+        event_log=lambda event: events.append(event),
+    )
+
+    with pytest.raises(SystemExit) as stopped:
+        lifecycle.run_once()
+
+    assert stopped.value.code == 1
+    assert events == ["consecutive_error_limit_reached"]
+    assert ConsecutiveErrorStore(tmp_path).read().count == 1
 
 
 @pytest.mark.parametrize("phase", [AttemptPhase.CLAIMED, AttemptPhase.SETUP])

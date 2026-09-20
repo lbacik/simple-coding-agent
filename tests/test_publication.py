@@ -134,6 +134,26 @@ def test_verifies_a_pull_request_created_before_an_ambiguous_response(tmp_path: 
     assert len(github.created) == 1
 
 
+def test_enforces_the_shared_publish_timeout_across_pull_request_work(tmp_path: Path) -> None:
+    remote, _ = repository_with_main(tmp_path)
+    workspace = GitWorkspace(tmp_path / "clone", str(remote), token_provider=lambda: "token")
+    prepared = workspace.prepare_attempt(base_branch="main", issue_number=23)
+    state = publishing_state(tmp_path)
+    state.transition(AttemptPhase.PUBLISHING)
+    moments = iter((0.0, 120.0))
+
+    result = Publisher(
+        workspace,
+        FakeGitHub(),
+        "octo/example",
+        attempt_state=state,
+        publish_timeout=120,
+        monotonic=lambda: next(moments),
+    ).publish(request(CompletionDecision(None, True, PublicationPath.COMPLETE, ("ready",)), prepared.branch))
+
+    assert result.outcome is AttemptOutcome.INFRASTRUCTURE_ERROR
+
+
 def request(decision: CompletionDecision, branch: str) -> PublicationRequest:
     return PublicationRequest(23, "Implement publication", branch, "2026-09-20T13:00:00Z", decision, "pytest", 1, 0, "all clear", "Check did not pass.", "main")
 

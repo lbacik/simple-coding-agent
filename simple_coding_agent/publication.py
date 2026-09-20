@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Protocol
+import time
+from typing import Callable, Protocol
 
 from simple_coding_agent.completion import AttemptOutcome, CompletionDecision, PublicationPath
 from simple_coding_agent.attempt_state import AttemptPhase, AttemptStateStore
@@ -69,13 +70,19 @@ class Publisher:
         repository: str,
         *,
         max_retries: int = 3,
+        publish_timeout: float = 120,
         attempt_state: AttemptStateStore | None = None,
+        sleeper: Callable[[float], None] = time.sleep,
+        monotonic: Callable[[], float] = time.monotonic,
     ) -> None:
         self._workspace = workspace
         self._github = github
         self._repository = repository
         self._max_retries = max_retries
+        self._publish_timeout = publish_timeout
         self._attempt_state = attempt_state
+        self._sleeper = sleeper
+        self._monotonic = monotonic
 
     def publish(self, request: PublicationRequest) -> PublicationResult:
         """Publish the permitted path and always try to record its outcome.
@@ -84,6 +91,7 @@ class Publisher:
         PR creation is deliberately limited to a locally complete candidate.
         """
 
+        deadline = self._monotonic() + self._publish_timeout
         outcome = request.decision.outcome
         branch_url: str | None = None
         pull_request: PullRequest | None = None
@@ -95,10 +103,14 @@ class Publisher:
             try:
                 checkpoint = self._attempt_state.read() if self._attempt_state is not None else None
                 if checkpoint is None or checkpoint.phase is not AttemptPhase.PUBLISHING:
-                    self._workspace.push_attempt_branch(request.branch, max_retries=self._max_retries)
+                    self._check_deadline(deadline)
+                    self._workspace.push_attempt_branch(
+                        request.branch, max_retries=self._max_retries, deadline=deadline
+                    )
+                    self._check_deadline(deadline)
                     self._mark_publishing()
                 branch_url = f"https://github.com/{self._repository}/tree/{request.branch}"
-            except GitWorkspaceError:
+            except (GitWorkspaceError, TimeoutError):
                 outcome = AttemptOutcome.INFRASTRUCTURE_ERROR
                 comment_posted = self._post_result(
                     request, outcome, branch_url, None, "Implementation succeeded but publication failed."
@@ -107,7 +119,7 @@ class Publisher:
 
         if request.decision.publication_eligible:
             try:
-                pull_request = self._ensure_pull_request(request)
+                pull_request = self._ensure_pull_request(request, deadline)
             except Exception:  # Transport implementations normalize only their own failures.
                 outcome = AttemptOutcome.INFRASTRUCTURE_ERROR
                 comment_posted = self._post_result(
@@ -135,12 +147,13 @@ class Publisher:
             raise GitWorkspaceError("Attempt is not ready to publish")
         self._attempt_state.transition(AttemptPhase.PUBLISHING)
 
-    def _ensure_pull_request(self, request: PublicationRequest) -> PullRequest:
+    def _ensure_pull_request(self, request: PublicationRequest, deadline: float) -> PullRequest:
         existing = self._github.find_pull_request(self._repository, request.branch)
         if existing is not None:
             return existing
         body = _pull_request_body(request)
         for attempt in range(self._max_retries):
+            self._check_deadline(deadline)
             try:
                 return self._github.create_pull_request(
                     self._repository,
@@ -155,7 +168,12 @@ class Publisher:
                     return existing
                 if attempt + 1 == self._max_retries:
                     raise
+                self._sleeper(min(2 * 2**attempt, 30))
         raise AssertionError("unreachable")
+
+    def _check_deadline(self, deadline: float) -> None:
+        if self._monotonic() >= deadline:
+            raise TimeoutError("PUBLISH_TIMEOUT exceeded")
 
     def _post_result(
         self,
