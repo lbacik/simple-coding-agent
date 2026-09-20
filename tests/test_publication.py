@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from simple_coding_agent.completion import AttemptOutcome, CompletionDecision, PublicationPath
+from simple_coding_agent.attempt_state import AttemptPhase, AttemptStateStore
 from simple_coding_agent.git_workspace import GitWorkspace
 from simple_coding_agent.publication import PublicationRequest, Publisher, PullRequest
 
@@ -16,8 +17,9 @@ def test_publishes_a_complete_attempt_once_and_renders_the_standard_result(tmp_p
     prepared = workspace.prepare_attempt(base_branch="main", issue_number=23)
     write_and_commit(tmp_path / "clone", "feature.txt", "done", "Implement publication")
     github = FakeGitHub()
+    state = publishing_state(tmp_path)
 
-    result = Publisher(workspace, github, "octo/example").publish(
+    result = Publisher(workspace, github, "octo/example", attempt_state=state).publish(
         PublicationRequest(
             issue_number=23,
             issue_title="Implement publication",
@@ -40,8 +42,9 @@ def test_publishes_a_complete_attempt_once_and_renders_the_standard_result(tmp_p
     assert "Closes #23" in github.pull_request_bodies[0]
     assert "## Agent Attempt Result: complete" in github.comments[0][1]
     assert "<!-- agent-attempt: 2026-09-20T13:00:00Z -->" in github.comments[0][1]
+    assert state.read().phase is AttemptPhase.PUBLISHING
 
-    repeated = Publisher(workspace, github, "octo/example").publish(
+    repeated = Publisher(workspace, github, "octo/example", attempt_state=state).publish(
         PublicationRequest(
             issue_number=23,
             issue_title="Implement publication",
@@ -112,6 +115,15 @@ def test_verifies_a_pull_request_created_before_an_ambiguous_response(tmp_path: 
 
 def request(decision: CompletionDecision, branch: str) -> PublicationRequest:
     return PublicationRequest(23, "Implement publication", branch, "2026-09-20T13:00:00Z", decision, "pytest", 1, 0, "all clear", "Check did not pass.", "main")
+
+
+def publishing_state(tmp_path: Path) -> AttemptStateStore:
+    state = AttemptStateStore(tmp_path / "state")
+    state.start(issue_number=23, branch="agent/issue-23")
+    state.transition(AttemptPhase.SETUP)
+    state.transition(AttemptPhase.MODEL_RUNNING)
+    state.transition(AttemptPhase.PUSHING)
+    return state
 
 
 @dataclass

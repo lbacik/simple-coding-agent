@@ -126,7 +126,9 @@ class GitWorkspace:
                     "origin",
                     f"{branch}:refs/heads/{branch}",
                 )
-                return local_revision
+                if self._remote_branch_revision(branch) == local_revision:
+                    return local_revision
+                raise GitWorkspaceError("Pushed branch does not match the local revision")
             except GitWorkspaceError as error:
                 last_error = error
                 try:

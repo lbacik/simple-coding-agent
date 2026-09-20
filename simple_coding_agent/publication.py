@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import Protocol
 
 from simple_coding_agent.completion import AttemptOutcome, CompletionDecision, PublicationPath
+from simple_coding_agent.attempt_state import AttemptPhase, AttemptStateStore
 from simple_coding_agent.git_workspace import GitWorkspace, GitWorkspaceError
 
 
@@ -67,11 +68,13 @@ class Publisher:
         repository: str,
         *,
         max_retries: int = 3,
+        attempt_state: AttemptStateStore | None = None,
     ) -> None:
         self._workspace = workspace
         self._github = github
         self._repository = repository
         self._max_retries = max_retries
+        self._attempt_state = attempt_state
 
     def publish(self, request: PublicationRequest) -> PublicationResult:
         """Publish the permitted path and always try to record its outcome.
@@ -89,7 +92,10 @@ class Publisher:
         )
         if needs_push:
             try:
-                self._workspace.push_attempt_branch(request.branch, max_retries=self._max_retries)
+                checkpoint = self._attempt_state.read() if self._attempt_state is not None else None
+                if checkpoint is None or checkpoint.phase is not AttemptPhase.PUBLISHING:
+                    self._workspace.push_attempt_branch(request.branch, max_retries=self._max_retries)
+                    self._mark_publishing()
                 branch_url = f"https://github.com/{self._repository}/tree/{request.branch}"
             except GitWorkspaceError:
                 outcome = AttemptOutcome.INFRASTRUCTURE_ERROR
@@ -109,6 +115,20 @@ class Publisher:
             outcome = AttemptOutcome.INFRASTRUCTURE_ERROR
         self._post_result(request, outcome, branch_url, pull_request, request.details)
         return PublicationResult(outcome, branch_url, pull_request)
+
+    def _mark_publishing(self) -> None:
+        """Durably record a verified branch write before any PR write can begin."""
+
+        if self._attempt_state is None:
+            return
+        checkpoint = self._attempt_state.read()
+        if checkpoint is None:
+            raise GitWorkspaceError("Attempt checkpoint is missing during publication")
+        if checkpoint.phase is AttemptPhase.PUBLISHING:
+            return
+        if checkpoint.phase is not AttemptPhase.PUSHING:
+            raise GitWorkspaceError("Attempt is not ready to publish")
+        self._attempt_state.transition(AttemptPhase.PUBLISHING)
 
     def _ensure_pull_request(self, request: PublicationRequest) -> PullRequest:
         existing = self._github.find_pull_request(self._repository, request.branch)
