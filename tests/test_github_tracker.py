@@ -1,0 +1,156 @@
+from __future__ import annotations
+
+from dataclasses import replace
+from datetime import UTC, datetime, timedelta
+
+import pytest
+
+from simple_coding_agent.github_tracker import (
+    Assignment,
+    GitHubIdentity,
+    GitHubTracker,
+    IssuePage,
+    TrackerIssue,
+)
+
+
+def test_lists_only_eligible_open_issues() -> None:
+    eligible = issue(1)
+    transport = FakeTransport(
+        pages=[
+            IssuePage(
+                issues=(
+                    eligible,
+                    replace(eligible, number=2, labels=frozenset()),
+                    replace(eligible, number=3, assignee_logins=("person",)),
+                    replace(eligible, number=4, body=" \n\t"),
+                    replace(eligible, number=5, blocked_by=1),
+                    replace(eligible, number=6, state="CLOSED"),
+                ),
+                next_cursor=None,
+            )
+        ]
+    )
+
+    assert GitHubTracker(transport, "octo/example").runnable_queue() == (eligible,)
+
+
+def test_paginates_then_orders_the_runnable_queue_fifo() -> None:
+    later = issue(2, created_at=datetime(2026, 9, 20, 14, 0, tzinfo=UTC))
+    first = issue(1, created_at=datetime(2026, 9, 20, 13, 0, tzinfo=UTC))
+    transport = FakeTransport(
+        pages=[
+            IssuePage(issues=(later,), next_cursor="next"),
+            IssuePage(issues=(first,), next_cursor=None),
+        ]
+    )
+
+    assert [item.number for item in GitHubTracker(transport, "octo/example").runnable_queue()] == [1, 2]
+    assert transport.page_cursors == [None, "next"]
+
+
+def test_claims_the_first_issue_that_remains_eligible() -> None:
+    selected = issue(2, title="Selected", body="Implement this")
+    transport = FakeTransport(
+        pages=[
+            IssuePage(
+                issues=(
+                    issue(1, created_at=datetime(2026, 9, 20, 12, 0, tzinfo=UTC)),
+                    selected,
+                ),
+                next_cursor=None,
+            )
+        ],
+        refreshed={
+            1: replace(issue(1), assignee_logins=("another-agent",)),
+            2: selected,
+        },
+    )
+
+    claim = GitHubTracker(transport, "octo/example").claim_next()
+
+    assert claim is not None
+    assert claim.issue.number == 2
+    assert claim.issue.title == "Selected"
+    assert claim.issue.body == "Implement this"
+    assert claim.assignment == Assignment(issue_id="issue-2", assignee_id="viewer-id")
+    assert transport.assignments == [("issue-2", "viewer-id")]
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        "assigned",
+        "empty_body",
+        "blocked",
+        "unlabelled",
+        "closed",
+    ],
+)
+def test_does_not_assign_an_issue_that_changes_before_claim(
+    change: str,
+) -> None:
+    candidate = issue(1)
+    changed_issue = {
+        "assigned": replace(candidate, assignee_logins=("human",)),
+        "empty_body": replace(candidate, body="  "),
+        "blocked": replace(candidate, blocked_by=1),
+        "unlabelled": replace(candidate, labels=frozenset()),
+        "closed": replace(candidate, state="CLOSED"),
+    }[change]
+    transport = FakeTransport(
+        pages=[IssuePage(issues=(candidate,), next_cursor=None)],
+        refreshed={1: changed_issue},
+    )
+
+    assert GitHubTracker(transport, "octo/example").claim_next() is None
+    assert transport.assignments == []
+
+
+def issue(
+    number: int,
+    *,
+    created_at: datetime | None = None,
+    title: str = "Issue title",
+    body: str = "Issue body",
+) -> TrackerIssue:
+    return TrackerIssue(
+        id=f"issue-{number}",
+        number=number,
+        title=title,
+        body=body,
+        created_at=created_at or datetime(2026, 9, 20, 13, 0, tzinfo=UTC) + timedelta(seconds=number),
+        state="OPEN",
+        labels=frozenset({"ready-for-agent"}),
+        assignee_logins=(),
+        blocked_by=0,
+    )
+
+
+class FakeTransport:
+    def __init__(
+        self,
+        *,
+        pages: list[IssuePage],
+        refreshed: dict[int, TrackerIssue] | None = None,
+    ) -> None:
+        self._pages = pages
+        self._refreshed = refreshed or {}
+        self.page_cursors: list[str | None] = []
+        self.assignments: list[tuple[str, str]] = []
+
+    def list_issues(self, repository: str, cursor: str | None) -> IssuePage:
+        assert repository == "octo/example"
+        self.page_cursors.append(cursor)
+        return self._pages[len(self.page_cursors) - 1]
+
+    def get_issue(self, repository: str, number: int) -> TrackerIssue | None:
+        assert repository == "octo/example"
+        return self._refreshed.get(number)
+
+    def viewer(self) -> GitHubIdentity:
+        return GitHubIdentity(id="viewer-id", login="agent")
+
+    def assign_issue(self, issue_id: str, assignee_id: str) -> Assignment:
+        self.assignments.append((issue_id, assignee_id))
+        return Assignment(issue_id=issue_id, assignee_id=assignee_id)

@@ -5,6 +5,19 @@ for one configured repository. This initial slice provides the validated runtime
 configuration and target-repository profile boundary; it does not start an SDK
 session, call GitHub, or publish changes.
 
+## GitHub issue trust boundary
+
+The tracker selects only OPEN issues in `TARGET_REPO` that are labelled
+`ready-for-agent`, unassigned, have a non-empty body, and have no open native
+GitHub blockers. It orders eligible issues FIFO by creation date and rechecks
+eligibility immediately before assigning the authenticated GitHub identity.
+That check-then-set claim assumes one process; it is not a distributed lock.
+
+Applying `ready-for-agent` is the human trust boundary: only repository
+collaborators with write access may apply it. The issue body is passed to the
+agent verbatim; the tracker intentionally does not infer dependencies from
+prose or filter issue text for prompt injection.
+
 ## Operator environment
 
 Copy `.env.example` and set `GITHUB_TOKEN`, `META_API_KEY`, and `TARGET_REPO`
