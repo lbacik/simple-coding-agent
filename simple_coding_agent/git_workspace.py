@@ -9,6 +9,7 @@ from pathlib import Path
 import stat
 import subprocess
 import tempfile
+import time
 from urllib.parse import urlsplit
 
 
@@ -45,11 +46,13 @@ class GitWorkspace:
         *,
         token_provider: Callable[[], str],
         run: GitRunner | None = None,
+        sleeper: Callable[[float], None] | None = None,
     ) -> None:
         self._clone_dir = clone_dir
         self._repository_url = repository_url
         self._token_provider = token_provider
         self._run = run or _run_git
+        self._sleeper = sleeper or time.sleep
 
     def prepare_attempt(self, *, base_branch: str, issue_number: int) -> PreparedAttempt:
         """Fetch, verify, and check out the branch used by an attempt.
@@ -100,6 +103,64 @@ class GitWorkspace:
         self._git("clean", "-fd")
         if not retain_branch:
             self._git("branch", "-D", prepared.branch)
+
+    def push_attempt_branch(self, branch: str, *, max_retries: int) -> str:
+        """Push an attempt branch using an explicit, observed force-with-lease.
+
+        The operation is independently callable during recovery.  A failed
+        push is first reconciled with the remote because the server may have
+        accepted it before the client lost its response.
+        """
+
+        if max_retries <= 0:
+            raise GitWorkspaceError("Push retry count must be positive")
+        local_revision = self._revision(branch, remote=False)
+        last_error: GitWorkspaceError | None = None
+        for attempt in range(max_retries):
+            try:
+                observed = self._fetch_remote_branch(branch)
+                expected = observed or ""
+                self._git(
+                    "push",
+                    f"--force-with-lease={branch}:{expected}",
+                    "origin",
+                    f"{branch}:refs/heads/{branch}",
+                )
+                return local_revision
+            except GitWorkspaceError as error:
+                last_error = error
+                try:
+                    if self._remote_branch_revision(branch) == local_revision:
+                        return local_revision
+                except GitWorkspaceError:
+                    pass
+                if attempt + 1 < max_retries:
+                    self._sleeper(2**attempt)
+        raise GitWorkspaceError("Attempt branch could not be pushed safely") from last_error
+
+    def _fetch_remote_branch(self, branch: str) -> str | None:
+        """Fetch an attempt branch, confirming an absent ref rather than guessing."""
+
+        try:
+            self._git("fetch", "origin", branch)
+        except GitWorkspaceError as fetch_error:
+            try:
+                observed = self._remote_branch_revision(branch)
+            except GitWorkspaceError:
+                raise fetch_error
+            if observed is not None:
+                raise fetch_error
+            return None
+        return self._remote_branch_revision(branch)
+
+    def _remote_branch_revision(self, branch: str) -> str | None:
+        output = self._git("ls-remote", "--heads", "origin", f"refs/heads/{branch}")
+        if not output:
+            return None
+        revision, separator, reference = output.partition("\t")
+        if not separator or reference != f"refs/heads/{branch}" or not revision:
+            raise GitWorkspaceError("Remote branch revision is invalid")
+        return revision
 
     def _ensure_clone(self) -> None:
         _reject_url_credentials(self._repository_url)
