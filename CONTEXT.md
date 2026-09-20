@@ -27,3 +27,7 @@ _Avoid_: Backlog, work queue, job queue
 **Claim**:
 Reserving an eligible issue by assigning the agent's GitHub identity as the issue assignee, after verifying the assignee is still empty. A claimed issue is no longer eligible for other sessions.
 _Avoid_: Lock, reservation
+
+**Attempt outcome**:
+The structured result of an implementation attempt. Exactly one of: `complete` (all acceptance criteria met, checks pass, review clear, PR created), `incomplete` (work performed but criteria not met), `infrastructure_error` (failure unrelated to implementation logic), or `no_changes` (skill loop finished with zero commits).
+_Avoid_: Status, result code, exit status
