@@ -125,6 +125,17 @@ def test_publication_transport_uses_attempt_marker_and_reuses_an_existing_pr() -
     assert "comments(last: 100)" in transport.queries[1]
 
 
+def test_releases_only_the_ready_label_and_the_authenticated_agent_assignment() -> None:
+    claimed = replace(issue(24), assignee_logins=("agent", "human"), labels=frozenset({"ready-for-agent", "bug"}))
+    after_label = replace(claimed, labels=frozenset({"bug"}))
+    transport = FakeTransport(pages=[], refreshed={24: claimed}, releases={24: after_label})
+
+    GitHubTracker(transport, "octo/example").release_attempt(24, "ready-for-agent", "viewer-id")
+
+    assert transport.removed_labels == [("issue-24", "ready-for-agent")]
+    assert transport.removed_assignees == [("issue-24", "viewer-id")]
+
+
 class RecordingGraphQLTransport:
     def __init__(self, responses: list[dict]) -> None:
         from simple_coding_agent.github_tracker import GitHubGraphQLTransport
@@ -171,11 +182,15 @@ class FakeTransport:
         *,
         pages: list[IssuePage],
         refreshed: dict[int, TrackerIssue] | None = None,
+        releases: dict[int, TrackerIssue] | None = None,
     ) -> None:
         self._pages = pages
         self._refreshed = refreshed or {}
+        self._releases = releases or {}
         self.page_cursors: list[str | None] = []
         self.assignments: list[tuple[str, str]] = []
+        self.removed_labels: list[tuple[str, str]] = []
+        self.removed_assignees: list[tuple[str, str]] = []
 
     def list_issues(self, repository: str, cursor: str | None) -> IssuePage:
         assert repository == "octo/example"
@@ -184,7 +199,7 @@ class FakeTransport:
 
     def get_issue(self, repository: str, number: int) -> TrackerIssue | None:
         assert repository == "octo/example"
-        return self._refreshed.get(number)
+        return self._releases.get(number, self._refreshed.get(number)) if self.removed_labels else self._refreshed.get(number)
 
     def viewer(self) -> GitHubIdentity:
         return GitHubIdentity(id="viewer-id", login="agent")
@@ -192,3 +207,9 @@ class FakeTransport:
     def assign_issue(self, issue_id: str, assignee_id: str) -> Assignment:
         self.assignments.append((issue_id, assignee_id))
         return Assignment(issue_id=issue_id, assignee_id=assignee_id)
+
+    def remove_label(self, issue_id: str, label: str) -> None:
+        self.removed_labels.append((issue_id, label))
+
+    def remove_assignee(self, issue_id: str, assignee_id: str) -> None:
+        self.removed_assignees.append((issue_id, assignee_id))

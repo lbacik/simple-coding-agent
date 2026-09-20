@@ -56,6 +56,7 @@ class PublicationResult:
     outcome: AttemptOutcome
     branch_url: str | None
     pull_request: PullRequest | None
+    comment_posted: bool = True
 
 
 class Publisher:
@@ -99,22 +100,26 @@ class Publisher:
                 branch_url = f"https://github.com/{self._repository}/tree/{request.branch}"
             except GitWorkspaceError:
                 outcome = AttemptOutcome.INFRASTRUCTURE_ERROR
-                self._post_result(request, outcome, branch_url, None, "Implementation succeeded but publication failed.")
-                return PublicationResult(outcome, branch_url, None)
+                comment_posted = self._post_result(
+                    request, outcome, branch_url, None, "Implementation succeeded but publication failed."
+                )
+                return PublicationResult(outcome, branch_url, None, comment_posted)
 
         if request.decision.publication_eligible:
             try:
                 pull_request = self._ensure_pull_request(request)
             except Exception:  # Transport implementations normalize only their own failures.
                 outcome = AttemptOutcome.INFRASTRUCTURE_ERROR
-                self._post_result(request, outcome, branch_url, None, "Implementation succeeded but publication failed.")
-                return PublicationResult(outcome, branch_url, None)
+                comment_posted = self._post_result(
+                    request, outcome, branch_url, None, "Implementation succeeded but publication failed."
+                )
+                return PublicationResult(outcome, branch_url, None, comment_posted)
             outcome = AttemptOutcome.COMPLETE
 
         if outcome is None:
             outcome = AttemptOutcome.INFRASTRUCTURE_ERROR
-        self._post_result(request, outcome, branch_url, pull_request, request.details)
-        return PublicationResult(outcome, branch_url, pull_request)
+        comment_posted = self._post_result(request, outcome, branch_url, pull_request, request.details)
+        return PublicationResult(outcome, branch_url, pull_request, comment_posted)
 
     def _mark_publishing(self) -> None:
         """Durably record a verified branch write before any PR write can begin."""
@@ -159,19 +164,20 @@ class Publisher:
         branch_url: str | None,
         pull_request: PullRequest | None,
         details: str,
-    ) -> None:
+    ) -> bool:
         marker = f"<!-- agent-attempt: {request.started_at} -->"
         try:
             if self._github.find_attempt_comment(self._repository, request.issue_number, marker):
-                return
+                return True
             self._github.add_comment(
                 self._repository,
                 request.issue_number,
                 _result_comment(request, outcome, branch_url, pull_request, details, marker),
             )
+            return True
         except Exception:
             # The local result remains authoritative when GitHub is unavailable.
-            return
+            return False
 
 
 def _pull_request_body(request: PublicationRequest) -> str:

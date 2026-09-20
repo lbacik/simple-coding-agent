@@ -3,7 +3,7 @@
 An unattended Python agent that attempts eligible GitHub implementation issues
 for one configured repository. It provides validated runtime configuration,
 the target-repository profile boundary, and a model-execution boundary. The
-driving process still owns GitHub calls and all publication.
+driving process owns GitHub calls, publication, cleanup, and polling.
 
 ## GitHub issue trust boundary
 
@@ -43,6 +43,17 @@ repository.
 Review findings of severity `must-fix` block by default. Set
 `REVIEW_BLOCKING_SEVERITIES` explicitly to an empty value to select the
 test-only review gate; `suggestion` remains advisory unless explicitly added.
+
+Start the single-process lifecycle with:
+
+```shell
+python -m simple_coding_agent
+```
+
+It claims one issue at a time. On every terminal outcome, it posts the result,
+removes only its `ready-for-agent` label and assignment, then removes the
+checkpoint. If the queue is empty, it sleeps for `POLL_INTERVAL` before polling
+again.
 
 ## Model execution
 

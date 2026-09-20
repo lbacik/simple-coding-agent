@@ -88,6 +88,10 @@ class GitHubTransport(Protocol):
 
     def assign_issue(self, issue_id: str, assignee_id: str) -> Assignment: ...
 
+    def remove_assignee(self, issue_id: str, assignee_id: str) -> None: ...
+
+    def remove_label(self, issue_id: str, label: str) -> None: ...
+
 
 class GitHubTracker:
     """Select and claim one eligible issue within exactly one repository."""
@@ -128,6 +132,26 @@ class GitHubTracker:
             return Claim(issue=current, assignment=assignment)
         return None
 
+    def release_attempt(self, issue_number: int, label: str, assignee_id: str) -> None:
+        """Idempotently release only this agent's assignment and queue label.
+
+        Each remote field is re-read immediately before its mutation, so a
+        restart after a partial cleanup neither removes a human's work nor
+        repeats an already-completed operation.
+        """
+
+        current = self._transport.get_issue(self._target_repo, issue_number)
+        if current is None:
+            return
+        if label in current.labels:
+            self._transport.remove_label(current.id, label)
+        current = self._transport.get_issue(self._target_repo, issue_number)
+        if current is None:
+            return
+        identity = self._transport.viewer()
+        if identity.login in current.assignee_logins:
+            self._transport.remove_assignee(current.id, assignee_id)
+
 
 class GitHubGraphQLTransport:
     """GitHub GraphQL transport used by the tracker in production."""
@@ -152,7 +176,7 @@ class GitHubGraphQLTransport:
             fragment IssueFields on Issue {
               id number title body createdAt state
               labels(first: 100) { nodes { name } }
-              assignees(first: 1) { nodes { login } }
+              assignees(first: 100) { nodes { login } }
               issueDependenciesSummary { blockedBy }
             }
             """,
@@ -180,7 +204,7 @@ class GitHubGraphQLTransport:
             fragment IssueFields on Issue {
               id number title body createdAt state
               labels(first: 100) { nodes { name } }
-              assignees(first: 1) { nodes { login } }
+              assignees(first: 100) { nodes { login } }
               issueDependenciesSummary { blockedBy }
             }
             """,
@@ -212,6 +236,47 @@ class GitHubGraphQLTransport:
             {"issueId": issue_id, "assigneeId": assignee_id},
         )
         return Assignment(issue_id=issue_id, assignee_id=assignee_id)
+
+    def remove_assignee(self, issue_id: str, assignee_id: str) -> None:
+        """Remove one known assignee without affecting any other assignee."""
+
+        self._execute(
+            """
+            mutation RemoveAssignee($issueId: ID!, $assigneeId: ID!) {
+              removeAssigneesFromAssignable(input: {assignableId: $issueId, assigneeIds: [$assigneeId]}) {
+                assignable { id }
+              }
+            }
+            """,
+            {"issueId": issue_id, "assigneeId": assignee_id},
+        )
+
+    def remove_label(self, issue_id: str, label: str) -> None:
+        """Remove just the queue label after resolving its repository node id."""
+
+        data = self._execute(
+            """
+            query LabelId($issueId: ID!) {
+              node(id: $issueId) { ... on Issue { labels(first: 100) { nodes { id name } } } }
+            }
+            """,
+            {"issueId": issue_id},
+        )
+        try:
+            labels = data["node"]["labels"]["nodes"]
+            label_id = next(item["id"] for item in labels if item["name"] == label)
+        except (KeyError, StopIteration, TypeError) as error:
+            raise GitHubTrackerError("GitHub returned an invalid issue label") from error
+        self._execute(
+            """
+            mutation RemoveLabel($issueId: ID!, $labelId: ID!) {
+              removeLabelsFromLabelable(input: {labelableId: $issueId, labelIds: [$labelId]}) {
+                labelable { id }
+              }
+            }
+            """,
+            {"issueId": issue_id, "labelId": label_id},
+        )
 
     def find_pull_request(self, repository: str, head: str) -> PullRequest | None:
         """Return an existing open PR for an attempt branch, if any."""

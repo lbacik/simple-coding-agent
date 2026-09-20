@@ -54,6 +54,12 @@ class GitWorkspace:
         self._run = run or _run_git
         self._sleeper = sleeper or time.sleep
 
+    @property
+    def working_directory(self) -> Path:
+        """The persistent clone directory used by profile commands and the SDK."""
+
+        return self._clone_dir
+
     def prepare_attempt(self, *, base_branch: str, issue_number: int) -> PreparedAttempt:
         """Fetch, verify, and check out the branch used by an attempt.
 
