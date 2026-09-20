@@ -1,0 +1,20 @@
+services:
+  agent:
+    build: .
+    image: simple-coding-agent:latest
+    # Single-instance, sequential-worker scope: do not scale beyond 1.
+    env_file:
+      - .env
+    volumes:
+      # Named volume keeps clone/state/logs through container replacement.
+      # Installed skills are baked into the image; they survive replacement
+      # because install-skills.sh runs at build time.
+      - agent_data:/data
+    # No Docker socket is mounted.
+    restart: unless-stopped
+
+volumes:
+  agent_data:
+    # Persistent named volume for /data: preserves clone, state, and logs
+    # across container replacement.  Remove manually only when a full reset
+    # is intended.
