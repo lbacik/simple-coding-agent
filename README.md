@@ -44,6 +44,23 @@ Review findings of severity `must-fix` block by default. Set
 `REVIEW_BLOCKING_SEVERITIES` explicitly to an empty value to select the
 test-only review gate; `suggestion` remains advisory unless explicitly added.
 
+## Local installation
+
+Install Python dependencies and the package in editable mode, then install the
+pinned upstream skill bundle:
+
+```shell
+python3 -m pip install -e '.[dev]'
+bash scripts/install-skills.sh
+```
+
+Copy `.env.example` to `.env` and fill in your credentials:
+
+```shell
+cp .env.example .env
+# edit .env: set GITHUB_TOKEN, META_API_KEY, TARGET_REPO
+```
+
 Start the single-process lifecycle with:
 
 ```shell
@@ -54,6 +71,35 @@ It claims one issue at a time. On every terminal outcome, it posts the result,
 removes only its `ready-for-agent` label and assignment, then removes the
 checkpoint. If the queue is empty, it sleeps for `POLL_INTERVAL` before polling
 again.
+
+## Docker Compose operation
+
+Build the image and start the long-running service (persistent data under the
+`agent_data` named volume):
+
+```shell
+cp .env.example .env
+# edit .env: set GITHUB_TOKEN, META_API_KEY, TARGET_REPO
+docker compose up --build
+```
+
+The service runs as a single-instance, sequential-worker process.  Do not
+scale it beyond one replica.  The `agent_data` volume preserves the repository
+clone, state files, and logs through container replacement.  Installed skills
+are baked into the image at build time and are therefore also preserved.
+
+For a one-shot run (useful for testing or manual invocation):
+
+```shell
+docker compose run --rm agent
+```
+
+Lifecycle and persistence semantics are the same for both launch paths.
+`restart: unless-stopped` in `docker-compose.yml` ensures the service
+recovers from transient failures, but the persisted `consecutive_errors.json`
+guard still trips at `MAX_CONSECUTIVE_ERRORS`; a restart alone does not reset
+it.  See [docs/agents/operator-onboarding.md](docs/agents/operator-onboarding.md)
+for recovery procedures and full onboarding guidance.
 
 ## Operating limits and evidence
 
