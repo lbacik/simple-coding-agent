@@ -7,12 +7,14 @@
 #
 # Pinned versions:
 #   agent-installer : 0.6.0
+#   source repo     : https://github.com/mattpocock/skills
 #   source commit   : c55ee46073ed923f86ce59a5eb3b6d895095d1b7
 #   skills          : implement, tdd, code-review, codebase-design
 
 set -euo pipefail
 
 INSTALLER_VERSION="0.6.0"
+SOURCE_REPO="https://github.com/mattpocock/skills"
 SKILLS_COMMIT="c55ee46073ed923f86ce59a5eb3b6d895095d1b7"
 SKILLS=(implement tdd code-review codebase-design)
 
@@ -36,12 +38,13 @@ fi
 # ---------------------------------------------------------------------------
 ONLY_FLAGS=()
 for skill in "${SKILLS[@]}"; do
-    ONLY_FLAGS+=(--only "${skill}")
+    ONLY_FLAGS+=(--only "skill:${skill}")
 done
 
-echo "[install-skills] Installing skills from commit ${SKILLS_COMMIT} ..."
+echo "[install-skills] Installing skills from ${SOURCE_REPO}@${SKILLS_COMMIT} ..."
 agent-installer install \
-    --source "${SKILLS_COMMIT}" \
+    "${SOURCE_REPO}" \
+    --ref "${SKILLS_COMMIT}" \
     "${ONLY_FLAGS[@]}"
 
 # ---------------------------------------------------------------------------
