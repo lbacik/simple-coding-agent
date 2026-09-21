@@ -85,6 +85,41 @@ def test_raises_a_recovery_error_when_the_diverged_base_cannot_be_repaired(
         broken_workspace.prepare_attempt(base_branch="main", issue_number=19)
 
 
+def test_rebases_a_reused_attempt_branch_onto_an_advanced_base(tmp_path: Path) -> None:
+    remote, seed = repository_with_main(tmp_path)
+    clone = tmp_path / "clone"
+    workspace = GitWorkspace(clone, str(remote), token_provider=lambda: "secret-token")
+    workspace.prepare_attempt(base_branch="main", issue_number=19)
+    write_and_commit(clone, "local.txt", "unpublished work", "Retain me")
+
+    write_and_commit(seed, "README.md", "fixed setup command", "Fix setup command")
+    git(seed, "push", "origin", "main")
+
+    prepared = workspace.prepare_attempt(base_branch="main", issue_number=19)
+
+    assert (clone / "README.md").read_text() == "fixed setup command"
+    assert [commit.subject for commit in workspace.commits_added(prepared)] == ["Retain me"]
+
+
+def test_discards_a_reused_attempt_branch_that_conflicts_with_an_advanced_base(
+    tmp_path: Path,
+) -> None:
+    remote, seed = repository_with_main(tmp_path)
+    clone = tmp_path / "clone"
+    workspace = GitWorkspace(clone, str(remote), token_provider=lambda: "secret-token")
+    workspace.prepare_attempt(base_branch="main", issue_number=19)
+    write_and_commit(clone, "README.md", "branch change", "Conflicting branch commit")
+
+    write_and_commit(seed, "README.md", "upstream fix", "Conflicting upstream commit")
+    git(seed, "push", "origin", "main")
+
+    prepared = workspace.prepare_attempt(base_branch="main", issue_number=19)
+
+    assert (clone / "README.md").read_text() == "upstream fix"
+    assert workspace.commits_added(prepared) == ()
+    assert git(clone, "status", "--porcelain") == ""
+
+
 def test_reports_the_verified_base_and_commits_added_by_the_attempt(tmp_path: Path) -> None:
     remote, _ = repository_with_main(tmp_path)
     clone = tmp_path / "clone"

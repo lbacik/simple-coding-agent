@@ -51,7 +51,9 @@ def test_empty_queue_sleeps_once_without_attempting_work(tmp_path: Path) -> None
         publisher=FakePublisher(),
         poll_interval=17,
         sleeper=sleeps.append,
-        event_log=lambda event, detail="", level="INFO": events.append((event, detail, level)),
+        event_log=lambda event, detail="", level="INFO", issue_number=None: events.append(
+            (event, detail, level)
+        ),
     )
 
     result = lifecycle.run_once()
@@ -73,19 +75,23 @@ def test_stops_after_the_persisted_consecutive_infrastructure_error_limit(tmp_pa
         publisher=FakePublisher(),
         error_store=ConsecutiveErrorStore(tmp_path),
         max_consecutive_errors=1,
-        event_log=lambda event, detail="", level="INFO": events.append((event, detail)),
+        event_log=lambda event, detail="", level="INFO", issue_number=None: events.append(
+            (event, detail, issue_number)
+        ),
     )
 
     with pytest.raises(SystemExit) as stopped:
         lifecycle.run_once()
 
     assert stopped.value.code == 1
-    assert [event for event, _ in events] == [
+    assert [event for event, _, _ in events] == [
         "polling_for_issue",
         "attempt_exception",
         "consecutive_error_limit_reached",
     ]
     assert events[1][1] == "OSError: profile is missing"
+    assert events[1][2] == 24
+    assert events[2][2] == 24
     assert ConsecutiveErrorStore(tmp_path).read().count == 1
 
 
@@ -357,7 +363,9 @@ def test_stops_without_touching_the_issue_when_the_workspace_cannot_be_repaired(
         workspace=workspace,
         profile_loader=lambda _: (_ for _ in ()).throw(AssertionError("must not be reached")),
         publisher=FakePublisher(),
-        event_log=lambda event, detail="", level="INFO": events.append((event, detail, level)),
+        event_log=lambda event, detail="", level="INFO", issue_number=None: events.append(
+            (event, detail, level, issue_number)
+        ),
     )
 
     with pytest.raises(SystemExit):
@@ -366,7 +374,12 @@ def test_stops_without_touching_the_issue_when_the_workspace_cannot_be_repaired(
     assert tracker.cleanup == []
     assert workspace.cleanup_calls == []
     assert state.read() is not None
-    assert ("git_workspace_unrecoverable", "GitWorkspaceRecoveryError: workspace is broken", "ERROR") in events
+    assert (
+        "git_workspace_unrecoverable",
+        "GitWorkspaceRecoveryError: workspace is broken",
+        "ERROR",
+        24,
+    ) in events
 
 
 @dataclass

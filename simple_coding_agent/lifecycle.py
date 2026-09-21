@@ -96,7 +96,9 @@ class ModelAttemptRunner:
         model_executor: ModelExecutor,
         acceptance_criteria_satisfied: Callable[[Claim], bool] = lambda claim: True,
         attempt_archive_factory: Callable[[int, str], AttemptArchive] | None = None,
-        event_log: Callable[..., None] = lambda event, detail="", level="INFO": None,
+        event_log: Callable[..., None] = (
+            lambda event, detail="", level="INFO", issue_number=None: None
+        ),
     ) -> None:
         self._attempt_state = attempt_state
         self._workspace = workspace
@@ -119,12 +121,20 @@ class ModelAttemptRunner:
         preparation = self._verifier.prepare(profile, getattr(self._workspace, "working_directory"))
         _archive_commands(archive, "setup", preparation.setup)
         if not preparation.setup.succeeded:
-            self._event_log("setup_failed", _command_failure_detail(preparation.setup), level="ERROR")
+            self._event_log(
+                "setup_failed",
+                _command_failure_detail(preparation.setup),
+                level="ERROR",
+                issue_number=claim.issue.number,
+            )
         if preparation.baseline is not None:
             _archive_commands(archive, "baseline_check", preparation.baseline)
             if not preparation.baseline.succeeded:
                 self._event_log(
-                    "baseline_check_failed", _command_failure_detail(preparation.baseline), level="ERROR"
+                    "baseline_check_failed",
+                    _command_failure_detail(preparation.baseline),
+                    level="ERROR",
+                    issue_number=claim.issue.number,
                 )
         if not preparation.setup.succeeded or preparation.baseline is None or not preparation.baseline.succeeded:
             decision = self._evaluator.evaluate(
@@ -167,7 +177,12 @@ class ModelAttemptRunner:
         if final_check is not None:
             _archive_commands(archive, "check", final_check)
             if not final_check.succeeded:
-                self._event_log("final_check_failed", _command_failure_detail(final_check), level="ERROR")
+                self._event_log(
+                    "final_check_failed",
+                    _command_failure_detail(final_check),
+                    level="ERROR",
+                    issue_number=claim.issue.number,
+                )
         decision = self._evaluator.evaluate(
             setup=preparation.setup,
             baseline=preparation.baseline,
@@ -205,7 +220,9 @@ class AgentLifecycle:
         sleeper: Callable[[float], None] = time.sleep,
         error_store: ConsecutiveErrorStore | None = None,
         max_consecutive_errors: int = 3,
-        event_log: Callable[..., None] = lambda event, detail="", level="INFO": None,
+        event_log: Callable[..., None] = (
+            lambda event, detail="", level="INFO", issue_number=None: None
+        ),
         attempt_archive_factory: Callable[[int, str], AttemptArchive] | None = None,
     ) -> None:
         self._tracker = tracker
@@ -292,12 +309,19 @@ class AgentLifecycle:
                     and getattr(published, "branch_url", None) is None
                 )
         except GitWorkspaceRecoveryError as error:
-            self._event_log("git_workspace_unrecoverable", _exception_detail(error), level="ERROR")
+            self._event_log(
+                "git_workspace_unrecoverable",
+                _exception_detail(error),
+                level="ERROR",
+                issue_number=claim.issue.number,
+            )
             comment_posted = False
             prepared = None
             raise SystemExit(1) from error
         except Exception as error:
-            self._event_log("attempt_exception", _exception_detail(error), level="ERROR")
+            self._event_log(
+                "attempt_exception", _exception_detail(error), level="ERROR", issue_number=claim.issue.number
+            )
             published = self._publish_terminal(
                 claim, checkpoint.started_at, prepared, profile, outcome
             )
@@ -322,7 +346,7 @@ class AgentLifecycle:
                     if remote_cleanup_complete:
                         self._attempt_state.delete()
         self._write_outcome(archive, outcome, checkpoint.started_at)
-        self._record_terminal_outcome(outcome, checkpoint.started_at)
+        self._record_terminal_outcome(outcome, checkpoint.started_at, issue_number=claim.issue.number)
         return LifecycleResult(LifecycleStatus.ATTEMPTED, outcome)
 
     def _reconcile_startup(self) -> AttemptOutcome | None:
@@ -392,12 +416,19 @@ class AgentLifecycle:
                 and has_commits
             )
         except GitWorkspaceRecoveryError as error:
-            self._event_log("git_workspace_unrecoverable", _exception_detail(error), level="ERROR")
+            self._event_log(
+                "git_workspace_unrecoverable",
+                _exception_detail(error),
+                level="ERROR",
+                issue_number=claim.issue.number,
+            )
             comment_posted = False
             prepared = None
             raise SystemExit(1) from error
         except Exception as error:
-            self._event_log("attempt_exception", _exception_detail(error), level="ERROR")
+            self._event_log(
+                "attempt_exception", _exception_detail(error), level="ERROR", issue_number=claim.issue.number
+            )
             published = self._publish_terminal(
                 claim, checkpoint.started_at, prepared, profile, AttemptOutcome.INFRASTRUCTURE_ERROR
             )
@@ -423,7 +454,7 @@ class AgentLifecycle:
                     if remote_cleanup_complete:
                         self._attempt_state.delete()
         self._write_outcome(archive, outcome, checkpoint.started_at)
-        self._record_terminal_outcome(outcome, checkpoint.started_at)
+        self._record_terminal_outcome(outcome, checkpoint.started_at, issue_number=claim.issue.number)
         return outcome
 
     def run_forever(self, *, stop: Callable[[], bool]) -> None:
@@ -458,14 +489,16 @@ class AgentLifecycle:
             )
         )
 
-    def _record_terminal_outcome(self, outcome: AttemptOutcome, attempt_id: str) -> None:
+    def _record_terminal_outcome(
+        self, outcome: AttemptOutcome, attempt_id: str, *, issue_number: int | None = None
+    ) -> None:
         """Advance the process-wide guard only after attempt cleanup is complete."""
 
         if self._error_store is None:
             return
         count = self._error_store.record(outcome, attempt_id)
         if count >= self._max_consecutive_errors:
-            self._event_log("consecutive_error_limit_reached", level="ERROR")
+            self._event_log("consecutive_error_limit_reached", level="ERROR", issue_number=issue_number)
             raise SystemExit(1)
 
     def _archive_for(self, issue_number: int, started_at: str) -> AttemptArchive | None:

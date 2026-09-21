@@ -96,6 +96,7 @@ class GitWorkspace:
 
         if self._branch_exists(branch):
             self._git("checkout", branch)
+            self._rebase_onto_base(branch, base_branch)
         else:
             self._git("checkout", "-b", branch, base_branch)
         return PreparedAttempt(branch=branch, base_revision=base_revision)
@@ -213,6 +214,29 @@ class GitWorkspace:
         except GitWorkspaceError as error:
             location = "origin" if remote else "local clone"
             raise GitWorkspaceError(f"Base branch is unavailable in the {location}") from error
+
+    def _rebase_onto_base(self, branch: str, base_branch: str) -> None:
+        """Replay a reused attempt branch onto the just-verified base.
+
+        A retained branch from a failed prior attempt (for example, a setup
+        failure) must never keep running against the base as it stood back
+        then: repository-owned config such as the setup profile has to be
+        read fresh. Rebasing preserves any unpublished commits on the branch
+        when possible; a conflicting rebase means those commits are not worth
+        preserving automatically, so the branch is discarded and recreated
+        fresh from the base instead of blocking the attempt.
+        """
+
+        try:
+            self._git("rebase", base_branch)
+        except GitWorkspaceError:
+            try:
+                self._git("rebase", "--abort")
+            except GitWorkspaceError:
+                pass
+            self._git("checkout", base_branch)
+            self._git("branch", "-D", branch)
+            self._git("checkout", "-b", branch, base_branch)
 
     def _reset_local_base(self, base_branch: str) -> None:
         """Best-effort repair of a local base branch that fell out of sync with origin."""

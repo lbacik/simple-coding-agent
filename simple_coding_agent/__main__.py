@@ -72,8 +72,8 @@ def main() -> None:
             ),
         ),
         attempt_archive_factory=archive_factory,
-        event_log=lambda event, detail="", level="ERROR": logger.emit(
-            event, phase="setup", detail=detail, level=level
+        event_log=lambda event, detail="", level="ERROR", issue_number=None: logger.emit(
+            event, phase="setup", detail=detail, level=level, issue_number=issue_number
         ),
     )
     lifecycle = AgentLifecycle(
@@ -93,8 +93,8 @@ def main() -> None:
         poll_interval=config.poll_interval,
         error_store=ConsecutiveErrorStore(config.data_dir),
         max_consecutive_errors=config.max_consecutive_errors,
-        event_log=lambda event, detail="", level="INFO": logger.emit(
-            event, phase="polling", detail=detail, level=level
+        event_log=lambda event, detail="", level="INFO", issue_number=None: logger.emit(
+            event, phase="polling", detail=detail, level=level, issue_number=issue_number
         ),
         attempt_archive_factory=archive_factory,
     )
