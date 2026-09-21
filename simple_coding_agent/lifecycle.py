@@ -95,6 +95,7 @@ class ModelAttemptRunner:
         model_executor: ModelExecutor,
         acceptance_criteria_satisfied: Callable[[Claim], bool] = lambda claim: True,
         attempt_archive_factory: Callable[[int, str], AttemptArchive] | None = None,
+        event_log: Callable[..., None] = lambda event, detail="", level="INFO": None,
     ) -> None:
         self._attempt_state = attempt_state
         self._workspace = workspace
@@ -103,6 +104,7 @@ class ModelAttemptRunner:
         self._model_executor = model_executor
         self._acceptance_criteria_satisfied = acceptance_criteria_satisfied
         self._attempt_archive_factory = attempt_archive_factory
+        self._event_log = event_log
 
     def __call__(self, claim: Claim, profile: RepositoryProfile, prepared: object) -> AttemptEvidence:
         """Run the local evidence gates in their mandated phase order."""
@@ -115,8 +117,14 @@ class ModelAttemptRunner:
         )
         preparation = self._verifier.prepare(profile, getattr(self._workspace, "working_directory"))
         _archive_commands(archive, "setup", preparation.setup)
+        if not preparation.setup.succeeded:
+            self._event_log("setup_failed", _command_failure_detail(preparation.setup), level="ERROR")
         if preparation.baseline is not None:
             _archive_commands(archive, "baseline_check", preparation.baseline)
+            if not preparation.baseline.succeeded:
+                self._event_log(
+                    "baseline_check_failed", _command_failure_detail(preparation.baseline), level="ERROR"
+                )
         if not preparation.setup.succeeded or preparation.baseline is None or not preparation.baseline.succeeded:
             decision = self._evaluator.evaluate(
                 setup=preparation.setup, baseline=preparation.baseline, model_status=None,
@@ -157,6 +165,8 @@ class ModelAttemptRunner:
                 final_check = None
         if final_check is not None:
             _archive_commands(archive, "check", final_check)
+            if not final_check.succeeded:
+                self._event_log("final_check_failed", _command_failure_detail(final_check), level="ERROR")
         decision = self._evaluator.evaluate(
             setup=preparation.setup,
             baseline=preparation.baseline,
@@ -487,6 +497,20 @@ def _attempt_evidence(
         review_findings=review_findings,
         details=details,
     )
+
+
+def _command_failure_detail(result: object, *, limit: int = 4000) -> str:
+    """Surface the failing command and its stderr for the live event stream."""
+
+    commands = getattr(result, "commands", ())
+    failed = next((command for command in commands if getattr(command, "exit_code", 0) != 0), None)
+    if failed is None and commands:
+        failed = commands[-1]
+    if failed is None:
+        return "timed out before any command ran"
+    stderr = (getattr(failed, "stderr", "") or "").strip()
+    detail = f"`{getattr(failed, 'command', '')}` (exit {getattr(failed, 'exit_code', None)}): {stderr}"
+    return detail[:limit]
 
 
 def _archive_commands(archive: AttemptArchive | None, name: str, result: object) -> None:

@@ -72,6 +72,9 @@ def main() -> None:
             ),
         ),
         attempt_archive_factory=archive_factory,
+        event_log=lambda event, detail="", level="ERROR": logger.emit(
+            event, phase="setup", detail=detail, level=level
+        ),
     )
     lifecycle = AgentLifecycle(
         tracker=GitHubTracker(github, config.target_repo),
