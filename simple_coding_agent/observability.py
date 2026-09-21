@@ -83,11 +83,13 @@ class AttemptArchive:
         evidence["token_estimate_authority"] = "non-authoritative"
         self._write_json("attempt.json", evidence)
 
-    def write_text(self, name: str, content: str) -> None:
+    def write_text(self, name: str, content: str) -> Path:
         if Path(name).name != name:
             raise ValueError("Attempt artifact name must not contain a path")
         self.directory.mkdir(parents=True, exist_ok=True)
-        (self.directory / name).write_text(str(self._redactor.redact(content)))
+        path = self.directory / name
+        path.write_text(str(self._redactor.redact(content)))
+        return path
 
     def _write_json(self, name: str, value: dict[str, object]) -> None:
         self.directory.mkdir(parents=True, exist_ok=True)

@@ -7,6 +7,7 @@ from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
+import json
 from pathlib import Path
 import shlex
 from typing import Any, Protocol
@@ -71,9 +72,15 @@ class SDKClient(Protocol):
     def receive_response(self) -> Any: ...
 
 
+class EvidenceWriter(Protocol):
+    """Durable per-attempt storage; the screen log gets a reference, not the payload."""
+
+    def write_text(self, name: str, content: str) -> Path: ...
+
+
 ClientFactory = Callable[[ClaudeAgentOptions], SDKClient]
 Clock = Callable[[], datetime]
-EventLog = Callable[[str, str], None]
+EventLog = Callable[..., None]
 
 _MAX_LOG_DETAIL = 2000
 
@@ -87,7 +94,7 @@ class ModelExecutor:
         *,
         client_factory: ClientFactory = ClaudeSDKClient,
         clock: Clock = lambda: datetime.now(UTC),
-        event_log: EventLog = lambda event, detail="": None,
+        event_log: EventLog = lambda event, detail="", issue_number=None: None,
     ) -> None:
         self._config = config
         self._client_factory = client_factory
@@ -95,6 +102,9 @@ class ModelExecutor:
         self._event_log = event_log
         self._skill_events: list[SkillEvent] = []
         self._review_count = 0
+        self._issue_number: int | None = None
+        self._archive: EvidenceWriter | None = None
+        self._event_sequence = 0
 
     @property
     def skill_events(self) -> tuple[SkillEvent, ...]:
@@ -102,12 +112,34 @@ class ModelExecutor:
 
         return tuple(self._skill_events)
 
-    async def execute(self, *, issue_body: str, working_directory: Path) -> ModelExecution:
+    def _log(self, event: str, detail: str = "") -> None:
+        self._event_log(event, detail, issue_number=self._issue_number)
+
+    def _archive_evidence(self, kind: str, content: str, *, extension: str) -> str | None:
+        """Write full evidence to the attempt archive; return a reference or None."""
+
+        if self._archive is None:
+            return None
+        self._event_sequence += 1
+        filename = f"{self._event_sequence:04d}_{kind}.{extension}"
+        return str(self._archive.write_text(filename, content))
+
+    async def execute(
+        self,
+        *,
+        issue_body: str,
+        working_directory: Path,
+        issue_number: int | None = None,
+        archive: EvidenceWriter | None = None,
+    ) -> ModelExecution:
         """Dispatch ``/implement`` and classify its one terminal SDK result."""
 
         self._skill_events.clear()
         self._review_count = 0
-        self._event_log("model_execution_started", f"issue_body_length={len(issue_body)}")
+        self._issue_number = issue_number
+        self._archive = archive
+        self._event_sequence = 0
+        self._log("model_execution_started", f"issue_body_length={len(issue_body)}")
         client = self._client_factory(self._options(working_directory))
         try:
             async with client:
@@ -180,7 +212,7 @@ class ModelExecutor:
             if isinstance(message, AssistantMessage):
                 for block in message.content:
                     if isinstance(block, TextBlock) and block.text.strip():
-                        self._event_log("model_response", _truncate(block.text))
+                        self._log("model_response", self._model_response_detail(block.text))
             model = getattr(message, "model", None)
             if isinstance(model, str):
                 observed_models.append(model)
@@ -255,7 +287,7 @@ class ModelExecutor:
         model_usage: Mapping[str, Any] | None,
         observed_models: tuple[str, ...],
     ) -> ModelExecution:
-        self._event_log("model_execution_finished", f"status={status}; {explanation}")
+        self._log("model_execution_finished", f"status={status}; {explanation}")
         return ModelExecution(
             status=status,
             explanation=explanation,
@@ -288,12 +320,44 @@ class ModelExecutor:
         tool_name = _hook_field(hook_input, "tool_name")
         if not isinstance(tool_name, str):
             return
+        skill_name = _skill_name(hook_input) if tool_name == "Skill" else None
+        label = f"skill:{skill_name}" if skill_name else tool_name
         if event == "tool_result":
-            detail = f"{tool_name}: {response!r}"
+            event_name = "skill_result" if skill_name else event
+            # Skill calls are already small; only offload plain tool payloads to disk.
+            detail = (
+                f"{label}: {response!r}"
+                if skill_name
+                else self._tool_result_detail(label, response)
+            )
         else:
             tool_input = _hook_field(hook_input, "tool_input", {})
-            detail = f"{tool_name}: {tool_input!r}"
-        self._event_log(event, _truncate(detail))
+            event_name = "skill_call" if skill_name else event
+            detail = (
+                f"{label}: {tool_input!r}"
+                if skill_name
+                else self._tool_call_detail(label, tool_input)
+            )
+        self._log(event_name, _truncate(detail))
+
+    def _tool_call_detail(self, label: str, tool_input: Any) -> str:
+        path = self._archive_evidence("tool_call", _json_or_repr(tool_input), extension="json")
+        if path is None:
+            return f"{label}: {tool_input!r}"
+        return f"{label} -> {path}"
+
+    def _tool_result_detail(self, label: str, response: Any) -> str:
+        path = self._archive_evidence("tool_result", _json_or_repr(response), extension="json")
+        if path is None:
+            return f"{label}: {response!r}"
+        outcome = _outcome_hint(response)
+        return f"{label} -> {path}" + (f" ({outcome})" if outcome else "")
+
+    def _model_response_detail(self, text: str) -> str:
+        path = self._archive_evidence("model_response", text, extension="txt")
+        if path is None:
+            return _truncate(text)
+        return f"-> {path} (chars={len(text)})"
 
     async def _record_skill_event(
         self, phase: str, hook_input: Any, tool_use_id: str | None, context: Any
@@ -446,3 +510,23 @@ def _truncate(text: str) -> str:
     if len(text) <= _MAX_LOG_DETAIL:
         return text
     return text[:_MAX_LOG_DETAIL] + "...[truncated]"
+
+
+def _json_or_repr(value: Any) -> str:
+    try:
+        return json.dumps(value, indent=2, default=str, sort_keys=True)
+    except TypeError:
+        return repr(value)
+
+
+def _outcome_hint(response: Any) -> str | None:
+    """Best-effort success/error hint; most tool responses carry no such field."""
+
+    if not isinstance(response, Mapping):
+        return None
+    if response.get("interrupted") is True:
+        return "interrupted"
+    is_error = response.get("is_error")
+    if isinstance(is_error, bool):
+        return "error" if is_error else "ok"
+    return None

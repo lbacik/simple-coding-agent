@@ -264,8 +264,123 @@ def test_captures_skill_provenance_from_pre_and_post_tool_hooks(tmp_path: Path) 
     assert all(event.timestamp.endswith("Z") for event in executor.skill_events)
 
 
-def test_logs_the_process_even_when_the_attempt_succeeds(tmp_path: Path) -> None:
+def test_logs_skill_invocations_under_distinct_event_names(tmp_path: Path) -> None:
     events: list[tuple[str, str]] = []
+    captured: list[FakeClient] = []
+
+    def client_factory(options: object) -> FakeClient:
+        client = FakeClient(options, [result()])
+        captured.append(client)
+        return client
+
+    executor = ModelExecutor(
+        runtime_config(tmp_path),
+        client_factory=client_factory,
+        event_log=lambda event, detail="", issue_number=None: events.append((event, detail)),
+    )
+    asyncio.run(executor.execute(issue_body="Fix it.", working_directory=tmp_path))
+    pre_hook = captured[0].options.hooks["PreToolUse"][0].hooks[0]
+    post_hook = captured[0].options.hooks["PostToolUse"][0].hooks[0]
+
+    asyncio.run(
+        pre_hook(
+            {"tool_name": "Skill", "tool_input": {"skill": "code-review"}, "agent_id": "review-1"},
+            None,
+            {},
+        )
+    )
+    asyncio.run(
+        post_hook(
+            {"tool_name": "Skill", "tool_input": {"skill": "code-review"}, "agent_id": "review-1"},
+            None,
+            {},
+        )
+    )
+
+    names = [event for event, _ in events]
+    assert "tool_call" not in names
+    assert "tool_result" not in names
+    assert any(name == "skill_call" and "code-review" in detail for name, detail in events)
+    assert any(name == "skill_result" and "code-review" in detail for name, detail in events)
+
+
+class FakeArchive:
+    def __init__(self, directory: Path) -> None:
+        self._directory = directory
+        self.written: dict[str, str] = {}
+
+    def write_text(self, name: str, content: str) -> Path:
+        path = self._directory / name
+        path.write_text(content)
+        self.written[name] = content
+        return path
+
+
+def test_offloads_tool_and_model_response_evidence_to_the_attempt_archive(
+    tmp_path: Path,
+) -> None:
+    events: list[tuple[str, str]] = []
+    captured: list[FakeClient] = []
+    archive = FakeArchive(tmp_path)
+
+    def client_factory(options: object) -> FakeClient:
+        client = FakeClient(
+            options,
+            [
+                AssistantMessage(
+                    content=[TextBlock(text="A" * 5000)],
+                    model="muse-spark-1.3-contributor",
+                ),
+                result(),
+            ],
+        )
+        captured.append(client)
+        return client
+
+    executor = ModelExecutor(
+        runtime_config(tmp_path),
+        client_factory=client_factory,
+        event_log=lambda event, detail="", issue_number=None: events.append((event, detail)),
+    )
+    asyncio.run(
+        executor.execute(
+            issue_body="Fix the parser.", working_directory=tmp_path, archive=archive
+        )
+    )
+    pre_hook = captured[0].options.hooks["PreToolUse"][0].hooks[0]
+    post_hook = captured[0].options.hooks["PostToolUse"][0].hooks[0]
+    asyncio.run(
+        pre_hook({"tool_name": "Bash", "tool_input": {"command": "pytest -q" * 200}}, None, {})
+    )
+    asyncio.run(
+        post_hook(
+            {
+                "tool_name": "Bash",
+                "tool_input": {"command": "pytest -q"},
+                "tool_response": {"stdout": "ok" * 500, "interrupted": False, "is_error": False},
+            },
+            None,
+            {},
+        )
+    )
+
+    call_event = next(detail for name, detail in events if name == "tool_call")
+    result_event = next(detail for name, detail in events if name == "tool_result")
+    response_event = next(detail for name, detail in events if name == "model_response")
+
+    assert len(call_event) < 200
+    assert len(result_event) < 200
+    assert len(response_event) < 200
+    assert "(ok)" in result_event
+    assert "chars=5000" in response_event
+    assert any(
+        "pytest -q" * 200 in content for content in archive.written.values()
+    )
+    assert any("A" * 5000 in content for content in archive.written.values())
+
+
+def test_logs_the_process_even_when_the_attempt_succeeds(tmp_path: Path) -> None:
+    events: list[tuple[str, str, int | None]] = []
     captured: list[FakeClient] = []
 
     def client_factory(options: object) -> FakeClient:
@@ -285,9 +400,15 @@ def test_logs_the_process_even_when_the_attempt_succeeds(tmp_path: Path) -> None
     executor = ModelExecutor(
         runtime_config(tmp_path),
         client_factory=client_factory,
-        event_log=lambda event, detail="": events.append((event, detail)),
+        event_log=lambda event, detail="", issue_number=None: events.append(
+            (event, detail, issue_number)
+        ),
     )
-    asyncio.run(executor.execute(issue_body="Fix the parser.", working_directory=tmp_path))
+    asyncio.run(
+        executor.execute(
+            issue_body="Fix the parser.", working_directory=tmp_path, issue_number=42
+        )
+    )
     pre_hook = captured[0].options.hooks["PreToolUse"][0].hooks[0]
     post_hook = captured[0].options.hooks["PostToolUse"][0].hooks[0]
     asyncio.run(
@@ -301,13 +422,16 @@ def test_logs_the_process_even_when_the_attempt_succeeds(tmp_path: Path) -> None
         )
     )
 
-    names = [event for event, _ in events]
+    names = [event for event, _, _ in events]
     assert names[0] == "model_execution_started"
     assert "model_response" in names
     assert "model_execution_finished" in names
-    assert any(name == "tool_call" and "pytest" in detail for name, detail in events)
-    assert any(name == "tool_result" and "ok" in detail for name, detail in events)
-    assert any("Looking at the parser now." in detail for name, detail in events if name == "model_response")
+    assert any(name == "tool_call" and "pytest" in detail for name, detail, _ in events)
+    assert any(name == "tool_result" and "ok" in detail for name, detail, _ in events)
+    assert all(issue_number == 42 for _, _, issue_number in events)
+    assert any(
+        "Looking at the parser now." in detail for name, detail, _ in events if name == "model_response"
+    )
 
 
 def test_blocks_a_third_repair_cycle_after_three_code_reviews(tmp_path: Path) -> None:

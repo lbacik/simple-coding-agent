@@ -147,7 +147,10 @@ class ModelAttemptRunner:
         self._attempt_state.transition(AttemptPhase.MODEL_RUNNING)
         execution = asyncio.run(
             self._model_executor.execute(
-                issue_body=claim.issue.body, working_directory=getattr(self._workspace, "working_directory")
+                issue_body=claim.issue.body,
+                working_directory=getattr(self._workspace, "working_directory"),
+                issue_number=claim.issue.number,
+                archive=archive,
             )
         )
         if archive is not None:

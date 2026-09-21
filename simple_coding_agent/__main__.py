@@ -67,8 +67,8 @@ def main() -> None:
         evaluator=CompletionEvaluator(config.review_blocking_severities),
         model_executor=ModelExecutor(
             config,
-            event_log=lambda event, detail="": logger.emit(
-                event, phase="model_execution", detail=detail
+            event_log=lambda event, detail="", issue_number=None: logger.emit(
+                event, phase="model_execution", detail=detail, issue_number=issue_number
             ),
         ),
         attempt_archive_factory=archive_factory,
