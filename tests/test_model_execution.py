@@ -377,6 +377,11 @@ def test_offloads_tool_and_model_response_evidence_to_the_attempt_archive(
         "pytest -q" * 200 in content for content in archive.written.values()
     )
     assert any("A" * 5000 in content for content in archive.written.values())
+    # References point at bare filenames so they resolve relative to
+    # agent_output.json, which lives in the same attempt directory.
+    assert call_event.split("-> ")[1] in archive.written
+    assert result_event.split("-> ")[1].split(" (")[0] in archive.written
+    assert response_event.split("-> ")[1].split(" (")[0] in archive.written
 
 
 def test_logs_the_process_even_when_the_attempt_succeeds(tmp_path: Path) -> None:

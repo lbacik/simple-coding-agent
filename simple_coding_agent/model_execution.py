@@ -116,13 +116,19 @@ class ModelExecutor:
         self._event_log(event, detail, issue_number=self._issue_number)
 
     def _archive_evidence(self, kind: str, content: str, *, extension: str) -> str | None:
-        """Write full evidence to the attempt archive; return a reference or None."""
+        """Write full evidence to the attempt archive; return a reference or None.
+
+        The reference is the bare filename: every archived file, including
+        agent_output.json, lives in the same attempt directory, so a
+        relative-to-itself path is just the name.
+        """
 
         if self._archive is None:
             return None
         self._event_sequence += 1
         filename = f"{self._event_sequence:04d}_{kind}.{extension}"
-        return str(self._archive.write_text(filename, content))
+        self._archive.write_text(filename, content)
+        return filename
 
     async def execute(
         self,

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from datetime import UTC, datetime
 import json
 from pathlib import Path
@@ -29,12 +29,28 @@ class Redactor:
         return value
 
 
-class JsonEventLogger:
-    """Write Docker/systemd-friendly JSON lines with the canonical fields."""
+AttemptSink = Callable[[int], "AttemptArchive | None"]
 
-    def __init__(self, stream: TextIO, *, redactions: Iterable[str] = ()) -> None:
+
+class JsonEventLogger:
+    """Write Docker/systemd-friendly JSON lines with the canonical fields.
+
+    Each emitted record is also mirrored into the active attempt's
+    ``agent_output.json`` (when ``attempt_sink`` resolves one), so the same
+    output an operator sees on stdout is durably readable next to the
+    attempt's other evidence files.
+    """
+
+    def __init__(
+        self,
+        stream: TextIO,
+        *,
+        redactions: Iterable[str] = (),
+        attempt_sink: AttemptSink | None = None,
+    ) -> None:
         self._stream = stream
         self._redactor = Redactor(redactions)
+        self._attempt_sink = attempt_sink
 
     def emit(
         self,
@@ -58,6 +74,10 @@ class JsonEventLogger:
         json.dump(record, self._stream, sort_keys=True)
         self._stream.write("\n")
         self._stream.flush()
+        if issue_number is not None and self._attempt_sink is not None:
+            archive = self._attempt_sink(issue_number)
+            if archive is not None:
+                archive.append_event(record)
 
 
 class AttemptArchive:
@@ -82,6 +102,15 @@ class AttemptArchive:
         evidence.update(metadata)
         evidence["token_estimate_authority"] = "non-authoritative"
         self._write_json("attempt.json", evidence)
+
+    def append_event(self, record: dict[str, object]) -> None:
+        """Append one emitted log record to this attempt's agent_output.json."""
+
+        self.directory.mkdir(parents=True, exist_ok=True)
+        path = self.directory / "agent_output.json"
+        with path.open("a", encoding="utf-8") as file:
+            json.dump(self._redactor.redact(record), file, sort_keys=True)
+            file.write("\n")
 
     def write_text(self, name: str, content: str) -> Path:
         if Path(name).name != name:

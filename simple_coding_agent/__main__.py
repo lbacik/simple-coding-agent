@@ -25,8 +25,24 @@ def main() -> None:
 
     load_dotenv(override=False)
     config = load_runtime_config()
+    attempt_state = AttemptStateStore(config.data_dir)
+    archive_factory = lambda issue_number, started_at: AttemptArchive(
+        config.data_dir,
+        issue_number=issue_number,
+        started_at=started_at,
+        redactions=(config.github_token, config.meta_api_key),
+    )
+
+    def _attempt_sink(issue_number: int) -> AttemptArchive | None:
+        checkpoint = attempt_state.read()
+        if checkpoint is None or checkpoint.issue_number != issue_number:
+            return None
+        return archive_factory(issue_number, checkpoint.started_at)
+
     logger = JsonEventLogger(
-        sys.stdout, redactions=(config.github_token, config.meta_api_key)
+        sys.stdout,
+        redactions=(config.github_token, config.meta_api_key),
+        attempt_sink=_attempt_sink,
     )
     try:
         provenance = ProvenanceVerifier(
@@ -43,18 +59,11 @@ def main() -> None:
         detail=f"sdk={provenance.sdk_version}; cli={provenance.cli_version}",
     )
     github = GitHubGraphQLTransport(config.github_token, max_retries=config.max_retries)
-    archive_factory = lambda issue_number, started_at: AttemptArchive(
-        config.data_dir,
-        issue_number=issue_number,
-        started_at=started_at,
-        redactions=(config.github_token, config.meta_api_key),
-    )
     workspace = GitWorkspace(
         config.clone_dir,
         f"https://github.com/{config.target_repo}.git",
         token_provider=lambda: config.github_token,
     )
-    attempt_state = AttemptStateStore(config.data_dir)
     runner = ModelAttemptRunner(
         attempt_state=attempt_state,
         workspace=workspace,
