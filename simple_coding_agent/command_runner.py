@@ -50,8 +50,9 @@ class CommandResult:
 class CommandRunner:
     """Execute profile commands without inheriting the orchestrator environment."""
 
-    def __init__(self, *, redactions: Iterable[str] = ()) -> None:
+    def __init__(self, *, redactions: Iterable[str] = (), extra_path: str = "") -> None:
         self._redactions = tuple(value for value in redactions if value)
+        self._extra_path = extra_path
 
     def run(
         self,
@@ -66,7 +67,7 @@ class CommandRunner:
         started = time.monotonic()
         deadline = started + timeout
         executions: list[CommandExecution] = []
-        subprocess_environment = _environment(environment or {})
+        subprocess_environment = _environment(environment or {}, self._extra_path)
 
         for command in commands:
             remaining = deadline - time.monotonic()
@@ -118,10 +119,11 @@ class CommandRunner:
         return value
 
 
-def _environment(profile_environment: Mapping[str, str]) -> dict[str, str]:
+def _environment(profile_environment: Mapping[str, str], extra_path: str = "") -> dict[str, str]:
     """Build the deliberately small environment exposed to repository commands."""
 
-    environment = {"PATH": os.defpath}
+    path = f"{extra_path}:{os.defpath}" if extra_path else os.defpath
+    environment = {"PATH": path}
     environment.update(profile_environment)
     # Credentials belong exclusively to the driving process and model boundary.
     environment.pop("GITHUB_TOKEN", None)

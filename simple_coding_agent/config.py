@@ -45,6 +45,7 @@ class RuntimeConfig:
     max_consecutive_errors: int
     agent_trust_project_settings: bool
     review_blocking_severities: frozenset[str]
+    profile_extra_path: str = ""
     model: str = _DEFAULT_MODEL_NAME
     claude_agent_sdk_version: str = _DEFAULT_CLAUDE_AGENT_SDK_VERSION
     claude_code_version: str = _DEFAULT_CLAUDE_CODE_VERSION
@@ -94,6 +95,7 @@ def load_runtime_config(environ: Mapping[str, str] | None = None) -> RuntimeConf
         max_consecutive_errors=_positive_integer(values, "MAX_CONSECUTIVE_ERRORS", 3),
         agent_trust_project_settings=_boolean(values, "AGENT_TRUST_PROJECT_SETTINGS", False),
         review_blocking_severities=_review_severities(values),
+        profile_extra_path=values.get("PROFILE_EXTRA_PATH", ""),
         model=_non_empty(values, "MODEL_NAME", _DEFAULT_MODEL_NAME),
         claude_agent_sdk_version=_non_empty(
             values, "CLAUDE_AGENT_SDK_VERSION", _DEFAULT_CLAUDE_AGENT_SDK_VERSION

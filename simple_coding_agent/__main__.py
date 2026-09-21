@@ -59,7 +59,10 @@ def main() -> None:
         attempt_state=attempt_state,
         workspace=workspace,
         verifier=VerificationRunner(
-            CommandRunner(redactions=(config.github_token, config.meta_api_key))
+            CommandRunner(
+                redactions=(config.github_token, config.meta_api_key),
+                extra_path=config.profile_extra_path,
+            )
         ),
         evaluator=CompletionEvaluator(config.review_blocking_severities),
         model_executor=ModelExecutor(
