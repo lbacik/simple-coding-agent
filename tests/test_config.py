@@ -3,8 +3,6 @@ from pathlib import Path
 import pytest
 
 from simple_coding_agent.config import (
-    CLAUDE_AGENT_SDK_VERSION,
-    CLAUDE_CODE_VERSION,
     ConfigurationError,
     ProfileError,
     load_repository_profile,
@@ -35,8 +33,8 @@ def test_loads_required_operator_settings_and_defaults(tmp_path: Path) -> None:
     assert config.model == "muse-spark-1.3-contributor"
     assert config.max_turns == 60
     assert config.max_budget_usd == 5
-    assert CLAUDE_AGENT_SDK_VERSION == "0.2.156"
-    assert CLAUDE_CODE_VERSION == "2.1.276"
+    assert config.claude_agent_sdk_version == "0.2.156"
+    assert config.claude_code_version == "2.1.278"
 
 
 @pytest.mark.parametrize(
@@ -89,6 +87,9 @@ def test_applies_operator_overrides_including_the_test_only_review_gate(
             "MAX_CONSECUTIVE_ERRORS": "2",
             "AGENT_TRUST_PROJECT_SETTINGS": "true",
             "REVIEW_BLOCKING_SEVERITIES": "",
+            "MODEL_NAME": "muse-spark-2.0",
+            "CLAUDE_AGENT_SDK_VERSION": "0.3.0",
+            "CLAUDE_CODE_VERSION": "3.0.0",
         }
     )
 
@@ -101,6 +102,9 @@ def test_applies_operator_overrides_including_the_test_only_review_gate(
     assert config.max_consecutive_errors == 2
     assert config.agent_trust_project_settings is True
     assert config.review_blocking_severities == frozenset()
+    assert config.model == "muse-spark-2.0"
+    assert config.claude_agent_sdk_version == "0.3.0"
+    assert config.claude_code_version == "3.0.0"
 
 
 def test_loads_repository_profile_with_defaults_and_environment(tmp_path: Path) -> None:

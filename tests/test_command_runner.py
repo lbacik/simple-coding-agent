@@ -59,6 +59,14 @@ def test_subprocess_environment_is_limited_to_profile_and_path(tmp_path: Path) -
     assert result.commands[0].stdout.split("|")[-1] == os.defpath
 
 
+def test_extra_path_is_prepended_to_the_subprocess_path(tmp_path: Path) -> None:
+    result = CommandRunner(extra_path="/opt/homebrew/bin").run(
+        ("printf '%s' \"$PATH\"",), timeout=5, cwd=tmp_path
+    )
+
+    assert result.commands[0].stdout == f"/opt/homebrew/bin:{os.defpath}"
+
+
 def test_scrubs_explicit_redactions_from_captured_output(tmp_path: Path) -> None:
     result = CommandRunner(redactions=("top-secret",)).run(
         ("printf top-secret; printf top-secret >&2",), timeout=5, cwd=tmp_path

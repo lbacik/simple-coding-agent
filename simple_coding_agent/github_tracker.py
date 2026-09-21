@@ -241,7 +241,7 @@ class GitHubGraphQLTransport:
             """
             mutation Assign($issueId: ID!, $assigneeId: ID!) {
               addAssigneesToAssignable(input: {assignableId: $issueId, assigneeIds: [$assigneeId]}) {
-                assignable { id }
+                clientMutationId
               }
             }
             """,
@@ -256,7 +256,7 @@ class GitHubGraphQLTransport:
             """
             mutation RemoveAssignee($issueId: ID!, $assigneeId: ID!) {
               removeAssigneesFromAssignable(input: {assignableId: $issueId, assigneeIds: [$assigneeId]}) {
-                assignable { id }
+                clientMutationId
               }
             }
             """,
@@ -283,7 +283,7 @@ class GitHubGraphQLTransport:
             """
             mutation RemoveLabel($issueId: ID!, $labelId: ID!) {
               removeLabelsFromLabelable(input: {labelableId: $issueId, labelIds: [$labelId]}) {
-                labelable { id }
+                clientMutationId
               }
             }
             """,
@@ -433,11 +433,29 @@ class GitHubGraphQLTransport:
         if response_data is None:
             raise GitHubTrackerError("GitHub request failed") from last_error
         if not isinstance(response_data, dict) or response_data.get("errors"):
-            raise GitHubTrackerError("GitHub GraphQL request was rejected")
+            raise GitHubTrackerError(
+                f"GitHub GraphQL request was rejected: {_graphql_error_summary(response_data)}"
+            )
         data = response_data.get("data")
         if not isinstance(data, dict):
             raise GitHubTrackerError("GitHub response has no data")
         return data
+
+
+def _graphql_error_summary(response_data: object) -> str:
+    """Surface GitHub's own error messages instead of hiding them behind a generic label."""
+
+    if not isinstance(response_data, dict):
+        return "malformed response"
+    errors = response_data.get("errors")
+    if not isinstance(errors, list) or not errors:
+        return "no error details provided"
+    messages = [
+        error["message"]
+        for error in errors
+        if isinstance(error, dict) and isinstance(error.get("message"), str)
+    ]
+    return "; ".join(messages) if messages else "no error details provided"
 
 
 def _retry_delay(error: Exception, attempt: int) -> float:

@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 from simple_coding_agent.attempt_state import AttemptPhase, AttemptStateStore
 from simple_coding_agent.completion import AttemptOutcome, CompletionDecision, PublicationPath
+from simple_coding_agent.git_workspace import GitWorkspaceRecoveryError
 from simple_coding_agent.github_tracker import Assignment, Claim, TrackerIssue
 from simple_coding_agent.lifecycle import AgentLifecycle, AttemptEvidence, LifecycleStatus
 from simple_coding_agent.operating import ConsecutiveErrorStore
@@ -41,6 +42,7 @@ def test_setup_failure_posts_result_then_releases_only_the_agent_claim(
 
 def test_empty_queue_sleeps_once_without_attempting_work(tmp_path: Path) -> None:
     sleeps: list[int] = []
+    events: list[tuple[str, str, str]] = []
     lifecycle = AgentLifecycle(
         tracker=FakeTracker(None),
         attempt_state=AttemptStateStore(tmp_path),
@@ -49,16 +51,22 @@ def test_empty_queue_sleeps_once_without_attempting_work(tmp_path: Path) -> None
         publisher=FakePublisher(),
         poll_interval=17,
         sleeper=sleeps.append,
+        event_log=lambda event, detail="", level="INFO", issue_number=None: events.append(
+            (event, detail, level)
+        ),
     )
 
     result = lifecycle.run_once()
 
     assert result.status is LifecycleStatus.IDLE
     assert sleeps == [17]
+    assert [event for event, _, _ in events] == ["polling_for_issue", "no_eligible_issue_found"]
+    assert events[1][1] == "no ready-for-agent issue available; sleeping 17s"
+    assert events[1][2] == "INFO"
 
 
 def test_stops_after_the_persisted_consecutive_infrastructure_error_limit(tmp_path: Path) -> None:
-    events: list[str] = []
+    events: list[tuple[str, str]] = []
     lifecycle = AgentLifecycle(
         tracker=FakeTracker(Claim(issue(24), Assignment("issue-24", "agent-id"))),
         attempt_state=AttemptStateStore(tmp_path),
@@ -67,14 +75,23 @@ def test_stops_after_the_persisted_consecutive_infrastructure_error_limit(tmp_pa
         publisher=FakePublisher(),
         error_store=ConsecutiveErrorStore(tmp_path),
         max_consecutive_errors=1,
-        event_log=lambda event: events.append(event),
+        event_log=lambda event, detail="", level="INFO", issue_number=None: events.append(
+            (event, detail, issue_number)
+        ),
     )
 
     with pytest.raises(SystemExit) as stopped:
         lifecycle.run_once()
 
     assert stopped.value.code == 1
-    assert events == ["consecutive_error_limit_reached"]
+    assert [event for event, _, _ in events] == [
+        "polling_for_issue",
+        "attempt_exception",
+        "consecutive_error_limit_reached",
+    ]
+    assert events[1][1] == "OSError: profile is missing"
+    assert events[1][2] == 24
+    assert events[2][2] == 24
     assert ConsecutiveErrorStore(tmp_path).read().count == 1
 
 
@@ -333,6 +350,38 @@ def test_does_not_start_cleanup_when_the_result_comment_was_not_posted(tmp_path:
     assert workspace.cleanup_calls == [("main", True)]
 
 
+def test_stops_without_touching_the_issue_when_the_workspace_cannot_be_repaired(
+    tmp_path: Path,
+) -> None:
+    events: list[tuple[str, str, str]] = []
+    state = AttemptStateStore(tmp_path)
+    tracker = FakeTracker(Claim(issue(24), Assignment("issue-24", "agent-id")))
+    workspace = RecoveryFailingWorkspace()
+    lifecycle = AgentLifecycle(
+        tracker=tracker,
+        attempt_state=state,
+        workspace=workspace,
+        profile_loader=lambda _: (_ for _ in ()).throw(AssertionError("must not be reached")),
+        publisher=FakePublisher(),
+        event_log=lambda event, detail="", level="INFO", issue_number=None: events.append(
+            (event, detail, level, issue_number)
+        ),
+    )
+
+    with pytest.raises(SystemExit):
+        lifecycle.run_once()
+
+    assert tracker.cleanup == []
+    assert workspace.cleanup_calls == []
+    assert state.read() is not None
+    assert (
+        "git_workspace_unrecoverable",
+        "GitWorkspaceRecoveryError: workspace is broken",
+        "ERROR",
+        24,
+    ) in events
+
+
 @dataclass
 class FakeTracker:
     next_claim: Claim | None
@@ -376,6 +425,11 @@ class FakeWorkspace:
 
     def commits_added(self, prepared: object) -> tuple[str, ...]:
         return self._commits
+
+
+class RecoveryFailingWorkspace(FakeWorkspace):
+    def prepare_attempt(self, *, base_branch: str, issue_number: int):
+        raise GitWorkspaceRecoveryError("workspace is broken")
 
 
 class FakePublisher:

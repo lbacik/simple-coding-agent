@@ -17,50 +17,73 @@ from simple_coding_agent.observability import AttemptArchive, JsonEventLogger
 from simple_coding_agent.operating import ConsecutiveErrorStore
 from simple_coding_agent.publication import Publisher
 from simple_coding_agent.provenance import ProvenanceError, ProvenanceVerifier
+from dotenv import load_dotenv
 
 
 def main() -> None:
     """Run sequential attempts forever for the one operator-configured repository."""
 
+    load_dotenv(override=False)
     config = load_runtime_config()
-    logger = JsonEventLogger(
-        sys.stdout, redactions=(config.github_token, config.meta_api_key)
-    )
-    try:
-        provenance = ProvenanceVerifier(home=Path.home()).verify()
-    except ProvenanceError as error:
-        logger.emit("provenance_verification_failed", phase="startup", detail=str(error), level="ERROR")
-        raise SystemExit(1) from error
-    logger.emit(
-        "provenance_verified",
-        phase="startup",
-        detail=(
-            f"skills={provenance.skill_commit}; sdk={provenance.sdk_version}; "
-            f"cli={provenance.cli_version}"
-        ),
-    )
-    github = GitHubGraphQLTransport(config.github_token, max_retries=config.max_retries)
+    attempt_state = AttemptStateStore(config.data_dir)
     archive_factory = lambda issue_number, started_at: AttemptArchive(
         config.data_dir,
         issue_number=issue_number,
         started_at=started_at,
         redactions=(config.github_token, config.meta_api_key),
     )
+
+    def _attempt_sink(issue_number: int) -> AttemptArchive | None:
+        checkpoint = attempt_state.read()
+        if checkpoint is None or checkpoint.issue_number != issue_number:
+            return None
+        return archive_factory(issue_number, checkpoint.started_at)
+
+    logger = JsonEventLogger(
+        sys.stdout,
+        redactions=(config.github_token, config.meta_api_key),
+        attempt_sink=_attempt_sink,
+    )
+    try:
+        provenance = ProvenanceVerifier(
+            home=Path.home(),
+            expected_sdk_version=config.claude_agent_sdk_version,
+            expected_cli_version=config.claude_code_version,
+        ).verify()
+    except ProvenanceError as error:
+        logger.emit("provenance_verification_failed", phase="startup", detail=str(error), level="ERROR")
+        raise SystemExit(1) from error
+    logger.emit(
+        "provenance_verified",
+        phase="startup",
+        detail=f"sdk={provenance.sdk_version}; cli={provenance.cli_version}",
+    )
+    github = GitHubGraphQLTransport(config.github_token, max_retries=config.max_retries)
     workspace = GitWorkspace(
         config.clone_dir,
         f"https://github.com/{config.target_repo}.git",
         token_provider=lambda: config.github_token,
     )
-    attempt_state = AttemptStateStore(config.data_dir)
     runner = ModelAttemptRunner(
         attempt_state=attempt_state,
         workspace=workspace,
         verifier=VerificationRunner(
-            CommandRunner(redactions=(config.github_token, config.meta_api_key))
+            CommandRunner(
+                redactions=(config.github_token, config.meta_api_key),
+                extra_path=config.profile_extra_path,
+            )
         ),
         evaluator=CompletionEvaluator(config.review_blocking_severities),
-        model_executor=ModelExecutor(config),
+        model_executor=ModelExecutor(
+            config,
+            event_log=lambda event, detail="", issue_number=None: logger.emit(
+                event, phase="model_execution", detail=detail, issue_number=issue_number
+            ),
+        ),
         attempt_archive_factory=archive_factory,
+        event_log=lambda event, detail="", level="ERROR", issue_number=None: logger.emit(
+            event, phase="setup", detail=detail, level=level, issue_number=issue_number
+        ),
     )
     lifecycle = AgentLifecycle(
         tracker=GitHubTracker(github, config.target_repo),
@@ -79,7 +102,9 @@ def main() -> None:
         poll_interval=config.poll_interval,
         error_store=ConsecutiveErrorStore(config.data_dir),
         max_consecutive_errors=config.max_consecutive_errors,
-        event_log=lambda event: logger.emit(event, phase="polling", level="ERROR"),
+        event_log=lambda event, detail="", level="INFO", issue_number=None: logger.emit(
+            event, phase="polling", detail=detail, level=level, issue_number=issue_number
+        ),
         attempt_archive_factory=archive_factory,
     )
     lifecycle.run_forever(stop=lambda: False)

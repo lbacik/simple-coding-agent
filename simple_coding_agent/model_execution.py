@@ -7,11 +7,19 @@ from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
+import json
 from pathlib import Path
 import shlex
 from typing import Any, Protocol
 
-from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient, HookMatcher, ResultMessage
+from claude_agent_sdk import (
+    AssistantMessage,
+    ClaudeAgentOptions,
+    ClaudeSDKClient,
+    HookMatcher,
+    ResultMessage,
+    TextBlock,
+)
 
 from simple_coding_agent.config import RuntimeConfig
 
@@ -64,8 +72,17 @@ class SDKClient(Protocol):
     def receive_response(self) -> Any: ...
 
 
+class EvidenceWriter(Protocol):
+    """Durable per-attempt storage; the screen log gets a reference, not the payload."""
+
+    def write_text(self, name: str, content: str) -> Path: ...
+
+
 ClientFactory = Callable[[ClaudeAgentOptions], SDKClient]
 Clock = Callable[[], datetime]
+EventLog = Callable[..., None]
+
+_MAX_LOG_DETAIL = 2000
 
 
 class ModelExecutor:
@@ -77,12 +94,17 @@ class ModelExecutor:
         *,
         client_factory: ClientFactory = ClaudeSDKClient,
         clock: Clock = lambda: datetime.now(UTC),
+        event_log: EventLog = lambda event, detail="", issue_number=None: None,
     ) -> None:
         self._config = config
         self._client_factory = client_factory
         self._clock = clock
+        self._event_log = event_log
         self._skill_events: list[SkillEvent] = []
         self._review_count = 0
+        self._issue_number: int | None = None
+        self._archive: EvidenceWriter | None = None
+        self._event_sequence = 0
 
     @property
     def skill_events(self) -> tuple[SkillEvent, ...]:
@@ -90,11 +112,40 @@ class ModelExecutor:
 
         return tuple(self._skill_events)
 
-    async def execute(self, *, issue_body: str, working_directory: Path) -> ModelExecution:
+    def _log(self, event: str, detail: str = "") -> None:
+        self._event_log(event, detail, issue_number=self._issue_number)
+
+    def _archive_evidence(self, kind: str, content: str, *, extension: str) -> str | None:
+        """Write full evidence to the attempt archive; return a reference or None.
+
+        The reference is the bare filename: every archived file, including
+        agent_output.json, lives in the same attempt directory, so a
+        relative-to-itself path is just the name.
+        """
+
+        if self._archive is None:
+            return None
+        self._event_sequence += 1
+        filename = f"{self._event_sequence:04d}_{kind}.{extension}"
+        self._archive.write_text(filename, content)
+        return filename
+
+    async def execute(
+        self,
+        *,
+        issue_body: str,
+        working_directory: Path,
+        issue_number: int | None = None,
+        archive: EvidenceWriter | None = None,
+    ) -> ModelExecution:
         """Dispatch ``/implement`` and classify its one terminal SDK result."""
 
         self._skill_events.clear()
         self._review_count = 0
+        self._issue_number = issue_number
+        self._archive = archive
+        self._event_sequence = 0
+        self._log("model_execution_started", f"issue_body_length={len(issue_body)}")
         client = self._client_factory(self._options(working_directory))
         try:
             async with client:
@@ -153,7 +204,7 @@ class ModelExecutor:
                 "PreToolUse": [
                     HookMatcher(hooks=[self._guard_and_record_pre_tool_use])
                 ],
-                "PostToolUse": [HookMatcher(matcher="Skill", hooks=[self._record_post_tool_use])],
+                "PostToolUse": [HookMatcher(hooks=[self._record_post_tool_use])],
             },
         )
 
@@ -164,6 +215,10 @@ class ModelExecutor:
         async for message in client.receive_response():
             if isinstance(message, ResultMessage) or _looks_like_result(message):
                 return message, tuple(observed_models)
+            if isinstance(message, AssistantMessage):
+                for block in message.content:
+                    if isinstance(block, TextBlock) and block.text.strip():
+                        self._log("model_response", self._model_response_detail(block.text))
             model = getattr(message, "model", None)
             if isinstance(model, str):
                 observed_models.append(model)
@@ -238,6 +293,7 @@ class ModelExecutor:
         model_usage: Mapping[str, Any] | None,
         observed_models: tuple[str, ...],
     ) -> ModelExecution:
+        self._log("model_execution_finished", f"status={status}; {explanation}")
         return ModelExecution(
             status=status,
             explanation=explanation,
@@ -250,6 +306,7 @@ class ModelExecutor:
     async def _guard_and_record_pre_tool_use(
         self, hook_input: Any, tool_use_id: str | None, context: Any
     ) -> dict[str, Any]:
+        self._log_tool_use("tool_call", hook_input)
         await self._record_skill_event("PreToolUse", hook_input, tool_use_id, context)
         if _skill_name(hook_input) == "code-review":
             self._review_count += 1
@@ -260,7 +317,53 @@ class ModelExecutor:
     async def _record_post_tool_use(
         self, hook_input: Any, tool_use_id: str | None, context: Any
     ) -> dict[str, Any]:
+        self._log_tool_use(
+            "tool_result", hook_input, response=_hook_field(hook_input, "tool_response")
+        )
         return await self._record_skill_event("PostToolUse", hook_input, tool_use_id, context)
+
+    def _log_tool_use(self, event: str, hook_input: Any, *, response: Any = None) -> None:
+        tool_name = _hook_field(hook_input, "tool_name")
+        if not isinstance(tool_name, str):
+            return
+        skill_name = _skill_name(hook_input) if tool_name == "Skill" else None
+        label = f"skill:{skill_name}" if skill_name else tool_name
+        if event == "tool_result":
+            event_name = "skill_result" if skill_name else event
+            # Skill calls are already small; only offload plain tool payloads to disk.
+            detail = (
+                f"{label}: {response!r}"
+                if skill_name
+                else self._tool_result_detail(label, response)
+            )
+        else:
+            tool_input = _hook_field(hook_input, "tool_input", {})
+            event_name = "skill_call" if skill_name else event
+            detail = (
+                f"{label}: {tool_input!r}"
+                if skill_name
+                else self._tool_call_detail(label, tool_input)
+            )
+        self._log(event_name, _truncate(detail))
+
+    def _tool_call_detail(self, label: str, tool_input: Any) -> str:
+        path = self._archive_evidence("tool_call", _json_or_repr(tool_input), extension="json")
+        if path is None:
+            return f"{label}: {tool_input!r}"
+        return f"{label} -> {path}"
+
+    def _tool_result_detail(self, label: str, response: Any) -> str:
+        path = self._archive_evidence("tool_result", _json_or_repr(response), extension="json")
+        if path is None:
+            return f"{label}: {response!r}"
+        outcome = _outcome_hint(response)
+        return f"{label} -> {path}" + (f" ({outcome})" if outcome else "")
+
+    def _model_response_detail(self, text: str) -> str:
+        path = self._archive_evidence("model_response", text, extension="txt")
+        if path is None:
+            return _truncate(text)
+        return f"-> {path} (chars={len(text)})"
 
     async def _record_skill_event(
         self, phase: str, hook_input: Any, tool_use_id: str | None, context: Any
@@ -407,3 +510,29 @@ def _gh_subcommand(arguments: list[str]) -> tuple[str, str] | None:
 
 def _timestamp(value: datetime) -> str:
     return value.astimezone(UTC).isoformat().replace("+00:00", "Z")
+
+
+def _truncate(text: str) -> str:
+    if len(text) <= _MAX_LOG_DETAIL:
+        return text
+    return text[:_MAX_LOG_DETAIL] + "...[truncated]"
+
+
+def _json_or_repr(value: Any) -> str:
+    try:
+        return json.dumps(value, indent=2, default=str, sort_keys=True)
+    except TypeError:
+        return repr(value)
+
+
+def _outcome_hint(response: Any) -> str | None:
+    """Best-effort success/error hint; most tool responses carry no such field."""
+
+    if not isinstance(response, Mapping):
+        return None
+    if response.get("interrupted") is True:
+        return "interrupted"
+    is_error = response.get("is_error")
+    if isinstance(is_error, bool):
+        return "error" if is_error else "ok"
+    return None
