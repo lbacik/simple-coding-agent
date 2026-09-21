@@ -9,6 +9,7 @@ description = "An unattended coding agent for one GitHub repository."
 requires-python = ">=3.11"
 dependencies = [
     "claude-agent-sdk==0.2.156",
+    "python-dotenv>=1.2.3",
     "PyYAML>=6.0,<7",
 ]
 

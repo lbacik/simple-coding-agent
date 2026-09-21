@@ -17,11 +17,13 @@ from simple_coding_agent.observability import AttemptArchive, JsonEventLogger
 from simple_coding_agent.operating import ConsecutiveErrorStore
 from simple_coding_agent.publication import Publisher
 from simple_coding_agent.provenance import ProvenanceError, ProvenanceVerifier
+from dotenv import load_dotenv
 
 
 def main() -> None:
     """Run sequential attempts forever for the one operator-configured repository."""
 
+    load_dotenv(override=False)
     config = load_runtime_config()
     logger = JsonEventLogger(
         sys.stdout, redactions=(config.github_token, config.meta_api_key)
