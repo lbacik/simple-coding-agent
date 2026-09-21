@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 from simple_coding_agent.attempt_state import AttemptPhase, AttemptStateStore
 from simple_coding_agent.completion import AttemptOutcome, CompletionDecision, PublicationPath
+from simple_coding_agent.git_workspace import GitWorkspaceRecoveryError
 from simple_coding_agent.github_tracker import Assignment, Claim, TrackerIssue
 from simple_coding_agent.lifecycle import AgentLifecycle, AttemptEvidence, LifecycleStatus
 from simple_coding_agent.operating import ConsecutiveErrorStore
@@ -343,6 +344,31 @@ def test_does_not_start_cleanup_when_the_result_comment_was_not_posted(tmp_path:
     assert workspace.cleanup_calls == [("main", True)]
 
 
+def test_stops_without_touching_the_issue_when_the_workspace_cannot_be_repaired(
+    tmp_path: Path,
+) -> None:
+    events: list[tuple[str, str, str]] = []
+    state = AttemptStateStore(tmp_path)
+    tracker = FakeTracker(Claim(issue(24), Assignment("issue-24", "agent-id")))
+    workspace = RecoveryFailingWorkspace()
+    lifecycle = AgentLifecycle(
+        tracker=tracker,
+        attempt_state=state,
+        workspace=workspace,
+        profile_loader=lambda _: (_ for _ in ()).throw(AssertionError("must not be reached")),
+        publisher=FakePublisher(),
+        event_log=lambda event, detail="", level="INFO": events.append((event, detail, level)),
+    )
+
+    with pytest.raises(SystemExit):
+        lifecycle.run_once()
+
+    assert tracker.cleanup == []
+    assert workspace.cleanup_calls == []
+    assert state.read() is not None
+    assert ("git_workspace_unrecoverable", "GitWorkspaceRecoveryError: workspace is broken", "ERROR") in events
+
+
 @dataclass
 class FakeTracker:
     next_claim: Claim | None
@@ -386,6 +412,11 @@ class FakeWorkspace:
 
     def commits_added(self, prepared: object) -> tuple[str, ...]:
         return self._commits
+
+
+class RecoveryFailingWorkspace(FakeWorkspace):
+    def prepare_attempt(self, *, base_branch: str, issue_number: int):
+        raise GitWorkspaceRecoveryError("workspace is broken")
 
 
 class FakePublisher:

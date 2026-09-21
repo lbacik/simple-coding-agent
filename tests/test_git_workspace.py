@@ -6,7 +6,11 @@ import subprocess
 
 import pytest
 
-from simple_coding_agent.git_workspace import GitWorkspace, GitWorkspaceError
+from simple_coding_agent.git_workspace import (
+    GitWorkspace,
+    GitWorkspaceError,
+    GitWorkspaceRecoveryError,
+)
 
 
 def test_clones_once_fetches_and_prepares_an_attempt_from_the_verified_base(
@@ -27,20 +31,23 @@ def test_clones_once_fetches_and_prepares_an_attempt_from_the_verified_base(
     assert git(tmp_path / "clone", "branch", "--show-current") == "agent/issue-19"
 
 
-def test_refuses_a_base_branch_that_diverges_from_origin(tmp_path: Path) -> None:
+def test_repairs_a_base_branch_that_diverges_from_origin_before_the_attempt(
+    tmp_path: Path,
+) -> None:
     remote, seed = repository_with_main(tmp_path)
-    workspace = GitWorkspace(tmp_path / "clone", str(remote), token_provider=lambda: "secret-token")
+    clone = tmp_path / "clone"
+    workspace = GitWorkspace(clone, str(remote), token_provider=lambda: "secret-token")
     workspace.prepare_attempt(base_branch="main", issue_number=19)
-    git(tmp_path / "clone", "checkout", "main")
-    write_and_commit(tmp_path / "clone", "local.txt", "local change", "local base")
+    git(clone, "checkout", "main")
+    write_and_commit(clone, "local.txt", "local change", "local base")
 
-    with pytest.raises(GitWorkspaceError, match="diverged"):
-        workspace.prepare_attempt(base_branch="main", issue_number=19)
+    prepared = workspace.prepare_attempt(base_branch="main", issue_number=19)
 
-    assert git(seed, "rev-parse", "main") != git(tmp_path / "clone", "rev-parse", "main")
+    assert prepared.base_revision == git(seed, "rev-parse", "main")
+    assert git(clone, "rev-parse", "main") == git(seed, "rev-parse", "main")
 
 
-def test_refuses_a_stale_base_after_origin_advances(tmp_path: Path) -> None:
+def test_repairs_a_stale_base_after_origin_advances(tmp_path: Path) -> None:
     remote, seed = repository_with_main(tmp_path)
     clone = tmp_path / "clone"
     workspace = GitWorkspace(clone, str(remote), token_provider=lambda: "secret-token")
@@ -48,10 +55,34 @@ def test_refuses_a_stale_base_after_origin_advances(tmp_path: Path) -> None:
     write_and_commit(seed, "upstream.txt", "upstream change", "Advance base")
     git(seed, "push", "origin", "main")
 
-    with pytest.raises(GitWorkspaceError, match="diverged"):
-        workspace.prepare_attempt(base_branch="main", issue_number=19)
+    prepared = workspace.prepare_attempt(base_branch="main", issue_number=19)
 
-    assert git(seed, "rev-parse", "main") != git(clone, "rev-parse", "main")
+    assert prepared.base_revision == git(seed, "rev-parse", "main")
+    assert git(clone, "rev-parse", "main") == git(seed, "rev-parse", "main")
+
+
+def test_raises_a_recovery_error_when_the_diverged_base_cannot_be_repaired(
+    tmp_path: Path,
+) -> None:
+    remote, seed = repository_with_main(tmp_path)
+    clone = tmp_path / "clone"
+
+    def failing_reset(command: tuple[str, ...], cwd: Path | None, env: dict[str, str]) -> str:
+        if command[1] == "branch" and command[2] == "-f":
+            raise subprocess.CalledProcessError(1, command)
+        return run_command(command, cwd=cwd, env=env)
+
+    workspace = GitWorkspace(clone, str(remote), token_provider=lambda: "secret-token")
+    workspace.prepare_attempt(base_branch="main", issue_number=19)
+    write_and_commit(seed, "upstream.txt", "upstream change", "Advance base")
+    git(seed, "push", "origin", "main")
+
+    broken_workspace = GitWorkspace(
+        clone, str(remote), token_provider=lambda: "secret-token", run=failing_reset
+    )
+
+    with pytest.raises(GitWorkspaceRecoveryError, match="diverged"):
+        broken_workspace.prepare_attempt(base_branch="main", issue_number=19)
 
 
 def test_reports_the_verified_base_and_commits_added_by_the_attempt(tmp_path: Path) -> None:

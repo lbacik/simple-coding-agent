@@ -17,6 +17,15 @@ class GitWorkspaceError(RuntimeError):
     """Raised when the persistent git workspace cannot be used safely."""
 
 
+class GitWorkspaceRecoveryError(GitWorkspaceError):
+    """Raised when the local workspace is broken in a way this attempt cannot fix.
+
+    Unlike other ``GitWorkspaceError`` cases, this is a fault in the agent's own
+    persistent clone rather than in the claimed issue, so callers must not treat
+    it as attempt failure: no result comment, no label release.
+    """
+
+
 @dataclass(frozen=True)
 class PreparedAttempt:
     """The branch and verified base revision for one implementation attempt."""
@@ -63,8 +72,13 @@ class GitWorkspace:
     def prepare_attempt(self, *, base_branch: str, issue_number: int) -> PreparedAttempt:
         """Fetch, verify, and check out the branch used by an attempt.
 
-        A local base that differs from ``origin/<base_branch>`` is deliberately
-        refused: setup must never run against stale or divergent code.
+        A local base that differs from ``origin/<base_branch>`` is never used
+        as-is: setup must never run against stale or divergent code. This is
+        normally just a leftover from an interrupted previous run, so it is
+        first repaired by resetting the local base to match origin. Only a
+        base that still disagrees after that repair is a broken workspace,
+        raised as ``GitWorkspaceRecoveryError`` for the caller to handle
+        separately from an ordinary attempt failure.
         """
 
         branch = _attempt_branch(issue_number)
@@ -73,7 +87,12 @@ class GitWorkspace:
         base_revision = self._revision(f"origin/{base_branch}", remote=True)
         local_base_revision = self._revision(base_branch, remote=False)
         if local_base_revision != base_revision:
-            raise GitWorkspaceError("Local base branch has diverged from origin")
+            self._reset_local_base(base_branch)
+            local_base_revision = self._revision(base_branch, remote=False)
+            if local_base_revision != base_revision:
+                raise GitWorkspaceRecoveryError(
+                    "Local base branch has diverged from origin and could not be repaired"
+                )
 
         if self._branch_exists(branch):
             self._git("checkout", branch)
@@ -194,6 +213,19 @@ class GitWorkspace:
         except GitWorkspaceError as error:
             location = "origin" if remote else "local clone"
             raise GitWorkspaceError(f"Base branch is unavailable in the {location}") from error
+
+    def _reset_local_base(self, base_branch: str) -> None:
+        """Best-effort repair of a local base branch that fell out of sync with origin."""
+
+        try:
+            current_branch = self._git("rev-parse", "--abbrev-ref", "HEAD")
+            if current_branch == base_branch:
+                self._git("reset", "--hard", f"origin/{base_branch}")
+                self._git("clean", "-fd")
+            else:
+                self._git("branch", "-f", base_branch, f"origin/{base_branch}")
+        except GitWorkspaceError:
+            pass
 
     def _branch_exists(self, branch: str) -> bool:
         try:

@@ -22,6 +22,7 @@ from simple_coding_agent.completion import (
     VerificationRunner,
 )
 from simple_coding_agent.config import RepositoryProfile
+from simple_coding_agent.git_workspace import GitWorkspaceRecoveryError
 from simple_coding_agent.github_tracker import Claim
 from simple_coding_agent.model_execution import ModelExecutionStatus, ModelExecutor
 from simple_coding_agent.observability import AttemptArchive
@@ -290,6 +291,11 @@ class AgentLifecycle:
                     outcome is AttemptOutcome.INFRASTRUCTURE_ERROR
                     and getattr(published, "branch_url", None) is None
                 )
+        except GitWorkspaceRecoveryError as error:
+            self._event_log("git_workspace_unrecoverable", _exception_detail(error), level="ERROR")
+            comment_posted = False
+            prepared = None
+            raise SystemExit(1) from error
         except Exception as error:
             self._event_log("attempt_exception", _exception_detail(error), level="ERROR")
             published = self._publish_terminal(
@@ -385,6 +391,11 @@ class AgentLifecycle:
                 and getattr(published, "branch_url", None) is None
                 and has_commits
             )
+        except GitWorkspaceRecoveryError as error:
+            self._event_log("git_workspace_unrecoverable", _exception_detail(error), level="ERROR")
+            comment_posted = False
+            prepared = None
+            raise SystemExit(1) from error
         except Exception as error:
             self._event_log("attempt_exception", _exception_detail(error), level="ERROR")
             published = self._publish_terminal(
