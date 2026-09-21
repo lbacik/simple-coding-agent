@@ -87,8 +87,8 @@ def main() -> None:
         poll_interval=config.poll_interval,
         error_store=ConsecutiveErrorStore(config.data_dir),
         max_consecutive_errors=config.max_consecutive_errors,
-        event_log=lambda event, detail="": logger.emit(
-            event, phase="polling", detail=detail, level="ERROR"
+        event_log=lambda event, detail="", level="INFO": logger.emit(
+            event, phase="polling", detail=detail, level=level
         ),
         attempt_archive_factory=archive_factory,
     )

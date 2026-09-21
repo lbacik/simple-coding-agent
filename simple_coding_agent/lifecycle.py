@@ -194,7 +194,7 @@ class AgentLifecycle:
         sleeper: Callable[[float], None] = time.sleep,
         error_store: ConsecutiveErrorStore | None = None,
         max_consecutive_errors: int = 3,
-        event_log: Callable[[str, str], None] = lambda event, detail="": None,
+        event_log: Callable[..., None] = lambda event, detail="", level="INFO": None,
         attempt_archive_factory: Callable[[int, str], AttemptArchive] | None = None,
     ) -> None:
         self._tracker = tracker
@@ -220,8 +220,14 @@ class AgentLifecycle:
             if recovered is not None:
                 return LifecycleResult(LifecycleStatus.ATTEMPTED, recovered)
 
+        self._event_log("polling_for_issue", "", level="INFO")
         claim = self._tracker.claim_next()
         if claim is None:
+            self._event_log(
+                "no_eligible_issue_found",
+                f"no ready-for-agent issue available; sleeping {self._poll_interval}s",
+                level="INFO",
+            )
             self._sleeper(self._poll_interval)
             return LifecycleResult(LifecycleStatus.IDLE)
 
@@ -275,7 +281,7 @@ class AgentLifecycle:
                     and getattr(published, "branch_url", None) is None
                 )
         except Exception as error:
-            self._event_log("attempt_exception", _exception_detail(error))
+            self._event_log("attempt_exception", _exception_detail(error), level="ERROR")
             published = self._publish_terminal(
                 claim, checkpoint.started_at, prepared, profile, outcome
             )
@@ -370,7 +376,7 @@ class AgentLifecycle:
                 and has_commits
             )
         except Exception as error:
-            self._event_log("attempt_exception", _exception_detail(error))
+            self._event_log("attempt_exception", _exception_detail(error), level="ERROR")
             published = self._publish_terminal(
                 claim, checkpoint.started_at, prepared, profile, AttemptOutcome.INFRASTRUCTURE_ERROR
             )
@@ -438,7 +444,7 @@ class AgentLifecycle:
             return
         count = self._error_store.record(outcome, attempt_id)
         if count >= self._max_consecutive_errors:
-            self._event_log("consecutive_error_limit_reached")
+            self._event_log("consecutive_error_limit_reached", level="ERROR")
             raise SystemExit(1)
 
     def _archive_for(self, issue_number: int, started_at: str) -> AttemptArchive | None:

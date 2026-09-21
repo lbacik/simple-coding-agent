@@ -41,6 +41,7 @@ def test_setup_failure_posts_result_then_releases_only_the_agent_claim(
 
 def test_empty_queue_sleeps_once_without_attempting_work(tmp_path: Path) -> None:
     sleeps: list[int] = []
+    events: list[tuple[str, str, str]] = []
     lifecycle = AgentLifecycle(
         tracker=FakeTracker(None),
         attempt_state=AttemptStateStore(tmp_path),
@@ -49,12 +50,16 @@ def test_empty_queue_sleeps_once_without_attempting_work(tmp_path: Path) -> None
         publisher=FakePublisher(),
         poll_interval=17,
         sleeper=sleeps.append,
+        event_log=lambda event, detail="", level="INFO": events.append((event, detail, level)),
     )
 
     result = lifecycle.run_once()
 
     assert result.status is LifecycleStatus.IDLE
     assert sleeps == [17]
+    assert [event for event, _, _ in events] == ["polling_for_issue", "no_eligible_issue_found"]
+    assert events[1][1] == "no ready-for-agent issue available; sleeping 17s"
+    assert events[1][2] == "INFO"
 
 
 def test_stops_after_the_persisted_consecutive_infrastructure_error_limit(tmp_path: Path) -> None:
@@ -67,15 +72,19 @@ def test_stops_after_the_persisted_consecutive_infrastructure_error_limit(tmp_pa
         publisher=FakePublisher(),
         error_store=ConsecutiveErrorStore(tmp_path),
         max_consecutive_errors=1,
-        event_log=lambda event, detail="": events.append((event, detail)),
+        event_log=lambda event, detail="", level="INFO": events.append((event, detail)),
     )
 
     with pytest.raises(SystemExit) as stopped:
         lifecycle.run_once()
 
     assert stopped.value.code == 1
-    assert [event for event, _ in events] == ["attempt_exception", "consecutive_error_limit_reached"]
-    assert events[0][1] == "OSError: profile is missing"
+    assert [event for event, _ in events] == [
+        "polling_for_issue",
+        "attempt_exception",
+        "consecutive_error_limit_reached",
+    ]
+    assert events[1][1] == "OSError: profile is missing"
     assert ConsecutiveErrorStore(tmp_path).read().count == 1
 
 
