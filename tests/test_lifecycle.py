@@ -58,7 +58,7 @@ def test_empty_queue_sleeps_once_without_attempting_work(tmp_path: Path) -> None
 
 
 def test_stops_after_the_persisted_consecutive_infrastructure_error_limit(tmp_path: Path) -> None:
-    events: list[str] = []
+    events: list[tuple[str, str]] = []
     lifecycle = AgentLifecycle(
         tracker=FakeTracker(Claim(issue(24), Assignment("issue-24", "agent-id"))),
         attempt_state=AttemptStateStore(tmp_path),
@@ -67,14 +67,15 @@ def test_stops_after_the_persisted_consecutive_infrastructure_error_limit(tmp_pa
         publisher=FakePublisher(),
         error_store=ConsecutiveErrorStore(tmp_path),
         max_consecutive_errors=1,
-        event_log=lambda event: events.append(event),
+        event_log=lambda event, detail="": events.append((event, detail)),
     )
 
     with pytest.raises(SystemExit) as stopped:
         lifecycle.run_once()
 
     assert stopped.value.code == 1
-    assert events == ["consecutive_error_limit_reached"]
+    assert [event for event, _ in events] == ["attempt_exception", "consecutive_error_limit_reached"]
+    assert events[0][1] == "OSError: profile is missing"
     assert ConsecutiveErrorStore(tmp_path).read().count == 1
 
 

@@ -23,9 +23,9 @@ class ProfileError(ValueError):
 
 _TARGET_REPOSITORY = re.compile(r"^[^/\s]+/[^/\s]+$")
 _LOG_LEVELS = frozenset({"CRITICAL", "ERROR", "WARNING", "INFO", "DEBUG"})
-MODEL_NAME = "muse-spark-1.3-contributor"
-CLAUDE_AGENT_SDK_VERSION = "0.2.156"
-CLAUDE_CODE_VERSION = "2.1.276"
+_DEFAULT_MODEL_NAME = "muse-spark-1.3-contributor"
+_DEFAULT_CLAUDE_AGENT_SDK_VERSION = "0.2.156"
+_DEFAULT_CLAUDE_CODE_VERSION = "2.1.278"
 
 
 @dataclass(frozen=True)
@@ -45,7 +45,9 @@ class RuntimeConfig:
     max_consecutive_errors: int
     agent_trust_project_settings: bool
     review_blocking_severities: frozenset[str]
-    model: str = MODEL_NAME
+    model: str = _DEFAULT_MODEL_NAME
+    claude_agent_sdk_version: str = _DEFAULT_CLAUDE_AGENT_SDK_VERSION
+    claude_code_version: str = _DEFAULT_CLAUDE_CODE_VERSION
     max_turns: int = 60
     max_budget_usd: int = 5
 
@@ -92,6 +94,13 @@ def load_runtime_config(environ: Mapping[str, str] | None = None) -> RuntimeConf
         max_consecutive_errors=_positive_integer(values, "MAX_CONSECUTIVE_ERRORS", 3),
         agent_trust_project_settings=_boolean(values, "AGENT_TRUST_PROJECT_SETTINGS", False),
         review_blocking_severities=_review_severities(values),
+        model=_non_empty(values, "MODEL_NAME", _DEFAULT_MODEL_NAME),
+        claude_agent_sdk_version=_non_empty(
+            values, "CLAUDE_AGENT_SDK_VERSION", _DEFAULT_CLAUDE_AGENT_SDK_VERSION
+        ),
+        claude_code_version=_non_empty(
+            values, "CLAUDE_CODE_VERSION", _DEFAULT_CLAUDE_CODE_VERSION
+        ),
     )
 
 
@@ -129,6 +138,13 @@ def _required(values: Mapping[str, str], name: str) -> str:
     value = values.get(name, "")
     if not value.strip():
         raise ConfigurationError(f"{name} must be set")
+    return value
+
+
+def _non_empty(values: Mapping[str, str], name: str, default: str) -> str:
+    value = values.get(name, default)
+    if not value.strip():
+        raise ConfigurationError(f"{name} must not be empty")
     return value
 
 

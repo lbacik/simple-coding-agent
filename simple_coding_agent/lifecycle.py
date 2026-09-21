@@ -194,7 +194,7 @@ class AgentLifecycle:
         sleeper: Callable[[float], None] = time.sleep,
         error_store: ConsecutiveErrorStore | None = None,
         max_consecutive_errors: int = 3,
-        event_log: Callable[[str], None] = lambda event: None,
+        event_log: Callable[[str, str], None] = lambda event, detail="": None,
         attempt_archive_factory: Callable[[int, str], AttemptArchive] | None = None,
     ) -> None:
         self._tracker = tracker
@@ -274,7 +274,8 @@ class AgentLifecycle:
                     outcome is AttemptOutcome.INFRASTRUCTURE_ERROR
                     and getattr(published, "branch_url", None) is None
                 )
-        except Exception:
+        except Exception as error:
+            self._event_log("attempt_exception", _exception_detail(error))
             published = self._publish_terminal(
                 claim, checkpoint.started_at, prepared, profile, outcome
             )
@@ -368,7 +369,8 @@ class AgentLifecycle:
                 and getattr(published, "branch_url", None) is None
                 and has_commits
             )
-        except Exception:
+        except Exception as error:
+            self._event_log("attempt_exception", _exception_detail(error))
             published = self._publish_terminal(
                 claim, checkpoint.started_at, prepared, profile, AttemptOutcome.INFRASTRUCTURE_ERROR
             )
@@ -497,3 +499,7 @@ def _infrastructure_decision(reason: str) -> CompletionDecision:
     return CompletionDecision(
         AttemptOutcome.INFRASTRUCTURE_ERROR, False, PublicationPath.NONE, (reason,)
     )
+
+
+def _exception_detail(error: Exception) -> str:
+    return f"{type(error).__name__}: {error}"

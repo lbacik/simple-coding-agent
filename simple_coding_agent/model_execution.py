@@ -11,7 +11,14 @@ from pathlib import Path
 import shlex
 from typing import Any, Protocol
 
-from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient, HookMatcher, ResultMessage
+from claude_agent_sdk import (
+    AssistantMessage,
+    ClaudeAgentOptions,
+    ClaudeSDKClient,
+    HookMatcher,
+    ResultMessage,
+    TextBlock,
+)
 
 from simple_coding_agent.config import RuntimeConfig
 
@@ -66,6 +73,9 @@ class SDKClient(Protocol):
 
 ClientFactory = Callable[[ClaudeAgentOptions], SDKClient]
 Clock = Callable[[], datetime]
+EventLog = Callable[[str, str], None]
+
+_MAX_LOG_DETAIL = 2000
 
 
 class ModelExecutor:
@@ -77,10 +87,12 @@ class ModelExecutor:
         *,
         client_factory: ClientFactory = ClaudeSDKClient,
         clock: Clock = lambda: datetime.now(UTC),
+        event_log: EventLog = lambda event, detail="": None,
     ) -> None:
         self._config = config
         self._client_factory = client_factory
         self._clock = clock
+        self._event_log = event_log
         self._skill_events: list[SkillEvent] = []
         self._review_count = 0
 
@@ -95,6 +107,7 @@ class ModelExecutor:
 
         self._skill_events.clear()
         self._review_count = 0
+        self._event_log("model_execution_started", f"issue_body_length={len(issue_body)}")
         client = self._client_factory(self._options(working_directory))
         try:
             async with client:
@@ -153,7 +166,7 @@ class ModelExecutor:
                 "PreToolUse": [
                     HookMatcher(hooks=[self._guard_and_record_pre_tool_use])
                 ],
-                "PostToolUse": [HookMatcher(matcher="Skill", hooks=[self._record_post_tool_use])],
+                "PostToolUse": [HookMatcher(hooks=[self._record_post_tool_use])],
             },
         )
 
@@ -164,6 +177,10 @@ class ModelExecutor:
         async for message in client.receive_response():
             if isinstance(message, ResultMessage) or _looks_like_result(message):
                 return message, tuple(observed_models)
+            if isinstance(message, AssistantMessage):
+                for block in message.content:
+                    if isinstance(block, TextBlock) and block.text.strip():
+                        self._event_log("model_response", _truncate(block.text))
             model = getattr(message, "model", None)
             if isinstance(model, str):
                 observed_models.append(model)
@@ -238,6 +255,7 @@ class ModelExecutor:
         model_usage: Mapping[str, Any] | None,
         observed_models: tuple[str, ...],
     ) -> ModelExecution:
+        self._event_log("model_execution_finished", f"status={status}; {explanation}")
         return ModelExecution(
             status=status,
             explanation=explanation,
@@ -250,6 +268,7 @@ class ModelExecutor:
     async def _guard_and_record_pre_tool_use(
         self, hook_input: Any, tool_use_id: str | None, context: Any
     ) -> dict[str, Any]:
+        self._log_tool_use("tool_call", hook_input)
         await self._record_skill_event("PreToolUse", hook_input, tool_use_id, context)
         if _skill_name(hook_input) == "code-review":
             self._review_count += 1
@@ -260,7 +279,21 @@ class ModelExecutor:
     async def _record_post_tool_use(
         self, hook_input: Any, tool_use_id: str | None, context: Any
     ) -> dict[str, Any]:
+        self._log_tool_use(
+            "tool_result", hook_input, response=_hook_field(hook_input, "tool_response")
+        )
         return await self._record_skill_event("PostToolUse", hook_input, tool_use_id, context)
+
+    def _log_tool_use(self, event: str, hook_input: Any, *, response: Any = None) -> None:
+        tool_name = _hook_field(hook_input, "tool_name")
+        if not isinstance(tool_name, str):
+            return
+        if event == "tool_result":
+            detail = f"{tool_name}: {response!r}"
+        else:
+            tool_input = _hook_field(hook_input, "tool_input", {})
+            detail = f"{tool_name}: {tool_input!r}"
+        self._event_log(event, _truncate(detail))
 
     async def _record_skill_event(
         self, phase: str, hook_input: Any, tool_use_id: str | None, context: Any
@@ -407,3 +440,9 @@ def _gh_subcommand(arguments: list[str]) -> tuple[str, str] | None:
 
 def _timestamp(value: datetime) -> str:
     return value.astimezone(UTC).isoformat().replace("+00:00", "Z")
+
+
+def _truncate(text: str) -> str:
+    if len(text) <= _MAX_LOG_DETAIL:
+        return text
+    return text[:_MAX_LOG_DETAIL] + "...[truncated]"

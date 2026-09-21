@@ -29,17 +29,18 @@ def main() -> None:
         sys.stdout, redactions=(config.github_token, config.meta_api_key)
     )
     try:
-        provenance = ProvenanceVerifier(home=Path.home()).verify()
+        provenance = ProvenanceVerifier(
+            home=Path.home(),
+            expected_sdk_version=config.claude_agent_sdk_version,
+            expected_cli_version=config.claude_code_version,
+        ).verify()
     except ProvenanceError as error:
         logger.emit("provenance_verification_failed", phase="startup", detail=str(error), level="ERROR")
         raise SystemExit(1) from error
     logger.emit(
         "provenance_verified",
         phase="startup",
-        detail=(
-            f"skills={provenance.skill_commit}; sdk={provenance.sdk_version}; "
-            f"cli={provenance.cli_version}"
-        ),
+        detail=f"sdk={provenance.sdk_version}; cli={provenance.cli_version}",
     )
     github = GitHubGraphQLTransport(config.github_token, max_retries=config.max_retries)
     archive_factory = lambda issue_number, started_at: AttemptArchive(
@@ -61,7 +62,12 @@ def main() -> None:
             CommandRunner(redactions=(config.github_token, config.meta_api_key))
         ),
         evaluator=CompletionEvaluator(config.review_blocking_severities),
-        model_executor=ModelExecutor(config),
+        model_executor=ModelExecutor(
+            config,
+            event_log=lambda event, detail="": logger.emit(
+                event, phase="model_execution", detail=detail
+            ),
+        ),
         attempt_archive_factory=archive_factory,
     )
     lifecycle = AgentLifecycle(
@@ -81,7 +87,9 @@ def main() -> None:
         poll_interval=config.poll_interval,
         error_store=ConsecutiveErrorStore(config.data_dir),
         max_consecutive_errors=config.max_consecutive_errors,
-        event_log=lambda event: logger.emit(event, phase="polling", level="ERROR"),
+        event_log=lambda event, detail="": logger.emit(
+            event, phase="polling", detail=detail, level="ERROR"
+        ),
         attempt_archive_factory=archive_factory,
     )
     lifecycle.run_forever(stop=lambda: False)

@@ -9,6 +9,8 @@ from types import SimpleNamespace
 
 import pytest
 
+from claude_agent_sdk import AssistantMessage, TextBlock
+
 from simple_coding_agent.config import RuntimeConfig
 from simple_coding_agent.model_execution import (
     ModelExecutor,
@@ -260,6 +262,52 @@ def test_captures_skill_provenance_from_pre_and_post_tool_hooks(tmp_path: Path) 
         ("PostToolUse", "code-review", "review-1"),
     ]
     assert all(event.timestamp.endswith("Z") for event in executor.skill_events)
+
+
+def test_logs_the_process_even_when_the_attempt_succeeds(tmp_path: Path) -> None:
+    events: list[tuple[str, str]] = []
+    captured: list[FakeClient] = []
+
+    def client_factory(options: object) -> FakeClient:
+        client = FakeClient(
+            options,
+            [
+                AssistantMessage(
+                    content=[TextBlock(text="Looking at the parser now.")],
+                    model="muse-spark-1.3-contributor",
+                ),
+                result(),
+            ],
+        )
+        captured.append(client)
+        return client
+
+    executor = ModelExecutor(
+        runtime_config(tmp_path),
+        client_factory=client_factory,
+        event_log=lambda event, detail="": events.append((event, detail)),
+    )
+    asyncio.run(executor.execute(issue_body="Fix the parser.", working_directory=tmp_path))
+    pre_hook = captured[0].options.hooks["PreToolUse"][0].hooks[0]
+    post_hook = captured[0].options.hooks["PostToolUse"][0].hooks[0]
+    asyncio.run(
+        pre_hook({"tool_name": "Bash", "tool_input": {"command": "pytest"}}, None, {})
+    )
+    asyncio.run(
+        post_hook(
+            {"tool_name": "Bash", "tool_input": {"command": "pytest"}, "tool_response": "ok"},
+            None,
+            {},
+        )
+    )
+
+    names = [event for event, _ in events]
+    assert names[0] == "model_execution_started"
+    assert "model_response" in names
+    assert "model_execution_finished" in names
+    assert any(name == "tool_call" and "pytest" in detail for name, detail in events)
+    assert any(name == "tool_result" and "ok" in detail for name, detail in events)
+    assert any("Looking at the parser now." in detail for name, detail in events if name == "model_response")
 
 
 def test_blocks_a_third_repair_cycle_after_three_code_reviews(tmp_path: Path) -> None:

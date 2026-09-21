@@ -9,10 +9,7 @@ from pathlib import Path
 import subprocess
 from typing import Any
 
-from simple_coding_agent.config import CLAUDE_AGENT_SDK_VERSION, CLAUDE_CODE_VERSION
 
-
-UPSTREAM_SKILLS_COMMIT = "c55ee46073ed923f86ce59a5eb3b6d895095d1b7"
 REQUIRED_SKILLS = ("implement", "tdd", "code-review", "codebase-design")
 
 
@@ -24,7 +21,6 @@ class ProvenanceError(RuntimeError):
 class ProvenanceEvidence:
     """Non-secret evidence retained with an attempt's operational record."""
 
-    skill_commit: str
     skill_hashes: dict[str, str]
     sdk_version: str
     cli_version: str
@@ -37,10 +33,14 @@ class ProvenanceVerifier:
         self,
         *,
         home: Path,
+        expected_sdk_version: str,
+        expected_cli_version: str,
         run: Callable[[tuple[str, ...]], str] | None = None,
         sdk_version: Callable[[], str] | None = None,
     ) -> None:
         self._home = home
+        self._expected_sdk_version = expected_sdk_version
+        self._expected_cli_version = expected_cli_version
         self._run = run or _run
         self._sdk_version = sdk_version or _installed_sdk_version
 
@@ -51,20 +51,18 @@ class ProvenanceVerifier:
             artifact = artifacts.get(f"skill:{skill}")
             if artifact is None:
                 raise ProvenanceError(f"Missing required skill: {skill}")
-            if artifact.get("resolvedCommit") != UPSTREAM_SKILLS_COMMIT:
-                raise ProvenanceError(f"Required skill has an unexpected source commit: {skill}")
-            digest = artifact.get("hash")
+            digest = artifact.get("installedHash")
             if not isinstance(digest, str) or not digest:
                 raise ProvenanceError(f"Required skill has no installed hash: {skill}")
             _verify_link(self._home, skill)
             hashes[skill] = digest
         sdk_version = self._sdk_version()
-        if sdk_version != CLAUDE_AGENT_SDK_VERSION:
+        if sdk_version != self._expected_sdk_version:
             raise ProvenanceError("Claude Agent SDK version does not match the pinned runtime")
         cli_version = _version(self._run(("claude", "--version")))
-        if cli_version != CLAUDE_CODE_VERSION:
+        if cli_version != self._expected_cli_version:
             raise ProvenanceError("Claude Code CLI version does not match the pinned runtime")
-        return ProvenanceEvidence(UPSTREAM_SKILLS_COMMIT, hashes, sdk_version, cli_version)
+        return ProvenanceEvidence(hashes, sdk_version, cli_version)
 
 
 def _artifacts(output: str) -> dict[str, dict[str, Any]]:
@@ -107,4 +105,4 @@ def _run(command: tuple[str, ...]) -> str:
 
 def _version(output: str) -> str:
     words = output.strip().split()
-    return words[-1].removeprefix("v") if words else ""
+    return words[0] if words else ""

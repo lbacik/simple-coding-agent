@@ -2,13 +2,16 @@ from __future__ import annotations
 
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
+import json
 
 import pytest
 
 from simple_coding_agent.github_tracker import (
     Assignment,
+    GitHubGraphQLTransport,
     GitHubIdentity,
     GitHubTracker,
+    GitHubTrackerError,
     IssuePage,
     TrackerIssue,
 )
@@ -134,6 +137,36 @@ def test_releases_only_the_ready_label_and_the_authenticated_agent_assignment() 
 
     assert transport.removed_labels == [("issue-24", "ready-for-agent")]
     assert transport.removed_assignees == [("issue-24", "viewer-id")]
+
+
+def test_graphql_errors_surface_githubs_own_message(monkeypatch: pytest.MonkeyPatch) -> None:
+    payload = json.dumps(
+        {"errors": [{"message": "Resource not accessible by integration"}]}
+    ).encode()
+    monkeypatch.setattr(
+        "simple_coding_agent.github_tracker.urlopen",
+        lambda request: _FakeResponse(payload),
+    )
+    transport = GitHubGraphQLTransport("token")
+
+    with pytest.raises(GitHubTrackerError) as excinfo:
+        transport._execute("query Viewer { viewer { id login } }", {})
+
+    assert "Resource not accessible by integration" in str(excinfo.value)
+
+
+class _FakeResponse:
+    def __init__(self, payload: bytes) -> None:
+        self._payload = payload
+
+    def __enter__(self) -> "_FakeResponse":
+        return self
+
+    def __exit__(self, *arguments: object) -> None:
+        return None
+
+    def read(self) -> bytes:
+        return self._payload
 
 
 class RecordingGraphQLTransport:
