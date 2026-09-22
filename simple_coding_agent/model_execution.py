@@ -39,6 +39,12 @@ _USAGE_TOKEN_FIELDS = (
     "cache_creation_input_tokens",
     "cache_read_input_tokens",
 )
+_CATEGORY_USD_PER_MILLION_TOKENS: Mapping[str, float] = {
+    "cache_read_input_tokens": 0.30,
+    "cache_creation_input_tokens": 3.75,
+    "input_tokens": 3.00,
+    "output_tokens": 15.00,
+}
 
 _HANDOFF_FOLLOWUP_TIMEOUT = 300
 
@@ -54,23 +60,53 @@ _LIMIT_HANDOFF_FOLLOWUP_PROMPT = (
 
 
 class _CostEstimator:
-    """Accumulate an approximate USD spend from streamed token usage."""
+    """Accumulate an approximate USD spend from streamed token usage or turn count."""
 
-    def __init__(self, rate_per_million_tokens: float = _ESTIMATED_USD_PER_MILLION_TOKENS) -> None:
+    def __init__(
+        self,
+        rate_per_million_tokens: float = _ESTIMATED_USD_PER_MILLION_TOKENS,
+        category_rates: Mapping[str, float] | None = None,
+        fallback_turn_cost: float = 0.05,
+    ) -> None:
         self._rate = rate_per_million_tokens
+        self._category_rates = dict(category_rates or _CATEGORY_USD_PER_MILLION_TOKENS)
+        self._fallback_turn_cost = fallback_turn_cost
         self._tokens = 0
+        self._estimated_cost = 0.0
+        self._has_positive_usage = False
+
+    @property
+    def has_positive_usage(self) -> bool:
+        return self._has_positive_usage
 
     def observe(self, usage: Any) -> float:
+        has_tokens = False
         if isinstance(usage, Mapping):
+            has_cache = any(
+                isinstance(usage.get(f), int) and usage.get(f) > 0
+                for f in ("cache_read_input_tokens", "cache_creation_input_tokens")
+            )
             for field in _USAGE_TOKEN_FIELDS:
                 value = usage.get(field)
-                if isinstance(value, int):
+                if isinstance(value, int) and value > 0:
+                    has_tokens = True
                     self._tokens += value
+                    rate = self._category_rates.get(field, self._rate) if has_cache else self._rate
+                    self._estimated_cost += (value / 1_000_000) * rate
+        if has_tokens:
+            self._has_positive_usage = True
+        elif not self._has_positive_usage and self._fallback_turn_cost > 0.0:
+            self._estimated_cost += self._fallback_turn_cost
+            self._tokens += int((self._fallback_turn_cost / self._rate) * 1_000_000)
+        return self.estimated_cost_usd
+
+    def observe_turn(self, estimated_turn_cost_usd: float) -> float:
+        self._estimated_cost += estimated_turn_cost_usd
         return self.estimated_cost_usd
 
     @property
     def estimated_cost_usd(self) -> float:
-        return (self._tokens / 1_000_000) * self._rate
+        return self._estimated_cost
 
 
 class ModelExecutionStatus(StrEnum):
@@ -102,6 +138,7 @@ class ModelExecution:
     model_usage: Mapping[str, Any] | None
     observed_models: tuple[str, ...]
     skill_events: tuple[SkillEvent, ...]
+    terminal_reason: str | None = None
 
 
 class SDKClient(Protocol):
@@ -153,9 +190,12 @@ class ModelExecutor:
         self._issue_number: int | None = None
         self._archive: EvidenceWriter | None = None
         self._event_sequence = 0
-        self._cost_estimator = _CostEstimator()
+        self._cost_estimator = _CostEstimator(
+            fallback_turn_cost=self._config.max_budget_usd / max(self._config.max_turns, 1)
+        )
         self._soft_threshold_crossed = False
         self._handoff_context_delivered = False
+        self._usage_shape_logged = False
 
     @property
     def skill_events(self) -> tuple[SkillEvent, ...]:
@@ -196,9 +236,12 @@ class ModelExecutor:
         self._issue_number = issue_number
         self._archive = archive
         self._event_sequence = 0
-        self._cost_estimator = _CostEstimator()
+        self._cost_estimator = _CostEstimator(
+            fallback_turn_cost=self._config.max_budget_usd / max(self._config.max_turns, 1)
+        )
         self._soft_threshold_crossed = False
         self._handoff_context_delivered = False
+        self._usage_shape_logged = False
         self._log("model_execution_started", f"issue_body_length={len(issue_body)}")
         client = self._client_factory(self._options(working_directory))
         try:
@@ -262,9 +305,25 @@ class ModelExecutor:
         if any(model != self._config.model for model in all_models):
             return False
         stop_reason = getattr(terminal, "stop_reason", None)
-        if stop_reason == "timeout" or (isinstance(stop_reason, str) and stop_reason.startswith("aborted_")):
+        terminal_reason = getattr(terminal, "terminal_reason", None)
+        subtype = getattr(terminal, "subtype", None)
+        total_cost_usd = getattr(terminal, "total_cost_usd", None)
+        if (
+            stop_reason == "timeout"
+            or (isinstance(stop_reason, str) and stop_reason.startswith("aborted_"))
+            or terminal_reason in ("aborted_streaming", "aborted_tools")
+        ):
             return False
-        if stop_reason in ("max_turns_exceeded", "max_budget_usd_exceeded"):
+        if (
+            terminal_reason in ("max_turns", "budget_exhausted")
+            or subtype in ("error_max_turns", "error_max_budget_usd")
+            or stop_reason in ("max_turns_exceeded", "max_budget_usd_exceeded")
+            or (
+                getattr(terminal, "is_error", False)
+                and total_cost_usd is not None
+                and total_cost_usd >= self._config.max_budget_usd
+            )
+        ):
             return True
         return bool(getattr(terminal, "is_error", False))
 
@@ -345,9 +404,15 @@ class ModelExecutor:
     def _observe_cost(self, usage: Any) -> None:
         """Latch a one-time soft-threshold crossing from estimated cumulative cost."""
 
+        if not self._usage_shape_logged:
+            self._usage_shape_logged = True
+            self._log("model_usage_shape", f"usage={usage!r}")
+        estimated_cost = self._cost_estimator.observe(usage)
+        self._check_soft_threshold(estimated_cost)
+
+    def _check_soft_threshold(self, estimated_cost: float) -> None:
         if self._soft_threshold_crossed:
             return
-        estimated_cost = self._cost_estimator.observe(usage)
         soft_threshold = self._config.max_budget_usd * (1 - self._config.soft_threshold_percentage)
         if estimated_cost >= soft_threshold:
             self._soft_threshold_crossed = True
@@ -377,6 +442,10 @@ class ModelExecutor:
         all_models = tuple(dict.fromkeys((*observed_models, *result_models)))
         mismatches = tuple(model for model in all_models if model != self._config.model)
         stop_reason = getattr(terminal, "stop_reason", None)
+        terminal_reason = getattr(terminal, "terminal_reason", None)
+        subtype = getattr(terminal, "subtype", None)
+        total_cost_usd = getattr(terminal, "total_cost_usd", None)
+
         if self._handoff_context_delivered and any(
             event.name == "handoff" for event in self._skill_events
         ):
@@ -386,6 +455,7 @@ class ModelExecutor:
                 stop_reason,
                 model_usage,
                 all_models,
+                terminal_reason=terminal_reason,
             )
         if mismatches:
             return self._evidence(
@@ -394,44 +464,69 @@ class ModelExecutor:
                 stop_reason,
                 model_usage,
                 all_models,
+                terminal_reason=terminal_reason,
             )
-        if stop_reason == "max_turns_exceeded":
+        if (
+            terminal_reason == "max_turns"
+            or subtype == "error_max_turns"
+            or stop_reason == "max_turns_exceeded"
+        ):
             return self._evidence(
                 ModelExecutionStatus.MODEL_LIMIT_REACHED,
                 "Model execution reached max_turns.",
                 stop_reason,
                 model_usage,
                 all_models,
+                terminal_reason=terminal_reason,
             )
-        if stop_reason == "timeout" or (isinstance(stop_reason, str) and stop_reason.startswith("aborted_")):
+        if (
+            stop_reason == "timeout"
+            or (isinstance(stop_reason, str) and stop_reason.startswith("aborted_"))
+            or terminal_reason in ("aborted_streaming", "aborted_tools")
+        ):
+            reason_name = terminal_reason or stop_reason
             return self._evidence(
                 ModelExecutionStatus.INFRASTRUCTURE_ERROR,
-                f"Model execution stopped with {stop_reason}.",
+                f"Model execution stopped with {reason_name}.",
                 stop_reason,
                 model_usage,
                 all_models,
+                terminal_reason=terminal_reason,
             )
-        if stop_reason == "max_budget_usd_exceeded":
+        if (
+            terminal_reason == "budget_exhausted"
+            or subtype == "error_max_budget_usd"
+            or stop_reason == "max_budget_usd_exceeded"
+            or (
+                getattr(terminal, "is_error", False)
+                and total_cost_usd is not None
+                and total_cost_usd >= self._config.max_budget_usd
+            )
+        ):
             return self._evidence(
                 ModelExecutionStatus.MODEL_LIMIT_REACHED,
                 "Model execution reached the hard cost ceiling "
-                f"(total_cost_usd={getattr(terminal, 'total_cost_usd', None)}, "
+                f"(total_cost_usd={total_cost_usd}, "
                 f"num_turns={getattr(terminal, 'num_turns', None)}); no further implementation "
                 "work was permitted.",
                 stop_reason,
                 model_usage,
                 all_models,
+                terminal_reason=terminal_reason,
             )
         if getattr(terminal, "is_error", True):
             return self._evidence(
                 ModelExecutionStatus.MODEL_LIMIT_REACHED,
                 "Claude SDK returned an error result "
                 f"(stop_reason={stop_reason!r}, "
+                f"terminal_reason={terminal_reason!r}, "
+                f"subtype={subtype!r}, "
                 f"api_error_status={getattr(terminal, 'api_error_status', None)!r}, "
                 f"errors={getattr(terminal, 'errors', None)!r}).",
                 stop_reason,
                 model_usage,
                 all_models,
+                terminal_reason=terminal_reason,
             )
         return self._evidence(
             ModelExecutionStatus.SUCCEEDED,
@@ -439,6 +534,7 @@ class ModelExecutor:
             stop_reason,
             model_usage,
             all_models,
+            terminal_reason=terminal_reason,
         )
 
     def _evidence(
@@ -448,6 +544,7 @@ class ModelExecutor:
         stop_reason: str | None,
         model_usage: Mapping[str, Any] | None,
         observed_models: tuple[str, ...],
+        terminal_reason: str | None = None,
     ) -> ModelExecution:
         self._log("model_execution_finished", f"status={status}; {explanation}")
         return ModelExecution(
@@ -457,6 +554,7 @@ class ModelExecutor:
             model_usage=model_usage,
             observed_models=observed_models,
             skill_events=self.skill_events,
+            terminal_reason=terminal_reason,
         )
 
     async def _guard_and_record_pre_tool_use(
@@ -477,6 +575,10 @@ class ModelExecutor:
             "tool_result", hook_input, response=_hook_field(hook_input, "tool_response")
         )
         await self._record_skill_event("PostToolUse", hook_input, tool_use_id, context)
+        if not self._cost_estimator.has_positive_usage:
+            per_turn_cost = self._config.max_budget_usd / max(self._config.max_turns, 1)
+            estimated_cost = self._cost_estimator.observe_turn(per_turn_cost)
+            self._check_soft_threshold(estimated_cost)
         if self._soft_threshold_crossed and not self._handoff_context_delivered:
             self._handoff_context_delivered = True
             self._log("cost_soft_threshold_handoff_context_injected")

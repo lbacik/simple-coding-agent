@@ -804,3 +804,127 @@ def test_missing_usage_data_never_crosses_the_soft_threshold(tmp_path: Path) -> 
         post_hook({"tool_name": "Bash", "tool_input": {"command": "pytest"}, "tool_response": "ok"}, None, {})
     )
     assert outcome == {}
+
+
+def test_hard_cost_ceiling_identified_from_sdk_terminal_reason_and_subtype(tmp_path: Path) -> None:
+    captured: list[FakeClient] = []
+
+    def client_factory(options: object) -> FakeClient:
+        client = FakeClient(
+            options,
+            [
+                SimpleNamespace(
+                    is_error=True,
+                    stop_reason="tool_use",
+                    terminal_reason="budget_exhausted",
+                    subtype="error_max_budget_usd",
+                    total_cost_usd=5.09,
+                    num_turns=116,
+                    model_usage={"muse-spark-1.3-contributor": {}},
+                )
+            ],
+            followup_messages=[result(stop_reason="end_turn")],
+        )
+        captured.append(client)
+        return client
+
+    executor = ModelExecutor(runtime_config(tmp_path), client_factory=client_factory)
+    execution = asyncio.run(executor.execute(issue_body="Fix it.", working_directory=tmp_path))
+
+    assert execution.status is ModelExecutionStatus.MODEL_LIMIT_REACHED
+    assert "hard cost ceiling" in execution.explanation
+    assert len(captured[0].queried_prompts) == 1
+
+
+def test_max_turns_identified_from_sdk_terminal_reason_and_subtype(tmp_path: Path) -> None:
+    captured: list[FakeClient] = []
+
+    def client_factory(options: object) -> FakeClient:
+        client = FakeClient(
+            options,
+            [
+                SimpleNamespace(
+                    is_error=True,
+                    stop_reason="tool_use",
+                    terminal_reason="max_turns",
+                    subtype="error_max_turns",
+                    num_turns=60,
+                    model_usage={"muse-spark-1.3-contributor": {}},
+                )
+            ],
+            followup_messages=[result(stop_reason="end_turn")],
+        )
+        captured.append(client)
+        return client
+
+    executor = ModelExecutor(runtime_config(tmp_path), client_factory=client_factory)
+    execution = asyncio.run(executor.execute(issue_body="Fix it.", working_directory=tmp_path))
+
+    assert execution.status is ModelExecutionStatus.MODEL_LIMIT_REACHED
+    assert "reached max_turns" in execution.explanation
+    assert len(captured[0].queried_prompts) == 1
+
+
+def test_zero_usage_live_sdk_stream_accumulates_turn_cost_and_crosses_soft_threshold(
+    tmp_path: Path,
+) -> None:
+    captured: list[FakeClient] = []
+
+    def client_factory(options: object) -> FakeClient:
+        client = FakeClient(
+            options,
+            [
+                AssistantMessage(
+                    content=[],
+                    model="muse-spark-1.3-contributor",
+                    usage={"input_tokens": 0, "output_tokens": 0},
+                ),
+                result(),
+            ],
+        )
+        captured.append(client)
+        return client
+
+    executor = ModelExecutor(runtime_config(tmp_path), client_factory=client_factory)
+    execution = asyncio.run(executor.execute(issue_body="Fix it.", working_directory=tmp_path))
+
+    assert execution.status is ModelExecutionStatus.SUCCEEDED
+    post_hook = captured[0].options.hooks["PostToolUse"][0].hooks[0]
+    tool_event = {"tool_name": "Bash", "tool_input": {"command": "pytest"}, "tool_response": "ok"}
+
+    outcomes = []
+    for _ in range(50):
+        outcomes.append(asyncio.run(post_hook(tool_event, None, {})))
+
+    injected = [o for o in outcomes if "additionalContext" in o.get("hookSpecificOutput", {})]
+    assert len(injected) == 1
+    assert "approaching its cost budget" in injected[0]["hookSpecificOutput"]["additionalContext"]
+
+
+def test_per_category_token_pricing_discounts_cache_read_tokens(tmp_path: Path) -> None:
+    captured: list[FakeClient] = []
+
+    def client_factory(options: object) -> FakeClient:
+        client = FakeClient(
+            options,
+            [
+                AssistantMessage(
+                    content=[],
+                    model="muse-spark-1.3-contributor",
+                    usage={"cache_read_input_tokens": 2_500_000, "input_tokens": 10_000},
+                ),
+                result(),
+            ],
+        )
+        captured.append(client)
+        return client
+
+    executor = ModelExecutor(runtime_config(tmp_path), client_factory=client_factory)
+    execution = asyncio.run(executor.execute(issue_body="Fix it.", working_directory=tmp_path))
+
+    assert execution.status is ModelExecutionStatus.SUCCEEDED
+    post_hook = captured[0].options.hooks["PostToolUse"][0].hooks[0]
+    outcome = asyncio.run(
+        post_hook({"tool_name": "Bash", "tool_input": {"command": "pytest"}, "tool_response": "ok"}, None, {})
+    )
+    assert outcome == {}
