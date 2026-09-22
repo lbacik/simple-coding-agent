@@ -644,3 +644,28 @@ def test_hard_cost_ceiling_reports_telemetry_and_makes_no_further_calls(
     assert execution.status is ModelExecutionStatus.MODEL_LIMIT_REACHED
     assert "hard cost ceiling" in execution.explanation
     assert captured[0].queried_prompts == []
+
+
+def test_missing_usage_data_never_crosses_the_soft_threshold(tmp_path: Path) -> None:
+    captured: list[FakeClient] = []
+
+    def client_factory(options: object) -> FakeClient:
+        client = FakeClient(
+            options,
+            [
+                AssistantMessage(content=[], model="muse-spark-1.3-contributor", usage=None),
+                result(),
+            ],
+        )
+        captured.append(client)
+        return client
+
+    executor = ModelExecutor(runtime_config(tmp_path), client_factory=client_factory)
+    execution = asyncio.run(executor.execute(issue_body="Fix it.", working_directory=tmp_path))
+
+    assert execution.status is ModelExecutionStatus.SUCCEEDED
+    post_hook = captured[0].options.hooks["PostToolUse"][0].hooks[0]
+    outcome = asyncio.run(
+        post_hook({"tool_name": "Bash", "tool_input": {"command": "pytest"}, "tool_response": "ok"}, None, {})
+    )
+    assert outcome == {}
