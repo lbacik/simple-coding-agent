@@ -55,6 +55,7 @@ class AttemptEvidence:
     review_cycles: int
     review_findings: str
     details: str
+    note_commit_sha: str | None = None
 
 
 class AttemptTracker(Protocol):
@@ -66,6 +67,8 @@ class AttemptTracker(Protocol):
 
     def release_attempt(self, issue_number: int, label: str, assignee_id: str) -> None: ...
 
+    def release_handoff(self, issue_number: int, assignee_id: str) -> None: ...
+
 
 class Workspace(Protocol):
     """Workspace operations needed by the orchestration seam."""
@@ -75,6 +78,8 @@ class Workspace(Protocol):
     def prepare_attempt(self, *, base_branch: str, issue_number: int): ...
 
     def cleanup(self, *, base_branch: str, prepared: object, retain_branch: bool) -> None: ...
+
+    def commit_dirty_work(self, message: str) -> bool: ...
 
 
 class Publisher(Protocol):
@@ -188,7 +193,24 @@ class ModelAttemptRunner:
                     "model_stop_reason": execution.stop_reason,
                 }
             )
+        if execution.status is ModelExecutionStatus.HANDOFF_REQUESTED:
+            preexisting_commits = getattr(self._workspace, "commits_added")(prepared)
+            # Only commit leftover dirty work when the note isn't already the
+            # last commit: the note must stay the final commit on the branch,
+            # and a well-behaved handoff never leaves anything dirty after it.
+            if not _is_handoff_recovery(preexisting_commits):
+                getattr(self._workspace, "commit_dirty_work")(
+                    "Preserve uncommitted work before handoff"
+                )
         commits = getattr(self._workspace, "commits_added")(prepared)
+        if execution.status is ModelExecutionStatus.HANDOFF_REQUESTED:
+            # The handoff note commit is not preserved work by itself; a
+            # request that only produced the note downgrades to no_changes.
+            effective_commit_count = sum(
+                1 for commit in commits if not _is_handoff_note_commit(commit)
+            )
+        else:
+            effective_commit_count = len(commits)
         review_count = sum(
             event.name == "code-review" and event.phase == "PreToolUse"
             for event in execution.skill_events
@@ -217,7 +239,7 @@ class ModelAttemptRunner:
             setup=preparation.setup,
             baseline=preparation.baseline,
             model_status=execution.status,
-            commit_count=len(commits),
+            commit_count=effective_commit_count,
             acceptance_criteria_satisfied=(
                 review_count > 0 and self._acceptance_criteria_satisfied(claim)
             ),
@@ -227,7 +249,17 @@ class ModelAttemptRunner:
         if decision.publication_eligible or decision.publication_path is PublicationPath.PARTIAL:
             self._attempt_state.transition(AttemptPhase.PUSHING)
         findings = "all clear" if not review.findings else "; ".join(finding.summary for finding in review.findings)
-        return _attempt_evidence(decision, profile, final_check, review_cycles, findings, execution.explanation)
+        details = execution.explanation
+        note_commit_sha = None
+        if decision.outcome is AttemptOutcome.HANDOFF:
+            details = _read_handoff_note(
+                getattr(self._workspace, "working_directory"), claim.issue.number
+            )
+            if commits and _is_handoff_note_commit(commits[0]):
+                note_commit_sha = commits[0].revision
+        return _attempt_evidence(
+            decision, profile, final_check, review_cycles, findings, details, note_commit_sha
+        )
 
 
 class AgentLifecycle:
@@ -330,6 +362,7 @@ class AgentLifecycle:
                         review_findings=evidence.review_findings,
                         details=evidence.details,
                         base_branch=profile.base_branch,
+                        note_commit_sha=evidence.note_commit_sha,
                     )
                 )
                 outcome = published.outcome
@@ -360,9 +393,7 @@ class AgentLifecycle:
             remote_cleanup_complete = False
             try:
                 if comment_posted:
-                    self._tracker.release_attempt(
-                        claim.issue.number, "ready-for-agent", claim.assignment.assignee_id
-                    )
+                    self._release(claim, outcome)
                     remote_cleanup_complete = True
             finally:
                 try:
@@ -378,6 +409,21 @@ class AgentLifecycle:
         self._write_outcome(archive, outcome, checkpoint.started_at)
         self._record_terminal_outcome(outcome, checkpoint.started_at, issue_number=claim.issue.number)
         return LifecycleResult(LifecycleStatus.ATTEMPTED, outcome)
+
+    def _release(self, claim: Claim, outcome: AttemptOutcome) -> None:
+        """Apply the label/assignee release sequence required by the outcome.
+
+        A handoff must add ``round-finished`` for human-controlled requeue
+        instead of the plain ready-for-agent/assignee release every other
+        outcome uses.
+        """
+
+        if outcome is AttemptOutcome.HANDOFF:
+            self._tracker.release_handoff(claim.issue.number, claim.assignment.assignee_id)
+        else:
+            self._tracker.release_attempt(
+                claim.issue.number, "ready-for-agent", claim.assignment.assignee_id
+            )
 
     def _reconcile_startup(self) -> AttemptOutcome | None:
         """Finish one durable attempt without recreating its SDK execution context."""
@@ -416,13 +462,25 @@ class AgentLifecycle:
                 else:
                     decision = _infrastructure_decision("Model execution was interrupted without commits.")
             elif checkpoint.phase in (AttemptPhase.PUSHING, AttemptPhase.PUBLISHING):
-                has_commits = bool(getattr(self._workspace, "commits_added")(prepared))
-                decision = CompletionDecision(
-                    None, True, PublicationPath.COMPLETE,
-                    ("Recovered previously completed local evidence for publication.",),
-                )
+                recovered_commits = getattr(self._workspace, "commits_added")(prepared)
+                has_commits = bool(recovered_commits)
+                if _is_handoff_recovery(recovered_commits):
+                    decision = CompletionDecision(
+                        AttemptOutcome.HANDOFF, False, PublicationPath.PARTIAL,
+                        ("Recovered a previously committed handoff note for publication.",),
+                    )
+                else:
+                    decision = CompletionDecision(
+                        None, True, PublicationPath.COMPLETE,
+                        ("Recovered previously completed local evidence for publication.",),
+                    )
             else:
                 decision = _infrastructure_decision("Attempt was interrupted before model execution.")
+            details = decision.reasons[0]
+            note_commit_sha = None
+            if decision.outcome is AttemptOutcome.HANDOFF:
+                details = _read_handoff_note(self._workspace.working_directory, claim.issue.number)
+                note_commit_sha = recovered_commits[0].revision
             published = self._publisher.publish(
                 PublicationRequest(
                     issue_number=claim.issue.number,
@@ -434,8 +492,9 @@ class AgentLifecycle:
                     check_exit_code=None,
                     review_cycles=0,
                     review_findings="not rerun during startup recovery",
-                    details=decision.reasons[0],
+                    details=details,
                     base_branch=profile.base_branch,
+                    note_commit_sha=note_commit_sha,
                 )
             )
             outcome = published.outcome
@@ -468,9 +527,7 @@ class AgentLifecycle:
             remote_cleanup_complete = False
             try:
                 if comment_posted:
-                    self._tracker.release_attempt(
-                        claim.issue.number, "ready-for-agent", claim.assignment.assignee_id
-                    )
+                    self._release(claim, outcome)
                     remote_cleanup_complete = True
             finally:
                 try:
@@ -562,6 +619,7 @@ def _attempt_evidence(
     review_cycles: int,
     review_findings: str,
     details: str = "Attempt did not reach local completion evidence.",
+    note_commit_sha: str | None = None,
 ) -> AttemptEvidence:
     return AttemptEvidence(
         decision=decision,
@@ -570,6 +628,7 @@ def _attempt_evidence(
         review_cycles=review_cycles,
         review_findings=review_findings,
         details=details,
+        note_commit_sha=note_commit_sha,
     )
 
 
@@ -599,6 +658,22 @@ def _archive_commands(archive: AttemptArchive | None, name: str, result: object)
     archive.write_text(f"{name}_stderr.log", stderr)
 
 
+def _read_handoff_note(working_directory: Path, issue_number: int) -> str:
+    """Read the model-authored handoff note verbatim, for the result comment.
+
+    The comment copy is the durable, human-visible record; the file on the
+    branch is what a continuation is pointed at (see _build_starting_prompt).
+    Missing is reported rather than raised: the note is written by the model
+    in the SDK session this function has no control over.
+    """
+
+    note_path = working_directory / ".agent" / "handoff" / f"{issue_number}.md"
+    try:
+        return note_path.read_text()
+    except OSError:
+        return "Handoff was requested, but the handoff note file could not be read."
+
+
 def _build_starting_prompt(
     issue_body: str, comments: Sequence[str], *, continuation: bool, issue_number: int
 ) -> str:
@@ -619,7 +694,12 @@ def _build_starting_prompt(
     return "\n\n".join(parts)
 
 
-_HANDOFF_RESULT_MARKER = "Agent Attempt Result: incomplete"
+_HANDOFF_NOTE_SUBJECT_PREFIX = "Handoff note:"
+
+_HANDOFF_RESULT_MARKERS = (
+    "Agent Attempt Result: incomplete",
+    "Agent Attempt Result: handoff",
+)
 
 
 def _continuation_expected(
@@ -627,15 +707,39 @@ def _continuation_expected(
 ) -> bool:
     """Whether this issue carries (or carried) a signal that a continuation was expected.
 
-    The ``round-finished`` label is the current signal; a prior incomplete
-    attempt-result comment is the historical one, since that comment is what
+    The ``round-finished`` label is the current signal; a prior incomplete or
+    handoff attempt-result comment is the historical one, since either is what
     a handoff publishes. Checked in that order so a present label never
-    triggers a needless comment fetch.
+    triggers a needless comment fetch, and so a real handoff comment is still
+    recognized once the label has been removed (e.g. on claim) or the remote
+    branch is missing.
     """
 
     if ROUND_FINISHED in issue.labels:
         return True
-    return any(_HANDOFF_RESULT_MARKER in comment for comment in issue_comments(issue))
+    return any(
+        marker in comment for comment in issue_comments(issue) for marker in _HANDOFF_RESULT_MARKERS
+    )
+
+
+def _is_handoff_note_commit(commit: object) -> bool:
+    """Whether a commit is the handoff note commit, by its fixed subject prefix."""
+
+    return getattr(commit, "subject", "").startswith(_HANDOFF_NOTE_SUBJECT_PREFIX)
+
+
+def _is_handoff_recovery(commits: Sequence[object]) -> bool:
+    """Whether the most recent commit on the branch is a handoff note commit.
+
+    Only the most recent commit is checked: the note is the required final
+    commit of a handoff attempt, so its presence there (rather than anywhere
+    in history) is what distinguishes a recovered handoff from a recovered
+    ordinary complete attempt.
+    """
+
+    if not commits:
+        return False
+    return _is_handoff_note_commit(commits[0])
 
 
 def _infrastructure_decision(reason: str) -> CompletionDecision:

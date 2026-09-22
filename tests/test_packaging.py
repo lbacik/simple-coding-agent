@@ -112,6 +112,16 @@ def test_dockerfile_entrypoint_runs_the_agent() -> None:
     )
 
 
+def test_dockerfile_copies_the_project_owned_skills_directory() -> None:
+    content = _dockerfile()
+    assert "COPY skills/" in content, (
+        "Dockerfile must copy the repository's project-owned skills/ directory"
+    )
+    assert "PROJECT_SKILLS_DIR" in content, (
+        "Dockerfile must point install-skills.sh at the copied project skills"
+    )
+
+
 # ---------------------------------------------------------------------------
 # docker-compose.yml
 # ---------------------------------------------------------------------------
@@ -217,6 +227,21 @@ def test_install_skills_uses_strict_error_handling() -> None:
     assert "set -euo pipefail" in content or "set -e" in content, (
         "install-skills.sh must enable strict error handling"
     )
+
+
+def test_install_skills_installs_the_project_owned_handoff_skill() -> None:
+    content = _script()
+    assert "handoff" in content, "install-skills.sh must install the project-owned handoff skill"
+    assert "PROJECT_SKILLS_DIR" in content, (
+        "install-skills.sh must resolve project skills from a configurable directory"
+    )
+
+
+def test_project_owned_handoff_skill_exists_in_the_repository() -> None:
+    skill_file = ROOT / "skills" / "handoff" / "SKILL.md"
+    assert skill_file.is_file(), "skills/handoff/SKILL.md must exist"
+    content = skill_file.read_text()
+    assert "name: handoff" in content, "skills/handoff/SKILL.md must declare the handoff skill name"
 
 
 # ---------------------------------------------------------------------------
@@ -421,7 +446,7 @@ class TestDockerSmoke:
         )
         assert result.returncode == 0
         installed = result.stdout.split()
-        for skill in ("implement", "tdd", "code-review", "codebase-design"):
+        for skill in ("implement", "tdd", "code-review", "codebase-design", "handoff"):
             assert skill in installed, f"Skill '{skill}' missing from /home/agent/.agents/skills/"
 
     def test_data_volume_is_writable_by_agent_user(self) -> None:

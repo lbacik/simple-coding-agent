@@ -15,16 +15,27 @@ from simple_coding_agent.config import RuntimeConfig
 from simple_coding_agent.model_execution import (
     ModelExecutor,
     ModelExecutionStatus,
+    SkillEvent,
     publication_guard,
 )
 
 
 class FakeClient:
-    def __init__(self, options: object, messages: list[object]) -> None:
+    def __init__(
+        self,
+        options: object,
+        messages: list[object],
+        *,
+        followup_messages: list[object] | None = None,
+        on_query=None,
+    ) -> None:
         self.options = options
         self._messages = messages
+        self._followup_messages = followup_messages or []
+        self._on_query = on_query
         self.prompt: str | None = None
         self.interrupted = False
+        self.queried_prompts: list[str] = []
 
     async def __aenter__(self) -> FakeClient:
         return self
@@ -38,7 +49,16 @@ class FakeClient:
     async def interrupt(self) -> None:
         self.interrupted = True
 
+    async def query(self, prompt: str) -> None:
+        self.queried_prompts.append(prompt)
+        if self._on_query is not None:
+            self._on_query()
+
     async def receive_response(self):
+        if self.queried_prompts:
+            for message in self._followup_messages:
+                yield message
+            return
         for message in self._messages:
             yield message
 
@@ -103,7 +123,7 @@ def test_dispatches_the_issue_body_to_the_pinned_sdk_and_returns_execution_evide
     assert options.max_turns == 60
     assert options.max_budget_usd == 5
     assert options.setting_sources == ["user"]
-    assert options.skills == ["implement", "tdd", "code-review", "codebase-design"]
+    assert options.skills == ["implement", "tdd", "code-review", "codebase-design", "handoff"]
     assert options.env == {
         "ANTHROPIC_BASE_URL": "https://api.meta.ai",
         "ANTHROPIC_AUTH_TOKEN": "meta-secret",
@@ -456,3 +476,196 @@ def test_blocks_a_third_repair_cycle_after_three_code_reviews(tmp_path: Path) ->
 
     assert decisions[:3] == [{}, {}, {}]
     assert decisions[3]["hookSpecificOutput"]["permissionDecision"] == "deny"
+
+
+# --- Resource-aware execution (issue #54) ------------------------------------
+
+
+def test_crossing_the_soft_cost_threshold_injects_additional_context_once(
+    tmp_path: Path,
+) -> None:
+    captured: list[FakeClient] = []
+
+    def client_factory(options: object) -> FakeClient:
+        client = FakeClient(
+            options,
+            [
+                AssistantMessage(
+                    content=[], model="muse-spark-1.3-contributor", usage={"input_tokens": 300_000}
+                ),
+                result(),
+            ],
+        )
+        captured.append(client)
+        return client
+
+    executor = ModelExecutor(runtime_config(tmp_path), client_factory=client_factory)
+    execution = asyncio.run(executor.execute(issue_body="Fix it.", working_directory=tmp_path))
+
+    assert execution.status is ModelExecutionStatus.SUCCEEDED
+    post_hook = captured[0].options.hooks["PostToolUse"][0].hooks[0]
+    tool_event = {"tool_name": "Bash", "tool_input": {"command": "pytest"}, "tool_response": "ok"}
+
+    first = asyncio.run(post_hook(tool_event, None, {}))
+    second = asyncio.run(post_hook(tool_event, None, {}))
+
+    assert first["hookSpecificOutput"]["hookEventName"] == "PostToolUse"
+    assert "handoff" in first["hookSpecificOutput"]["additionalContext"]
+    assert second == {}
+
+
+def test_cost_below_the_soft_threshold_never_injects_additional_context(
+    tmp_path: Path,
+) -> None:
+    captured: list[FakeClient] = []
+
+    def client_factory(options: object) -> FakeClient:
+        client = FakeClient(
+            options,
+            [
+                AssistantMessage(
+                    content=[], model="muse-spark-1.3-contributor", usage={"input_tokens": 100}
+                ),
+                result(),
+            ],
+        )
+        captured.append(client)
+        return client
+
+    executor = ModelExecutor(runtime_config(tmp_path), client_factory=client_factory)
+    asyncio.run(executor.execute(issue_body="Fix it.", working_directory=tmp_path))
+    post_hook = captured[0].options.hooks["PostToolUse"][0].hooks[0]
+
+    outcome = asyncio.run(
+        post_hook({"tool_name": "Bash", "tool_input": {"command": "pytest"}, "tool_response": "ok"}, None, {})
+    )
+
+    assert outcome == {}
+
+
+def test_max_turns_exceeded_gets_a_same_client_handoff_followup_that_succeeds(
+    tmp_path: Path,
+) -> None:
+    captured: list[FakeClient] = []
+    holder: dict[str, ModelExecutor] = {}
+
+    def invoke_handoff_skill() -> None:
+        holder["executor"]._skill_events.append(
+            SkillEvent(phase="PreToolUse", name="handoff", agent_id=None, timestamp="2026-09-22T00:00:00Z")
+        )
+
+    def client_factory(options: object) -> FakeClient:
+        client = FakeClient(
+            options,
+            [result(stop_reason="max_turns_exceeded")],
+            followup_messages=[result(stop_reason="end_turn")],
+            on_query=invoke_handoff_skill,
+        )
+        captured.append(client)
+        return client
+
+    executor = ModelExecutor(runtime_config(tmp_path), client_factory=client_factory)
+    holder["executor"] = executor
+
+    execution = asyncio.run(executor.execute(issue_body="Fix it.", working_directory=tmp_path))
+
+    assert execution.status is ModelExecutionStatus.HANDOFF_REQUESTED
+    assert len(captured[0].queried_prompts) == 1
+    assert not captured[0].interrupted  # the stream already stopped itself; nothing to interrupt
+
+
+def test_max_turns_exceeded_falls_back_to_model_limit_reached_without_a_handoff(
+    tmp_path: Path,
+) -> None:
+    captured: list[FakeClient] = []
+
+    def client_factory(options: object) -> FakeClient:
+        client = FakeClient(
+            options,
+            [result(stop_reason="max_turns_exceeded")],
+            followup_messages=[result(stop_reason="end_turn")],
+        )
+        captured.append(client)
+        return client
+
+    executor = ModelExecutor(runtime_config(tmp_path), client_factory=client_factory)
+    execution = asyncio.run(executor.execute(issue_body="Fix it.", working_directory=tmp_path))
+
+    assert execution.status is ModelExecutionStatus.MODEL_LIMIT_REACHED
+    assert len(captured[0].queried_prompts) == 1
+
+
+def test_model_timeout_gets_a_same_client_handoff_followup_that_succeeds(
+    tmp_path: Path,
+) -> None:
+    holder: dict[str, ModelExecutor] = {}
+
+    def invoke_handoff_skill() -> None:
+        holder["executor"]._skill_events.append(
+            SkillEvent(phase="PreToolUse", name="handoff", agent_id=None, timestamp="2026-09-22T00:00:00Z")
+        )
+
+    class HangingClient(FakeClient):
+        async def receive_response(self):
+            if self.queried_prompts:
+                for message in self._followup_messages:
+                    yield message
+                return
+            await asyncio.sleep(10)
+            yield result()
+
+    def client_factory(options: object) -> FakeClient:
+        return HangingClient(
+            options, [], followup_messages=[result(stop_reason="end_turn")], on_query=invoke_handoff_skill
+        )
+
+    config = replace(runtime_config(tmp_path), model_timeout=0)
+    executor = ModelExecutor(config, client_factory=client_factory)
+    holder["executor"] = executor
+
+    execution = asyncio.run(executor.execute(issue_body="Fix it.", working_directory=tmp_path))
+
+    assert execution.status is ModelExecutionStatus.HANDOFF_REQUESTED
+
+
+def test_hard_cost_ceiling_reports_telemetry_and_makes_no_further_calls(
+    tmp_path: Path,
+) -> None:
+    captured: list[FakeClient] = []
+
+    def client_factory(options: object) -> FakeClient:
+        client = FakeClient(options, [result(stop_reason="max_budget_usd_exceeded")])
+        captured.append(client)
+        return client
+
+    executor = ModelExecutor(runtime_config(tmp_path), client_factory=client_factory)
+    execution = asyncio.run(executor.execute(issue_body="Fix it.", working_directory=tmp_path))
+
+    assert execution.status is ModelExecutionStatus.MODEL_LIMIT_REACHED
+    assert "hard cost ceiling" in execution.explanation
+    assert captured[0].queried_prompts == []
+
+
+def test_missing_usage_data_never_crosses_the_soft_threshold(tmp_path: Path) -> None:
+    captured: list[FakeClient] = []
+
+    def client_factory(options: object) -> FakeClient:
+        client = FakeClient(
+            options,
+            [
+                AssistantMessage(content=[], model="muse-spark-1.3-contributor", usage=None),
+                result(),
+            ],
+        )
+        captured.append(client)
+        return client
+
+    executor = ModelExecutor(runtime_config(tmp_path), client_factory=client_factory)
+    execution = asyncio.run(executor.execute(issue_body="Fix it.", working_directory=tmp_path))
+
+    assert execution.status is ModelExecutionStatus.SUCCEEDED
+    post_hook = captured[0].options.hooks["PostToolUse"][0].hooks[0]
+    outcome = asyncio.run(
+        post_hook({"tool_name": "Bash", "tool_input": {"command": "pytest"}, "tool_response": "ok"}, None, {})
+    )
+    assert outcome == {}

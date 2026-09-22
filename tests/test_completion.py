@@ -123,6 +123,30 @@ def test_zero_commit_successful_skill_run_is_no_changes() -> None:
     assert decision.outcome is AttemptOutcome.NO_CHANGES
 
 
+def test_handoff_request_with_committed_progress_is_a_handoff_eligible_for_partial_publication() -> None:
+    decision = CompletionEvaluator({"must-fix"}).evaluate(
+        setup=command_result(), baseline=command_result(),
+        model_status=ModelExecutionStatus.HANDOFF_REQUESTED,
+        commit_count=1, acceptance_criteria_satisfied=False, review=ReviewEvidence((), 0), final_check=None,
+    )
+
+    assert decision.outcome is AttemptOutcome.HANDOFF
+    assert decision.publication_eligible is False
+    assert decision.publication_path is PublicationPath.PARTIAL
+
+
+def test_handoff_request_without_preserved_work_downgrades_to_no_changes() -> None:
+    decision = CompletionEvaluator({"must-fix"}).evaluate(
+        setup=command_result(), baseline=command_result(),
+        model_status=ModelExecutionStatus.HANDOFF_REQUESTED,
+        commit_count=0, acceptance_criteria_satisfied=False, review=ReviewEvidence((), 0), final_check=None,
+    )
+
+    assert decision.outcome is AttemptOutcome.NO_CHANGES
+    assert decision.publication_eligible is False
+    assert decision.publication_path is PublicationPath.NONE
+
+
 def test_local_success_is_only_eligible_until_push_and_pr_are_observed() -> None:
     evaluator = CompletionEvaluator({"must-fix"})
     arguments = dict(

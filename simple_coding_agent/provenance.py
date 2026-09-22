@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
+import hashlib
 import json
 from pathlib import Path
 import subprocess
@@ -11,6 +12,12 @@ from typing import Any
 
 
 REQUIRED_SKILLS = ("implement", "tdd", "code-review", "codebase-design")
+
+# Vendored in this repository under skills/<name>, not installed via
+# agent-installer: there is no upstream artifact or pinned commit to check,
+# only the HOME symlink shape shared with the upstream skills and a content
+# hash retained for the operational record.
+PROJECT_OWNED_SKILLS = ("handoff",)
 
 
 class ProvenanceError(RuntimeError):
@@ -56,6 +63,9 @@ class ProvenanceVerifier:
                 raise ProvenanceError(f"Required skill has no installed hash: {skill}")
             _verify_link(self._home, skill)
             hashes[skill] = digest
+        for skill in PROJECT_OWNED_SKILLS:
+            _verify_link(self._home, skill)
+            hashes[skill] = _skill_content_hash(self._home / ".agents" / "skills" / skill)
         sdk_version = self._sdk_version()
         if sdk_version != self._expected_sdk_version:
             raise ProvenanceError("Claude Agent SDK version does not match the pinned runtime")
@@ -78,6 +88,21 @@ def _artifacts(output: str) -> dict[str, dict[str, Any]]:
         for artifact in values
         if isinstance(artifact, dict) and isinstance(artifact.get("id"), str)
     }
+
+
+def _skill_content_hash(skill_dir: Path) -> str:
+    """Hash a project-owned skill's files for the operational record.
+
+    There is no upstream commit to pin against, so this is retained evidence
+    of what was actually installed, not a match against an expected value.
+    """
+
+    digest = hashlib.sha256()
+    for path in sorted(skill_dir.rglob("*")):
+        if path.is_file():
+            digest.update(path.relative_to(skill_dir).as_posix().encode())
+            digest.update(path.read_bytes())
+    return digest.hexdigest()
 
 
 def _verify_link(home: Path, skill: str) -> None:

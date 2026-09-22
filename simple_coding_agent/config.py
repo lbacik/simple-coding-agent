@@ -51,6 +51,7 @@ class RuntimeConfig:
     claude_code_version: str = _DEFAULT_CLAUDE_CODE_VERSION
     max_turns: int = 60
     max_budget_usd: int = 5
+    soft_threshold_percentage: float = 0.2
 
 
 @dataclass(frozen=True)
@@ -103,6 +104,9 @@ def load_runtime_config(environ: Mapping[str, str] | None = None) -> RuntimeConf
         claude_code_version=_non_empty(
             values, "CLAUDE_CODE_VERSION", _DEFAULT_CLAUDE_CODE_VERSION
         ),
+        max_turns=_positive_integer(values, "MAX_TURNS", 60),
+        max_budget_usd=_positive_integer(values, "MAX_BUDGET_USD", 5),
+        soft_threshold_percentage=_fraction(values, "SOFT_THRESHOLD_PERCENTAGE", 0.2),
     )
 
 
@@ -164,6 +168,17 @@ def _positive_integer(values: Mapping[str, str], name: str, default: int) -> int
         raise ConfigurationError(f"{name} must be a positive integer") from error
     if number <= 0:
         raise ConfigurationError(f"{name} must be a positive integer")
+    return number
+
+
+def _fraction(values: Mapping[str, str], name: str, default: float) -> float:
+    value = values.get(name, str(default))
+    try:
+        number = float(value)
+    except ValueError as error:
+        raise ConfigurationError(f"{name} must be a number between 0 and 1") from error
+    if not 0.0 <= number < 1.0:
+        raise ConfigurationError(f"{name} must be a number between 0 and 1")
     return number
 
 

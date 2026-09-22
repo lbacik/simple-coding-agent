@@ -33,6 +33,7 @@ def test_loads_required_operator_settings_and_defaults(tmp_path: Path) -> None:
     assert config.model == "muse-spark-1.3-contributor"
     assert config.max_turns == 60
     assert config.max_budget_usd == 5
+    assert config.soft_threshold_percentage == 0.2
     assert config.claude_agent_sdk_version == "0.2.156"
     assert config.claude_code_version == "2.1.278"
 
@@ -49,6 +50,12 @@ def test_loads_required_operator_settings_and_defaults(tmp_path: Path) -> None:
         ("AGENT_TRUST_PROJECT_SETTINGS", "sometimes"),
         ("REVIEW_BLOCKING_SEVERITIES", " "),
         ("REVIEW_BLOCKING_SEVERITIES", ","),
+        ("MAX_TURNS", "0"),
+        ("MAX_TURNS", "many"),
+        ("MAX_BUDGET_USD", "-1"),
+        ("SOFT_THRESHOLD_PERCENTAGE", "1"),
+        ("SOFT_THRESHOLD_PERCENTAGE", "-0.1"),
+        ("SOFT_THRESHOLD_PERCENTAGE", "not-a-number"),
     ],
 )
 def test_rejects_invalid_operator_settings_without_leaking_secrets(
@@ -90,10 +97,16 @@ def test_applies_operator_overrides_including_the_test_only_review_gate(
             "MODEL_NAME": "muse-spark-2.0",
             "CLAUDE_AGENT_SDK_VERSION": "0.3.0",
             "CLAUDE_CODE_VERSION": "3.0.0",
+            "MAX_TURNS": "90",
+            "MAX_BUDGET_USD": "10",
+            "SOFT_THRESHOLD_PERCENTAGE": "0.3",
         }
     )
 
     assert config.clone_dir == tmp_path / "clone"
+    assert config.max_turns == 90
+    assert config.max_budget_usd == 10
+    assert config.soft_threshold_percentage == 0.3
     assert config.poll_interval == 15
     assert config.log_level == "DEBUG"
     assert config.model_timeout == 120

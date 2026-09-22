@@ -226,6 +226,70 @@ def test_releases_only_the_ready_label_and_the_authenticated_agent_assignment() 
     assert transport.removed_assignees == [("issue-24", "viewer-id")]
 
 
+def test_release_handoff_applies_the_required_label_and_assignee_sequence() -> None:
+    transport = StatefulTransport(
+        issue(24, labels=frozenset({"ready-for-agent", "bug"}), assignee_logins=("agent",))
+    )
+
+    GitHubTracker(transport, "octo/example").release_handoff(24, "viewer-id")
+
+    assert transport.removed_labels == [("issue-24", "ready-for-agent")]
+    assert transport.added_labels == [("issue-24", "round-finished")]
+    assert transport.removed_assignees == [("issue-24", "viewer-id")]
+    assert transport.current.labels == frozenset({"bug", "round-finished"})
+    assert transport.current.assignee_logins == ()
+
+
+def test_release_handoff_does_not_duplicate_round_finished_already_present() -> None:
+    transport = StatefulTransport(
+        issue(24, labels=frozenset({"ready-for-agent", "round-finished"}), assignee_logins=("agent",))
+    )
+
+    GitHubTracker(transport, "octo/example").release_handoff(24, "viewer-id")
+
+    assert transport.added_labels == []
+    assert transport.current.labels == frozenset({"round-finished"})
+
+
+def test_release_handoff_resumes_from_the_first_unconfirmed_step_after_a_restart() -> None:
+    """A restart between steps must not repeat a completed step or skip one."""
+
+    # ready-for-agent already removed and round-finished already added by a
+    # first, interrupted call; only the assignee release is still pending.
+    transport = StatefulTransport(
+        issue(24, labels=frozenset({"bug", "round-finished"}), assignee_logins=("agent",))
+    )
+
+    GitHubTracker(transport, "octo/example").release_handoff(24, "viewer-id")
+
+    assert transport.removed_labels == []
+    assert transport.added_labels == []
+    assert transport.removed_assignees == [("issue-24", "viewer-id")]
+    assert transport.current.assignee_logins == ()
+
+
+def test_graphql_add_label_resolves_the_repository_label_id_first() -> None:
+    responses = iter(
+        [
+            {"node": {"repository": {"label": {"id": "label-id-1"}}}},
+            {},
+        ]
+    )
+    queries: list[str] = []
+
+    def execute(query: str, variables: dict[str, object]) -> dict:
+        queries.append(query)
+        return next(responses)
+
+    transport = GitHubGraphQLTransport("token")
+    transport._execute = execute  # type: ignore[method-assign]
+
+    transport.add_label("issue-id", "round-finished")
+
+    assert "label(name: $label)" in queries[0]
+    assert "addLabelsToLabelable" in queries[1]
+
+
 def test_graphql_errors_surface_githubs_own_message(monkeypatch: pytest.MonkeyPatch) -> None:
     payload = json.dumps(
         {"errors": [{"message": "Resource not accessible by integration"}]}
@@ -286,6 +350,8 @@ def issue(
     title: str = "Issue title",
     body: str = "Issue body",
     author_login: str = "reporter",
+    labels: frozenset[str] = frozenset({"ready-for-agent"}),
+    assignee_logins: tuple[str, ...] = (),
 ) -> TrackerIssue:
     return TrackerIssue(
         id=f"issue-{number}",
@@ -294,11 +360,41 @@ def issue(
         body=body,
         created_at=created_at or datetime(2026, 9, 20, 13, 0, tzinfo=UTC) + timedelta(seconds=number),
         state="OPEN",
-        labels=frozenset({"ready-for-agent"}),
-        assignee_logins=(),
+        labels=labels,
+        assignee_logins=assignee_logins,
         blocked_by=0,
         author_login=author_login,
     )
+
+
+class StatefulTransport:
+    """A mutable single-issue transport double for the multi-step release flows."""
+
+    def __init__(self, initial: TrackerIssue) -> None:
+        self.current = initial
+        self.removed_labels: list[tuple[str, str]] = []
+        self.added_labels: list[tuple[str, str]] = []
+        self.removed_assignees: list[tuple[str, str]] = []
+
+    def get_issue(self, repository: str, number: int) -> TrackerIssue | None:
+        return self.current if number == self.current.number else None
+
+    def viewer(self) -> GitHubIdentity:
+        return GitHubIdentity(id="viewer-id", login="agent")
+
+    def remove_label(self, issue_id: str, label: str) -> None:
+        self.removed_labels.append((issue_id, label))
+        self.current = replace(self.current, labels=self.current.labels - {label})
+
+    def add_label(self, issue_id: str, label: str) -> None:
+        self.added_labels.append((issue_id, label))
+        self.current = replace(self.current, labels=self.current.labels | {label})
+
+    def remove_assignee(self, issue_id: str, assignee_id: str) -> None:
+        self.removed_assignees.append((issue_id, assignee_id))
+        self.current = replace(
+            self.current, assignee_logins=tuple(login for login in self.current.assignee_logins if login != "agent")
+        )
 
 
 class FakeTransport:

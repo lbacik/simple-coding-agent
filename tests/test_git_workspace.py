@@ -208,6 +208,33 @@ def test_reports_the_verified_base_and_commits_added_by_the_attempt(tmp_path: Pa
     assert commits[0].revision == git(clone, "rev-parse", "HEAD")
 
 
+def test_commit_dirty_work_preserves_untracked_and_modified_changes(tmp_path: Path) -> None:
+    remote, _ = repository_with_main(tmp_path)
+    clone = tmp_path / "clone"
+    workspace = GitWorkspace(clone, str(remote), token_provider=lambda: "secret-token")
+    prepared = workspace.prepare_attempt(base_branch="main", issue_number=19)
+    (clone / "untracked.txt").write_text("dirty work")
+
+    committed = workspace.commit_dirty_work("Preserve uncommitted work before handoff")
+
+    assert committed is True
+    commits = workspace.commits_added(prepared)
+    assert [commit.subject for commit in commits] == ["Preserve uncommitted work before handoff"]
+    assert git(clone, "status", "--porcelain") == ""
+
+
+def test_commit_dirty_work_is_a_noop_on_a_clean_worktree(tmp_path: Path) -> None:
+    remote, _ = repository_with_main(tmp_path)
+    clone = tmp_path / "clone"
+    workspace = GitWorkspace(clone, str(remote), token_provider=lambda: "secret-token")
+    prepared = workspace.prepare_attempt(base_branch="main", issue_number=19)
+
+    committed = workspace.commit_dirty_work("Preserve uncommitted work before handoff")
+
+    assert committed is False
+    assert workspace.commits_added(prepared) == ()
+
+
 def test_cleanup_restores_base_and_preserves_ignored_dependencies(tmp_path: Path) -> None:
     remote, _ = repository_with_main(tmp_path)
     clone = tmp_path / "clone"

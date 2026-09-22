@@ -145,6 +145,22 @@ class GitWorkspace:
             commits.append(AttemptCommit(revision=revision, subject=subject))
         return tuple(commits)
 
+    def commit_dirty_work(self, message: str) -> bool:
+        """Commit any dirty or untracked change on ``branch``; return whether one was made.
+
+        A safety net for the handoff path: the model is expected to commit
+        its own work, but a request produced after an interrupt may leave
+        the worktree dirty. Without this, ``cleanup``'s hard reset would
+        silently discard it before it could ever be pushed.
+        """
+
+        status = self._git("status", "--porcelain")
+        if not status.strip():
+            return False
+        self._git("add", "-A")
+        self._git("commit", "--message", message)
+        return True
+
     def cleanup(
         self, *, base_branch: str, prepared: PreparedAttempt, retain_branch: bool
     ) -> None:
