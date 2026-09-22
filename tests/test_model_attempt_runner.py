@@ -55,6 +55,58 @@ def test_continuation_adds_only_a_pointer_to_the_handoff_note(tmp_path: Path) ->
     )
 
 
+def test_missing_continuation_branch_skips_the_model_when_label_present(tmp_path: Path) -> None:
+    executor = FakeModelExecutor()
+    runner = build_runner(tmp_path, model_executor=executor)
+
+    evidence = runner(
+        claim(issue_number=24, labels=frozenset({"ready-for-agent", "round-finished"})),
+        profile(),
+        FakePrepared(restored_from_remote=False),
+    )
+
+    assert executor.captured_prompt is None
+    assert evidence.decision.outcome is AttemptOutcome.INCOMPLETE
+    assert not evidence.decision.publication_eligible
+    assert "agent/issue-24" in evidence.details
+    assert "not found on origin" in evidence.details
+
+
+def test_missing_continuation_branch_skips_the_model_with_a_prior_handoff_comment(
+    tmp_path: Path,
+) -> None:
+    executor = FakeModelExecutor()
+    comments = ("## Agent Attempt Result: incomplete\n<!-- agent-attempt: earlier -->",)
+    runner = build_runner(tmp_path, model_executor=executor, issue_comments=lambda issue: comments)
+
+    evidence = runner(claim(issue_number=24), profile(), FakePrepared(restored_from_remote=False))
+
+    assert executor.captured_prompt is None
+    assert evidence.decision.outcome is AttemptOutcome.INCOMPLETE
+
+
+def test_restored_continuation_branch_runs_the_model_normally(tmp_path: Path) -> None:
+    executor = FakeModelExecutor()
+    runner = build_runner(tmp_path, model_executor=executor)
+
+    runner(
+        claim(issue_number=24, labels=frozenset({"ready-for-agent", "round-finished"})),
+        profile(),
+        FakePrepared(restored_from_remote=True),
+    )
+
+    assert executor.captured_prompt is not None
+
+
+def test_normal_claim_with_no_continuation_signal_runs_the_model_normally(tmp_path: Path) -> None:
+    executor = FakeModelExecutor()
+    runner = build_runner(tmp_path, model_executor=executor)
+
+    runner(claim(issue_number=24), profile(), FakePrepared(restored_from_remote=False))
+
+    assert executor.captured_prompt is not None
+
+
 def build_runner(
     tmp_path: Path,
     *,
@@ -123,10 +175,17 @@ class FakeWorkspace:
 
 
 class FakePrepared:
-    branch = "agent/issue-24"
+    def __init__(self, *, branch: str = "agent/issue-24", restored_from_remote: bool = True) -> None:
+        self.branch = branch
+        self.restored_from_remote = restored_from_remote
 
 
-def claim(*, issue_number: int = 24, issue_body: str = "Fix the parser.") -> Claim:
+def claim(
+    *,
+    issue_number: int = 24,
+    issue_body: str = "Fix the parser.",
+    labels: frozenset[str] = frozenset({"ready-for-agent"}),
+) -> Claim:
     return Claim(
         TrackerIssue(
             id=f"issue-{issue_number}",
@@ -135,7 +194,7 @@ def claim(*, issue_number: int = 24, issue_body: str = "Fix the parser.") -> Cla
             body=issue_body,
             created_at=datetime(2026, 9, 20, tzinfo=UTC),
             state="OPEN",
-            labels=frozenset({"ready-for-agent"}),
+            labels=labels,
             assignee_logins=(),
             blocked_by=0,
             author_login="reporter",

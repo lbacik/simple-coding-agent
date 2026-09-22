@@ -23,7 +23,7 @@ from simple_coding_agent.completion import (
 )
 from simple_coding_agent.config import RepositoryProfile
 from simple_coding_agent.git_workspace import GitWorkspaceRecoveryError
-from simple_coding_agent.github_tracker import Claim, TrackerIssue
+from simple_coding_agent.github_tracker import ROUND_FINISHED, Claim, TrackerIssue
 from simple_coding_agent.model_execution import ModelExecutionStatus, ModelExecutor
 from simple_coding_agent.observability import AttemptArchive
 from simple_coding_agent.operating import ConsecutiveErrorStore
@@ -113,6 +113,20 @@ class ModelAttemptRunner:
 
     def __call__(self, claim: Claim, profile: RepositoryProfile, prepared: object) -> AttemptEvidence:
         """Run the local evidence gates in their mandated phase order."""
+
+        if not getattr(prepared, "restored_from_remote", False) and _continuation_expected(
+            claim.issue, self._issue_comments
+        ):
+            branch = getattr(prepared, "branch", f"agent/issue-{claim.issue.number}")
+            details = (
+                f"Expected continuation branch `{branch}` was not found on origin, so it "
+                "could not be restored. A human should inspect this issue and decide next steps."
+            )
+            self._event_log(
+                "continuation_branch_missing", details, level="ERROR", issue_number=claim.issue.number
+            )
+            decision = CompletionDecision(AttemptOutcome.INCOMPLETE, False, PublicationPath.NONE, (details,))
+            return _attempt_evidence(decision, profile, None, 0, "not run", details)
 
         checkpoint = self._attempt_state.read()
         archive = (
@@ -603,6 +617,25 @@ def _build_starting_prompt(
             f"previous attempt is at .agent/handoff/{issue_number}.md."
         )
     return "\n\n".join(parts)
+
+
+_HANDOFF_RESULT_MARKER = "Agent Attempt Result: incomplete"
+
+
+def _continuation_expected(
+    issue: TrackerIssue, issue_comments: Callable[[TrackerIssue], tuple[str, ...]]
+) -> bool:
+    """Whether this issue carries (or carried) a signal that a continuation was expected.
+
+    The ``round-finished`` label is the current signal; a prior incomplete
+    attempt-result comment is the historical one, since that comment is what
+    a handoff publishes. Checked in that order so a present label never
+    triggers a needless comment fetch.
+    """
+
+    if ROUND_FINISHED in issue.labels:
+        return True
+    return any(_HANDOFF_RESULT_MARKER in comment for comment in issue_comments(issue))
 
 
 def _infrastructure_decision(reason: str) -> CompletionDecision:

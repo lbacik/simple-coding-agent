@@ -159,8 +159,18 @@ def test_resumes_a_published_handoff_branch_on_a_fresh_clone(tmp_path: Path) -> 
     prepared = workspace.prepare_attempt(base_branch="main", issue_number=19)
 
     assert prepared.branch == "agent/issue-19"
+    assert prepared.restored_from_remote is True
     assert (clone / "handoff.txt").read_text() == "handoff work"
     assert [commit.subject for commit in workspace.commits_added(prepared)] == ["Handoff note"]
+
+
+def test_reports_restored_from_remote_as_false_with_no_published_branch(tmp_path: Path) -> None:
+    remote, seed = repository_with_main(tmp_path)
+    workspace = GitWorkspace(tmp_path / "clone", str(remote), token_provider=lambda: "secret-token")
+
+    prepared = workspace.prepare_attempt(base_branch="main", issue_number=19)
+
+    assert prepared.restored_from_remote is False
 
 
 def test_prefers_the_published_branch_over_diverged_local_state(tmp_path: Path) -> None:
