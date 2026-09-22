@@ -29,5 +29,9 @@ Reserving an eligible issue by assigning the agent's GitHub identity as the issu
 _Avoid_: Lock, reservation
 
 **Attempt outcome**:
-The structured result of an implementation attempt. Exactly one of: `complete` (all acceptance criteria met, checks pass, review clear, PR created), `incomplete` (work performed but criteria not met), `infrastructure_error` (failure unrelated to implementation logic), or `no_changes` (skill loop finished with zero commits).
+The structured result of an implementation attempt. Exactly one of: `complete` (all acceptance criteria met, checks pass, review clear, PR created), `incomplete` (work performed but criteria not met), `infrastructure_error` (failure unrelated to implementation logic), `no_changes` (skill loop finished with zero commits), or `handoff` (work paused cooperatively near a resource limit, with progress committed and published as a Handoff note for human-approved continuation; a zero-commit handoff downgrades to `no_changes`).
 _Avoid_: Status, result code, exit status
+
+**Handoff note**:
+The durable record of a `handoff` outcome: a committed file at a fixed per-issue path (`.agent/handoff/<issue-number>.md`) describing remaining work, plus a verbatim copy posted as an issue comment. The comment copy is what a continuation's starting prompt is enriched with; the file itself is only pointed at, never digested, since it is already reachable on the resumed branch.
+_Avoid_: Progress note, status update, summary
