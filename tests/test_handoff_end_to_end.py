@@ -404,6 +404,47 @@ def test_repeated_real_handoff_retains_note_history_and_both_comments(tmp_path: 
     assert "Step two done." in handoff_comments[1].body
 
 
+# --- Scenario 14: restart mid handoff publication recovers as handoff, not complete
+
+
+def test_restart_mid_handoff_publication_recovers_as_handoff_not_complete(
+    tmp_path: Path,
+) -> None:
+    remote, _ = repository_with_main(tmp_path)
+    clone_dir = tmp_path / "clone"
+    data_dir = tmp_path / "data"
+    github = FakeGitHub(issue(24, body="Rewrite the parser.", labels=frozenset({"ready-for-agent"})))
+
+    # First process: model committed work and the note, checkpoint reached
+    # PUSHING, then "crashed" before the push happened.
+    workspace = GitWorkspace(clone_dir, str(remote), token_provider=lambda: "token")
+    workspace.prepare_attempt(base_branch="main", issue_number=24)
+    write_and_commit(clone_dir, "parser.py", "half done", "Half-finish the parser")
+    write_handoff_note(clone_dir, 24, "# Handoff note: issue #24\n\nHalfway done.\n")
+    attempt_state = AttemptStateStore(data_dir)
+    attempt_state.start(issue_number=24, branch="agent/issue-24")
+    attempt_state.transition(AttemptPhase.SETUP)
+    attempt_state.transition(AttemptPhase.MODEL_RUNNING)
+    attempt_state.transition(AttemptPhase.PUSHING)
+
+    # Restart: a fresh AgentLifecycle reconciles the interrupted attempt at
+    # startup without recreating an SDK execution context.
+    executor = FakeModelExecutor()
+    lifecycle = build_lifecycle(remote, clone_dir, data_dir, github, executor)
+
+    result = lifecycle.run_once()
+
+    assert result.status is LifecycleStatus.ATTEMPTED
+    assert result.outcome is AttemptOutcome.HANDOFF
+    assert executor.calls == 0
+    assert github.pull_requests == {}
+    [comment] = github.comments
+    assert "## Agent Attempt Result: handoff" in comment.body
+    assert "Halfway done." in comment.body
+    assert "round-finished" in github.labels
+    assert AttemptStateStore(data_dir).read() is None
+
+
 # --- Harness -----------------------------------------------------------------
 
 

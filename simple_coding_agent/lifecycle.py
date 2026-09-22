@@ -250,8 +250,8 @@ class ModelAttemptRunner:
             details = _read_handoff_note(
                 getattr(self._workspace, "working_directory"), claim.issue.number
             )
-            if commits and commits[-1].subject.startswith(_HANDOFF_NOTE_SUBJECT_PREFIX):
-                note_commit_sha = commits[-1].revision
+            if commits and commits[0].subject.startswith(_HANDOFF_NOTE_SUBJECT_PREFIX):
+                note_commit_sha = commits[0].revision
         return _attempt_evidence(
             decision, profile, final_check, review_cycles, findings, details, note_commit_sha
         )
@@ -475,7 +475,7 @@ class AgentLifecycle:
             note_commit_sha = None
             if decision.outcome is AttemptOutcome.HANDOFF:
                 details = _read_handoff_note(self._workspace.working_directory, claim.issue.number)
-                note_commit_sha = recovered_commits[-1].revision
+                note_commit_sha = recovered_commits[0].revision
             published = self._publisher.publish(
                 PublicationRequest(
                     issue_number=claim.issue.number,
@@ -728,7 +728,7 @@ def _is_handoff_recovery(commits: Sequence[object]) -> bool:
 
     if not commits:
         return False
-    return getattr(commits[-1], "subject", "").startswith(_HANDOFF_NOTE_SUBJECT_PREFIX)
+    return getattr(commits[0], "subject", "").startswith(_HANDOFF_NOTE_SUBJECT_PREFIX)
 
 
 def _infrastructure_decision(reason: str) -> CompletionDecision:
