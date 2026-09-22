@@ -85,9 +85,30 @@ The agent does not delete log directories.
 
 Configure spending limits in Meta's dashboard.  The agent sets
 `max_budget_usd=5` as a client-side SDK circuit breaker; this is not
-authoritative billing.  The only model used is `muse-spark-1.3-contributor`;
-no fallback is configured.  Exceeded budget appears as a model-limit outcome
-(incomplete attempt), not an infrastructure error.
+authoritative billing.  Override it with `MAX_BUDGET_USD` (a positive
+integer number of dollars) and the turn cap with `MAX_TURNS` (default 60).
+The only model used is `muse-spark-1.3-contributor`; no fallback is
+configured.
+
+Before the hard ceiling, the agent tries a cooperative `handoff`: once
+estimated spend crosses `soft = max_budget_usd - max_budget_usd *
+SOFT_THRESHOLD_PERCENTAGE` (default `SOFT_THRESHOLD_PERCENTAGE=0.2`, i.e. 80%
+of budget), it asks the model to commit its progress and stop. This estimate
+is derived from streamed token counts, not the SDK's authoritative
+`total_cost_usd` (only available once the attempt ends), so treat the
+threshold as approximate. Turns and `MODEL_TIMEOUT` get no soft threshold:
+reaching either limit gets one best-effort same-client handoff follow-up
+instead. If usage is unavailable, the threshold is skipped, or the follow-up
+does not produce a handoff, the agent falls back to the existing
+model-limit/`incomplete` outcome; exceeding the hard cost ceiling makes no
+further model calls and reports the outcome from available telemetry.
+
+A `handoff` outcome pushes the attempt branch (no pull request), posts the
+handoff note as an issue comment, removes `ready-for-agent`, and adds
+`round-finished`. **Continuation requires a human decision**: review the
+note and comment, then re-apply `ready-for-agent` to requeue the issue (this
+also clears `round-finished`), or leave it labelled `round-finished` to end
+the attempt sequence.
 
 ## Persisted error-guard recovery
 
