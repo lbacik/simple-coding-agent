@@ -134,6 +134,16 @@ def test_trusted_comments_degrades_to_empty_tuple_with_no_comments() -> None:
     assert trusted == ()
 
 
+def test_trusted_comments_never_matches_a_deleted_account_by_empty_login() -> None:
+    transport = FakeCommentTransport(
+        comments=(IssueComment(author_login="", body="from a deleted account"),)
+    )
+
+    trusted = GitHubTracker(transport, "octo/example").trusted_comments(issue(1, author_login=""))
+
+    assert trusted == ()
+
+
 def test_lists_issue_comments_with_author_login_via_graphql() -> None:
     transport = RecordingGraphQLTransport(
         [

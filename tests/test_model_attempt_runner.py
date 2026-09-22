@@ -20,10 +20,8 @@ from simple_coding_agent.model_execution import ModelExecution, ModelExecutionSt
 
 def test_prompt_appends_trusted_comments_in_order(tmp_path: Path) -> None:
     executor = FakeModelExecutor()
-    runner = build_runner(tmp_path, model_executor=executor, issue_comments=lambda issue: (
-        "please also handle timeouts",
-        "keep the old retry behaviour",
-    ))
+    comments = ("please also handle timeouts", "keep the old retry behaviour")
+    runner = build_runner(tmp_path, model_executor=executor, issue_comments=lambda issue: comments)
 
     runner(claim(issue_body="Fix the parser."), profile(), FakePrepared())
 

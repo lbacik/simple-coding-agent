@@ -147,6 +147,10 @@ class ModelAttemptRunner:
             return _attempt_evidence(decision, profile, None, 0, "not run")
 
         self._attempt_state.transition(AttemptPhase.MODEL_RUNNING)
+        # Snapshot before dispatch: any commit already on the branch at this
+        # point is carried over from a resumed attempt, not produced by this
+        # run. `commits_added` is read again after the model runs to count
+        # what this run itself added.
         continuation = bool(getattr(self._workspace, "commits_added")(prepared))
         prompt_body = _build_starting_prompt(
             claim.issue.body,

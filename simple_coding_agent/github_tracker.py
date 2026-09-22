@@ -188,7 +188,9 @@ class GitHubTracker:
         return tuple(
             comment.body
             for comment in comments
-            if comment.author_login in (issue.author_login, viewer.login)
+            # An empty login means a deleted account; never trust one by
+            # incidentally matching another deleted account.
+            if comment.author_login and comment.author_login in (issue.author_login, viewer.login)
         )
 
 
@@ -395,7 +397,7 @@ class GitHubGraphQLTransport:
             raise GitHubTrackerError("GitHub returned invalid issue comments") from error
 
     def list_issue_comments(self, repository: str, issue_number: int) -> tuple[IssueComment, ...]:
-        """Return every comment on an issue, oldest first, with its author."""
+        """Return every comment on an issue, unfiltered; trust filtering is the tracker's job."""
 
         owner, name = _repository_parts(repository)
         data = self._execute(
