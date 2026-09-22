@@ -64,6 +64,7 @@ def main() -> None:
         f"https://github.com/{config.target_repo}.git",
         token_provider=lambda: config.github_token,
     )
+    tracker = GitHubTracker(github, config.target_repo)
     runner = ModelAttemptRunner(
         attempt_state=attempt_state,
         workspace=workspace,
@@ -74,6 +75,7 @@ def main() -> None:
             )
         ),
         evaluator=CompletionEvaluator(config.review_blocking_severities),
+        issue_comments=tracker.trusted_comments,
         model_executor=ModelExecutor(
             config,
             event_log=lambda event, detail="", issue_number=None: logger.emit(
@@ -86,7 +88,7 @@ def main() -> None:
         ),
     )
     lifecycle = AgentLifecycle(
-        tracker=GitHubTracker(github, config.target_repo),
+        tracker=tracker,
         attempt_state=attempt_state,
         workspace=workspace,
         profile_loader=load_repository_profile,

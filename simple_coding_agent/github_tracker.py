@@ -33,6 +33,7 @@ class TrackerIssue:
     labels: frozenset[str]
     assignee_logins: tuple[str, ...]
     blocked_by: int
+    author_login: str
 
     @property
     def is_eligible(self) -> bool:
@@ -79,6 +80,14 @@ class Claim:
     assignment: Assignment
 
 
+@dataclass(frozen=True)
+class IssueComment:
+    """One issue comment, kept minimal to the fields prompt filtering needs."""
+
+    author_login: str
+    body: str
+
+
 class GitHubTransport(Protocol):
     """Transport seam; tests can provide a deterministic fake."""
 
@@ -93,6 +102,8 @@ class GitHubTransport(Protocol):
     def remove_assignee(self, issue_id: str, assignee_id: str) -> None: ...
 
     def remove_label(self, issue_id: str, label: str) -> None: ...
+
+    def list_issue_comments(self, repository: str, issue_number: int) -> tuple[IssueComment, ...]: ...
 
 
 class GitHubTracker:
@@ -163,6 +174,23 @@ class GitHubTracker:
         if identity.login in current.assignee_logins:
             self._transport.remove_assignee(current.id, assignee_id)
 
+    def trusted_comments(self, issue: TrackerIssue) -> tuple[str, ...]:
+        """Chronologically ordered bodies of comments trusted for the model's prompt.
+
+        Trusted means authored by the issue's own author or by this agent's
+        GitHub identity (its own attempt-result and handoff comments). Any
+        other commenter is excluded, so the model never sees guidance it
+        cannot attribute to someone with write access to the issue.
+        """
+
+        viewer = self._transport.viewer()
+        comments = self._transport.list_issue_comments(self._target_repo, issue.number)
+        return tuple(
+            comment.body
+            for comment in comments
+            if comment.author_login in (issue.author_login, viewer.login)
+        )
+
 
 class GitHubGraphQLTransport:
     """GitHub GraphQL transport used by the tracker in production."""
@@ -187,6 +215,7 @@ class GitHubGraphQLTransport:
             }
             fragment IssueFields on Issue {
               id number title body createdAt state
+              author { login }
               labels(first: 100) { nodes { name } }
               assignees(first: 100) { nodes { login } }
               issueDependenciesSummary { blockedBy }
@@ -215,6 +244,7 @@ class GitHubGraphQLTransport:
             }
             fragment IssueFields on Issue {
               id number title body createdAt state
+              author { login }
               labels(first: 100) { nodes { name } }
               assignees(first: 100) { nodes { login } }
               issueDependenciesSummary { blockedBy }
@@ -364,6 +394,28 @@ class GitHubGraphQLTransport:
         except (KeyError, TypeError) as error:
             raise GitHubTrackerError("GitHub returned invalid issue comments") from error
 
+    def list_issue_comments(self, repository: str, issue_number: int) -> tuple[IssueComment, ...]:
+        """Return every comment on an issue, oldest first, with its author."""
+
+        owner, name = _repository_parts(repository)
+        data = self._execute(
+            """
+            query IssueComments($owner: String!, $name: String!, $number: Int!) {
+              repository(owner: $owner, name: $name) {
+                issue(number: $number) {
+                  comments(first: 100) { nodes { body author { login } } }
+                }
+              }
+            }
+            """,
+            {"owner": owner, "name": name, "number": issue_number},
+        )
+        try:
+            nodes = data["repository"]["issue"]["comments"]["nodes"]
+            return tuple(_comment_from_graphql(value) for value in nodes)
+        except (KeyError, TypeError) as error:
+            raise GitHubTrackerError("GitHub returned invalid issue comments") from error
+
     def add_comment(self, repository: str, issue_number: int, body: str) -> None:
         """Post a concise result comment without exposing local execution data."""
 
@@ -481,6 +533,7 @@ def _repository_parts(repository: str) -> tuple[str, str]:
 
 
 def _issue_from_graphql(value: dict[str, Any]) -> TrackerIssue:
+    author = value["author"]
     return TrackerIssue(
         id=value["id"],
         number=value["number"],
@@ -491,6 +544,15 @@ def _issue_from_graphql(value: dict[str, Any]) -> TrackerIssue:
         labels=frozenset(label["name"] for label in value["labels"]["nodes"]),
         assignee_logins=tuple(assignee["login"] for assignee in value["assignees"]["nodes"]),
         blocked_by=value["issueDependenciesSummary"]["blockedBy"],
+        author_login=author["login"] if author is not None else "",
+    )
+
+
+def _comment_from_graphql(value: dict[str, Any]) -> IssueComment:
+    author = value["author"]
+    return IssueComment(
+        author_login=author["login"] if author is not None else "",
+        body=value["body"],
     )
 
 

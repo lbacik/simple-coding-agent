@@ -486,4 +486,5 @@ def issue(number: int) -> TrackerIssue:
         labels=frozenset({"ready-for-agent"}),
         assignee_logins=(),
         blocked_by=0,
+        author_login="reporter",
     )
