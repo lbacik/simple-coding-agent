@@ -101,7 +101,7 @@ def test_rebases_a_reused_attempt_branch_onto_an_advanced_base(tmp_path: Path) -
     assert [commit.subject for commit in workspace.commits_added(prepared)] == ["Retain me"]
 
 
-def test_discards_a_reused_attempt_branch_that_conflicts_with_an_advanced_base(
+def test_preserves_a_reused_attempt_branch_that_conflicts_with_an_advanced_base(
     tmp_path: Path,
 ) -> None:
     remote, seed = repository_with_main(tmp_path)
@@ -115,9 +115,74 @@ def test_discards_a_reused_attempt_branch_that_conflicts_with_an_advanced_base(
 
     prepared = workspace.prepare_attempt(base_branch="main", issue_number=19)
 
-    assert (clone / "README.md").read_text() == "upstream fix"
-    assert workspace.commits_added(prepared) == ()
+    assert prepared.branch == "agent/issue-19"
+    assert "<<<<<<<" in (clone / "README.md").read_text()
+    assert "UU README.md" in git(clone, "status", "--porcelain")
+    git(clone, "rev-parse", "--verify", "REBASE_HEAD")
+    assert git(clone, "rev-parse", "agent/issue-19") != git(clone, "rev-parse", "HEAD")
+
+
+def test_cleanup_aborts_an_unresolved_rebase_left_by_the_model_session(tmp_path: Path) -> None:
+    remote, seed = repository_with_main(tmp_path)
+    clone = tmp_path / "clone"
+    workspace = GitWorkspace(clone, str(remote), token_provider=lambda: "secret-token")
+    workspace.prepare_attempt(base_branch="main", issue_number=19)
+    write_and_commit(clone, "README.md", "branch change", "Conflicting branch commit")
+
+    write_and_commit(seed, "README.md", "upstream fix", "Conflicting upstream commit")
+    git(seed, "push", "origin", "main")
+
+    prepared = workspace.prepare_attempt(base_branch="main", issue_number=19)
+    git(clone, "rev-parse", "--verify", "REBASE_HEAD")
+
+    workspace.cleanup(base_branch="main", prepared=prepared, retain_branch=False)
+
+    assert git(clone, "branch", "--show-current") == "main"
     assert git(clone, "status", "--porcelain") == ""
+    with pytest.raises(subprocess.CalledProcessError):
+        git(clone, "rev-parse", "--verify", "REBASE_HEAD")
+
+
+def test_resumes_a_published_handoff_branch_on_a_fresh_clone(tmp_path: Path) -> None:
+    remote, seed = repository_with_main(tmp_path)
+    published = tmp_path / "published"
+    git(tmp_path, "clone", str(remote), str(published))
+    git(published, "config", "user.name", "Test User")
+    git(published, "config", "user.email", "test@example.com")
+    git(published, "checkout", "-b", "agent/issue-19")
+    write_and_commit(published, "handoff.txt", "handoff work", "Handoff note")
+    git(published, "push", "-u", "origin", "agent/issue-19")
+
+    clone = tmp_path / "clone"
+    workspace = GitWorkspace(clone, str(remote), token_provider=lambda: "secret-token")
+
+    prepared = workspace.prepare_attempt(base_branch="main", issue_number=19)
+
+    assert prepared.branch == "agent/issue-19"
+    assert (clone / "handoff.txt").read_text() == "handoff work"
+    assert [commit.subject for commit in workspace.commits_added(prepared)] == ["Handoff note"]
+
+
+def test_prefers_the_published_branch_over_diverged_local_state(tmp_path: Path) -> None:
+    remote, seed = repository_with_main(tmp_path)
+    clone = tmp_path / "clone"
+    workspace = GitWorkspace(clone, str(remote), token_provider=lambda: "secret-token")
+    workspace.prepare_attempt(base_branch="main", issue_number=19)
+    write_and_commit(clone, "local-only.txt", "should be discarded", "Local-only commit")
+
+    published = tmp_path / "published"
+    git(tmp_path, "clone", str(remote), str(published))
+    git(published, "config", "user.name", "Test User")
+    git(published, "config", "user.email", "test@example.com")
+    git(published, "checkout", "-b", "agent/issue-19")
+    write_and_commit(published, "handoff.txt", "handoff work", "Handoff note")
+    git(published, "push", "-u", "origin", "agent/issue-19")
+
+    prepared = workspace.prepare_attempt(base_branch="main", issue_number=19)
+
+    assert (clone / "handoff.txt").read_text() == "handoff work"
+    assert not (clone / "local-only.txt").exists()
+    assert [commit.subject for commit in workspace.commits_added(prepared)] == ["Handoff note"]
 
 
 def test_reports_the_verified_base_and_commits_added_by_the_attempt(tmp_path: Path) -> None:

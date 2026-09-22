@@ -79,6 +79,12 @@ class GitWorkspace:
         base that still disagrees after that repair is a broken workspace,
         raised as ``GitWorkspaceRecoveryError`` for the caller to handle
         separately from an ordinary attempt failure.
+
+        A previously published attempt branch (for example, a handoff) is
+        always preferred over whatever the local clone happens to have: the
+        remote ref is fetched and, when present, used as the branch's
+        starting point regardless of local state, so a fresh clone resumes
+        published work instead of silently starting over from base.
         """
 
         branch = _attempt_branch(issue_number)
@@ -94,12 +100,27 @@ class GitWorkspace:
                     "Local base branch has diverged from origin and could not be repaired"
                 )
 
-        if self._branch_exists(branch):
+        remote_branch_revision = self._fetch_attempt_branch(branch)
+        if remote_branch_revision is not None:
+            self._git("checkout", base_branch)
+            self._git("branch", "-f", branch, remote_branch_revision)
+            self._git("checkout", branch)
+            self._rebase_onto_base(branch, base_branch)
+        elif self._branch_exists(branch):
             self._git("checkout", branch)
             self._rebase_onto_base(branch, base_branch)
         else:
             self._git("checkout", "-b", branch, base_branch)
         return PreparedAttempt(branch=branch, base_revision=base_revision)
+
+    def _fetch_attempt_branch(self, branch: str) -> str | None:
+        """Best-effort fetch of a published attempt branch; a missing ref is not an error."""
+
+        try:
+            self._git("fetch", "origin", branch)
+        except GitWorkspaceError:
+            return None
+        return self._remote_branch_revision(branch)
 
     def commits_added(self, prepared: PreparedAttempt) -> tuple[AttemptCommit, ...]:
         """Return commits reachable from the attempt branch but not its base."""
@@ -122,8 +143,18 @@ class GitWorkspace:
     def cleanup(
         self, *, base_branch: str, prepared: PreparedAttempt, retain_branch: bool
     ) -> None:
-        """Restore the base worktree and optionally delete a disposable branch."""
+        """Restore the base worktree and optionally delete a disposable branch.
 
+        A rebase left conflicted because the model session could not resolve
+        it is aborted here, best-effort, before switching branches: checking
+        out another branch mid-rebase fails in git, and this runs
+        unconditionally from a ``finally`` block, so it must not raise.
+        """
+
+        try:
+            self._git("rebase", "--abort")
+        except GitWorkspaceError:
+            pass
         self._git("checkout", base_branch)
         self._git("reset", "--hard", f"origin/{base_branch}")
         self._git("clean", "-fd")
@@ -221,22 +252,18 @@ class GitWorkspace:
         A retained branch from a failed prior attempt (for example, a setup
         failure) must never keep running against the base as it stood back
         then: repository-owned config such as the setup profile has to be
-        read fresh. Rebasing preserves any unpublished commits on the branch
-        when possible; a conflicting rebase means those commits are not worth
-        preserving automatically, so the branch is discarded and recreated
-        fresh from the base instead of blocking the attempt.
+        read fresh. Rebasing preserves any commits on the branch, published
+        or not. A conflicting rebase is left in its conflicted state rather
+        than aborted and recreated from base: discarding the branch here
+        would destroy exactly the work a resumed handoff exists to preserve,
+        so the conflict is left for the attempt's model session to resolve
+        as ordinary remaining work, using normal git commands.
         """
 
         try:
             self._git("rebase", base_branch)
         except GitWorkspaceError:
-            try:
-                self._git("rebase", "--abort")
-            except GitWorkspaceError:
-                pass
-            self._git("checkout", base_branch)
-            self._git("branch", "-D", branch)
-            self._git("checkout", "-b", branch, base_branch)
+            pass
 
     def _reset_local_base(self, base_branch: str) -> None:
         """Best-effort repair of a local base branch that fell out of sync with origin."""
