@@ -103,7 +103,7 @@ def test_dispatches_the_issue_body_to_the_pinned_sdk_and_returns_execution_evide
     assert options.max_turns == 60
     assert options.max_budget_usd == 5
     assert options.setting_sources == ["user"]
-    assert options.skills == ["implement", "tdd", "code-review", "codebase-design"]
+    assert options.skills == ["implement", "tdd", "code-review", "codebase-design", "handoff"]
     assert options.env == {
         "ANTHROPIC_BASE_URL": "https://api.meta.ai",
         "ANTHROPIC_AUTH_TOKEN": "meta-secret",

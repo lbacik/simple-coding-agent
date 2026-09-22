@@ -96,7 +96,7 @@ class Publisher:
         branch_url: str | None = None
         pull_request: PullRequest | None = None
         needs_push = request.decision.publication_eligible or (
-            outcome is AttemptOutcome.INCOMPLETE
+            outcome in (AttemptOutcome.INCOMPLETE, AttemptOutcome.HANDOFF)
             and request.decision.publication_path is PublicationPath.PARTIAL
         )
         if needs_push:

@@ -18,6 +18,7 @@ class AttemptOutcome(StrEnum):
     INCOMPLETE = "incomplete"
     INFRASTRUCTURE_ERROR = "infrastructure_error"
     NO_CHANGES = "no_changes"
+    HANDOFF = "handoff"
 
 
 class PublicationPath(StrEnum):
@@ -180,6 +181,19 @@ class CompletionEvaluator:
         if model_status is ModelExecutionStatus.MODEL_LIMIT_REACHED:
             return _decision(
                 AttemptOutcome.INCOMPLETE, "Model execution reached its limit.", commit_count
+            )
+        if model_status is ModelExecutionStatus.HANDOFF_REQUESTED:
+            if commit_count <= 0:
+                return _decision(
+                    AttemptOutcome.NO_CHANGES,
+                    "Handoff was requested without any preserved work commits.",
+                    commit_count,
+                )
+            return CompletionDecision(
+                outcome=AttemptOutcome.HANDOFF,
+                publication_eligible=False,
+                publication_path=PublicationPath.PARTIAL,
+                reasons=("Handoff was requested with committed progress to preserve.",),
             )
         if model_status is None:
             return _decision(

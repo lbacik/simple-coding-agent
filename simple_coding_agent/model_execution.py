@@ -24,8 +24,53 @@ from claude_agent_sdk import (
 from simple_coding_agent.config import RuntimeConfig
 
 
-_SKILLS = ["implement", "tdd", "code-review", "codebase-design"]
+_SKILLS = ["implement", "tdd", "code-review", "codebase-design", "handoff"]
 _META_BASE_URL = "https://api.meta.ai"
+
+# SDK 0.2.156 reports authoritative `total_cost_usd` only on the terminal
+# ResultMessage; there is no live cost feed mid-stream. This blended rate
+# converts tokens observed on each AssistantMessage into an estimate that is
+# precise enough to trigger a best-effort cooperative handoff near the
+# budget ceiling, but it is never an exact accounting guarantee.
+_ESTIMATED_USD_PER_MILLION_TOKENS = 15.0
+_USAGE_TOKEN_FIELDS = (
+    "input_tokens",
+    "output_tokens",
+    "cache_creation_input_tokens",
+    "cache_read_input_tokens",
+)
+
+_HANDOFF_FOLLOWUP_TIMEOUT = 300
+
+_COST_HANDOFF_INSTRUCTION = (
+    "This attempt is approaching its cost budget. Invoke the `handoff` skill now "
+    "to preserve your progress cooperatively instead of continuing further work."
+)
+_LIMIT_HANDOFF_FOLLOWUP_PROMPT = (
+    "Execution reached its turn or time limit. Invoke the `handoff` skill now to "
+    "preserve your progress: commit any outstanding work, then write and commit "
+    "the handoff note. Do not attempt further implementation work."
+)
+
+
+class _CostEstimator:
+    """Accumulate an approximate USD spend from streamed token usage."""
+
+    def __init__(self, rate_per_million_tokens: float = _ESTIMATED_USD_PER_MILLION_TOKENS) -> None:
+        self._rate = rate_per_million_tokens
+        self._tokens = 0
+
+    def observe(self, usage: Any) -> float:
+        if isinstance(usage, Mapping):
+            for field in _USAGE_TOKEN_FIELDS:
+                value = usage.get(field)
+                if isinstance(value, int):
+                    self._tokens += value
+        return self.estimated_cost_usd
+
+    @property
+    def estimated_cost_usd(self) -> float:
+        return (self._tokens / 1_000_000) * self._rate
 
 
 class ModelExecutionStatus(StrEnum):
@@ -34,6 +79,7 @@ class ModelExecutionStatus(StrEnum):
     SUCCEEDED = "succeeded"
     MODEL_LIMIT_REACHED = "model_limit_reached"
     INFRASTRUCTURE_ERROR = "infrastructure_error"
+    HANDOFF_REQUESTED = "handoff_requested"
 
 
 @dataclass(frozen=True)
@@ -105,6 +151,9 @@ class ModelExecutor:
         self._issue_number: int | None = None
         self._archive: EvidenceWriter | None = None
         self._event_sequence = 0
+        self._cost_estimator = _CostEstimator()
+        self._soft_threshold_crossed = False
+        self._handoff_context_delivered = False
 
     @property
     def skill_events(self) -> tuple[SkillEvent, ...]:
@@ -145,6 +194,9 @@ class ModelExecutor:
         self._issue_number = issue_number
         self._archive = archive
         self._event_sequence = 0
+        self._cost_estimator = _CostEstimator()
+        self._soft_threshold_crossed = False
+        self._handoff_context_delivered = False
         self._log("model_execution_started", f"issue_body_length={len(issue_body)}")
         client = self._client_factory(self._options(working_directory))
         try:
@@ -156,6 +208,9 @@ class ModelExecutor:
                 except TimeoutError:
                     await client.interrupt()
                     await self._drain(client)
+                    followup = await self._attempt_handoff_followup(client, observed_models)
+                    if followup is not None:
+                        return followup
                     return self._evidence(
                         ModelExecutionStatus.INFRASTRUCTURE_ERROR,
                         "Model execution exceeded MODEL_TIMEOUT and was interrupted.",
@@ -163,6 +218,10 @@ class ModelExecutor:
                         None,
                         (),
                     )
+                if terminal is not None and terminal.stop_reason == "max_turns_exceeded":
+                    followup = await self._attempt_handoff_followup(client, observed_models)
+                    if followup is not None:
+                        return followup
         except Exception as error:
             return self._evidence(
                 ModelExecutionStatus.INFRASTRUCTURE_ERROR,
@@ -181,6 +240,37 @@ class ModelExecutor:
                 observed_models,
             )
         return self._classify(terminal, observed_models)
+
+    async def _attempt_handoff_followup(
+        self, client: SDKClient, observed_models: tuple[str, ...]
+    ) -> ModelExecution | None:
+        """Best-effort same-client follow-up after a turns/timeout limit.
+
+        Returns a HANDOFF_REQUESTED evidence only when the model actually
+        invoked the handoff skill during the follow-up; otherwise returns
+        None so the caller falls back to its ordinary limit classification.
+        This never retries: a follow-up that fails or times out is itself
+        evidence that handoff is not achievable right now.
+        """
+
+        try:
+            await client.query(_LIMIT_HANDOFF_FOLLOWUP_PROMPT)
+            async with asyncio.timeout(_HANDOFF_FOLLOWUP_TIMEOUT):
+                followup_terminal, followup_models = await self._receive_terminal(client)
+        except Exception:
+            return None
+        if followup_terminal is None:
+            return None
+        all_models = tuple(dict.fromkeys((*observed_models, *followup_models)))
+        if not any(event.name == "handoff" for event in self._skill_events):
+            return None
+        return self._evidence(
+            ModelExecutionStatus.HANDOFF_REQUESTED,
+            "Model invoked the handoff skill after reaching a turns/timeout limit.",
+            followup_terminal.stop_reason,
+            getattr(followup_terminal, "model_usage", None),
+            all_models,
+        )
 
     def _options(self, working_directory: Path) -> ClaudeAgentOptions:
         settings_sources = ["user"]
@@ -219,10 +309,25 @@ class ModelExecutor:
                 for block in message.content:
                     if isinstance(block, TextBlock) and block.text.strip():
                         self._log("model_response", self._model_response_detail(block.text))
+                self._observe_cost(message.usage)
             model = getattr(message, "model", None)
             if isinstance(model, str):
                 observed_models.append(model)
         return None, tuple(observed_models)
+
+    def _observe_cost(self, usage: Any) -> None:
+        """Latch a one-time soft-threshold crossing from estimated cumulative cost."""
+
+        if self._soft_threshold_crossed:
+            return
+        estimated_cost = self._cost_estimator.observe(usage)
+        soft_threshold = self._config.max_budget_usd * (1 - self._config.soft_threshold_percentage)
+        if estimated_cost >= soft_threshold:
+            self._soft_threshold_crossed = True
+            self._log(
+                "cost_soft_threshold_crossed",
+                f"estimated_cost_usd={estimated_cost:.4f}; soft_threshold_usd={soft_threshold:.4f}",
+            )
 
     async def _drain(self, client: SDKClient) -> None:
         """Consume buffered messages after interrupting before client teardown."""
@@ -245,6 +350,16 @@ class ModelExecutor:
         all_models = tuple(dict.fromkeys((*observed_models, *result_models)))
         mismatches = tuple(model for model in all_models if model != self._config.model)
         stop_reason = getattr(terminal, "stop_reason", None)
+        if self._handoff_context_delivered and any(
+            event.name == "handoff" for event in self._skill_events
+        ):
+            return self._evidence(
+                ModelExecutionStatus.HANDOFF_REQUESTED,
+                "Model invoked the handoff skill after a cost soft-threshold instruction.",
+                stop_reason,
+                model_usage,
+                all_models,
+            )
         if mismatches:
             return self._evidence(
                 ModelExecutionStatus.INFRASTRUCTURE_ERROR,
@@ -265,6 +380,16 @@ class ModelExecutor:
             return self._evidence(
                 ModelExecutionStatus.INFRASTRUCTURE_ERROR,
                 f"Model execution stopped with {stop_reason}.",
+                stop_reason,
+                model_usage,
+                all_models,
+            )
+        if stop_reason == "max_budget_usd_exceeded":
+            return self._evidence(
+                ModelExecutionStatus.MODEL_LIMIT_REACHED,
+                "Model execution reached the hard cost ceiling "
+                f"(total_cost_usd={getattr(terminal, 'total_cost_usd', None)}, "
+                f"num_turns={getattr(terminal, 'num_turns', None)}); no further model calls were made.",
                 stop_reason,
                 model_usage,
                 all_models,
@@ -320,7 +445,17 @@ class ModelExecutor:
         self._log_tool_use(
             "tool_result", hook_input, response=_hook_field(hook_input, "tool_response")
         )
-        return await self._record_skill_event("PostToolUse", hook_input, tool_use_id, context)
+        await self._record_skill_event("PostToolUse", hook_input, tool_use_id, context)
+        if self._soft_threshold_crossed and not self._handoff_context_delivered:
+            self._handoff_context_delivered = True
+            self._log("cost_soft_threshold_handoff_context_injected")
+            return {
+                "hookSpecificOutput": {
+                    "hookEventName": "PostToolUse",
+                    "additionalContext": _COST_HANDOFF_INSTRUCTION,
+                }
+            }
+        return {}
 
     def _log_tool_use(self, event: str, hook_input: Any, *, response: Any = None) -> None:
         tool_name = _hook_field(hook_input, "tool_name")

@@ -104,6 +104,8 @@ class GitHubTransport(Protocol):
 
     def remove_label(self, issue_id: str, label: str) -> None: ...
 
+    def add_label(self, issue_id: str, label: str) -> None: ...
+
     def list_issue_comments(self, repository: str, issue_number: int) -> tuple[IssueComment, ...]: ...
 
 
@@ -176,6 +178,32 @@ class GitHubTracker:
             return
         if label in current.labels:
             self._transport.remove_label(current.id, label)
+        current = self._transport.get_issue(self._target_repo, issue_number)
+        if current is None:
+            return
+        identity = self._transport.viewer()
+        if identity.login in current.assignee_logins:
+            self._transport.remove_assignee(current.id, assignee_id)
+
+    def release_handoff(self, issue_number: int, assignee_id: str) -> None:
+        """Idempotently apply the handoff label/assignee sequence in its required order.
+
+        Each remote field is re-read immediately before its mutation, exactly
+        like ``release_attempt``, so a restart between steps resumes from the
+        first unconfirmed one without repeating an already-completed write or
+        prematurely releasing a human's requeue signal.
+        """
+
+        current = self._transport.get_issue(self._target_repo, issue_number)
+        if current is None:
+            return
+        if READY_FOR_AGENT in current.labels:
+            self._transport.remove_label(current.id, READY_FOR_AGENT)
+        current = self._transport.get_issue(self._target_repo, issue_number)
+        if current is None:
+            return
+        if ROUND_FINISHED not in current.labels:
+            self._transport.add_label(current.id, ROUND_FINISHED)
         current = self._transport.get_issue(self._target_repo, issue_number)
         if current is None:
             return
@@ -324,6 +352,36 @@ class GitHubGraphQLTransport:
             """
             mutation RemoveLabel($issueId: ID!, $labelId: ID!) {
               removeLabelsFromLabelable(input: {labelableId: $issueId, labelIds: [$labelId]}) {
+                clientMutationId
+              }
+            }
+            """,
+            {"issueId": issue_id, "labelId": label_id},
+        )
+
+    def add_label(self, issue_id: str, label: str) -> None:
+        """Add a repository label to the issue, resolving its node id first."""
+
+        data = self._execute(
+            """
+            query RepositoryLabelId($issueId: ID!, $label: String!) {
+              node(id: $issueId) {
+                ... on Issue {
+                  repository { label(name: $label) { id } }
+                }
+              }
+            }
+            """,
+            {"issueId": issue_id, "label": label},
+        )
+        try:
+            label_id = data["node"]["repository"]["label"]["id"]
+        except (KeyError, TypeError) as error:
+            raise GitHubTrackerError("GitHub returned an invalid repository label") from error
+        self._execute(
+            """
+            mutation AddLabel($issueId: ID!, $labelId: ID!) {
+              addLabelsToLabelable(input: {labelableId: $issueId, labelIds: [$labelId]}) {
                 clientMutationId
               }
             }
