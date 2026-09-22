@@ -12,6 +12,7 @@ from simple_coding_agent.github_tracker import (
     GitHubIdentity,
     GitHubTracker,
     GitHubTrackerError,
+    IssueComment,
     IssuePage,
     TrackerIssue,
 )
@@ -111,6 +112,65 @@ def test_does_not_assign_an_issue_that_changes_before_claim(
     assert transport.assignments == []
 
 
+def test_trusted_comments_keeps_only_the_author_and_the_viewer_in_order() -> None:
+    transport = FakeCommentTransport(
+        comments=(
+            IssueComment(author_login="reporter", body="please also handle timeouts"),
+            IssueComment(author_login="random-passerby", body="+1"),
+            IssueComment(author_login="agent", body="## Agent Attempt Result: incomplete"),
+        )
+    )
+
+    trusted = GitHubTracker(transport, "octo/example").trusted_comments(issue(1, author_login="reporter"))
+
+    assert trusted == ("please also handle timeouts", "## Agent Attempt Result: incomplete")
+
+
+def test_trusted_comments_degrades_to_empty_tuple_with_no_comments() -> None:
+    transport = FakeCommentTransport(comments=())
+
+    trusted = GitHubTracker(transport, "octo/example").trusted_comments(issue(1, author_login="reporter"))
+
+    assert trusted == ()
+
+
+def test_trusted_comments_never_matches_a_deleted_account_by_empty_login() -> None:
+    transport = FakeCommentTransport(
+        comments=(IssueComment(author_login="", body="from a deleted account"),)
+    )
+
+    trusted = GitHubTracker(transport, "octo/example").trusted_comments(issue(1, author_login=""))
+
+    assert trusted == ()
+
+
+def test_lists_issue_comments_with_author_login_via_graphql() -> None:
+    transport = RecordingGraphQLTransport(
+        [
+            {
+                "repository": {
+                    "issue": {
+                        "comments": {
+                            "nodes": [
+                                {"body": "note", "author": {"login": "reporter"}},
+                                {"body": "from a deleted account", "author": None},
+                            ]
+                        }
+                    }
+                }
+            }
+        ]
+    )
+
+    comments = transport.list_issue_comments("octo/example", 1)
+
+    assert comments == (
+        IssueComment(author_login="reporter", body="note"),
+        IssueComment(author_login="", body="from a deleted account"),
+    )
+    assert "comments(first: 100)" in transport.queries[0]
+
+
 def test_publication_transport_uses_attempt_marker_and_reuses_an_existing_pr() -> None:
     transport = RecordingGraphQLTransport(
         [
@@ -188,6 +248,9 @@ class RecordingGraphQLTransport:
     def find_attempt_comment(self, repository: str, issue_number: int, marker: str):
         return self._delegate.find_attempt_comment(repository, issue_number, marker)
 
+    def list_issue_comments(self, repository: str, issue_number: int):
+        return self._delegate.list_issue_comments(repository, issue_number)
+
 
 def issue(
     number: int,
@@ -195,6 +258,7 @@ def issue(
     created_at: datetime | None = None,
     title: str = "Issue title",
     body: str = "Issue body",
+    author_login: str = "reporter",
 ) -> TrackerIssue:
     return TrackerIssue(
         id=f"issue-{number}",
@@ -206,6 +270,7 @@ def issue(
         labels=frozenset({"ready-for-agent"}),
         assignee_logins=(),
         blocked_by=0,
+        author_login=author_login,
     )
 
 
@@ -246,3 +311,18 @@ class FakeTransport:
 
     def remove_assignee(self, issue_id: str, assignee_id: str) -> None:
         self.removed_assignees.append((issue_id, assignee_id))
+
+    def list_issue_comments(self, repository: str, issue_number: int) -> tuple[IssueComment, ...]:
+        return ()
+
+
+class FakeCommentTransport:
+    def __init__(self, *, comments: tuple[IssueComment, ...]) -> None:
+        self._comments = comments
+
+    def viewer(self) -> GitHubIdentity:
+        return GitHubIdentity(id="viewer-id", login="agent")
+
+    def list_issue_comments(self, repository: str, issue_number: int) -> tuple[IssueComment, ...]:
+        assert repository == "octo/example"
+        return self._comments

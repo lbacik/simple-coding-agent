@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -23,7 +23,7 @@ from simple_coding_agent.completion import (
 )
 from simple_coding_agent.config import RepositoryProfile
 from simple_coding_agent.git_workspace import GitWorkspaceRecoveryError
-from simple_coding_agent.github_tracker import Claim
+from simple_coding_agent.github_tracker import Claim, TrackerIssue
 from simple_coding_agent.model_execution import ModelExecutionStatus, ModelExecutor
 from simple_coding_agent.observability import AttemptArchive
 from simple_coding_agent.operating import ConsecutiveErrorStore
@@ -95,6 +95,7 @@ class ModelAttemptRunner:
         evaluator: CompletionEvaluator,
         model_executor: ModelExecutor,
         acceptance_criteria_satisfied: Callable[[Claim], bool] = lambda claim: True,
+        issue_comments: Callable[[TrackerIssue], tuple[str, ...]] = lambda issue: (),
         attempt_archive_factory: Callable[[int, str], AttemptArchive] | None = None,
         event_log: Callable[..., None] = (
             lambda event, detail="", level="INFO", issue_number=None: None
@@ -106,6 +107,7 @@ class ModelAttemptRunner:
         self._evaluator = evaluator
         self._model_executor = model_executor
         self._acceptance_criteria_satisfied = acceptance_criteria_satisfied
+        self._issue_comments = issue_comments
         self._attempt_archive_factory = attempt_archive_factory
         self._event_log = event_log
 
@@ -145,9 +147,20 @@ class ModelAttemptRunner:
             return _attempt_evidence(decision, profile, None, 0, "not run")
 
         self._attempt_state.transition(AttemptPhase.MODEL_RUNNING)
+        # Snapshot before dispatch: any commit already on the branch at this
+        # point is carried over from a resumed attempt, not produced by this
+        # run. `commits_added` is read again after the model runs to count
+        # what this run itself added.
+        continuation = bool(getattr(self._workspace, "commits_added")(prepared))
+        prompt_body = _build_starting_prompt(
+            claim.issue.body,
+            self._issue_comments(claim.issue),
+            continuation=continuation,
+            issue_number=claim.issue.number,
+        )
         execution = asyncio.run(
             self._model_executor.execute(
-                issue_body=claim.issue.body,
+                issue_body=prompt_body,
                 working_directory=getattr(self._workspace, "working_directory"),
                 issue_number=claim.issue.number,
                 archive=archive,
@@ -570,6 +583,26 @@ def _archive_commands(archive: AttemptArchive | None, name: str, result: object)
     stderr = "".join(getattr(command, "stderr", "") for command in commands)
     archive.write_text(f"{name}_stdout.log", stdout)
     archive.write_text(f"{name}_stderr.log", stderr)
+
+
+def _build_starting_prompt(
+    issue_body: str, comments: Sequence[str], *, continuation: bool, issue_number: int
+) -> str:
+    """Compose the model's starting context from the issue body and trusted comments.
+
+    Trusted comments are appended verbatim in the chronological order the
+    tracker already returns them in. A continuation adds only a pointer
+    sentence: the handoff note's own content is never fetched or digested
+    here, since it is already reachable on the resumed branch.
+    """
+
+    parts = [issue_body, *comments]
+    if continuation:
+        parts.append(
+            "This is a continued attempt; if it exists, the handoff note from the "
+            f"previous attempt is at .agent/handoff/{issue_number}.md."
+        )
+    return "\n\n".join(parts)
 
 
 def _infrastructure_decision(reason: str) -> CompletionDecision:
