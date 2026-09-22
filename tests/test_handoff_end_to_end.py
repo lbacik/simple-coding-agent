@@ -301,6 +301,109 @@ def test_third_party_comment_is_excluded_from_the_prompt(tmp_path: Path) -> None
     assert "I think this is fine as-is." not in prompt
 
 
+# --- Scenario 11: real handoff production, publication, and label sequence --
+
+
+def test_real_handoff_is_produced_pushed_and_labeled_without_a_pull_request(
+    tmp_path: Path,
+) -> None:
+    remote, _ = repository_with_main(tmp_path)
+    github = FakeGitHub(
+        issue(24, body="Rewrite the parser.", labels=frozenset({"ready-for-agent"})),
+    )
+
+    def do_handoff(working_directory: Path) -> None:
+        write_and_commit(working_directory, "parser.py", "half done", "Half-finish the parser")
+        write_handoff_note(working_directory, 24, "# Handoff note: issue #24\n\nHalfway done.\n")
+
+    executor = FakeModelExecutor(actions=[do_handoff], handoff=True)
+    lifecycle = build_lifecycle(remote, tmp_path / "clone", tmp_path / "data", github, executor)
+
+    result = lifecycle.run_once()
+
+    assert result.outcome is AttemptOutcome.HANDOFF
+    assert github.pull_requests == {}
+    subjects = remote_branch_subjects(remote, "agent/issue-24")
+    assert subjects[:2] == ["Handoff note: issue #24", "Half-finish the parser"]
+    [comment] = github.comments
+    assert "## Agent Attempt Result: handoff" in comment.body
+    assert "Halfway done." in comment.body
+    assert github.removed_labels == [("issue-24", "ready-for-agent")]
+    assert github.added_labels == [("issue-24", "round-finished")]
+    assert "round-finished" in github.labels
+    assert github.assignee_logins == []
+
+
+# --- Scenario 12: note-only handoff downgrades to no_changes and is discarded
+
+
+def test_note_only_handoff_downgrades_to_no_changes_and_is_not_published(
+    tmp_path: Path,
+) -> None:
+    remote, _ = repository_with_main(tmp_path)
+    github = FakeGitHub(issue(24, body="Investigate flaky test."))
+
+    def note_only(working_directory: Path) -> None:
+        write_handoff_note(working_directory, 24, "# Handoff note: issue #24\n\nNothing to preserve.\n")
+
+    executor = FakeModelExecutor(actions=[note_only], handoff=True)
+    lifecycle = build_lifecycle(remote, tmp_path / "clone", tmp_path / "data", github, executor)
+
+    result = lifecycle.run_once()
+
+    assert result.outcome is AttemptOutcome.NO_CHANGES
+    assert github.pull_requests == {}
+    assert github.added_labels == []
+    assert not remote_has_branch(remote, "agent/issue-24")
+
+
+# --- Scenario 13: repeated handoff retains note history and both comments ---
+
+
+def test_repeated_real_handoff_retains_note_history_and_both_comments(tmp_path: Path) -> None:
+    remote, _ = repository_with_main(tmp_path)
+    clone_dir = tmp_path / "clone"
+    data_dir = tmp_path / "data"
+    github = FakeGitHub(issue(24, body="Rewrite the parser.", labels=frozenset({"ready-for-agent"})))
+
+    def first_handoff(working_directory: Path) -> None:
+        write_and_commit(working_directory, "parser.py", "step one", "Start the parser rewrite")
+        write_handoff_note(working_directory, 24, "# Handoff note: issue #24\n\nStep one done.\n")
+
+    first_executor = FakeModelExecutor(actions=[first_handoff], handoff=True)
+    first_lifecycle = build_lifecycle(remote, clone_dir, data_dir, github, first_executor)
+    first_result = first_lifecycle.run_once()
+
+    assert first_result.outcome is AttemptOutcome.HANDOFF
+    assert "round-finished" in github.labels
+
+    # A human restores ready-for-agent to requeue; claim_next clears
+    # round-finished the same way it already does for a fabricated one.
+    github.labels.add("ready-for-agent")
+    github.assignee_logins.clear()
+
+    def second_handoff(working_directory: Path) -> None:
+        write_and_commit(working_directory, "parser.py", "step two", "Finish the parser rewrite")
+        write_handoff_note(working_directory, 24, "# Handoff note: issue #24\n\nStep two done.\n")
+
+    second_executor = FakeModelExecutor(actions=[second_handoff], handoff=True)
+    second_lifecycle = build_lifecycle(remote, clone_dir, data_dir, github, second_executor)
+    second_result = second_lifecycle.run_once()
+
+    assert second_result.outcome is AttemptOutcome.HANDOFF
+    subjects = remote_branch_subjects(remote, "agent/issue-24")
+    assert subjects[:4] == [
+        "Handoff note: issue #24",
+        "Finish the parser rewrite",
+        "Handoff note: issue #24",
+        "Start the parser rewrite",
+    ]
+    handoff_comments = [c for c in github.comments if "Agent Attempt Result: handoff" in c.body]
+    assert len(handoff_comments) == 2
+    assert "Step one done." in handoff_comments[0].body
+    assert "Step two done." in handoff_comments[1].body
+
+
 # --- Harness -----------------------------------------------------------------
 
 
@@ -377,13 +480,16 @@ def profile() -> RepositoryProfile:
 class FakeModelExecutor:
     """Runs a scripted local git action to stand in for one model turn.
 
-    Always succeeds with one completed code-review, the minimum evidence the
-    real evaluator requires to reach ``complete`` -- none of these scenarios
-    need a failing or unreviewed model run.
+    Defaults to succeeding with one completed code-review, the minimum
+    evidence the real evaluator requires to reach ``complete``. Pass
+    ``handoff=True`` for an action that stands in for the model invoking the
+    handoff skill instead (write/commit the note, then stop): the returned
+    evidence carries HANDOFF_REQUESTED and a ``handoff`` skill event instead.
     """
 
-    def __init__(self, *, actions: list | None = None) -> None:
+    def __init__(self, *, actions: list | None = None, handoff: bool = False) -> None:
         self._actions = list(actions or [])
+        self._handoff = handoff
         self.calls = 0
         self.captured_prompts: list[str] = []
 
@@ -394,6 +500,17 @@ class FakeModelExecutor:
         self.captured_prompts.append(issue_body)
         if self._actions:
             self._actions.pop(0)(working_directory)
+        if self._handoff:
+            return ModelExecution(
+                status=ModelExecutionStatus.HANDOFF_REQUESTED,
+                explanation="scripted handoff",
+                stop_reason="end_turn",
+                model_usage=None,
+                observed_models=(),
+                skill_events=(
+                    SkillEvent(phase="PreToolUse", name="handoff", agent_id=None, timestamp="2026-09-22T00:00:00Z"),
+                ),
+            )
         return ModelExecution(
             status=ModelExecutionStatus.SUCCEEDED,
             explanation="scripted",
@@ -414,6 +531,7 @@ class FakeGitHub:
         self.comments: list[IssueComment] = list(comments)
         self.pull_requests: dict[str, PullRequest] = {}
         self.removed_labels: list[tuple[str, str]] = []
+        self.added_labels: list[tuple[str, str]] = []
         self._next_pr = 100
 
     def _current(self) -> TrackerIssue:
@@ -441,6 +559,10 @@ class FakeGitHub:
     def remove_label(self, issue_id: str, label: str) -> None:
         self.removed_labels.append((issue_id, label))
         self.labels.discard(label)
+
+    def add_label(self, issue_id: str, label: str) -> None:
+        self.added_labels.append((issue_id, label))
+        self.labels.add(label)
 
     def list_issue_comments(self, repository: str, issue_number: int) -> tuple[IssueComment, ...]:
         return tuple(self.comments)
@@ -523,6 +645,13 @@ def write_and_commit(repository: Path, name: str, contents: str, message: str) -
     (repository / name).write_text(contents)
     git(repository, "add", name)
     git(repository, "commit", "-m", message)
+
+
+def write_handoff_note(working_directory: Path, issue_number: int, body: str) -> None:
+    """Stand in for the handoff skill's own final, separate note commit."""
+
+    (working_directory / ".agent" / "handoff").mkdir(parents=True, exist_ok=True)
+    write_and_commit(working_directory, f".agent/handoff/{issue_number}.md", body, f"Handoff note: issue #{issue_number}")
 
 
 def remote_branch_subjects(remote: Path, branch: str) -> list[str]:
