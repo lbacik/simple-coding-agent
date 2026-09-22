@@ -95,9 +95,6 @@ class _CostEstimator:
                     self._estimated_cost += (value / 1_000_000) * rate
         if has_tokens:
             self._has_positive_usage = True
-        elif not self._has_positive_usage and self._fallback_turn_cost > 0.0:
-            self._estimated_cost += self._fallback_turn_cost
-            self._tokens += int((self._fallback_turn_cost / self._rate) * 1_000_000)
         return self.estimated_cost_usd
 
     def observe_turn(self, estimated_turn_cost_usd: float) -> float:
@@ -196,6 +193,7 @@ class ModelExecutor:
         self._soft_threshold_crossed = False
         self._handoff_context_delivered = False
         self._usage_shape_logged = False
+        self._cost_estimator_observed_on_assistant = False
 
     @property
     def skill_events(self) -> tuple[SkillEvent, ...]:
@@ -242,6 +240,7 @@ class ModelExecutor:
         self._soft_threshold_crossed = False
         self._handoff_context_delivered = False
         self._usage_shape_logged = False
+        self._cost_estimator_observed_on_assistant = False
         self._log("model_execution_started", f"issue_body_length={len(issue_body)}")
         client = self._client_factory(self._options(working_directory))
         try:
@@ -404,6 +403,7 @@ class ModelExecutor:
     def _observe_cost(self, usage: Any) -> None:
         """Latch a one-time soft-threshold crossing from estimated cumulative cost."""
 
+        self._cost_estimator_observed_on_assistant = True
         if not self._usage_shape_logged:
             self._usage_shape_logged = True
             self._log("model_usage_shape", f"usage={usage!r}")
@@ -566,6 +566,26 @@ class ModelExecutor:
             self._review_count += 1
             if self._review_count > 3:
                 return _deny("At most two code-review repair cycles are allowed.")
+        if self._soft_threshold_crossed and not any(
+            event.name == "handoff" for event in self._skill_events
+        ):
+            tool_name = _hook_field(hook_input, "tool_name")
+            if tool_name == "Skill" and _skill_name(hook_input) == "handoff":
+                pass
+            elif tool_name in ("Edit", "Write"):
+                file_path = str(_hook_field(hook_input, "tool_input", {}).get("file_path", ""))
+                if ".agent/handoff" not in file_path:
+                    return _deny(
+                        "Cost soft threshold reached. Further implementation work is disabled. "
+                        "You must invoke the `handoff` skill now to preserve your progress."
+                    )
+            elif tool_name == "Bash":
+                command = str(_hook_field(hook_input, "tool_input", {}).get("command", ""))
+                if not _is_handoff_command(command):
+                    return _deny(
+                        "Cost soft threshold reached. Further implementation work is disabled. "
+                        "You must invoke the `handoff` skill now to preserve your progress."
+                    )
         return await publication_guard(hook_input, tool_use_id, context)
 
     async def _record_post_tool_use(
@@ -754,6 +774,30 @@ def _is_prohibited_invocation(tokens: list[str]) -> bool:
         script_index = arguments.index("-c") + 1
         return script_index < len(arguments) and _is_publication_command(arguments[script_index])
     return False
+
+
+def _is_handoff_command(command: str) -> bool:
+    for segment in _shell_segments(command):
+        if not segment:
+            continue
+        index = 0
+        while index < len(segment) and "=" in segment[index] and not segment[index].startswith("-"):
+            index += 1
+        if index < len(segment) and segment[index] in {"command", "env"}:
+            index += 1
+        if index >= len(segment):
+            continue
+        executable = Path(segment[index]).name
+        arguments = segment[index + 1 :]
+        if executable == "git":
+            subcommand = _git_subcommand(arguments)
+            if subcommand in ("status", "diff", "add", "commit", "log", "rev-parse", "rev-list"):
+                continue
+            return False
+        if executable in ("date", "mkdir", "echo", "cat", "pwd", "ls", "test", "true"):
+            continue
+        return False
+    return True
 
 
 def _git_subcommand(arguments: list[str]) -> str | None:

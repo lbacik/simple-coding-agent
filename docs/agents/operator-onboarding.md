@@ -96,12 +96,20 @@ SOFT_THRESHOLD_PERCENTAGE` (default `SOFT_THRESHOLD_PERCENTAGE=0.2`, i.e. 80%
 of budget), it asks the model to commit its progress and stop. This estimate
 is derived from streamed token counts, not the SDK's authoritative
 `total_cost_usd` (only available once the attempt ends), so treat the
-threshold as approximate. Turns and `MODEL_TIMEOUT` get no soft threshold:
-reaching either limit gets one best-effort same-client handoff follow-up
-instead. If usage is unavailable, the threshold is skipped, or the follow-up
-does not produce a handoff, the agent falls back to the existing
-model-limit/`incomplete` outcome; exceeding the hard cost ceiling makes no
-further model calls and reports the outcome from available telemetry.
+threshold as approximate. Once the soft threshold is crossed, tool enforcement
+blocks general file modifications and arbitrary execution, only allowing the
+model to write the handoff note (`.agent/handoff/<issue-number>.md`) and execute
+read/inspection or git wrap-up commands (e.g. `git status`, `git add`, `git commit`).
+Turns and `MODEL_TIMEOUT` get no soft threshold: reaching either limit gets
+one best-effort same-client handoff follow-up instead.
+
+If the hard ceiling (`max_budget_usd`) is reached, or the model limit is hit
+without a cooperative handoff note, the agent performs an **emergency handoff**:
+any uncommitted dirty work is automatically committed, an emergency handoff note
+documenting the limit (`cost_hard_limit` or `model_limit`) and touched files is
+created and committed, and the outcome is recorded as `handoff` so that no work
+is lost. If zero work was accomplished before hitting the limit, the attempt
+downgrades cleanly to `no_changes`.
 
 A `handoff` outcome pushes the attempt branch (no pull request), posts the
 handoff note as an issue comment, removes `ready-for-agent`, and adds
@@ -109,6 +117,21 @@ handoff note as an issue comment, removes `ready-for-agent`, and adds
 note and comment, then re-apply `ready-for-agent` to requeue the issue (this
 also clears `round-finished`), or leave it labelled `round-finished` to end
 the attempt sequence.
+
+## Non-destructive workspace management
+
+The agent adheres strictly to non-destructive cleanup:
+- The agent **never** deletes uncommitted files or removes branches after an attempt
+  ends (`git reset --hard`, `git clean -fd`, and `git branch -D` are not run on attempt cleanup).
+- Attempt branches and untracked artifacts remain intact for human review and debugging.
+- **Clean workspace precondition**: Before starting or claiming an attempt, the agent
+  inspects the repository working tree (`git status --porcelain`). If the workspace
+  contains uncommitted or untracked changes, the agent:
+  1. Emits a warning log (`working_tree_dirty`).
+  2. Releases the claim, removes the `ready-for-agent` label from the issue, and posts
+     a comment indicating that uncommitted changes exist in the workspace.
+  3. Halts execution with exit code 1.
+  Cleaning the working tree is strictly the responsibility of human operators.
 
 ## Persisted error-guard recovery
 

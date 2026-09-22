@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
@@ -23,7 +23,11 @@ from simple_coding_agent.completion import (
     VerificationRunner,
 )
 from simple_coding_agent.config import RepositoryProfile
-from simple_coding_agent.git_workspace import GitWorkspaceError, GitWorkspaceRecoveryError
+from simple_coding_agent.git_workspace import (
+    DirtyWorkspaceError,
+    GitWorkspaceError,
+    GitWorkspaceRecoveryError,
+)
 from simple_coding_agent.github_tracker import ROUND_FINISHED, Claim, TrackerIssue
 from simple_coding_agent.model_execution import ModelExecutionStatus, ModelExecutor
 from simple_coding_agent.observability import AttemptArchive
@@ -207,31 +211,49 @@ class ModelAttemptRunner:
                     "model_stop_reason": execution.stop_reason,
                 }
             )
-        if execution.status is ModelExecutionStatus.HANDOFF_REQUESTED:
+        if execution.status in (
+            ModelExecutionStatus.HANDOFF_REQUESTED,
+            ModelExecutionStatus.MODEL_LIMIT_REACHED,
+        ):
             # Always preserve dirty/untracked work as a commit rather than
-            # letting it get silently discarded by cleanup()'s hard reset.
-            # This can leave the note no longer the final commit; that is
-            # caught below as an invalid handoff rather than papered over,
-            # since a continuation must be able to trust that the note is
-            # genuinely the last word on the branch.
-            try:
-                getattr(self._workspace, "commit_dirty_work")(
-                    "Preserve uncommitted work before handoff"
-                )
-            except GitWorkspaceError as error:
-                # A decision here (rather than letting this propagate to the
-                # generic exception handler) routes through the normal
-                # infrastructure_error retain_branch logic, so the branch and
-                # whatever did commit are kept locally for inspection instead
-                # of being deleted as an assumed-discardable failed attempt.
-                decision = CompletionDecision(
-                    outcome=AttemptOutcome.INFRASTRUCTURE_ERROR,
-                    publication_eligible=False,
-                    publication_path=PublicationPath.NONE,
-                    reasons=(f"Failed to preserve dirty work before handoff: {error}",),
-                )
-                return _attempt_evidence(decision, profile, None, 0, "not run", str(error))
+            # letting it get silently discarded.
+            commit_fn = getattr(self._workspace, "commit_dirty_work", None)
+            if callable(commit_fn):
+                try:
+                    commit_fn("Preserve uncommitted work before handoff")
+                except GitWorkspaceError as error:
+                    decision = CompletionDecision(
+                        outcome=AttemptOutcome.INFRASTRUCTURE_ERROR,
+                        publication_eligible=False,
+                        publication_path=PublicationPath.NONE,
+                        reasons=(f"Failed to preserve dirty work before handoff: {error}",),
+                    )
+                    return _attempt_evidence(decision, profile, None, 0, "not run", str(error))
         commits = getattr(self._workspace, "commits_added")(prepared)
+        if execution.status is ModelExecutionStatus.MODEL_LIMIT_REACHED:
+            # Emergency handoff: synthesize and commit a handoff note so
+            # progress is preserved for human review with round-finished.
+            if not commits or not _is_handoff_note_commit(commits[0]):
+                note_content = _build_emergency_handoff_note(
+                    issue_number=claim.issue.number,
+                    started_at=checkpoint.started_at,
+                    reason=_classify_handoff_reason(execution),
+                    last_work_commit=getattr(commits[0], "revision", str(commits[0])) if commits else getattr(prepared, "base_revision", "0" * 40),
+                    explanation=execution.explanation,
+                )
+                working_dir = getattr(self._workspace, "working_directory", None)
+                if working_dir is not None:
+                    try:
+                        note_path = working_dir / ".agent" / "handoff" / f"{claim.issue.number}.md"
+                        note_path.parent.mkdir(parents=True, exist_ok=True)
+                        note_path.write_text(note_content)
+                    except OSError:
+                        pass
+                commit_fn = getattr(self._workspace, "commit_dirty_work", None)
+                if callable(commit_fn):
+                    commit_fn(f"Handoff note: issue #{claim.issue.number}")
+                commits = getattr(self._workspace, "commits_added")(prepared)
+            execution = replace(execution, status=ModelExecutionStatus.HANDOFF_REQUESTED)
         commit_count = len(commits)
         review_count = sum(
             event.name == "code-review" and event.phase == "PreToolUse"
@@ -350,6 +372,14 @@ class AgentLifecycle:
             if recovered is not None:
                 return LifecycleResult(LifecycleStatus.ATTEMPTED, recovered)
 
+        if hasattr(self._workspace, "is_clean") and not self._workspace.is_clean():
+            self._event_log(
+                "working_tree_dirty",
+                "Repository working tree contains uncommitted or untracked changes before claim; human cleanup is required.",
+                level="WARNING",
+            )
+            raise SystemExit(1)
+
         self._event_log("polling_for_issue", "", level="INFO")
         claim = self._tracker.claim_next()
         if claim is None:
@@ -441,6 +471,24 @@ class AgentLifecycle:
                     outcome is AttemptOutcome.INFRASTRUCTURE_ERROR
                     and getattr(published, "branch_url", None) is None
                 )
+        except DirtyWorkspaceError as error:
+            self._event_log(
+                "working_tree_dirty",
+                _exception_detail(error),
+                level="WARNING",
+                issue_number=claim.issue.number,
+            )
+            published = self._publish_terminal(
+                claim,
+                checkpoint.started_at,
+                prepared,
+                profile,
+                AttemptOutcome.INFRASTRUCTURE_ERROR,
+                details="Repository working tree contains uncommitted or untracked changes. Human inspection is required.",
+            )
+            outcome = AttemptOutcome.INFRASTRUCTURE_ERROR
+            comment_posted = getattr(published, "comment_posted", True)
+            raise SystemExit(1) from error
         except GitWorkspaceRecoveryError as error:
             self._event_log(
                 "git_workspace_unrecoverable",
@@ -639,6 +687,7 @@ class AgentLifecycle:
         prepared: object | None,
         profile: RepositoryProfile | None,
         outcome: AttemptOutcome,
+        details: str = "Repository profile could not be loaded or the attempt could not start.",
     ):
         branch = getattr(prepared, "branch", f"agent/issue-{claim.issue.number}")
         base_branch = profile.base_branch if profile is not None else "main"
@@ -648,12 +697,12 @@ class AgentLifecycle:
                 issue_title=claim.issue.title,
                 branch=branch,
                 started_at=started_at,
-                decision=CompletionDecision(outcome, False, PublicationPath.NONE, ("Attempt could not complete.",)),
+                decision=CompletionDecision(outcome, False, PublicationPath.NONE, (details,)),
                 check_command="not run",
                 check_exit_code=None,
                 review_cycles=0,
                 review_findings="not run",
-                details="Repository profile could not be loaded or the attempt could not start.",
+                details=details,
                 base_branch=base_branch,
             )
         )
@@ -824,7 +873,42 @@ def _is_handoff_recovery(commits: Sequence[object]) -> bool:
     return _is_handoff_note_commit(commits[0])
 
 
-_ALLOWED_HANDOFF_REASONS = frozenset({"cost_soft_threshold", "turn_limit", "time_limit"})
+_ALLOWED_HANDOFF_REASONS = frozenset(
+    {"cost_soft_threshold", "cost_hard_limit", "turn_limit", "time_limit"}
+)
+
+
+def _classify_handoff_reason(execution: object) -> str:
+    explanation = getattr(execution, "explanation", "").lower()
+    terminal_reason = (getattr(execution, "terminal_reason", None) or "").lower()
+    if "budget" in terminal_reason or "hard cost ceiling" in explanation or "budget" in explanation:
+        return "cost_hard_limit"
+    if "turn" in terminal_reason or "max_turns" in explanation:
+        return "turn_limit"
+    if "timeout" in explanation or "time" in terminal_reason:
+        return "time_limit"
+    return "cost_hard_limit"
+
+
+def _build_emergency_handoff_note(
+    *,
+    issue_number: int,
+    started_at: str,
+    reason: str,
+    last_work_commit: str,
+    explanation: str,
+) -> str:
+    return (
+        f"# Handoff note: issue #{issue_number}\n\n"
+        f"- issue: {issue_number}\n"
+        f"- started_at: {started_at}\n"
+        f"- reason: {reason}\n"
+        f"- last_work_commit: {last_work_commit}\n\n"
+        "## Summary\n\n"
+        f"{explanation}\n\n"
+        "## Remaining work\n\n"
+        "Review progress preserved on this branch and continue implementation.\n"
+    )
 
 _HANDOFF_NOTE_TITLE_PATTERN = re.compile(r"^#\s*Handoff note:\s*issue #(\d+)")
 _HANDOFF_NOTE_FIELD_PATTERN = re.compile(r"^-\s*(issue|started_at|reason|last_work_commit):\s*(.+?)\s*$")

@@ -28,7 +28,7 @@ other publishing command.
 
    - issue: <issue-number>
    - started_at: <UTC ISO-8601 timestamp, e.g. from `date -u +%Y-%m-%dT%H:%M:%SZ`>
-   - reason: <cost_soft_threshold | turn_limit | time_limit>
+   - reason: <cost_soft_threshold | cost_hard_limit | turn_limit | time_limit>
    - last_work_commit: <SHA of the last commit from step 1, or the branch's
      existing HEAD if step 1 committed nothing>
 

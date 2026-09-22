@@ -7,6 +7,7 @@ import subprocess
 import pytest
 
 from simple_coding_agent.git_workspace import (
+    DirtyWorkspaceError,
     GitWorkspace,
     GitWorkspaceError,
     GitWorkspaceRecoveryError,
@@ -235,21 +236,22 @@ def test_commit_dirty_work_is_a_noop_on_a_clean_worktree(tmp_path: Path) -> None
     assert workspace.commits_added(prepared) == ()
 
 
-def test_cleanup_restores_base_and_preserves_ignored_dependencies(tmp_path: Path) -> None:
+def test_cleanup_preserves_untracked_files_and_attempt_branch(tmp_path: Path) -> None:
     remote, _ = repository_with_main(tmp_path)
     clone = tmp_path / "clone"
     workspace = GitWorkspace(clone, str(remote), token_provider=lambda: "secret-token")
     prepared = workspace.prepare_attempt(base_branch="main", issue_number=19)
     (clone / ".venv").mkdir()
     (clone / ".venv" / "marker").write_text("keep")
-    (clone / "untracked.txt").write_text("discard")
+    (clone / "untracked.txt").write_text("preserve")
 
     workspace.cleanup(base_branch="main", prepared=prepared, retain_branch=False)
 
-    assert git(clone, "branch", "--show-current") == "main"
-    assert not (clone / "untracked.txt").exists()
+    assert (clone / "untracked.txt").exists()
     assert (clone / ".venv" / "marker").read_text() == "keep"
-    assert "agent/issue-19" not in git(clone, "branch", "--format=%(refname:short)").splitlines()
+    assert "agent/issue-19" in git(clone, "branch", "--format=%(refname:short)").splitlines()
+    with pytest.raises(DirtyWorkspaceError):
+        workspace.prepare_attempt(base_branch="main", issue_number=20)
 
 
 def test_cleanup_retains_unpublished_commits_when_requested(tmp_path: Path) -> None:

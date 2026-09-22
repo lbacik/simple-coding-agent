@@ -3,3 +3,4 @@ __pycache__/
 .pytest_cache/
 # Operator credentials — copy .env.example and fill in; never commit .env
 .env
+uv.lock

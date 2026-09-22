@@ -26,6 +26,10 @@ class GitWorkspaceRecoveryError(GitWorkspaceError):
     """
 
 
+class DirtyWorkspaceError(GitWorkspaceError):
+    """Raised when the working tree has uncommitted changes before an attempt starts."""
+
+
 @dataclass(frozen=True)
 class PreparedAttempt:
     """The branch and verified base revision for one implementation attempt."""
@@ -70,6 +74,16 @@ class GitWorkspace:
 
         return self._clone_dir
 
+    def is_clean(self) -> bool:
+        """Return True if working tree has no uncommitted or untracked changes."""
+        if not (self._clone_dir / ".git").exists():
+            return True
+        return not bool(self.dirty_status().strip())
+
+    def dirty_status(self) -> str:
+        """Return porcelain status of dirty or untracked changes."""
+        return self._git("status", "--porcelain")
+
     def prepare_attempt(self, *, base_branch: str, issue_number: int) -> PreparedAttempt:
         """Fetch, verify, and check out the branch used by an attempt.
 
@@ -90,6 +104,10 @@ class GitWorkspace:
 
         branch = _attempt_branch(issue_number)
         self._ensure_clone()
+        if not self.is_clean():
+            raise DirtyWorkspaceError(
+                f"Repository working tree contains uncommitted or untracked changes:\n{self.dirty_status()}"
+            )
         self._git("fetch", "origin")
         base_revision = self._revision(f"origin/{base_branch}", remote=True)
         local_base_revision = self._revision(base_branch, remote=False)
@@ -162,25 +180,22 @@ class GitWorkspace:
         return True
 
     def cleanup(
-        self, *, base_branch: str, prepared: PreparedAttempt, retain_branch: bool
+        self, *, base_branch: str, prepared: PreparedAttempt, retain_branch: bool = True
     ) -> None:
-        """Restore the base worktree and optionally delete a disposable branch.
+        """Best-effort abort of an unresolved rebase and switch to base_branch.
 
-        A rebase left conflicted because the model session could not resolve
-        it is aborted here, best-effort, before switching branches: checking
-        out another branch mid-rebase fails in git, and this runs
-        unconditionally from a ``finally`` block, so it must not raise.
+        Never delete files or branches: uncommitted/untracked files and attempt
+        branches are preserved as-is for human operator inspection and cleanup.
         """
 
         try:
             self._git("rebase", "--abort")
         except GitWorkspaceError:
             pass
-        self._git("checkout", base_branch)
-        self._git("reset", "--hard", f"origin/{base_branch}")
-        self._git("clean", "-fd")
-        if not retain_branch:
-            self._git("branch", "-D", prepared.branch)
+        try:
+            self._git("checkout", base_branch)
+        except GitWorkspaceError:
+            pass
 
     def push_attempt_branch(
         self, branch: str, *, max_retries: int, deadline: float | None = None
@@ -293,7 +308,6 @@ class GitWorkspace:
             current_branch = self._git("rev-parse", "--abbrev-ref", "HEAD")
             if current_branch == base_branch:
                 self._git("reset", "--hard", f"origin/{base_branch}")
-                self._git("clean", "-fd")
             else:
                 self._git("branch", "-f", base_branch, f"origin/{base_branch}")
         except GitWorkspaceError:
