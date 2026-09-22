@@ -61,6 +61,8 @@ RUN npm install --global @anthropic-ai/claude-code@2.1.276
 # ---------------------------------------------------------------------------
 COPY scripts/install-skills.sh /usr/local/bin/install-skills.sh
 RUN chmod +x /usr/local/bin/install-skills.sh
+COPY skills/ /opt/simple-coding-agent-skills/
+ENV PROJECT_SKILLS_DIR=/opt/simple-coding-agent-skills
 
 USER agent
 RUN /usr/local/bin/install-skills.sh
