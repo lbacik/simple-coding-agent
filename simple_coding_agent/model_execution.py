@@ -74,10 +74,15 @@ class _CostEstimator:
         self._tokens = 0
         self._estimated_cost = 0.0
         self._has_positive_usage = False
+        self._turns = 0
 
     @property
     def has_positive_usage(self) -> bool:
         return self._has_positive_usage
+
+    @property
+    def turns(self) -> int:
+        return self._turns
 
     def observe(self, usage: Any) -> float:
         has_tokens = False
@@ -95,9 +100,11 @@ class _CostEstimator:
                     self._estimated_cost += (value / 1_000_000) * rate
         if has_tokens:
             self._has_positive_usage = True
+            self._turns += 1
         return self.estimated_cost_usd
 
     def observe_turn(self, estimated_turn_cost_usd: float) -> float:
+        self._turns += 1
         self._estimated_cost += estimated_turn_cost_usd
         return self.estimated_cost_usd
 
@@ -190,6 +197,7 @@ class ModelExecutor:
         self._cost_estimator = _CostEstimator(
             fallback_turn_cost=self._config.max_budget_usd / max(self._config.max_turns, 1)
         )
+        self._started_at = self._clock()
         self._soft_threshold_crossed = False
         self._handoff_context_delivered = False
         self._usage_shape_logged = False
@@ -234,6 +242,7 @@ class ModelExecutor:
         self._issue_number = issue_number
         self._archive = archive
         self._event_sequence = 0
+        self._started_at = self._clock()
         self._cost_estimator = _CostEstimator(
             fallback_turn_cost=self._config.max_budget_usd / max(self._config.max_turns, 1)
         )
@@ -241,7 +250,15 @@ class ModelExecutor:
         self._handoff_context_delivered = False
         self._usage_shape_logged = False
         self._cost_estimator_observed_on_assistant = False
-        self._log("model_execution_started", f"issue_body_length={len(issue_body)}")
+        soft_threshold = self._config.max_budget_usd * (1 - self._config.soft_threshold_percentage)
+        self._log(
+            "model_execution_started",
+            f"issue_body_length={len(issue_body)}; limits: "
+            f"max_budget_usd={self._config.max_budget_usd:.4f}; "
+            f"soft_threshold_usd={soft_threshold:.4f}; "
+            f"max_turns={self._config.max_turns}; "
+            f"timeout_seconds={self._config.model_timeout}",
+        )
         client = self._client_factory(self._options(working_directory))
         try:
             async with client:
@@ -407,18 +424,35 @@ class ModelExecutor:
         if not self._usage_shape_logged:
             self._usage_shape_logged = True
             self._log("model_usage_shape", f"usage={usage!r}")
-        estimated_cost = self._cost_estimator.observe(usage)
-        self._check_soft_threshold(estimated_cost)
+        self._cost_estimator.observe(usage)
+        if self._cost_estimator.has_positive_usage:
+            self._check_limits()
 
-    def _check_soft_threshold(self, estimated_cost: float) -> None:
-        if self._soft_threshold_crossed:
-            return
+    def _elapsed_seconds(self) -> int:
+        delta = (self._clock() - self._started_at).total_seconds()
+        return max(0, int(delta))
+
+    def _limits_detail(self) -> str:
         soft_threshold = self._config.max_budget_usd * (1 - self._config.soft_threshold_percentage)
-        if estimated_cost >= soft_threshold:
+        return (
+            f"estimated_cost_usd={self._cost_estimator.estimated_cost_usd:.4f}; "
+            f"soft_threshold_usd={soft_threshold:.4f}; "
+            f"max_budget_usd={self._config.max_budget_usd:.4f}; "
+            f"turns={self._cost_estimator.turns}; "
+            f"max_turns={self._config.max_turns}; "
+            f"elapsed_seconds={self._elapsed_seconds()}; "
+            f"timeout_seconds={self._config.model_timeout}"
+        )
+
+    def _check_limits(self) -> None:
+        self._log("limits_checked", self._limits_detail())
+        soft_threshold = self._config.max_budget_usd * (1 - self._config.soft_threshold_percentage)
+        if not self._soft_threshold_crossed and self._cost_estimator.estimated_cost_usd >= soft_threshold:
             self._soft_threshold_crossed = True
             self._log(
                 "cost_soft_threshold_crossed",
-                f"estimated_cost_usd={estimated_cost:.4f}; soft_threshold_usd={soft_threshold:.4f}",
+                f"estimated_cost_usd={self._cost_estimator.estimated_cost_usd:.4f}; "
+                f"soft_threshold_usd={soft_threshold:.4f}",
             )
 
     async def _drain(self, client: SDKClient) -> None:
@@ -597,8 +631,8 @@ class ModelExecutor:
         await self._record_skill_event("PostToolUse", hook_input, tool_use_id, context)
         if not self._cost_estimator.has_positive_usage:
             per_turn_cost = self._config.max_budget_usd / max(self._config.max_turns, 1)
-            estimated_cost = self._cost_estimator.observe_turn(per_turn_cost)
-            self._check_soft_threshold(estimated_cost)
+            self._cost_estimator.observe_turn(per_turn_cost)
+        self._check_limits()
         if self._soft_threshold_crossed and not self._handoff_context_delivered:
             self._handoff_context_delivered = True
             self._log("cost_soft_threshold_handoff_context_injected")

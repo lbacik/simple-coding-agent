@@ -290,6 +290,37 @@ def test_graphql_add_label_resolves_the_repository_label_id_first() -> None:
     assert "addLabelsToLabelable" in queries[1]
 
 
+def test_graphql_add_label_creates_missing_repository_label_before_adding() -> None:
+    responses = iter(
+        [
+            {"node": {"repository": {"id": "repo-id-1", "label": None}}},
+            {"createLabel": {"label": {"id": "created-label-id"}}},
+            {},
+        ]
+    )
+    queries: list[str] = []
+    variables_list: list[dict[str, object]] = []
+
+    def execute(query: str, variables: dict[str, object]) -> dict:
+        queries.append(query)
+        variables_list.append(variables)
+        return next(responses)
+
+    transport = GitHubGraphQLTransport("token")
+    transport._execute = execute  # type: ignore[method-assign]
+
+    transport.add_label("issue-id", "round-finished")
+
+    assert "label(name: $label)" in queries[0]
+    assert "createLabel" in queries[1]
+    assert variables_list[1]["repositoryId"] == "repo-id-1"
+    assert variables_list[1]["name"] == "round-finished"
+    assert variables_list[1]["color"] == "fbca04"
+    assert "addLabelsToLabelable" in queries[2]
+    assert variables_list[2]["labelId"] == "created-label-id"
+
+
+
 def test_graphql_errors_surface_githubs_own_message(monkeypatch: pytest.MonkeyPatch) -> None:
     payload = json.dumps(
         {"errors": [{"message": "Resource not accessible by integration"}]}

@@ -360,14 +360,18 @@ class GitHubGraphQLTransport:
         )
 
     def add_label(self, issue_id: str, label: str) -> None:
-        """Add a repository label to the issue, resolving its node id first."""
+        """Add a repository label to the issue, resolving its node id first.
+
+        If the label does not exist in the repository yet, it is created
+        automatically so the tracker never crashes on uninitialized labels.
+        """
 
         data = self._execute(
             """
             query RepositoryLabelId($issueId: ID!, $label: String!) {
               node(id: $issueId) {
                 ... on Issue {
-                  repository { label(name: $label) { id } }
+                  repository { id label(name: $label) { id } }
                 }
               }
             }
@@ -375,7 +379,13 @@ class GitHubGraphQLTransport:
             {"issueId": issue_id, "label": label},
         )
         try:
-            label_id = data["node"]["repository"]["label"]["id"]
+            repo_node = data["node"]["repository"]
+            label_obj = repo_node.get("label")
+            if label_obj and isinstance(label_obj, dict) and "id" in label_obj:
+                label_id = label_obj["id"]
+            else:
+                repo_id = repo_node["id"]
+                label_id = self._create_label(repo_id, label)
         except (KeyError, TypeError) as error:
             raise GitHubTrackerError("GitHub returned an invalid repository label") from error
         self._execute(
@@ -388,6 +398,34 @@ class GitHubGraphQLTransport:
             """,
             {"issueId": issue_id, "labelId": label_id},
         )
+
+    def _create_label(self, repository_id: str, label: str) -> str:
+        color = "fbca04" if label == ROUND_FINISHED else "ededed"
+        description = (
+            "Agent round finished; requires human evaluation to continue"
+            if label == ROUND_FINISHED
+            else ""
+        )
+        data = self._execute(
+            """
+            mutation CreateLabel($repositoryId: ID!, $name: String!, $color: String!, $description: String) {
+              createLabel(input: {repositoryId: $repositoryId, name: $name, color: $color, description: $description}) {
+                label { id }
+              }
+            }
+            """,
+            {
+                "repositoryId": repository_id,
+                "name": label,
+                "color": color,
+                "description": description,
+            },
+        )
+        try:
+            return data["createLabel"]["label"]["id"]
+        except (KeyError, TypeError) as error:
+            raise GitHubTrackerError(f"GitHub returned an invalid repository label: {error}") from error
+
 
     def find_pull_request(self, repository: str, head: str) -> PullRequest | None:
         """Return an existing open PR for an attempt branch, if any."""

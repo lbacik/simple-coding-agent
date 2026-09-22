@@ -928,3 +928,93 @@ def test_per_category_token_pricing_discounts_cache_read_tokens(tmp_path: Path) 
         post_hook({"tool_name": "Bash", "tool_input": {"command": "pytest"}, "tool_response": "ok"}, None, {})
     )
     assert outcome == {}
+
+
+def test_model_execution_logs_configured_limits_and_limits_checked_progress(tmp_path: Path) -> None:
+    events: list[tuple[str, str, int | None]] = []
+    captured: list[FakeClient] = []
+
+    def client_factory(options: object) -> FakeClient:
+        client = FakeClient(
+            options,
+            [
+                AssistantMessage(
+                    content=[],
+                    model="muse-spark-1.3-contributor",
+                    usage={"input_tokens": 0, "output_tokens": 0},
+                ),
+                result(),
+            ],
+        )
+        captured.append(client)
+        return client
+
+    executor = ModelExecutor(
+        runtime_config(tmp_path),
+        client_factory=client_factory,
+        event_log=lambda event, detail="", issue_number=None: events.append((event, detail, issue_number)),
+    )
+    execution = asyncio.run(
+        executor.execute(issue_body="Fix the tests.", working_directory=tmp_path, issue_number=45)
+    )
+
+    assert execution.status is ModelExecutionStatus.SUCCEEDED
+
+    # Verify model_execution_started includes limits
+    started_event = next(detail for name, detail, _ in events if name == "model_execution_started")
+    assert "limits:" in started_event
+    assert "max_budget_usd=5.0000" in started_event
+    assert "soft_threshold_usd=4.0000" in started_event
+    assert "max_turns=60" in started_event
+    assert "timeout_seconds=60" in started_event
+
+    post_hook = captured[0].options.hooks["PostToolUse"][0].hooks[0]
+    tool_event = {"tool_name": "Bash", "tool_input": {"command": "pytest"}, "tool_response": "ok"}
+
+    asyncio.run(post_hook(tool_event, None, {}))
+
+    limits_events = [detail for name, detail, num in events if name == "limits_checked"]
+    assert len(limits_events) == 1
+    assert "estimated_cost_usd=0.0833" in limits_events[0]
+    assert "soft_threshold_usd=4.0000" in limits_events[0]
+    assert "max_budget_usd=5.0000" in limits_events[0]
+    assert "turns=1" in limits_events[0]
+    assert "max_turns=60" in limits_events[0]
+    assert "elapsed_seconds=" in limits_events[0]
+    assert "timeout_seconds=60" in limits_events[0]
+
+
+def test_positive_token_usage_logs_limits_checked_progress(tmp_path: Path) -> None:
+    events: list[tuple[str, str, int | None]] = []
+
+    def client_factory(options: object) -> FakeClient:
+        return FakeClient(
+            options,
+            [
+                AssistantMessage(
+                    content=[],
+                    model="muse-spark-1.3-contributor",
+                    usage={"input_tokens": 100_000, "output_tokens": 5_000},
+                ),
+                result(),
+            ],
+        )
+
+    executor = ModelExecutor(
+        runtime_config(tmp_path),
+        client_factory=client_factory,
+        event_log=lambda event, detail="", issue_number=None: events.append((event, detail, issue_number)),
+    )
+    execution = asyncio.run(
+        executor.execute(issue_body="Fix the tests.", working_directory=tmp_path, issue_number=45)
+    )
+
+    assert execution.status is ModelExecutionStatus.SUCCEEDED
+    limits_events = [detail for name, detail, _ in events if name == "limits_checked"]
+    assert len(limits_events) == 1
+    assert "turns=1" in limits_events[0]
+    assert "estimated_cost_usd=" in limits_events[0]
+    assert "soft_threshold_usd=4.0000" in limits_events[0]
+    assert "max_budget_usd=5.0000" in limits_events[0]
+
+
