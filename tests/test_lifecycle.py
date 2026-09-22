@@ -86,12 +86,14 @@ def test_stops_after_the_persisted_consecutive_infrastructure_error_limit(tmp_pa
     assert stopped.value.code == 1
     assert [event for event, _, _ in events] == [
         "polling_for_issue",
+        "issue_claimed",
+        "workspace_prepared",
         "attempt_exception",
         "consecutive_error_limit_reached",
     ]
-    assert events[1][1] == "OSError: profile is missing"
-    assert events[1][2] == 24
-    assert events[2][2] == 24
+    assert events[3][1] == "OSError: profile is missing"
+    assert events[3][2] == 24
+    assert events[4][2] == 24
     assert ConsecutiveErrorStore(tmp_path).read().count == 1
 
 
@@ -296,6 +298,57 @@ def test_attempt_runs_the_injected_workflow_then_publishes_before_cleanup(tmp_pa
     assert publisher.outcomes == [None]
     assert tracker.cleanup == [(24, "ready-for-agent", "agent-id")]
     assert workspace.cleanup_calls == [("main", False)]
+
+
+def test_logs_every_stage_from_claiming_the_issue_to_dispatching_the_model(
+    tmp_path: Path,
+) -> None:
+    """Nothing was logged between claiming an issue and dispatching the model,
+
+    so an operator reading the log stream during that window (workspace
+    prep, profile load, setup/baseline checks) couldn't tell which of those
+    steps an attempt was stuck on.
+    """
+
+    claim = Claim(issue(24), Assignment("issue-24", "agent-id"))
+    tracker = FakeTracker(claim)
+    workspace = FakeWorkspace()
+    publisher = FakePublisher()
+    events: list[tuple[str, int | None]] = []
+
+    def run_workflow(received_claim: Claim, profile: object, prepared: object) -> AttemptEvidence:
+        return AttemptEvidence(
+            decision=CompletionDecision(None, True, PublicationPath.COMPLETE, ("ready",)),
+            check_command="pytest",
+            check_exit_code=0,
+            review_cycles=1,
+            review_findings="all clear",
+            details="Implemented the lifecycle.",
+        )
+
+    lifecycle = AgentLifecycle(
+        tracker=tracker,
+        attempt_state=AttemptStateStore(tmp_path),
+        workspace=workspace,
+        profile_loader=lambda _: profile(),
+        publisher=publisher,
+        attempt_runner=run_workflow,
+        event_log=lambda event, detail="", level="INFO", issue_number=None: events.append(
+            (event, issue_number)
+        ),
+    )
+
+    result = lifecycle.run_once()
+
+    assert result.outcome is AttemptOutcome.COMPLETE
+    assert [event for event, _ in events] == [
+        "polling_for_issue",
+        "issue_claimed",
+        "workspace_prepared",
+        "profile_loaded",
+        "attempt_phase_transitioned",
+    ]
+    assert all(issue_number == 24 for _, issue_number in events[1:])
 
 
 def test_keeps_the_checkpoint_when_remote_cleanup_is_interrupted(tmp_path: Path) -> None:

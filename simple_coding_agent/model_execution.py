@@ -220,7 +220,7 @@ class ModelExecutor:
                         None,
                         (),
                     )
-                if terminal is not None and terminal.stop_reason == "max_turns_exceeded":
+                if terminal is not None and self._is_model_limit(terminal, observed_models):
                     followup = await self._attempt_handoff_followup(client, observed_models)
                     if followup is not None:
                         return followup
@@ -242,6 +242,31 @@ class ModelExecutor:
                 observed_models,
             )
         return self._classify(terminal, observed_models)
+
+    def _is_model_limit(
+        self, terminal: ResultMessage, observed_models: tuple[str, ...]
+    ) -> bool:
+        """Mirror ``_classify``'s MODEL_LIMIT_REACHED predicate ahead of time.
+
+        Every path that would otherwise classify as MODEL_LIMIT_REACHED
+        (turns exceeded, hard budget ceiling, or a bare SDK error result)
+        deserves one cooperative handoff attempt before that classification
+        is finalised; a model/config mismatch or a plain
+        timeout/aborted_* stop reason is an infrastructure problem, not a
+        limit the model can hand off from, so those are excluded.
+        """
+
+        model_usage = getattr(terminal, "model_usage", None)
+        result_models = tuple(model_usage.keys()) if isinstance(model_usage, Mapping) else ()
+        all_models = tuple(dict.fromkeys((*observed_models, *result_models)))
+        if any(model != self._config.model for model in all_models):
+            return False
+        stop_reason = getattr(terminal, "stop_reason", None)
+        if stop_reason == "timeout" or (isinstance(stop_reason, str) and stop_reason.startswith("aborted_")):
+            return False
+        if stop_reason in ("max_turns_exceeded", "max_budget_usd_exceeded"):
+            return True
+        return bool(getattr(terminal, "is_error", False))
 
     async def _attempt_handoff_followup(
         self, client: SDKClient, observed_models: tuple[str, ...]
@@ -391,7 +416,8 @@ class ModelExecutor:
                 ModelExecutionStatus.MODEL_LIMIT_REACHED,
                 "Model execution reached the hard cost ceiling "
                 f"(total_cost_usd={getattr(terminal, 'total_cost_usd', None)}, "
-                f"num_turns={getattr(terminal, 'num_turns', None)}); no further model calls were made.",
+                f"num_turns={getattr(terminal, 'num_turns', None)}); no further implementation "
+                "work was permitted.",
                 stop_reason,
                 model_usage,
                 all_models,
@@ -399,7 +425,10 @@ class ModelExecutor:
         if getattr(terminal, "is_error", True):
             return self._evidence(
                 ModelExecutionStatus.MODEL_LIMIT_REACHED,
-                "Claude SDK returned an error result.",
+                "Claude SDK returned an error result "
+                f"(stop_reason={stop_reason!r}, "
+                f"api_error_status={getattr(terminal, 'api_error_status', None)!r}, "
+                f"errors={getattr(terminal, 'errors', None)!r}).",
                 stop_reason,
                 model_usage,
                 all_models,

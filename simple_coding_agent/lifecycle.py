@@ -140,6 +140,7 @@ class ModelAttemptRunner:
             if checkpoint is not None and self._attempt_archive_factory is not None
             else None
         )
+        self._event_log("setup_started", "", level="INFO", issue_number=claim.issue.number)
         preparation = self._verifier.prepare(profile, getattr(self._workspace, "working_directory"))
         _archive_commands(archive, "setup", preparation.setup)
         if not preparation.setup.succeeded:
@@ -149,6 +150,8 @@ class ModelAttemptRunner:
                 level="ERROR",
                 issue_number=claim.issue.number,
             )
+        else:
+            self._event_log("setup_succeeded", "", level="INFO", issue_number=claim.issue.number)
         if preparation.baseline is not None:
             _archive_commands(archive, "baseline_check", preparation.baseline)
             if not preparation.baseline.succeeded:
@@ -157,6 +160,10 @@ class ModelAttemptRunner:
                     _command_failure_detail(preparation.baseline),
                     level="ERROR",
                     issue_number=claim.issue.number,
+                )
+            else:
+                self._event_log(
+                    "baseline_check_succeeded", "", level="INFO", issue_number=claim.issue.number
                 )
         if not preparation.setup.succeeded or preparation.baseline is None or not preparation.baseline.succeeded:
             decision = self._evaluator.evaluate(
@@ -176,6 +183,12 @@ class ModelAttemptRunner:
             claim.issue.body,
             self._issue_comments(claim.issue),
             continuation=continuation,
+            issue_number=claim.issue.number,
+        )
+        self._event_log(
+            "model_dispatch_starting",
+            f"continuation={continuation}",
+            level="INFO",
             issue_number=claim.issue.number,
         )
         execution = asyncio.run(
@@ -355,6 +368,12 @@ class AgentLifecycle:
             self._sleeper(self._poll_interval)
             return LifecycleResult(LifecycleStatus.IDLE)
 
+        self._event_log(
+            "issue_claimed",
+            f"title={claim.issue.title!r}",
+            level="INFO",
+            issue_number=claim.issue.number,
+        )
         checkpoint = self._attempt_state.start(
             issue_number=claim.issue.number, branch=f"agent/issue-{claim.issue.number}"
         )
@@ -366,7 +385,19 @@ class AgentLifecycle:
         comment_posted = True
         try:
             prepared = self._workspace.prepare_attempt(base_branch="main", issue_number=claim.issue.number)
+            self._event_log(
+                "workspace_prepared",
+                f"branch={getattr(prepared, 'branch', None)}; base_branch=main",
+                level="INFO",
+                issue_number=claim.issue.number,
+            )
             profile = self._profile_loader(self._workspace.working_directory)
+            self._event_log(
+                "profile_loaded",
+                f"base_branch={profile.base_branch}",
+                level="INFO",
+                issue_number=claim.issue.number,
+            )
             if profile.base_branch != "main":
                 self._workspace.cleanup(
                     base_branch="main", prepared=prepared, retain_branch=False
@@ -374,7 +405,19 @@ class AgentLifecycle:
                 prepared = self._workspace.prepare_attempt(
                     base_branch=profile.base_branch, issue_number=claim.issue.number
                 )
+                self._event_log(
+                    "workspace_reprepared",
+                    f"branch={getattr(prepared, 'branch', None)}; base_branch={profile.base_branch}",
+                    level="INFO",
+                    issue_number=claim.issue.number,
+                )
             self._attempt_state.transition(AttemptPhase.SETUP)
+            self._event_log(
+                "attempt_phase_transitioned",
+                f"phase={AttemptPhase.SETUP.value}",
+                level="INFO",
+                issue_number=claim.issue.number,
+            )
             if self._attempt_runner is None:
                 outcome = AttemptOutcome.INFRASTRUCTURE_ERROR
                 published = self._publish_terminal(

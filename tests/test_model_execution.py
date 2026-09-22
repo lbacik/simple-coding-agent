@@ -628,13 +628,17 @@ def test_model_timeout_gets_a_same_client_handoff_followup_that_succeeds(
     assert execution.status is ModelExecutionStatus.HANDOFF_REQUESTED
 
 
-def test_hard_cost_ceiling_reports_telemetry_and_makes_no_further_calls(
+def test_hard_cost_ceiling_gets_a_same_client_handoff_followup_before_falling_back(
     tmp_path: Path,
 ) -> None:
     captured: list[FakeClient] = []
 
     def client_factory(options: object) -> FakeClient:
-        client = FakeClient(options, [result(stop_reason="max_budget_usd_exceeded")])
+        client = FakeClient(
+            options,
+            [result(stop_reason="max_budget_usd_exceeded")],
+            followup_messages=[result(stop_reason="end_turn")],
+        )
         captured.append(client)
         return client
 
@@ -643,6 +647,137 @@ def test_hard_cost_ceiling_reports_telemetry_and_makes_no_further_calls(
 
     assert execution.status is ModelExecutionStatus.MODEL_LIMIT_REACHED
     assert "hard cost ceiling" in execution.explanation
+    assert len(captured[0].queried_prompts) == 1
+
+
+def test_hard_cost_ceiling_handoff_followup_that_succeeds(tmp_path: Path) -> None:
+    holder: dict[str, ModelExecutor] = {}
+
+    def invoke_handoff_skill() -> None:
+        holder["executor"]._skill_events.append(
+            SkillEvent(phase="PreToolUse", name="handoff", agent_id=None, timestamp="2026-09-22T00:00:00Z")
+        )
+
+    def client_factory(options: object) -> FakeClient:
+        return FakeClient(
+            options,
+            [result(stop_reason="max_budget_usd_exceeded")],
+            followup_messages=[result(stop_reason="end_turn")],
+            on_query=invoke_handoff_skill,
+        )
+
+    executor = ModelExecutor(runtime_config(tmp_path), client_factory=client_factory)
+    holder["executor"] = executor
+
+    execution = asyncio.run(executor.execute(issue_body="Fix it.", working_directory=tmp_path))
+
+    assert execution.status is ModelExecutionStatus.HANDOFF_REQUESTED
+
+
+def test_bare_sdk_error_gets_a_same_client_handoff_followup_before_falling_back(
+    tmp_path: Path,
+) -> None:
+    """The 2026-09-22 issue-45 attempt died from a bare SDK error result mid-turn
+
+    with no max_turns/timeout/budget stop reason attached, and the model was
+    never given a chance to hand off. Any MODEL_LIMIT_REACHED-shaped result
+    must get the same cooperative handoff opportunity as max_turns_exceeded.
+    """
+
+    captured: list[FakeClient] = []
+
+    def client_factory(options: object) -> FakeClient:
+        client = FakeClient(
+            options,
+            [result(is_error=True, stop_reason=None)],
+            followup_messages=[result(stop_reason="end_turn")],
+        )
+        captured.append(client)
+        return client
+
+    executor = ModelExecutor(runtime_config(tmp_path), client_factory=client_factory)
+    execution = asyncio.run(executor.execute(issue_body="Fix it.", working_directory=tmp_path))
+
+    assert execution.status is ModelExecutionStatus.MODEL_LIMIT_REACHED
+    assert len(captured[0].queried_prompts) == 1
+
+
+def test_bare_sdk_error_handoff_followup_that_succeeds(tmp_path: Path) -> None:
+    holder: dict[str, ModelExecutor] = {}
+
+    def invoke_handoff_skill() -> None:
+        holder["executor"]._skill_events.append(
+            SkillEvent(phase="PreToolUse", name="handoff", agent_id=None, timestamp="2026-09-22T00:00:00Z")
+        )
+
+    def client_factory(options: object) -> FakeClient:
+        return FakeClient(
+            options,
+            [result(is_error=True, stop_reason=None)],
+            followup_messages=[result(stop_reason="end_turn")],
+            on_query=invoke_handoff_skill,
+        )
+
+    executor = ModelExecutor(runtime_config(tmp_path), client_factory=client_factory)
+    holder["executor"] = executor
+
+    execution = asyncio.run(executor.execute(issue_body="Fix it.", working_directory=tmp_path))
+
+    assert execution.status is ModelExecutionStatus.HANDOFF_REQUESTED
+
+
+def test_bare_sdk_error_explanation_surfaces_stop_reason_and_api_error_status(
+    tmp_path: Path,
+) -> None:
+    def client_factory(options: object) -> FakeClient:
+        return FakeClient(
+            options,
+            [
+                SimpleNamespace(
+                    is_error=True,
+                    stop_reason=None,
+                    model_usage={"muse-spark-1.3-contributor": {"input_tokens": 12}},
+                    api_error_status=529,
+                    errors=["overloaded_error"],
+                )
+            ],
+        )
+
+    executor = ModelExecutor(runtime_config(tmp_path), client_factory=client_factory)
+    execution = asyncio.run(executor.execute(issue_body="Fix it.", working_directory=tmp_path))
+
+    assert execution.status is ModelExecutionStatus.MODEL_LIMIT_REACHED
+    assert "api_error_status=529" in execution.explanation
+    assert "overloaded_error" in execution.explanation
+
+
+def test_model_mismatch_does_not_get_a_handoff_followup(tmp_path: Path) -> None:
+    """A mismatched model is an infrastructure/config problem, not a limit the
+
+    model itself can cooperate on, so it must not get the turns/budget-style
+    handoff opportunity.
+    """
+
+    captured: list[FakeClient] = []
+
+    def client_factory(options: object) -> FakeClient:
+        client = FakeClient(
+            options,
+            [
+                SimpleNamespace(
+                    is_error=True,
+                    stop_reason=None,
+                    model_usage={"some-other-model": {"input_tokens": 12}},
+                )
+            ],
+        )
+        captured.append(client)
+        return client
+
+    executor = ModelExecutor(runtime_config(tmp_path), client_factory=client_factory)
+    execution = asyncio.run(executor.execute(issue_body="Fix it.", working_directory=tmp_path))
+
+    assert execution.status is ModelExecutionStatus.INFRASTRUCTURE_ERROR
     assert captured[0].queried_prompts == []
 
 

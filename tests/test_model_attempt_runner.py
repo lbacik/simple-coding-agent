@@ -114,10 +114,12 @@ def build_runner(
     workspace: "FakeWorkspace | None" = None,
     issue_comments=lambda issue: (),
     issue_number: int = 24,
+    event_log=None,
 ) -> ModelAttemptRunner:
     attempt_state = AttemptStateStore(tmp_path)
     attempt_state.start(issue_number=issue_number, branch=f"agent/issue-{issue_number}")
     attempt_state.transition(AttemptPhase.SETUP)
+    kwargs = {} if event_log is None else {"event_log": event_log}
     return ModelAttemptRunner(
         attempt_state=attempt_state,
         workspace=workspace or FakeWorkspace(),
@@ -125,7 +127,36 @@ def build_runner(
         evaluator=FakeEvaluator(),
         model_executor=model_executor,
         issue_comments=issue_comments,
+        **kwargs,
     )
+
+
+def test_logs_setup_baseline_and_model_dispatch_stages(tmp_path: Path) -> None:
+    """Setup, baseline check, and model dispatch previously ran silently on
+
+    success; only failures were logged. An operator watching the log stream
+    couldn't tell an attempt was progressing normally versus stuck.
+    """
+
+    executor = FakeModelExecutor()
+    events: list[tuple[str, int | None]] = []
+    runner = build_runner(
+        tmp_path,
+        model_executor=executor,
+        event_log=lambda event, detail="", level="INFO", issue_number=None: events.append(
+            (event, issue_number)
+        ),
+    )
+
+    runner(claim(issue_number=24, issue_body="Fix the parser."), profile(), FakePrepared())
+
+    assert [event for event, _ in events] == [
+        "setup_started",
+        "setup_succeeded",
+        "baseline_check_succeeded",
+        "model_dispatch_starting",
+    ]
+    assert all(issue_number == 24 for _, issue_number in events)
 
 
 class FakeModelExecutor:
