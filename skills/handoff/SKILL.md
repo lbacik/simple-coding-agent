@@ -66,7 +66,8 @@ other publishing command.
    the note, posts it as an issue comment, and manages the continuation
    labels.
 
-If there is nothing to preserve (no dirty/untracked changes and no commits
+If there is no code change to preserve (no dirty/untracked changes and no commits
 already on the branch beyond its base), still write and commit the note —
-the driving process treats a note-only handoff as `no_changes`, not as an
-error, so it is always safe to follow these steps.
+the handoff note itself preserves progress (such as investigation findings
+and implementation plans), and the driving process will publish the branch and note
+for human evaluation.

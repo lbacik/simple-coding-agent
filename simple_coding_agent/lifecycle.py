@@ -232,14 +232,7 @@ class ModelAttemptRunner:
                 )
                 return _attempt_evidence(decision, profile, None, 0, "not run", str(error))
         commits = getattr(self._workspace, "commits_added")(prepared)
-        if execution.status is ModelExecutionStatus.HANDOFF_REQUESTED:
-            # The handoff note commit is not preserved work by itself; a
-            # request that only produced the note downgrades to no_changes.
-            effective_commit_count = sum(
-                1 for commit in commits if not _is_handoff_note_commit(commit)
-            )
-        else:
-            effective_commit_count = len(commits)
+        commit_count = len(commits)
         review_count = sum(
             event.name == "code-review" and event.phase == "PreToolUse"
             for event in execution.skill_events
@@ -268,7 +261,7 @@ class ModelAttemptRunner:
             setup=preparation.setup,
             baseline=preparation.baseline,
             model_status=execution.status,
-            commit_count=effective_commit_count,
+            commit_count=commit_count,
             acceptance_criteria_satisfied=(
                 review_count > 0 and self._acceptance_criteria_satisfied(claim)
             ),

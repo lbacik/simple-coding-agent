@@ -186,7 +186,7 @@ class CompletionEvaluator:
             if commit_count <= 0:
                 return _decision(
                     AttemptOutcome.NO_CHANGES,
-                    "Handoff was requested without any preserved work commits.",
+                    "Handoff was requested without any commits on the branch.",
                     commit_count,
                 )
             return CompletionDecision(

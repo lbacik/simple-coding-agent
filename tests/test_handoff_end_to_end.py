@@ -24,6 +24,7 @@ from __future__ import annotations
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
+import os
 import subprocess
 
 from simple_coding_agent.attempt_state import AttemptPhase, AttemptStateStore
@@ -538,27 +539,29 @@ def test_handoff_reports_infrastructure_error_when_the_note_commit_fails(tmp_pat
     assert git(clone_dir, "rev-parse", "--verify", "agent/issue-24")
 
 
-# --- Scenario 12: note-only handoff downgrades to no_changes and is discarded
+# --- Scenario 12: note-only handoff preserves progress and publishes as handoff
 
 
-def test_note_only_handoff_downgrades_to_no_changes_and_is_not_published(
+def test_note_only_handoff_publishes_as_handoff(
     tmp_path: Path,
 ) -> None:
     remote, _ = repository_with_main(tmp_path)
     github = FakeGitHub(issue(24, body="Investigate flaky test."))
 
     def note_only(working_directory: Path) -> None:
-        write_handoff_note(working_directory, 24, "# Handoff note: issue #24\n\nNothing to preserve.\n")
+        write_handoff_note(working_directory, 24, "# Handoff note: issue #24\n\nInvestigation complete, no code changes.\n")
 
     executor = FakeModelExecutor(actions=[note_only], handoff=True)
     lifecycle = build_lifecycle(remote, tmp_path / "clone", tmp_path / "data", github, executor)
 
     result = lifecycle.run_once()
 
-    assert result.outcome is AttemptOutcome.NO_CHANGES
+    assert result.outcome is AttemptOutcome.HANDOFF
     assert github.pull_requests == {}
-    assert github.added_labels == []
-    assert not remote_has_branch(remote, "agent/issue-24")
+    assert github.added_labels == [("issue-24", "round-finished")]
+    assert remote_has_branch(remote, "agent/issue-24")
+    [comment] = [c for c in github.comments if "Agent Attempt Result: handoff" in c.body]
+    assert "Investigation complete, no code changes." in comment.body
 
 
 # --- Scenario 13: repeated handoff retains note history and both comments ---
@@ -980,4 +983,5 @@ def remote_has_branch(remote: Path, branch: str) -> bool:
 
 
 def git(cwd: Path, *arguments: str) -> str:
-    return subprocess.run(("git", *arguments), cwd=cwd, check=True, text=True, capture_output=True).stdout.strip()
+    env = dict(os.environ, GIT_EDITOR="true")
+    return subprocess.run(("git", *arguments), cwd=cwd, env=env, check=True, text=True, capture_output=True).stdout.strip()
