@@ -334,31 +334,208 @@ def test_real_handoff_is_produced_pushed_and_labeled_without_a_pull_request(
     assert github.assignee_logins == []
 
 
-# --- Scenario 11b: the note commit stays last even with stray dirty leftovers
+# --- Scenario 11b: a stray dirty leftover after the note breaks the note-last
+# invariant, so it is preserved locally instead of silently discarded or
+# published as a trustworthy handoff.
 
 
-def test_handoff_note_stays_the_last_commit_despite_a_stray_dirty_leftover(
+def test_stray_dirty_leftover_after_the_note_is_preserved_not_published(
     tmp_path: Path,
 ) -> None:
     remote, _ = repository_with_main(tmp_path)
     github = FakeGitHub(issue(24, body="Rewrite the parser.", labels=frozenset({"ready-for-agent"})))
+    clone_dir = tmp_path / "clone"
 
     def do_handoff(working_directory: Path) -> None:
         write_and_commit(working_directory, "parser.py", "half done", "Half-finish the parser")
         write_handoff_note(working_directory, 24, "# Handoff note: issue #24\n\nHalfway done.\n")
         # A stray artifact left behind after the note was already committed
-        # (e.g. a hook side effect) must not become a commit on top of it.
+        # (e.g. a hook side effect) must be preserved, not silently discarded
+        # -- but it also means the note is no longer trustworthy as the
+        # final word on the branch, so this cannot publish as a handoff.
         (working_directory / "stray.tmp").write_text("noise")
 
     executor = FakeModelExecutor(actions=[do_handoff], handoff=True)
-    lifecycle = build_lifecycle(remote, tmp_path / "clone", tmp_path / "data", github, executor)
+    lifecycle = build_lifecycle(remote, clone_dir, tmp_path / "data", github, executor)
 
     result = lifecycle.run_once()
 
-    assert result.outcome is AttemptOutcome.HANDOFF
-    subjects = remote_branch_subjects(remote, "agent/issue-24")
-    assert subjects[0] == "Handoff note: issue #24"
-    assert "Preserve uncommitted work before handoff" not in subjects
+    assert result.outcome is AttemptOutcome.INFRASTRUCTURE_ERROR
+    assert not remote_has_branch(remote, "agent/issue-24")
+    assert github.added_labels == []
+    subjects = git(clone_dir, "log", "agent/issue-24", "--format=%s").splitlines()
+    assert subjects[:3] == [
+        "Preserve uncommitted work before handoff",
+        "Handoff note: issue #24",
+        "Half-finish the parser",
+    ]
+    assert git(clone_dir, "show", "agent/issue-24:stray.tmp") == "noise"
+
+
+# --- Scenario 11d: a valid handoff survives locally when push is exhausted --
+
+
+def test_valid_handoff_survives_locally_when_push_retries_are_exhausted(
+    tmp_path: Path,
+) -> None:
+    """A well-formed handoff (work, then note, nothing dirty after) whose push fails.
+
+    Nothing is left dirty by the time push is attempted -- ``commit_dirty_work``
+    already ran -- so this proves the "note commit or push fails" preservation
+    guarantee for the ordinary case: local content, not merely branch
+    existence, survives an exhausted push.
+    """
+
+    remote, _ = repository_with_main(tmp_path)
+    github = FakeGitHub(issue(24, body="Rewrite the parser.", labels=frozenset({"ready-for-agent"})))
+    clone_dir = tmp_path / "clone"
+
+    def do_handoff(working_directory: Path) -> None:
+        write_and_commit(working_directory, "parser.py", "half done", "Half-finish the parser")
+        write_handoff_note(working_directory, 24, "# Handoff note: issue #24\n\nHalfway done.\n")
+        # Break the remote after the initial clone/fetch so push exhausts its retries.
+        git(working_directory, "remote", "set-url", "origin", str(tmp_path / "nonexistent.git"))
+
+    executor = FakeModelExecutor(actions=[do_handoff], handoff=True)
+    lifecycle = build_lifecycle(remote, clone_dir, tmp_path / "data", github, executor)
+
+    result = lifecycle.run_once()
+
+    assert result.outcome is AttemptOutcome.INFRASTRUCTURE_ERROR
+    assert not remote_has_branch(remote, "agent/issue-24")
+    subjects = git(clone_dir, "log", "agent/issue-24", "--format=%s").splitlines()
+    assert subjects[:2] == ["Handoff note: issue #24", "Half-finish the parser"]
+    assert git(clone_dir, "show", "agent/issue-24:parser.py") == "half done"
+
+
+# --- Scenario 11c: a handoff without a committed note cannot publish --------
+
+
+def test_handoff_without_a_committed_note_is_not_published(tmp_path: Path) -> None:
+    remote, _ = repository_with_main(tmp_path)
+    github = FakeGitHub(issue(24, body="Rewrite the parser.", labels=frozenset({"ready-for-agent"})))
+    clone_dir = tmp_path / "clone"
+
+    def do_handoff(working_directory: Path) -> None:
+        write_and_commit(working_directory, "parser.py", "half done", "Half-finish the parser")
+
+    executor = FakeModelExecutor(actions=[do_handoff], handoff=True)
+    lifecycle = build_lifecycle(remote, clone_dir, tmp_path / "data", github, executor)
+
+    result = lifecycle.run_once()
+
+    assert result.outcome is AttemptOutcome.INFRASTRUCTURE_ERROR
+    assert not remote_has_branch(remote, "agent/issue-24")
+    assert github.added_labels == []
+    [comment] = github.comments
+    assert "## Agent Attempt Result: infrastructure_error" in comment.body
+
+
+def test_handoff_with_an_uncommitted_note_is_not_published(tmp_path: Path) -> None:
+    remote, _ = repository_with_main(tmp_path)
+    github = FakeGitHub(issue(24, body="Rewrite the parser.", labels=frozenset({"ready-for-agent"})))
+    clone_dir = tmp_path / "clone"
+
+    def do_handoff(working_directory: Path) -> None:
+        write_and_commit(working_directory, "parser.py", "half done", "Half-finish the parser")
+        # The note is written but never committed by the model.
+        note_path = working_directory / ".agent" / "handoff" / "24.md"
+        note_path.parent.mkdir(parents=True, exist_ok=True)
+        note_path.write_text("# Handoff note: issue #24\n\nHalfway done.\n")
+
+    executor = FakeModelExecutor(actions=[do_handoff], handoff=True)
+    lifecycle = build_lifecycle(remote, clone_dir, tmp_path / "data", github, executor)
+
+    result = lifecycle.run_once()
+
+    assert result.outcome is AttemptOutcome.INFRASTRUCTURE_ERROR
+    assert not remote_has_branch(remote, "agent/issue-24")
+    assert github.added_labels == []
+    # The note content still survives locally, as an ordinary preserved commit.
+    assert git(clone_dir, "show", "agent/issue-24:.agent/handoff/24.md") == (
+        "# Handoff note: issue #24\n\nHalfway done."
+    )
+
+
+def test_handoff_note_commit_with_the_expected_subject_but_no_note_file_is_not_published(
+    tmp_path: Path,
+) -> None:
+    remote, _ = repository_with_main(tmp_path)
+    github = FakeGitHub(issue(24, body="Rewrite the parser.", labels=frozenset({"ready-for-agent"})))
+    clone_dir = tmp_path / "clone"
+
+    def do_handoff(working_directory: Path) -> None:
+        write_and_commit(working_directory, "parser.py", "half done", "Half-finish the parser")
+        git(working_directory, "commit", "--allow-empty", "-m", "Handoff note: issue #24")
+
+    executor = FakeModelExecutor(actions=[do_handoff], handoff=True)
+    lifecycle = build_lifecycle(remote, clone_dir, tmp_path / "data", github, executor)
+
+    result = lifecycle.run_once()
+
+    assert result.outcome is AttemptOutcome.INFRASTRUCTURE_ERROR
+    assert not remote_has_branch(remote, "agent/issue-24")
+    assert github.added_labels == []
+
+
+def test_handoff_note_with_stale_last_work_commit_is_not_published(tmp_path: Path) -> None:
+    remote, _ = repository_with_main(tmp_path)
+    github = FakeGitHub(issue(24, body="Rewrite the parser.", labels=frozenset({"ready-for-agent"})))
+    clone_dir = tmp_path / "clone"
+
+    def do_handoff(working_directory: Path) -> None:
+        write_and_commit(working_directory, "parser.py", "half done", "Half-finish the parser")
+        write_handoff_note(
+            working_directory,
+            24,
+            "# Handoff note: issue #24\n\nHalfway done.\n",
+            last_work_commit="0" * 40,
+        )
+
+    executor = FakeModelExecutor(actions=[do_handoff], handoff=True)
+    lifecycle = build_lifecycle(remote, clone_dir, tmp_path / "data", github, executor)
+
+    result = lifecycle.run_once()
+
+    assert result.outcome is AttemptOutcome.INFRASTRUCTURE_ERROR
+    assert not remote_has_branch(remote, "agent/issue-24")
+    assert github.added_labels == []
+
+
+def test_handoff_reports_infrastructure_error_when_the_note_commit_fails(tmp_path: Path) -> None:
+    """Apply the same evidence-preserving outcome when the note commit itself fails.
+
+    A failed commit is simulated with a rejecting pre-commit hook rather than
+    the note validation path above: the note is left dirty on disk (as the
+    model would leave it after a failed ``git commit``), so this exercises
+    ``commit_dirty_work`` raising instead of a bad-but-committed note.
+    """
+
+    remote, _ = repository_with_main(tmp_path)
+    github = FakeGitHub(issue(24, body="Rewrite the parser.", labels=frozenset({"ready-for-agent"})))
+    clone_dir = tmp_path / "clone"
+
+    def do_handoff(working_directory: Path) -> None:
+        write_and_commit(working_directory, "parser.py", "half done", "Half-finish the parser")
+        hooks_dir = working_directory / ".git" / "hooks"
+        hooks_dir.mkdir(parents=True, exist_ok=True)
+        hook = hooks_dir / "pre-commit"
+        hook.write_text("#!/bin/sh\nexit 1\n")
+        hook.chmod(0o755)
+        note_dir = working_directory / ".agent" / "handoff"
+        note_dir.mkdir(parents=True, exist_ok=True)
+        (note_dir / "24.md").write_text("# Handoff note: issue #24\n\nHalfway done.\n")
+
+    executor = FakeModelExecutor(actions=[do_handoff], handoff=True)
+    lifecycle = build_lifecycle(remote, clone_dir, tmp_path / "data", github, executor)
+
+    result = lifecycle.run_once()
+
+    assert result.outcome is AttemptOutcome.INFRASTRUCTURE_ERROR
+    assert not remote_has_branch(remote, "agent/issue-24")
+    assert github.added_labels == []
+    # The local branch is retained (not deleted) so the evidence stays inspectable.
+    assert git(clone_dir, "rev-parse", "--verify", "agent/issue-24")
 
 
 # --- Scenario 12: note-only handoff downgrades to no_changes and is discarded
@@ -752,11 +929,35 @@ def write_and_commit(repository: Path, name: str, contents: str, message: str) -
     git(repository, "commit", "-m", message)
 
 
-def write_handoff_note(working_directory: Path, issue_number: int, body: str) -> None:
-    """Stand in for the handoff skill's own final, separate note commit."""
+def write_handoff_note(
+    working_directory: Path,
+    issue_number: int,
+    body: str,
+    *,
+    reason: str = "cost_soft_threshold",
+    last_work_commit: str | None = None,
+) -> None:
+    """Stand in for the handoff skill's own final, separate note commit.
 
+    Follows the required note format from ``skills/handoff/SKILL.md`` so the
+    resulting commit passes ``lifecycle._validate_handoff_note``: a title
+    referencing the issue, the required metadata fields, and a
+    ``last_work_commit`` pointing at whatever HEAD already was (the last
+    preserved work commit, or the branch's base if there was none) unless a
+    caller passes one explicitly, e.g. to exercise a stale-metadata rejection.
+    """
+
+    last_work_commit = last_work_commit or git(working_directory, "rev-parse", "HEAD")
+    note = (
+        f"# Handoff note: issue #{issue_number}\n\n"
+        f"- issue: {issue_number}\n"
+        "- started_at: 2026-09-22T00:00:00Z\n"
+        f"- reason: {reason}\n"
+        f"- last_work_commit: {last_work_commit}\n\n"
+        f"{body}"
+    )
     (working_directory / ".agent" / "handoff").mkdir(parents=True, exist_ok=True)
-    write_and_commit(working_directory, f".agent/handoff/{issue_number}.md", body, f"Handoff note: issue #{issue_number}")
+    write_and_commit(working_directory, f".agent/handoff/{issue_number}.md", note, f"Handoff note: issue #{issue_number}")
 
 
 def remote_branch_subjects(remote: Path, branch: str) -> list[str]:
