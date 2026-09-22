@@ -75,7 +75,13 @@ class VerificationRunner:
         self._baseline_passed = False
         self._review_completed = False
 
-    def prepare(self, profile: RepositoryProfile, working_directory: Path) -> PreparationEvidence:
+    def prepare(
+        self,
+        profile: RepositoryProfile,
+        working_directory: Path,
+        *,
+        continuation: bool = False,
+    ) -> PreparationEvidence:
         """Run setup and, only after success, an uncached baseline check."""
 
         self._baseline_passed = False
@@ -90,7 +96,7 @@ class VerificationRunner:
             self._baseline_passed = False
             return PreparationEvidence(setup=setup, baseline=None)
         baseline = self._run_check(profile, working_directory)
-        self._baseline_passed = baseline.succeeded
+        self._baseline_passed = baseline.succeeded or continuation
         return PreparationEvidence(setup=setup, baseline=baseline)
 
     def mark_review_complete(
@@ -147,6 +153,7 @@ class CompletionEvaluator:
         push_succeeded: bool | None = None,
         pr_exists: bool | None = None,
         profile_error: ProfileError | None = None,
+        continuation: bool = False,
     ) -> CompletionDecision:
         """Classify observed evidence; a local pass is eligibility, not completion."""
 
@@ -166,7 +173,7 @@ class CompletionEvaluator:
                 "Baseline check was not observed.",
                 commit_count,
             )
-        if not baseline.succeeded:
+        if not baseline.succeeded and not continuation:
             return _decision(
                 AttemptOutcome.INCOMPLETE,
                 "Baseline check failed before model execution.",

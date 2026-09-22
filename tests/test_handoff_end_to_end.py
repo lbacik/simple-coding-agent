@@ -237,6 +237,56 @@ def test_missing_continuation_branch_short_circuits_to_incomplete(tmp_path: Path
     assert not remote_has_branch(remote, "agent/issue-24")
 
 
+# --- Scenario 7b: continuation with failing baseline check succeeds when fixed ---
+
+
+def test_continuation_with_broken_baseline_check_succeeds_when_fixed_by_model(tmp_path: Path) -> None:
+    """A prior attempt may end in emergency/incomplete mode with broken tests on the branch.
+
+    On continuation, a failing baseline check must be tolerated, allowing the model
+    to fix the broken work and achieve completion.
+    """
+    remote, _ = repository_with_main(tmp_path)
+    publish_attempt_branch(
+        tmp_path,
+        remote,
+        24,
+        {".agent/handoff/24.md": "Remaining: fix tests"},
+        "Handoff note: issue #24",
+    )
+    github = FakeGitHub(
+        issue(24, body="Fix broken tests.", labels=frozenset({"ready-for-agent", "round-finished"})),
+        comments=(IssueComment(author_login="agent", body="## Agent Attempt Result: incomplete\n\nhanded off"),),
+    )
+    check_profile = RepositoryProfile(
+        setup=(),
+        check=("test -f fixed.txt",),
+        base_branch="main",
+        timeout=30,
+        setup_timeout=30,
+        env={},
+    )
+
+    def fix_and_commit(wd: Path) -> None:
+        write_and_commit(wd, "fixed.txt", "fixed content", "Fix the failing test")
+
+    executor = FakeModelExecutor(actions=[fix_and_commit])
+    lifecycle = build_lifecycle(
+        remote,
+        tmp_path / "clone",
+        tmp_path / "data",
+        github,
+        executor,
+        profile_fn=lambda _: check_profile,
+    )
+
+    result = lifecycle.run_once()
+
+    assert result.outcome is AttemptOutcome.COMPLETE
+    assert executor.calls == 1
+    assert "agent/issue-24" in github.pull_requests
+
+
 # --- Scenario 8: zero-commit handoff stays no_changes ------------------------
 
 
@@ -734,6 +784,8 @@ def build_lifecycle(
     data_dir: Path,
     github: "FakeGitHub",
     executor: "FakeModelExecutor",
+    *,
+    profile_fn=None,
 ) -> AgentLifecycle:
     attempt_state = AttemptStateStore(data_dir)
     workspace = GitWorkspace(clone_dir, str(remote), token_provider=lambda: "token")
@@ -751,7 +803,7 @@ def build_lifecycle(
         tracker=tracker,
         attempt_state=attempt_state,
         workspace=workspace,
-        profile_loader=lambda _: profile(),
+        profile_loader=profile_fn or (lambda _: profile()),
         publisher=publisher,
         attempt_runner=runner,
         sleeper=lambda _: None,

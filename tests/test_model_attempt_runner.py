@@ -112,6 +112,7 @@ def build_runner(
     *,
     model_executor: "FakeModelExecutor",
     workspace: "FakeWorkspace | None" = None,
+    verifier: "FakeVerifier | None" = None,
     issue_comments=lambda issue: (),
     issue_number: int = 24,
     event_log=None,
@@ -123,7 +124,7 @@ def build_runner(
     return ModelAttemptRunner(
         attempt_state=attempt_state,
         workspace=workspace or FakeWorkspace(),
-        verifier=FakeVerifier(),
+        verifier=verifier or FakeVerifier(),
         evaluator=FakeEvaluator(),
         model_executor=model_executor,
         issue_comments=issue_comments,
@@ -159,6 +160,57 @@ def test_logs_setup_baseline_and_model_dispatch_stages(tmp_path: Path) -> None:
     assert all(issue_number == 24 for _, issue_number in events)
 
 
+def test_baseline_failure_tolerated_on_continuation_and_logs_warning(tmp_path: Path) -> None:
+    executor = FakeModelExecutor()
+    events: list[tuple[str, str, int | None]] = []
+    workspace = FakeWorkspace(commits=("Previous work",))
+    verifier = FakeVerifier(baseline_succeeded=False)
+    runner = build_runner(
+        tmp_path,
+        model_executor=executor,
+        workspace=workspace,
+        verifier=verifier,
+        event_log=lambda event, detail="", level="INFO", issue_number=None: events.append(
+            (event, level, issue_number)
+        ),
+    )
+
+    runner(claim(issue_number=24, issue_body="Fix the parser."), profile(), FakePrepared())
+
+    assert [(event, level) for event, level, _ in events] == [
+        ("setup_started", "INFO"),
+        ("setup_succeeded", "INFO"),
+        ("baseline_check_failed", "WARNING"),
+        ("model_dispatch_starting", "INFO"),
+    ]
+    assert executor.captured_prompt is not None
+
+
+def test_baseline_failure_aborts_on_fresh_attempt_and_logs_error(tmp_path: Path) -> None:
+    executor = FakeModelExecutor()
+    events: list[tuple[str, str, int | None]] = []
+    workspace = FakeWorkspace(commits=())
+    verifier = FakeVerifier(baseline_succeeded=False)
+    runner = build_runner(
+        tmp_path,
+        model_executor=executor,
+        workspace=workspace,
+        verifier=verifier,
+        event_log=lambda event, detail="", level="INFO", issue_number=None: events.append(
+            (event, level, issue_number)
+        ),
+    )
+
+    runner(claim(issue_number=24, issue_body="Fix the parser."), profile(), FakePrepared())
+
+    assert [(event, level) for event, level, _ in events] == [
+        ("setup_started", "INFO"),
+        ("setup_succeeded", "INFO"),
+        ("baseline_check_failed", "ERROR"),
+    ]
+    assert executor.captured_prompt is None
+
+
 class FakeModelExecutor:
     def __init__(self, *, status: ModelExecutionStatus = ModelExecutionStatus.MODEL_LIMIT_REACHED) -> None:
         self.captured_prompt: str | None = None
@@ -179,9 +231,17 @@ class FakeModelExecutor:
 
 
 class FakeVerifier:
-    def prepare(self, profile: object, working_directory: Path):
-        result = SimpleNamespace(succeeded=True, commands=())
-        return SimpleNamespace(setup=result, baseline=result)
+    def __init__(self, *, baseline_succeeded: bool = True) -> None:
+        self._baseline_succeeded = baseline_succeeded
+
+    def prepare(self, profile: object, working_directory: Path, **kwargs: object):
+        setup = SimpleNamespace(succeeded=True, commands=())
+        baseline = SimpleNamespace(
+            succeeded=self._baseline_succeeded,
+            commands=(),
+            exit_code=0 if self._baseline_succeeded else 1,
+        )
+        return SimpleNamespace(setup=setup, baseline=baseline)
 
     def mark_review_complete(self, **kwargs: object) -> None:
         return None

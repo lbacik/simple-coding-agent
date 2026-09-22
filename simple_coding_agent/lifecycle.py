@@ -144,8 +144,24 @@ class ModelAttemptRunner:
             if checkpoint is not None and self._attempt_archive_factory is not None
             else None
         )
+        initial_commits = (
+            getattr(self._workspace, "commits_added")(prepared)
+            if hasattr(self._workspace, "commits_added")
+            else ()
+        )
+        continuation = bool(initial_commits)
         self._event_log("setup_started", "", level="INFO", issue_number=claim.issue.number)
-        preparation = self._verifier.prepare(profile, getattr(self._workspace, "working_directory"))
+        try:
+            preparation = self._verifier.prepare(
+                profile,
+                getattr(self._workspace, "working_directory"),
+                continuation=continuation,
+            )
+        except TypeError:
+            preparation = self._verifier.prepare(
+                profile,
+                getattr(self._workspace, "working_directory"),
+            )
         _archive_commands(archive, "setup", preparation.setup)
         if not preparation.setup.succeeded:
             self._event_log(
@@ -162,19 +178,39 @@ class ModelAttemptRunner:
                 self._event_log(
                     "baseline_check_failed",
                     _command_failure_detail(preparation.baseline),
-                    level="ERROR",
+                    level="WARNING" if continuation else "ERROR",
                     issue_number=claim.issue.number,
                 )
             else:
                 self._event_log(
                     "baseline_check_succeeded", "", level="INFO", issue_number=claim.issue.number
                 )
-        if not preparation.setup.succeeded or preparation.baseline is None or not preparation.baseline.succeeded:
-            decision = self._evaluator.evaluate(
-                setup=preparation.setup, baseline=preparation.baseline, model_status=None,
-                commit_count=0, acceptance_criteria_satisfied=False,
-                review=ReviewEvidence((), 0), final_check=None,
-            )
+        if (
+            not preparation.setup.succeeded
+            or preparation.baseline is None
+            or (not preparation.baseline.succeeded and not continuation)
+        ):
+            try:
+                decision = self._evaluator.evaluate(
+                    setup=preparation.setup,
+                    baseline=preparation.baseline,
+                    model_status=None,
+                    commit_count=0,
+                    acceptance_criteria_satisfied=False,
+                    review=ReviewEvidence((), 0),
+                    final_check=None,
+                    continuation=continuation,
+                )
+            except TypeError:
+                decision = self._evaluator.evaluate(
+                    setup=preparation.setup,
+                    baseline=preparation.baseline,
+                    model_status=None,
+                    commit_count=0,
+                    acceptance_criteria_satisfied=False,
+                    review=ReviewEvidence((), 0),
+                    final_check=None,
+                )
             return _attempt_evidence(decision, profile, None, 0, "not run")
 
         self._attempt_state.transition(AttemptPhase.MODEL_RUNNING)
@@ -182,7 +218,6 @@ class ModelAttemptRunner:
         # point is carried over from a resumed attempt, not produced by this
         # run. `commits_added` is read again after the model runs to count
         # what this run itself added.
-        continuation = bool(getattr(self._workspace, "commits_added")(prepared))
         prompt_body = _build_starting_prompt(
             claim.issue.body,
             self._issue_comments(claim.issue),
@@ -279,17 +314,31 @@ class ModelAttemptRunner:
                     level="ERROR",
                     issue_number=claim.issue.number,
                 )
-        decision = self._evaluator.evaluate(
-            setup=preparation.setup,
-            baseline=preparation.baseline,
-            model_status=execution.status,
-            commit_count=commit_count,
-            acceptance_criteria_satisfied=(
-                review_count > 0 and self._acceptance_criteria_satisfied(claim)
-            ),
-            review=review,
-            final_check=final_check,
-        )
+        try:
+            decision = self._evaluator.evaluate(
+                setup=preparation.setup,
+                baseline=preparation.baseline,
+                model_status=execution.status,
+                commit_count=commit_count,
+                acceptance_criteria_satisfied=(
+                    review_count > 0 and self._acceptance_criteria_satisfied(claim)
+                ),
+                review=review,
+                final_check=final_check,
+                continuation=continuation,
+            )
+        except TypeError:
+            decision = self._evaluator.evaluate(
+                setup=preparation.setup,
+                baseline=preparation.baseline,
+                model_status=execution.status,
+                commit_count=commit_count,
+                acceptance_criteria_satisfied=(
+                    review_count > 0 and self._acceptance_criteria_satisfied(claim)
+                ),
+                review=review,
+                final_check=final_check,
+            )
         handoff_rejection_reason: str | None = None
         if decision.outcome is AttemptOutcome.HANDOFF:
             validation = _validate_handoff_note(

@@ -115,6 +115,53 @@ def test_baseline_failure_is_incomplete_before_model_execution() -> None:
     assert decision.publication_eligible is False
 
 
+def test_baseline_failure_on_continuation_allows_successful_completion() -> None:
+    evaluator = CompletionEvaluator({"must-fix"})
+    common = dict(
+        setup=command_result(),
+        baseline=command_result(CommandStatus.FAILED),
+        model_status=ModelExecutionStatus.SUCCEEDED,
+        commit_count=1,
+        acceptance_criteria_satisfied=True,
+        review=ReviewEvidence((), 0),
+        final_check=command_result(CommandStatus.SUCCEEDED),
+        continuation=True,
+    )
+    eligible = evaluator.evaluate(**common)
+    complete = evaluator.evaluate(**common, push_succeeded=True, pr_exists=True)
+    assert eligible.outcome is None
+    assert eligible.publication_eligible is True
+    assert complete.outcome is AttemptOutcome.COMPLETE
+
+
+def test_verification_allows_baseline_failure_on_continuation(tmp_path: Path) -> None:
+    class Runner:
+        def __init__(self) -> None:
+            self.calls = []
+
+        def run(self, commands, **kwargs):
+            self.calls.append(commands)
+            if len(self.calls) == 2:  # baseline check
+                return command_result(CommandStatus.FAILED)
+            return command_result(CommandStatus.SUCCEEDED)
+
+    profile = RepositoryProfile(("setup",), ("check",), "main", 30, 20, {})
+    runner = Runner()
+    verifier = VerificationRunner(runner)
+
+    preparation = verifier.prepare(profile, tmp_path, continuation=True)
+    assert preparation.setup.succeeded
+    assert not preparation.baseline.succeeded
+
+    verifier.mark_review_complete(
+        model_status=ModelExecutionStatus.SUCCEEDED,
+        commit_count=1,
+        review=ReviewEvidence((), 0),
+    )
+    final_check = verifier.final_check(profile, tmp_path)
+    assert final_check.succeeded
+
+
 def test_zero_commit_successful_skill_run_is_no_changes() -> None:
     decision = CompletionEvaluator({"must-fix"}).evaluate(
         setup=command_result(), baseline=command_result(), model_status=ModelExecutionStatus.SUCCEEDED,
