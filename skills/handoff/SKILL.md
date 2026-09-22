@@ -1,7 +1,6 @@
 ---
 name: handoff
 description: "Pause an implementation attempt cooperatively near a resource limit, preserving progress for human-approved continuation."
-disable-model-invocation: true
 ---
 
 Invoke this skill only when instructed to do so (a cost soft-threshold
