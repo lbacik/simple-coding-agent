@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
+import re
 import time
 from typing import Protocol
 
@@ -22,7 +23,7 @@ from simple_coding_agent.completion import (
     VerificationRunner,
 )
 from simple_coding_agent.config import RepositoryProfile
-from simple_coding_agent.git_workspace import GitWorkspaceRecoveryError
+from simple_coding_agent.git_workspace import GitWorkspaceError, GitWorkspaceRecoveryError
 from simple_coding_agent.github_tracker import ROUND_FINISHED, Claim, TrackerIssue
 from simple_coding_agent.model_execution import ModelExecutionStatus, ModelExecutor
 from simple_coding_agent.observability import AttemptArchive
@@ -194,14 +195,29 @@ class ModelAttemptRunner:
                 }
             )
         if execution.status is ModelExecutionStatus.HANDOFF_REQUESTED:
-            preexisting_commits = getattr(self._workspace, "commits_added")(prepared)
-            # Only commit leftover dirty work when the note isn't already the
-            # last commit: the note must stay the final commit on the branch,
-            # and a well-behaved handoff never leaves anything dirty after it.
-            if not _is_handoff_recovery(preexisting_commits):
+            # Always preserve dirty/untracked work as a commit rather than
+            # letting it get silently discarded by cleanup()'s hard reset.
+            # This can leave the note no longer the final commit; that is
+            # caught below as an invalid handoff rather than papered over,
+            # since a continuation must be able to trust that the note is
+            # genuinely the last word on the branch.
+            try:
                 getattr(self._workspace, "commit_dirty_work")(
                     "Preserve uncommitted work before handoff"
                 )
+            except GitWorkspaceError as error:
+                # A decision here (rather than letting this propagate to the
+                # generic exception handler) routes through the normal
+                # infrastructure_error retain_branch logic, so the branch and
+                # whatever did commit are kept locally for inspection instead
+                # of being deleted as an assumed-discardable failed attempt.
+                decision = CompletionDecision(
+                    outcome=AttemptOutcome.INFRASTRUCTURE_ERROR,
+                    publication_eligible=False,
+                    publication_path=PublicationPath.NONE,
+                    reasons=(f"Failed to preserve dirty work before handoff: {error}",),
+                )
+                return _attempt_evidence(decision, profile, None, 0, "not run", str(error))
         commits = getattr(self._workspace, "commits_added")(prepared)
         if execution.status is ModelExecutionStatus.HANDOFF_REQUESTED:
             # The handoff note commit is not preserved work by itself; a
@@ -246,6 +262,22 @@ class ModelAttemptRunner:
             review=review,
             final_check=final_check,
         )
+        handoff_rejection_reason: str | None = None
+        if decision.outcome is AttemptOutcome.HANDOFF:
+            validation = _validate_handoff_note(
+                commits,
+                claim.issue.number,
+                getattr(self._workspace, "working_directory"),
+                getattr(prepared, "base_revision"),
+            )
+            if not validation.valid:
+                decision = CompletionDecision(
+                    outcome=AttemptOutcome.INFRASTRUCTURE_ERROR,
+                    publication_eligible=False,
+                    publication_path=PublicationPath.NONE,
+                    reasons=(validation.reason,),
+                )
+                handoff_rejection_reason = validation.reason
         if decision.publication_eligible or decision.publication_path is PublicationPath.PARTIAL:
             self._attempt_state.transition(AttemptPhase.PUSHING)
         findings = "all clear" if not review.findings else "; ".join(finding.summary for finding in review.findings)
@@ -257,6 +289,8 @@ class ModelAttemptRunner:
             )
             if commits and _is_handoff_note_commit(commits[0]):
                 note_commit_sha = commits[0].revision
+        elif handoff_rejection_reason is not None:
+            details = handoff_rejection_reason
         return _attempt_evidence(
             decision, profile, final_check, review_cycles, findings, details, note_commit_sha
         )
@@ -465,10 +499,22 @@ class AgentLifecycle:
                 recovered_commits = getattr(self._workspace, "commits_added")(prepared)
                 has_commits = bool(recovered_commits)
                 if _is_handoff_recovery(recovered_commits):
-                    decision = CompletionDecision(
-                        AttemptOutcome.HANDOFF, False, PublicationPath.PARTIAL,
-                        ("Recovered a previously committed handoff note for publication.",),
+                    validation = _validate_handoff_note(
+                        recovered_commits,
+                        claim.issue.number,
+                        self._workspace.working_directory,
+                        prepared.base_revision,
                     )
+                    if validation.valid:
+                        decision = CompletionDecision(
+                            AttemptOutcome.HANDOFF, False, PublicationPath.PARTIAL,
+                            ("Recovered a previously committed handoff note for publication.",),
+                        )
+                    else:
+                        decision = CompletionDecision(
+                            AttemptOutcome.INFRASTRUCTURE_ERROR, False, PublicationPath.NONE,
+                            (validation.reason,),
+                        )
                 else:
                     decision = CompletionDecision(
                         None, True, PublicationPath.COMPLETE,
@@ -740,6 +786,108 @@ def _is_handoff_recovery(commits: Sequence[object]) -> bool:
     if not commits:
         return False
     return _is_handoff_note_commit(commits[0])
+
+
+_ALLOWED_HANDOFF_REASONS = frozenset({"cost_soft_threshold", "turn_limit", "time_limit"})
+
+_HANDOFF_NOTE_TITLE_PATTERN = re.compile(r"^#\s*Handoff note:\s*issue #(\d+)")
+_HANDOFF_NOTE_FIELD_PATTERN = re.compile(r"^-\s*(issue|started_at|reason|last_work_commit):\s*(.+?)\s*$")
+
+
+@dataclass(frozen=True)
+class _HandoffNoteValidation:
+    """Whether a handoff note commit is trustworthy enough to publish."""
+
+    valid: bool
+    reason: str = ""
+
+
+def _validate_handoff_note(
+    commits: Sequence[object],
+    issue_number: int,
+    working_directory: Path,
+    base_revision: str,
+) -> _HandoffNoteValidation:
+    """Confirm a handoff has a trustworthy, committed note before it may publish.
+
+    Recognizing a commit by its subject prefix only proves a commit with that
+    subject exists; it does not prove the note file was actually written,
+    belongs to this issue and attempt, or reflects the work actually
+    preserved. All of that is checked here, since a continuation trusts the
+    note and a human trusts the ``round-finished`` label that only a valid
+    handoff may add.
+    """
+
+    if not commits or not _is_handoff_note_commit(commits[0]):
+        return _HandoffNoteValidation(
+            False,
+            "Handoff was requested, but no committed handoff note is the final "
+            "commit on the branch.",
+        )
+    # The note commit being the newest commit (just checked above) means the
+    # checked-out working tree is clean and matches that commit's tree, so
+    # reading the file here reads the committed blob, not uncommitted state.
+    note_path = working_directory / ".agent" / "handoff" / f"{issue_number}.md"
+    try:
+        text = note_path.read_text()
+    except OSError:
+        return _HandoffNoteValidation(
+            False,
+            "Handoff was requested, but the handoff note file could not be read "
+            "from the committed branch state.",
+        )
+    fields = _parse_handoff_note_fields(text)
+    if fields.get("title_issue") != str(issue_number):
+        return _HandoffNoteValidation(
+            False, "Handoff note does not carry the required title for this issue."
+        )
+    if fields.get("issue") != str(issue_number):
+        return _HandoffNoteValidation(
+            False, "Handoff note is missing a matching `issue` field."
+        )
+    started_at = fields.get("started_at", "")
+    if not started_at or not _is_iso8601(started_at):
+        return _HandoffNoteValidation(
+            False, "Handoff note is missing a valid `started_at` field."
+        )
+    if fields.get("reason") not in _ALLOWED_HANDOFF_REASONS:
+        return _HandoffNoteValidation(
+            False, "Handoff note is missing a valid `reason` field."
+        )
+    last_work_commit = fields.get("last_work_commit", "")
+    expected_last_work_commit = commits[1].revision if len(commits) > 1 else base_revision
+    if (
+        len(last_work_commit) < 7
+        or not expected_last_work_commit.startswith(last_work_commit)
+    ):
+        return _HandoffNoteValidation(
+            False,
+            "Handoff note's `last_work_commit` does not match the last preserved "
+            "work commit.",
+        )
+    return _HandoffNoteValidation(True)
+
+
+def _parse_handoff_note_fields(text: str) -> dict[str, str]:
+    fields: dict[str, str] = {}
+    for line in text.splitlines():
+        title_match = _HANDOFF_NOTE_TITLE_PATTERN.match(line)
+        if title_match and "title_issue" not in fields:
+            fields["title_issue"] = title_match.group(1)
+            continue
+        field_match = _HANDOFF_NOTE_FIELD_PATTERN.match(line)
+        if field_match:
+            fields[field_match.group(1)] = field_match.group(2)
+    return fields
+
+
+def _is_iso8601(value: str) -> bool:
+    candidate = f"{value[:-1]}+00:00" if value.endswith("Z") else value
+    try:
+        datetime.fromisoformat(candidate)
+    except ValueError:
+        return False
+    return True
 
 
 def _infrastructure_decision(reason: str) -> CompletionDecision:
