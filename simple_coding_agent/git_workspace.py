@@ -32,6 +32,7 @@ class PreparedAttempt:
 
     branch: str
     base_revision: str
+    restored_from_remote: bool = False
 
 
 @dataclass(frozen=True)
@@ -111,7 +112,11 @@ class GitWorkspace:
             self._rebase_onto_base(branch, base_branch)
         else:
             self._git("checkout", "-b", branch, base_branch)
-        return PreparedAttempt(branch=branch, base_revision=base_revision)
+        return PreparedAttempt(
+            branch=branch,
+            base_revision=base_revision,
+            restored_from_remote=remote_branch_revision is not None,
+        )
 
     def _fetch_attempt_branch(self, branch: str) -> str | None:
         """Best-effort fetch of a published attempt branch; a missing ref is not an error."""

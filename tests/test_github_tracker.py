@@ -82,6 +82,33 @@ def test_claims_the_first_issue_that_remains_eligible() -> None:
     assert transport.assignments == [("issue-2", "viewer-id")]
 
 
+def test_claiming_removes_a_stale_round_finished_label() -> None:
+    candidate = replace(issue(1), labels=frozenset({"ready-for-agent", "round-finished"}))
+    transport = FakeTransport(
+        pages=[IssuePage(issues=(candidate,), next_cursor=None)],
+        refreshed={1: candidate},
+    )
+
+    claim = GitHubTracker(transport, "octo/example").claim_next()
+
+    assert claim is not None
+    assert claim.issue.labels == frozenset({"ready-for-agent", "round-finished"})
+    assert transport.removed_labels == [("issue-1", "round-finished")]
+
+
+def test_claiming_a_normal_issue_removes_no_label() -> None:
+    candidate = issue(1)
+    transport = FakeTransport(
+        pages=[IssuePage(issues=(candidate,), next_cursor=None)],
+        refreshed={1: candidate},
+    )
+
+    claim = GitHubTracker(transport, "octo/example").claim_next()
+
+    assert claim is not None
+    assert transport.removed_labels == []
+
+
 @pytest.mark.parametrize(
     "change",
     [

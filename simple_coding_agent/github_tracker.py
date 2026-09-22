@@ -14,6 +14,7 @@ from simple_coding_agent.publication import PullRequest
 
 
 READY_FOR_AGENT = "ready-for-agent"
+ROUND_FINISHED = "round-finished"
 
 
 class GitHubTrackerError(RuntimeError):
@@ -131,6 +132,12 @@ class GitHubTracker:
 
         This deliberately uses a check-then-set operation. The configured agent
         is a single process, so it is not presented as a distributed lock.
+
+        A stale ``round-finished`` label from a prior handoff is removed here,
+        regardless of this attempt's eventual outcome, so it never lingers
+        across repeated handoff/continue cycles. The returned claim still
+        carries the pre-removal issue snapshot, so callers can detect that a
+        continuation was expected even after the label is gone.
         """
 
         queue = self.runnable_queue()
@@ -142,6 +149,8 @@ class GitHubTracker:
             if current is None or not current.is_eligible:
                 continue
             assignment = self._transport.assign_issue(current.id, identity.id)
+            if ROUND_FINISHED in current.labels:
+                self._transport.remove_label(current.id, ROUND_FINISHED)
             return Claim(issue=current, assignment=assignment)
         return None
 
