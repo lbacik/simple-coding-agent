@@ -115,6 +115,8 @@ class SDKClient(Protocol):
 
     async def interrupt(self) -> None: ...
 
+    async def query(self, prompt: str) -> None: ...
+
     def receive_response(self) -> Any: ...
 
 
@@ -208,7 +210,7 @@ class ModelExecutor:
                 except TimeoutError:
                     await client.interrupt()
                     await self._drain(client)
-                    followup = await self._attempt_handoff_followup(client, observed_models)
+                    followup = await self._attempt_handoff_followup(client, ())
                     if followup is not None:
                         return followup
                     return self._evidence(
