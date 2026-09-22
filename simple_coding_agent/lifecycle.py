@@ -78,6 +78,8 @@ class Workspace(Protocol):
 
     def cleanup(self, *, base_branch: str, prepared: object, retain_branch: bool) -> None: ...
 
+    def commit_dirty_work(self, message: str) -> bool: ...
+
 
 class Publisher(Protocol):
     """Publication boundary, including the result-comment operation."""
@@ -189,6 +191,10 @@ class ModelAttemptRunner:
                     "skill_events": [event.__dict__ for event in execution.skill_events],
                     "model_stop_reason": execution.stop_reason,
                 }
+            )
+        if execution.status is ModelExecutionStatus.HANDOFF_REQUESTED:
+            getattr(self._workspace, "commit_dirty_work")(
+                "Preserve uncommitted work before handoff"
             )
         commits = getattr(self._workspace, "commits_added")(prepared)
         if execution.status is ModelExecutionStatus.HANDOFF_REQUESTED:
