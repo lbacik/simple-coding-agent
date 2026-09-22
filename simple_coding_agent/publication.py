@@ -48,6 +48,7 @@ class PublicationRequest:
     review_findings: str
     details: str
     base_branch: str
+    note_commit_sha: str | None = None
 
 
 @dataclass(frozen=True)
@@ -221,10 +222,16 @@ def _result_comment(
 ) -> str:
     branch = f"[{request.branch}]({branch_url})" if branch_url else "no branch created"
     pr = f"[#{pull_request.number}]({pull_request.url})" if pull_request else "none"
+    commit_line = (
+        f"**Handoff note commit**: `{request.note_commit_sha}`\n"
+        if outcome is AttemptOutcome.HANDOFF and request.note_commit_sha
+        else ""
+    )
     return (
         f"## Agent Attempt Result: {outcome.value}\n\n"
         f"**Branch**: {branch}\n"
-        f"**PR**: {pr}\n\n"
+        f"**PR**: {pr}\n"
+        f"{commit_line}\n"
         "### Evidence\n"
         f"- Check command: `{request.check_command}` → exit code {request.check_exit_code}\n"
         f"- Review cycles: {request.review_cycles}/2\n"

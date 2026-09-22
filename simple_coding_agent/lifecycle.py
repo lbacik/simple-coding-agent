@@ -55,6 +55,7 @@ class AttemptEvidence:
     review_cycles: int
     review_findings: str
     details: str
+    note_commit_sha: str | None = None
 
 
 class AttemptTracker(Protocol):
@@ -243,7 +244,17 @@ class ModelAttemptRunner:
         if decision.publication_eligible or decision.publication_path is PublicationPath.PARTIAL:
             self._attempt_state.transition(AttemptPhase.PUSHING)
         findings = "all clear" if not review.findings else "; ".join(finding.summary for finding in review.findings)
-        return _attempt_evidence(decision, profile, final_check, review_cycles, findings, execution.explanation)
+        details = execution.explanation
+        note_commit_sha = None
+        if decision.outcome is AttemptOutcome.HANDOFF:
+            details = _read_handoff_note(
+                getattr(self._workspace, "working_directory"), claim.issue.number
+            )
+            if commits and commits[-1].subject.startswith(_HANDOFF_NOTE_SUBJECT_PREFIX):
+                note_commit_sha = commits[-1].revision
+        return _attempt_evidence(
+            decision, profile, final_check, review_cycles, findings, details, note_commit_sha
+        )
 
 
 class AgentLifecycle:
@@ -346,6 +357,7 @@ class AgentLifecycle:
                         review_findings=evidence.review_findings,
                         details=evidence.details,
                         base_branch=profile.base_branch,
+                        note_commit_sha=evidence.note_commit_sha,
                     )
                 )
                 outcome = published.outcome
@@ -459,6 +471,11 @@ class AgentLifecycle:
                     )
             else:
                 decision = _infrastructure_decision("Attempt was interrupted before model execution.")
+            details = decision.reasons[0]
+            note_commit_sha = None
+            if decision.outcome is AttemptOutcome.HANDOFF:
+                details = _read_handoff_note(self._workspace.working_directory, claim.issue.number)
+                note_commit_sha = recovered_commits[-1].revision
             published = self._publisher.publish(
                 PublicationRequest(
                     issue_number=claim.issue.number,
@@ -470,8 +487,9 @@ class AgentLifecycle:
                     check_exit_code=None,
                     review_cycles=0,
                     review_findings="not rerun during startup recovery",
-                    details=decision.reasons[0],
+                    details=details,
                     base_branch=profile.base_branch,
+                    note_commit_sha=note_commit_sha,
                 )
             )
             outcome = published.outcome
@@ -596,6 +614,7 @@ def _attempt_evidence(
     review_cycles: int,
     review_findings: str,
     details: str = "Attempt did not reach local completion evidence.",
+    note_commit_sha: str | None = None,
 ) -> AttemptEvidence:
     return AttemptEvidence(
         decision=decision,
@@ -604,6 +623,7 @@ def _attempt_evidence(
         review_cycles=review_cycles,
         review_findings=review_findings,
         details=details,
+        note_commit_sha=note_commit_sha,
     )
 
 
@@ -631,6 +651,22 @@ def _archive_commands(archive: AttemptArchive | None, name: str, result: object)
     stderr = "".join(getattr(command, "stderr", "") for command in commands)
     archive.write_text(f"{name}_stdout.log", stdout)
     archive.write_text(f"{name}_stderr.log", stderr)
+
+
+def _read_handoff_note(working_directory: Path, issue_number: int) -> str:
+    """Read the model-authored handoff note verbatim, for the result comment.
+
+    The comment copy is the durable, human-visible record; the file on the
+    branch is what a continuation is pointed at (see _build_starting_prompt).
+    Missing is reported rather than raised: the note is written by the model
+    in the SDK session this function has no control over.
+    """
+
+    note_path = working_directory / ".agent" / "handoff" / f"{issue_number}.md"
+    try:
+        return note_path.read_text()
+    except OSError:
+        return "Handoff was requested, but the handoff note file could not be read."
 
 
 def _build_starting_prompt(
