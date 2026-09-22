@@ -194,15 +194,20 @@ class ModelAttemptRunner:
                 }
             )
         if execution.status is ModelExecutionStatus.HANDOFF_REQUESTED:
-            getattr(self._workspace, "commit_dirty_work")(
-                "Preserve uncommitted work before handoff"
-            )
+            preexisting_commits = getattr(self._workspace, "commits_added")(prepared)
+            # Only commit leftover dirty work when the note isn't already the
+            # last commit: the note must stay the final commit on the branch,
+            # and a well-behaved handoff never leaves anything dirty after it.
+            if not _is_handoff_recovery(preexisting_commits):
+                getattr(self._workspace, "commit_dirty_work")(
+                    "Preserve uncommitted work before handoff"
+                )
         commits = getattr(self._workspace, "commits_added")(prepared)
         if execution.status is ModelExecutionStatus.HANDOFF_REQUESTED:
             # The handoff note commit is not preserved work by itself; a
             # request that only produced the note downgrades to no_changes.
             effective_commit_count = sum(
-                1 for commit in commits if not commit.subject.startswith(_HANDOFF_NOTE_SUBJECT_PREFIX)
+                1 for commit in commits if not _is_handoff_note_commit(commit)
             )
         else:
             effective_commit_count = len(commits)
@@ -250,7 +255,7 @@ class ModelAttemptRunner:
             details = _read_handoff_note(
                 getattr(self._workspace, "working_directory"), claim.issue.number
             )
-            if commits and commits[0].subject.startswith(_HANDOFF_NOTE_SUBJECT_PREFIX):
+            if commits and _is_handoff_note_commit(commits[0]):
                 note_commit_sha = commits[0].revision
         return _attempt_evidence(
             decision, profile, final_check, review_cycles, findings, details, note_commit_sha
@@ -717,6 +722,12 @@ def _continuation_expected(
     )
 
 
+def _is_handoff_note_commit(commit: object) -> bool:
+    """Whether a commit is the handoff note commit, by its fixed subject prefix."""
+
+    return getattr(commit, "subject", "").startswith(_HANDOFF_NOTE_SUBJECT_PREFIX)
+
+
 def _is_handoff_recovery(commits: Sequence[object]) -> bool:
     """Whether the most recent commit on the branch is a handoff note commit.
 
@@ -728,7 +739,7 @@ def _is_handoff_recovery(commits: Sequence[object]) -> bool:
 
     if not commits:
         return False
-    return getattr(commits[0], "subject", "").startswith(_HANDOFF_NOTE_SUBJECT_PREFIX)
+    return _is_handoff_note_commit(commits[0])
 
 
 def _infrastructure_decision(reason: str) -> CompletionDecision:

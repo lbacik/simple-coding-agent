@@ -334,6 +334,33 @@ def test_real_handoff_is_produced_pushed_and_labeled_without_a_pull_request(
     assert github.assignee_logins == []
 
 
+# --- Scenario 11b: the note commit stays last even with stray dirty leftovers
+
+
+def test_handoff_note_stays_the_last_commit_despite_a_stray_dirty_leftover(
+    tmp_path: Path,
+) -> None:
+    remote, _ = repository_with_main(tmp_path)
+    github = FakeGitHub(issue(24, body="Rewrite the parser.", labels=frozenset({"ready-for-agent"})))
+
+    def do_handoff(working_directory: Path) -> None:
+        write_and_commit(working_directory, "parser.py", "half done", "Half-finish the parser")
+        write_handoff_note(working_directory, 24, "# Handoff note: issue #24\n\nHalfway done.\n")
+        # A stray artifact left behind after the note was already committed
+        # (e.g. a hook side effect) must not become a commit on top of it.
+        (working_directory / "stray.tmp").write_text("noise")
+
+    executor = FakeModelExecutor(actions=[do_handoff], handoff=True)
+    lifecycle = build_lifecycle(remote, tmp_path / "clone", tmp_path / "data", github, executor)
+
+    result = lifecycle.run_once()
+
+    assert result.outcome is AttemptOutcome.HANDOFF
+    subjects = remote_branch_subjects(remote, "agent/issue-24")
+    assert subjects[0] == "Handoff note: issue #24"
+    assert "Preserve uncommitted work before handoff" not in subjects
+
+
 # --- Scenario 12: note-only handoff downgrades to no_changes and is discarded
 
 
@@ -441,6 +468,43 @@ def test_restart_mid_handoff_publication_recovers_as_handoff_not_complete(
     [comment] = github.comments
     assert "## Agent Attempt Result: handoff" in comment.body
     assert "Halfway done." in comment.body
+    assert "round-finished" in github.labels
+    assert AttemptStateStore(data_dir).read() is None
+
+
+# --- Scenario 15: restart after a successful push but before the PUBLISHING marker
+
+
+def test_restart_after_a_successful_handoff_push_before_the_marker_persists(
+    tmp_path: Path,
+) -> None:
+    remote, _ = repository_with_main(tmp_path)
+    clone_dir = tmp_path / "clone"
+    data_dir = tmp_path / "data"
+    github = FakeGitHub(issue(24, body="Rewrite the parser.", labels=frozenset({"ready-for-agent"})))
+
+    # First process: model committed work and the note, the branch was
+    # pushed, but the process "crashed" before the PUSHING->PUBLISHING
+    # checkpoint transition was persisted.
+    workspace = GitWorkspace(clone_dir, str(remote), token_provider=lambda: "token")
+    workspace.prepare_attempt(base_branch="main", issue_number=24)
+    write_and_commit(clone_dir, "parser.py", "half done", "Half-finish the parser")
+    write_handoff_note(clone_dir, 24, "# Handoff note: issue #24\n\nHalfway done.\n")
+    workspace.push_attempt_branch("agent/issue-24", max_retries=3)
+    attempt_state = AttemptStateStore(data_dir)
+    attempt_state.start(issue_number=24, branch="agent/issue-24")
+    attempt_state.transition(AttemptPhase.SETUP)
+    attempt_state.transition(AttemptPhase.MODEL_RUNNING)
+    attempt_state.transition(AttemptPhase.PUSHING)
+
+    executor = FakeModelExecutor()
+    lifecycle = build_lifecycle(remote, clone_dir, data_dir, github, executor)
+
+    result = lifecycle.run_once()
+
+    assert result.outcome is AttemptOutcome.HANDOFF
+    assert len(github.comments) == 1  # the already-pushed branch is not re-pushed or double-published
+    assert remote_branch_subjects(remote, "agent/issue-24")[0] == "Handoff note: issue #24"
     assert "round-finished" in github.labels
     assert AttemptStateStore(data_dir).read() is None
 

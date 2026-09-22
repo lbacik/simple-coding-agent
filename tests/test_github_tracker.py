@@ -251,6 +251,23 @@ def test_release_handoff_does_not_duplicate_round_finished_already_present() -> 
     assert transport.current.labels == frozenset({"round-finished"})
 
 
+def test_release_handoff_resumes_from_the_first_unconfirmed_step_after_a_restart() -> None:
+    """A restart between steps must not repeat a completed step or skip one."""
+
+    # ready-for-agent already removed and round-finished already added by a
+    # first, interrupted call; only the assignee release is still pending.
+    transport = StatefulTransport(
+        issue(24, labels=frozenset({"bug", "round-finished"}), assignee_logins=("agent",))
+    )
+
+    GitHubTracker(transport, "octo/example").release_handoff(24, "viewer-id")
+
+    assert transport.removed_labels == []
+    assert transport.added_labels == []
+    assert transport.removed_assignees == [("issue-24", "viewer-id")]
+    assert transport.current.assignee_logins == ()
+
+
 def test_graphql_add_label_resolves_the_repository_label_id_first() -> None:
     responses = iter(
         [
