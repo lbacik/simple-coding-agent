@@ -46,6 +46,7 @@ class RuntimeConfig:
     agent_trust_project_settings: bool
     review_blocking_severities: frozenset[str]
     profile_extra_path: str = ""
+    profile_path: str = ""
     model: str = _DEFAULT_MODEL_NAME
     claude_agent_sdk_version: str = _DEFAULT_CLAUDE_AGENT_SDK_VERSION
     claude_code_version: str = _DEFAULT_CLAUDE_CODE_VERSION
@@ -97,6 +98,7 @@ def load_runtime_config(environ: Mapping[str, str] | None = None) -> RuntimeConf
         agent_trust_project_settings=_boolean(values, "AGENT_TRUST_PROJECT_SETTINGS", False),
         review_blocking_severities=_review_severities(values),
         profile_extra_path=values.get("PROFILE_EXTRA_PATH", ""),
+        profile_path=values.get("PROFILE_PATH", ""),
         model=_non_empty(values, "MODEL_NAME", _DEFAULT_MODEL_NAME),
         claude_agent_sdk_version=_non_empty(
             values, "CLAUDE_AGENT_SDK_VERSION", _DEFAULT_CLAUDE_AGENT_SDK_VERSION
@@ -110,10 +112,18 @@ def load_runtime_config(environ: Mapping[str, str] | None = None) -> RuntimeConf
     )
 
 
-def load_repository_profile(repository_dir: Path) -> RepositoryProfile:
-    """Load the required repository profile for lifecycle configuration."""
+def load_repository_profile(repository_dir: Path, profile_path: str = "") -> RepositoryProfile:
+    """Load the required repository profile for lifecycle configuration.
 
-    path = repository_dir / "docs" / "agents" / "simple-coding-agent-profile.yml"
+    When ``profile_path`` is set, the profile is read from that location instead of
+    the default in-repo path, allowing it to live alongside the agent's own config.
+    """
+
+    path = (
+        Path(profile_path)
+        if profile_path
+        else repository_dir / "docs" / "agents" / "simple-coding-agent-profile.yml"
+    )
 
     try:
         raw_profile = yaml.safe_load(path.read_text())

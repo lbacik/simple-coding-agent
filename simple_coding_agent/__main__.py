@@ -91,7 +91,9 @@ def main() -> None:
         tracker=tracker,
         attempt_state=attempt_state,
         workspace=workspace,
-        profile_loader=load_repository_profile,
+        profile_loader=lambda repository_dir: load_repository_profile(
+            repository_dir, config.profile_path
+        ),
         publisher=Publisher(
             workspace,
             github,

@@ -162,6 +162,10 @@ and `setup_timeout` to 120 seconds. `env` maps environment-variable names to
 string values. Missing or invalid profiles are infrastructure errors for the
 lifecycle, never silent success.
 
+Set `PROFILE_PATH` to load the profile from a path outside the target
+repository instead, such as alongside the agent's own `Dockerfile`. When unset
+or empty, the default in-repo path above is used.
+
 ## Durable attempt state
 
 While an implementation attempt is active, its checkpoint is stored at

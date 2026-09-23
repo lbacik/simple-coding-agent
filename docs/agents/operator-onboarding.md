@@ -18,6 +18,10 @@ The profile must be in the default branch before a `ready-for-agent` issue is
 claimed.  A missing or unparseable profile is an `infrastructure_error`; the
 agent posts a result comment and removes its assignee.
 
+Set `PROFILE_PATH` to load the profile from a path outside the target
+repository instead, such as alongside the agent's own `Dockerfile`.  When
+unset or empty, the default in-repo path above is used.
+
 Required tracker context for skills to function correctly:
 - The repository's `CONTEXT.md` describes the project domain vocabulary.
 - `docs/agents/issue-tracker.md` explains how the agent finds and claims issues.

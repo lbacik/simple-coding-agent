@@ -120,6 +120,33 @@ def test_applies_operator_overrides_including_the_test_only_review_gate(
     assert config.claude_code_version == "3.0.0"
 
 
+def test_profile_path_defaults_to_empty_string(tmp_path: Path) -> None:
+    config = load_runtime_config(
+        {
+            "GITHUB_TOKEN": "github-secret",
+            "META_API_KEY": "meta-secret",
+            "TARGET_REPO": "octo/example",
+            "DATA_DIR": str(tmp_path),
+        }
+    )
+
+    assert config.profile_path == ""
+
+
+def test_profile_path_is_read_from_the_environment(tmp_path: Path) -> None:
+    config = load_runtime_config(
+        {
+            "GITHUB_TOKEN": "github-secret",
+            "META_API_KEY": "meta-secret",
+            "TARGET_REPO": "octo/example",
+            "DATA_DIR": str(tmp_path),
+            "PROFILE_PATH": str(tmp_path / "profile.yml"),
+        }
+    )
+
+    assert config.profile_path == str(tmp_path / "profile.yml")
+
+
 def test_loads_repository_profile_with_defaults_and_environment(tmp_path: Path) -> None:
     profile_path = tmp_path / "docs" / "agents" / "simple-coding-agent-profile.yml"
     profile_path.parent.mkdir(parents=True)
@@ -187,3 +214,42 @@ def test_missing_required_repository_profile_is_an_infrastructure_error(tmp_path
         load_repository_profile(tmp_path)
 
     assert error.value.outcome == "infrastructure_error"
+
+
+def test_loads_repository_profile_from_an_override_path(tmp_path: Path) -> None:
+    override_path = tmp_path / "colocated" / "profile.yml"
+    override_path.parent.mkdir(parents=True)
+    override_path.write_text("setup: pytest\ncheck: pytest\n")
+
+    profile = load_repository_profile(tmp_path, str(override_path))
+
+    assert profile.setup == ("pytest",)
+    assert profile.check == ("pytest",)
+
+
+def test_override_path_is_used_even_without_a_default_in_repo_profile(tmp_path: Path) -> None:
+    repository_dir = tmp_path / "repo"
+    repository_dir.mkdir()
+    override_path = tmp_path / "profile.yml"
+    override_path.write_text("setup: pytest\ncheck: pytest\n")
+
+    profile = load_repository_profile(repository_dir, str(override_path))
+
+    assert profile.setup == ("pytest",)
+
+
+def test_missing_override_path_is_an_infrastructure_error(tmp_path: Path) -> None:
+    with pytest.raises(ProfileError) as error:
+        load_repository_profile(tmp_path, str(tmp_path / "does-not-exist.yml"))
+
+    assert error.value.outcome == "infrastructure_error"
+
+
+def test_empty_override_path_falls_back_to_the_default_in_repo_location(tmp_path: Path) -> None:
+    profile_path = tmp_path / "docs" / "agents" / "simple-coding-agent-profile.yml"
+    profile_path.parent.mkdir(parents=True)
+    profile_path.write_text("setup: pytest\ncheck: pytest\n")
+
+    profile = load_repository_profile(tmp_path, "")
+
+    assert profile.setup == ("pytest",)
