@@ -118,6 +118,14 @@ note and comment, then re-apply `ready-for-agent` to requeue the issue (this
 also clears `round-finished`), or leave it labelled `round-finished` to end
 the attempt sequence.
 
+Independent of the handoff path, any dirty or untracked change left in the
+working tree once the model reports success is also committed automatically
+before commits are counted and the final check runs. Without this, a model
+that describes further edits (e.g. in response to a code review) but stops
+before actually running `git commit` would have those edits silently left
+out of the pushed branch and the pull request, even though the final check
+observed them on disk and the attempt still gets recorded as `complete`.
+
 ## Non-destructive workspace management
 
 The agent adheres strictly to non-destructive cleanup:

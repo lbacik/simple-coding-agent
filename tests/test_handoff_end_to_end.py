@@ -304,6 +304,43 @@ def test_zero_commit_attempt_stays_no_changes_and_never_publishes(tmp_path: Path
     assert not remote_has_branch(remote, "agent/issue-24")
 
 
+# --- Scenario 8b: uncommitted work left after a reported success ------------
+
+
+def test_uncommitted_work_left_after_success_is_committed_and_published(
+    tmp_path: Path,
+) -> None:
+    """A model that reports success but stops before its own final commit.
+
+    For example, after reacting to a code review with more edits and never
+    running `git commit` before the turn ended. This work must not be
+    silently dropped from the pushed branch just because an earlier commit
+    already exists -- otherwise the pull request can be missing exactly the
+    fix the model believed it had already committed (issue #49).
+    """
+
+    remote, _ = repository_with_main(tmp_path)
+    github = FakeGitHub(issue(24, body="Improve error messages."))
+
+    def do_work(working_directory: Path) -> None:
+        write_and_commit(working_directory, "errors.py", "first pass", "Improve errors")
+        # Left dirty: the model described this fix in its final message but
+        # never actually ran `git commit` before the turn ended.
+        (working_directory / "errors.py").write_text("first pass, reviewed and fixed")
+
+    executor = FakeModelExecutor(actions=[do_work])
+    lifecycle = build_lifecycle(remote, tmp_path / "clone", tmp_path / "data", github, executor)
+
+    result = lifecycle.run_once()
+
+    assert result.outcome is AttemptOutcome.COMPLETE
+    assert "agent/issue-24" in github.pull_requests
+    assert remote_branch_subjects(remote, "agent/issue-24")[0] == (
+        "Preserve uncommitted work left after model completion"
+    )
+    assert git(remote, "show", "agent/issue-24:errors.py") == "first pass, reviewed and fixed"
+
+
 # --- Scenario 9: author/operator guidance reaches the prompt ----------------
 
 

@@ -249,19 +249,28 @@ class ModelAttemptRunner:
         if execution.status in (
             ModelExecutionStatus.HANDOFF_REQUESTED,
             ModelExecutionStatus.MODEL_LIMIT_REACHED,
+            ModelExecutionStatus.SUCCEEDED,
         ):
             # Always preserve dirty/untracked work as a commit rather than
-            # letting it get silently discarded.
+            # letting it get silently discarded. This also covers a model
+            # that reports success but stops before its own final commit:
+            # without this, commit_count and the final check would be
+            # evaluated against work that never makes it into the push.
             commit_fn = getattr(self._workspace, "commit_dirty_work", None)
             if callable(commit_fn):
+                message = (
+                    "Preserve uncommitted work before handoff"
+                    if execution.status is not ModelExecutionStatus.SUCCEEDED
+                    else "Preserve uncommitted work left after model completion"
+                )
                 try:
-                    commit_fn("Preserve uncommitted work before handoff")
+                    commit_fn(message)
                 except GitWorkspaceError as error:
                     decision = CompletionDecision(
                         outcome=AttemptOutcome.INFRASTRUCTURE_ERROR,
                         publication_eligible=False,
                         publication_path=PublicationPath.NONE,
-                        reasons=(f"Failed to preserve dirty work before handoff: {error}",),
+                        reasons=(f"Failed to preserve dirty work after model completion: {error}",),
                     )
                     return _attempt_evidence(decision, profile, None, 0, "not run", str(error))
         commits = getattr(self._workspace, "commits_added")(prepared)
