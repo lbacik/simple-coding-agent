@@ -9,6 +9,8 @@ from simple_coding_agent.attempt_state import AttemptStateStore
 from simple_coding_agent.command_runner import CommandRunner
 from simple_coding_agent.completion import CompletionEvaluator, VerificationRunner
 from simple_coding_agent.config import load_repository_profile, load_runtime_config
+from simple_coding_agent.control import ControlStore
+from simple_coding_agent.control_server import ControlServer, socket_path_for
 from simple_coding_agent.finalization import AttemptCompletionStore
 from simple_coding_agent.git_workspace import GitWorkspace
 from simple_coding_agent.github_tracker import GitHubGraphQLTransport, GitHubTracker
@@ -115,6 +117,8 @@ def main() -> None:
         ),
         attempt_archive_factory=archive_factory,
         completion_store=AttemptCompletionStore(config.data_dir),
+        control_store=ControlStore(config.data_dir),
+        repository=config.target_repo,
     )
     interruption_handler = AttemptInterruptionHandler(
         event_log=lambda event, detail="", level="INFO", issue_number=None: logger.emit(
@@ -123,9 +127,20 @@ def main() -> None:
         issue_number_provider=lambda: lifecycle.active_issue_number,
     )
     restore_interruption_handler = interruption_handler.install()
+    control_server = ControlServer(socket_path_for(config.data_dir), lifecycle)
+    try:
+        control_server.start()
+    except Exception as error:
+        logger.emit(
+            "control_endpoint_unavailable",
+            f"Operator control socket could not be opened: {error}",
+            level="ERROR",
+        )
+        raise SystemExit(1) from error
     try:
         lifecycle.run_forever(stop=lambda: False)
     finally:
+        control_server.stop()
         restore_interruption_handler()
 
 

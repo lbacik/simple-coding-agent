@@ -13,6 +13,9 @@ dependencies = [
     "PyYAML>=6.0,<7",
 ]
 
+[project.scripts]
+agentctl = "simple_coding_agent.agentctl:main"
+
 [project.optional-dependencies]
 dev = [
     "pytest>=8.0,<9",
