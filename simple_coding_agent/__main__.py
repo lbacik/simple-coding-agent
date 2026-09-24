@@ -101,6 +101,9 @@ def main() -> None:
             max_retries=config.max_retries,
             publish_timeout=config.publish_timeout,
             attempt_state=attempt_state,
+            event_log=lambda event, detail="", level="INFO", issue_number=None: logger.emit(
+                event, phase="publication", detail=detail, level=level, issue_number=issue_number
+            ),
         ),
         attempt_runner=runner,
         poll_interval=config.poll_interval,

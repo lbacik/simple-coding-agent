@@ -11,6 +11,9 @@ from simple_coding_agent.attempt_state import AttemptPhase, AttemptStateStore
 from simple_coding_agent.git_workspace import GitWorkspace, GitWorkspaceError
 
 
+_SUCCEEDED_BUT_UNPUBLISHED = "Implementation succeeded but publication failed."
+
+
 @dataclass(frozen=True)
 class PullRequest:
     """The small, stable portion of a GitHub pull request used by an attempt."""
@@ -59,6 +62,7 @@ class PublicationResult:
     branch_url: str | None
     pull_request: PullRequest | None
     comment_posted: bool = True
+    details: str = ""
 
 
 class Publisher:
@@ -75,6 +79,9 @@ class Publisher:
         attempt_state: AttemptStateStore | None = None,
         sleeper: Callable[[float], None] = time.sleep,
         monotonic: Callable[[], float] = time.monotonic,
+        event_log: Callable[..., None] = (
+            lambda event, detail="", level="INFO", issue_number=None: None
+        ),
     ) -> None:
         self._workspace = workspace
         self._github = github
@@ -84,6 +91,7 @@ class Publisher:
         self._attempt_state = attempt_state
         self._sleeper = sleeper
         self._monotonic = monotonic
+        self._event_log = event_log
 
     def publish(self, request: PublicationRequest) -> PublicationResult:
         """Publish the permitted path and always try to record its outcome.
@@ -111,28 +119,39 @@ class Publisher:
                     self._check_deadline(deadline)
                     self._mark_publishing()
                 branch_url = f"https://github.com/{self._repository}/tree/{request.branch}"
-            except (GitWorkspaceError, TimeoutError):
-                outcome = AttemptOutcome.INFRASTRUCTURE_ERROR
-                comment_posted = self._post_result(
-                    request, outcome, branch_url, None, "Implementation succeeded but publication failed."
+            except (GitWorkspaceError, TimeoutError) as error:
+                push_failure = f"Partial branch push failed: {type(error).__name__}: {error}"
+                self._event_log(
+                    "publication_failed",
+                    push_failure,
+                    level="ERROR",
+                    issue_number=request.issue_number,
                 )
-                return PublicationResult(outcome, branch_url, None, comment_posted)
+                if outcome is AttemptOutcome.INCOMPLETE and not request.decision.publication_eligible:
+                    # A failed final authoritative check stays reported as
+                    # incomplete; the push failure is secondary and must not
+                    # hide the evaluator's reason.
+                    details = "; ".join((*request.decision.reasons, push_failure))
+                else:
+                    outcome = AttemptOutcome.INFRASTRUCTURE_ERROR
+                    details = _SUCCEEDED_BUT_UNPUBLISHED
+                comment_posted = self._post_result(request, outcome, branch_url, None, details)
+                return PublicationResult(outcome, branch_url, None, comment_posted, details)
 
         if request.decision.publication_eligible:
             try:
                 pull_request = self._ensure_pull_request(request, deadline)
             except Exception:  # Transport implementations normalize only their own failures.
                 outcome = AttemptOutcome.INFRASTRUCTURE_ERROR
-                comment_posted = self._post_result(
-                    request, outcome, branch_url, None, "Implementation succeeded but publication failed."
-                )
-                return PublicationResult(outcome, branch_url, None, comment_posted)
+                details = _SUCCEEDED_BUT_UNPUBLISHED
+                comment_posted = self._post_result(request, outcome, branch_url, None, details)
+                return PublicationResult(outcome, branch_url, None, comment_posted, details)
             outcome = AttemptOutcome.COMPLETE
 
         if outcome is None:
             outcome = AttemptOutcome.INFRASTRUCTURE_ERROR
         comment_posted = self._post_result(request, outcome, branch_url, pull_request, request.details)
-        return PublicationResult(outcome, branch_url, pull_request, comment_posted)
+        return PublicationResult(outcome, branch_url, pull_request, comment_posted, request.details)
 
     def _mark_publishing(self) -> None:
         """Durably record a verified branch write before any PR write can begin."""

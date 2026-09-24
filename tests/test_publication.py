@@ -5,7 +5,7 @@ from pathlib import Path
 
 from simple_coding_agent.completion import AttemptOutcome, CompletionDecision, PublicationPath
 from simple_coding_agent.attempt_state import AttemptPhase, AttemptStateStore
-from simple_coding_agent.git_workspace import GitWorkspace
+from simple_coding_agent.git_workspace import GitWorkspace, GitWorkspaceError
 from simple_coding_agent.publication import PublicationRequest, Publisher, PullRequest
 
 from test_git_workspace import git, repository_with_main, write_and_commit
@@ -154,6 +154,74 @@ def test_enforces_the_shared_publish_timeout_across_pull_request_work(tmp_path: 
     assert result.outcome is AttemptOutcome.INFRASTRUCTURE_ERROR
 
 
+def test_partial_push_failure_keeps_incomplete_and_reports_both_reasons(tmp_path: Path) -> None:
+    remote, _ = repository_with_main(tmp_path)
+    workspace = GitWorkspace(tmp_path / "clone", str(remote), token_provider=lambda: "token")
+    prepared = workspace.prepare_attempt(base_branch="main", issue_number=23)
+    write_and_commit(tmp_path / "clone", "partial.txt", "partial", "Partial work")
+    github = FakeGitHub()
+    events: list[tuple[str, str, str, int | None]] = []
+
+    result = Publisher(
+        PushFailingWorkspace(),
+        github,
+        "octo/example",
+        event_log=lambda event, detail="", level="INFO", issue_number=None: events.append(
+            (event, detail, level, issue_number)
+        ),
+    ).publish(
+        PublicationRequest(
+            23,
+            "Implement publication",
+            prepared.branch,
+            "2026-09-20T13:00:00Z",
+            CompletionDecision(
+                AttemptOutcome.INCOMPLETE,
+                False,
+                PublicationPath.PARTIAL,
+                ("Final authoritative check did not succeed.",),
+            ),
+            "APP_ENV=test vendor/bin/phpunit",
+            2,
+            0,
+            "all clear",
+            "Model explanation.",
+            "main",
+        )
+    )
+
+    assert result.outcome is AttemptOutcome.INCOMPLETE
+    assert result.branch_url is None
+    assert len(github.comments) == 1
+    assert "Implementation succeeded" not in github.comments[0][1]
+    assert "Final authoritative check did not succeed." in github.comments[0][1]
+    assert "Partial branch push failed" in github.comments[0][1]
+    assert "remote hung up unexpectedly" in github.comments[0][1]
+    assert "Final authoritative check did not succeed." in result.details
+    assert "Partial branch push failed" in result.details
+    assert len(events) == 1
+    assert events[0][0] == "publication_failed"
+    assert "remote hung up unexpectedly" in events[0][1]
+    assert events[0][2] == "ERROR"
+    assert events[0][3] == 23
+
+
+def test_pr_creation_failure_keeps_the_established_infrastructure_error_details(tmp_path: Path) -> None:
+    remote, _ = repository_with_main(tmp_path)
+    workspace = GitWorkspace(tmp_path / "clone", str(remote), token_provider=lambda: "token")
+    prepared = workspace.prepare_attempt(base_branch="main", issue_number=23)
+    write_and_commit(tmp_path / "clone", "feature.txt", "done", "Implement publication")
+    github = AlwaysFailingGitHub()
+
+    result = Publisher(workspace, github, "octo/example", sleeper=lambda _: None).publish(
+        request(CompletionDecision(None, True, PublicationPath.COMPLETE, ("ready",)), prepared.branch)
+    )
+
+    assert result.outcome is AttemptOutcome.INFRASTRUCTURE_ERROR
+    assert len(github.comments) == 1
+    assert "Implementation succeeded but publication failed." in github.comments[0][1]
+
+
 def request(decision: CompletionDecision, branch: str) -> PublicationRequest:
     return PublicationRequest(23, "Implement publication", branch, "2026-09-20T13:00:00Z", decision, "pytest", 1, 0, "all clear", "Check did not pass.", "main")
 
@@ -193,3 +261,17 @@ class FakeGitHub:
 
     def add_comment(self, repository: str, issue_number: int, body: str) -> None:
         self.comments.append((issue_number, body))
+
+
+class PushFailingWorkspace:
+    def push_attempt_branch(self, branch: str, *, max_retries: int, deadline: float | None = None) -> str:
+        raise GitWorkspaceError("remote hung up unexpectedly")
+
+
+@dataclass
+class AlwaysFailingGitHub(FakeGitHub):
+    def find_pull_request(self, repository: str, head: str) -> PullRequest | None:
+        return None
+
+    def create_pull_request(self, repository: str, head: str, base: str, title: str, body: str) -> PullRequest:
+        raise OSError("pull request creation unavailable")

@@ -538,9 +538,12 @@ class AgentLifecycle:
                 )
                 outcome = published.outcome
                 comment_posted = getattr(published, "comment_posted", True)
-                retain_branch = (
+                retain_branch = getattr(published, "branch_url", None) is None and (
                     outcome is AttemptOutcome.INFRASTRUCTURE_ERROR
-                    and getattr(published, "branch_url", None) is None
+                    or (
+                        outcome is AttemptOutcome.INCOMPLETE
+                        and evidence.decision.publication_path is PublicationPath.PARTIAL
+                    )
                 )
         except DirtyWorkspaceError as error:
             self._event_log(
@@ -701,9 +704,15 @@ class AgentLifecycle:
             outcome = published.outcome
             comment_posted = getattr(published, "comment_posted", True)
             retain_branch = (
-                outcome is AttemptOutcome.INFRASTRUCTURE_ERROR
-                and getattr(published, "branch_url", None) is None
+                getattr(published, "branch_url", None) is None
                 and has_commits
+                and (
+                    outcome is AttemptOutcome.INFRASTRUCTURE_ERROR
+                    or (
+                        outcome is AttemptOutcome.INCOMPLETE
+                        and decision.publication_path is PublicationPath.PARTIAL
+                    )
+                )
             )
         except GitWorkspaceRecoveryError as error:
             self._event_log(

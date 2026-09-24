@@ -300,6 +300,48 @@ def test_attempt_runs_the_injected_workflow_then_publishes_before_cleanup(tmp_pa
     assert workspace.cleanup_calls == [("main", False)]
 
 
+def test_partial_push_failure_keeps_incomplete_and_retains_the_local_branch(
+    tmp_path: Path,
+) -> None:
+    claim = Claim(issue(24), Assignment("issue-24", "agent-id"))
+    tracker = FakeTracker(claim)
+    workspace = FakeWorkspace()
+    publisher = IncompletePushFailingPublisher()
+    store = ConsecutiveErrorStore(tmp_path)
+
+    def run_workflow(received_claim: Claim, profile: object, prepared: object) -> AttemptEvidence:
+        return AttemptEvidence(
+            decision=CompletionDecision(
+                AttemptOutcome.INCOMPLETE,
+                False,
+                PublicationPath.PARTIAL,
+                ("Final authoritative check did not succeed.",),
+            ),
+            check_command="pytest",
+            check_exit_code=2,
+            review_cycles=1,
+            review_findings="all clear",
+            details="Partial implementation.",
+        )
+
+    lifecycle = AgentLifecycle(
+        tracker=tracker,
+        attempt_state=AttemptStateStore(tmp_path),
+        workspace=workspace,
+        profile_loader=lambda _: profile(),
+        publisher=publisher,
+        attempt_runner=run_workflow,
+        error_store=store,
+        max_consecutive_errors=3,
+    )
+
+    result = lifecycle.run_once()
+
+    assert result.outcome is AttemptOutcome.INCOMPLETE
+    assert workspace.cleanup_calls == [("main", True)]
+    assert store.read().count == 0
+
+
 def test_logs_every_stage_from_claiming_the_issue_to_dispatching_the_model(
     tmp_path: Path,
 ) -> None:
@@ -494,7 +536,12 @@ class FakePublisher:
         self.requests.append(request)
         self.outcomes.append(request.decision.outcome)
         outcome = request.decision.outcome or AttemptOutcome.COMPLETE
-        return type("Published", (), {"outcome": outcome})()
+        branch_url = (
+            None
+            if outcome is AttemptOutcome.INFRASTRUCTURE_ERROR
+            else "https://example.test/tree/agent/issue-24"
+        )
+        return type("Published", (), {"outcome": outcome, "branch_url": branch_url})()
 
 
 class CommentFailingPublisher(FakePublisher):
@@ -508,6 +555,16 @@ class PushFailingPublisher(FakePublisher):
         self.outcomes.append(AttemptOutcome.INFRASTRUCTURE_ERROR)
         return type("Published", (), {
             "outcome": AttemptOutcome.INFRASTRUCTURE_ERROR,
+            "branch_url": None,
+        })()
+
+
+class IncompletePushFailingPublisher(FakePublisher):
+    def publish(self, request: object):
+        self.requests.append(request)
+        self.outcomes.append(AttemptOutcome.INCOMPLETE)
+        return type("Published", (), {
+            "outcome": AttemptOutcome.INCOMPLETE,
             "branch_url": None,
         })()
 
