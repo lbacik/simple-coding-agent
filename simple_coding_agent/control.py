@@ -7,9 +7,9 @@ durable sequence assigned at commit time. Retrying the same request ID with
 an identical payload returns the stored acknowledgement without applying
 the command twice; reusing an ID with different content is rejected.
 
-This slice implements ``stop``, ``resume``, and ``stop --after N``. The
+This slice implements ``stop``, ``resume``, ``stop --after N``, and ``next issue``. The
 record already stores the command kind and canonical payload so later
-commands (next-issue, handoff) can reuse the same ordering, retry, and
+commands (handoff) can reuse the same ordering, retry, and
 acknowledgement rules.
 """
 
@@ -72,6 +72,15 @@ class StopAfterRejectedError(ValueError):
     """
 
 
+class NextIssueRejectedError(ValueError):
+    """Raised when ``next issue`` is rejected without a control change.
+
+    An unknown, invalid, ineligible, or unverifiable target leaves the
+    intake state and any existing priority intact, and no command is
+    recorded.
+    """
+
+
 @dataclass(frozen=True)
 class CommandRecord:
     """One durably recorded operator command."""
@@ -110,8 +119,11 @@ _STORE_FILENAME = "control.sqlite3"
 _STOP_KIND = "stop"
 _STOP_AFTER_KIND = "stop_after"
 _RESUME_KIND = "resume"
+_NEXT_ISSUE_KIND = "next_issue"
 # Stop-plan kinds a newer ``resume`` (or a newer stop plan) replaces. Later
 # commands extend this tuple without changing the replacement rules.
+# ``next issue`` is intentionally absent: it neither replaces a stop plan
+# nor is replaced by one.
 _STOP_PLAN_KINDS = (_STOP_KIND, _STOP_AFTER_KIND)
 
 
@@ -147,6 +159,31 @@ def parse_stop_after(value: object) -> int:
 
 def _attempts_noun(count: int) -> str:
     return "1 attempt" if count == 1 else f"{count} attempts"
+
+
+def _invalid_issue_message(value: object) -> str:
+    return (
+        f"Invalid issue number {value!r}: must be a positive integer issue"
+        " number. No control change was accepted."
+    )
+
+
+def parse_next_issue(value: object) -> int:
+    """Validate a ``next issue`` target; raise without side effects."""
+
+    if isinstance(value, bool):
+        raise NextIssueRejectedError(_invalid_issue_message(value))
+    if isinstance(value, int):
+        number = value
+    elif isinstance(value, str):
+        if re.fullmatch(r"[+-]?\d+", value.strip()) is None:
+            raise NextIssueRejectedError(_invalid_issue_message(value))
+        number = int(value.strip(), 10)
+    else:
+        raise NextIssueRejectedError(_invalid_issue_message(value))
+    if number <= 0:
+        raise NextIssueRejectedError(_invalid_issue_message(value))
+    return number
 
 
 class ControlStore:
@@ -438,10 +475,199 @@ class ControlStore:
             except sqlite3.Error as error:
                 raise ControlStoreError("Control command could not be committed") from error
 
+
+    def submit_next_issue(self, request_id: str, issue: object) -> CommandRecord:
+        """Durably record a one-shot ``next issue`` priority.
+
+        The target must already have been verified eligible by the caller
+        (open, unassigned, labelled ``ready-for-agent``, with a non-empty
+        body and no open blocker); this method validates only the issue
+        number itself. Acceptance never changes the intake state and never
+        touches a pending stop plan. A newer accepted priority supersedes
+        only the earlier priority: the older command becomes terminal
+        ``superseded`` naming this request, and the new detail names the
+        replaced command. Retrying the same request ID with the identical
+        payload returns the stored record without applying the command
+        twice; reuse with different content is rejected.
+        """
+
+        _check_request_id(request_id)
+        number = parse_next_issue(issue)
+        with self.lock:
+            try:
+                with self._connect() as connection:
+                    connection.execute("BEGIN IMMEDIATE")
+                    existing = self._find_locked(connection, request_id)
+                    if existing is not None:
+                        self._ensure_payload_identical(
+                            connection, existing, _NEXT_ISSUE_KIND, {"issue": number}
+                        )
+                        connection.execute("ROLLBACK")
+                        return existing
+                    current_number, current_request = self._next_issue_locked(connection)
+                    timestamp = self._timestamp()
+                    if current_request is not None:
+                        connection.execute(
+                            "UPDATE commands SET acknowledgement = ?, detail = ?,"
+                            " updated_at = ? WHERE request_id = ?"
+                            " AND acknowledgement = ?",
+                            (
+                                CommandAcknowledgement.SUPERSEDED.value,
+                                f"superseded by {request_id}",
+                                timestamp,
+                                current_request,
+                                CommandAcknowledgement.ACCEPTED.value,
+                            ),
+                        )
+                        detail = (
+                            f"next issue #{number} prioritized for the next"
+                            f" permitted claim; supersedes {current_request}"
+                            f" (was #{current_number})"
+                        )
+                    else:
+                        detail = (
+                            f"next issue #{number} prioritized for the next"
+                            " permitted claim"
+                        )
+                    record = self._insert_locked(
+                        connection,
+                        request_id,
+                        _NEXT_ISSUE_KIND,
+                        {"issue": number},
+                        CommandAcknowledgement.ACCEPTED,
+                        detail,
+                    )
+                    connection.execute(
+                        "UPDATE control_state SET next_issue_number = ?,"
+                        " next_issue_request_id = ? WHERE id = 1",
+                        (number, request_id),
+                    )
+                    connection.execute("COMMIT")
+                    return record
+            except (PayloadMismatchError, RequestIdError, NextIssueRejectedError):
+                raise
+            except sqlite3.Error as error:
+                raise ControlStoreError("Control command could not be committed") from error
+
+    def next_issue_snapshot(self) -> dict | None:
+        """Return the pending one-shot priority for status, if any."""
+
+        with self.lock:
+            try:
+                with self._connect() as connection:
+                    number, request_id = self._next_issue_locked(connection)
+            except sqlite3.Error as error:
+                raise ControlStoreError("Control state could not be read") from error
+        if request_id is None or number is None:
+            return None
+        return {"request_id": request_id, "issue_number": int(number)}
+
+    def complete_next_issue(self, issue_number: int) -> CommandRecord | None:
+        """Consume the pending priority after its successful assignment.
+
+        Marks the pending ``next issue`` command terminal ``completed`` and
+        clears the one-shot priority. The stored target must match the
+        claimed issue; a mismatch leaves the priority intact and returns
+        ``None`` so a confused claim is never reported as completed.
+        """
+
+        with self.lock:
+            try:
+                with self._connect() as connection:
+                    connection.execute("BEGIN IMMEDIATE")
+                    stored_number, stored_request = self._next_issue_locked(connection)
+                    if stored_request is None or stored_number is None:
+                        connection.execute("ROLLBACK")
+                        return None
+                    if int(stored_number) != int(issue_number):
+                        connection.execute("ROLLBACK")
+                        return None
+                    timestamp = self._timestamp()
+                    connection.execute(
+                        "UPDATE commands SET acknowledgement = ?, detail = ?,"
+                        " updated_at = ? WHERE request_id = ?"
+                        " AND acknowledgement = ?",
+                        (
+                            CommandAcknowledgement.COMPLETED.value,
+                            f"claimed issue #{issue_number} as the prioritized next issue",
+                            timestamp,
+                            stored_request,
+                            CommandAcknowledgement.ACCEPTED.value,
+                        ),
+                    )
+                    row = connection.execute(
+                        "SELECT request_id, sequence, kind, acknowledgement,"
+                        " detail, created_at, updated_at FROM commands"
+                        " WHERE request_id = ?",
+                        (stored_request,),
+                    ).fetchone()
+                    connection.execute(
+                        "UPDATE control_state SET next_issue_number = NULL,"
+                        " next_issue_request_id = NULL WHERE id = 1"
+                    )
+                    connection.execute("COMMIT")
+                    if row is None:  # pragma: no cover - just updated above
+                        raise ControlStoreError("Control command is missing")
+                    return self._record_from_row(row)
+            except sqlite3.Error as error:
+                raise ControlStoreError("Control command could not be committed") from error
+
+    def fail_next_issue(self, reason: str) -> CommandRecord | None:
+        """Clear the pending priority as terminal ``not fulfilled``.
+
+        Records the observed loss-of-eligibility reason so status and
+        request-ID lookup expose it; the caller falls back to the ordinary
+        FIFO queue in the same intake cycle. Returns the terminal record,
+        or ``None`` when no priority was pending.
+        """
+
+        if not isinstance(reason, str) or not reason.strip():
+            raise ControlStoreError("A not-fulfilled priority must carry a reason")
+        with self.lock:
+            try:
+                with self._connect() as connection:
+                    connection.execute("BEGIN IMMEDIATE")
+                    stored_number, stored_request = self._next_issue_locked(connection)
+                    if stored_request is None or stored_number is None:
+                        connection.execute("ROLLBACK")
+                        return None
+                    timestamp = self._timestamp()
+                    connection.execute(
+                        "UPDATE commands SET acknowledgement = ?, detail = ?,"
+                        " updated_at = ? WHERE request_id = ?"
+                        " AND acknowledgement = ?",
+                        (
+                            CommandAcknowledgement.NOT_FULFILLED.value,
+                            f"next issue #{stored_number} not fulfilled:"
+                            f" {reason.strip()}",
+                            timestamp,
+                            stored_request,
+                            CommandAcknowledgement.ACCEPTED.value,
+                        ),
+                    )
+                    row = connection.execute(
+                        "SELECT request_id, sequence, kind, acknowledgement,"
+                        " detail, created_at, updated_at FROM commands"
+                        " WHERE request_id = ?",
+                        (stored_request,),
+                    ).fetchone()
+                    connection.execute(
+                        "UPDATE control_state SET next_issue_number = NULL,"
+                        " next_issue_request_id = NULL WHERE id = 1"
+                    )
+                    connection.execute("COMMIT")
+                    if row is None:  # pragma: no cover - just updated above
+                        raise ControlStoreError("Control command is missing")
+                    return self._record_from_row(row)
+            except sqlite3.Error as error:
+                raise ControlStoreError("Control command could not be committed") from error
+
     def submit_command(self, kind: str, request_id: str, payload: dict) -> CommandRecord:
         """Generic command entry used to detect request-ID reuse.
 
-        Only ``stop``, ``resume``, and ``stop_after`` apply a control change;
+        Only ``stop``, ``resume``, and ``stop_after`` apply a control change
+        through this entry point (``next issue`` has its own
+        ``submit_next_issue``);
         any other kind with a fresh ID is rejected without altering control
         state, while a repeated ID returns (or rejects on mismatch) the
         stored record.
@@ -823,6 +1049,8 @@ class ControlStore:
                     "stop_after_active_attempt_id TEXT NULL",
                     "latest_counted_attempt_id TEXT NULL",
                     "latest_counted_outcome TEXT NULL",
+                    "next_issue_number INTEGER NULL",
+                    "next_issue_request_id TEXT NULL",
                 ):
                     column = column_ddl.split(" ", 1)[0]
                     known = {
@@ -949,6 +1177,31 @@ class ControlStore:
             " stop_after_remaining = NULL, stop_after_active_attempt_id = NULL"
             " WHERE id = 1"
         )
+
+    def _next_issue_locked(
+        self, connection: sqlite3.Connection
+    ) -> tuple[int | None, str | None]:
+        """Return the pending priority ``(issue_number, request_id)``, if any."""
+
+        try:
+            row = connection.execute(
+                "SELECT next_issue_number, next_issue_request_id"
+                " FROM control_state WHERE id = 1"
+            ).fetchone()
+        except sqlite3.Error as error:
+            raise ControlStoreError("Control state could not be read") from error
+        if row is None:  # pragma: no cover - initialized above
+            raise ControlStoreError("Control state is missing")
+        number, request_id = row
+        if number is None or request_id is None:
+            return (None, None)
+        if not isinstance(request_id, str):
+            raise ControlStoreError("Control state is malformed")
+        try:
+            parsed = int(number)
+        except (TypeError, ValueError) as error:
+            raise ControlStoreError("Control state is malformed") from error
+        return (parsed, request_id)
 
     def _find_locked(
         self, connection: sqlite3.Connection, request_id: str
@@ -1097,14 +1350,17 @@ def build_status(
     pending_command_id: str | None,
     get_command: Callable[[str], CommandRecord | None],
     recent_commands: Callable[[], list[CommandRecord]],
+    next_issue: dict | None = None,
     stop_plan: dict | None = None,
 ) -> dict:
     """Build one consistent live status snapshot.
 
     Read-only: it never opens the database directly but renders records the
-    caller already serialized under the control lock. ``stop_plan`` carries
-    the pending ``stop --after`` countdown (requested and remaining count,
-    active-attempt inclusion, and latest counted attempt and outcome).
+    caller already serialized under the control lock. ``next_issue`` carries
+    the pending one-shot priority (``request_id`` and ``issue_number``), and
+    ``stop_plan`` carries the pending ``stop --after`` countdown (requested
+    and remaining count, active-attempt inclusion, and latest counted
+    attempt and outcome).
     """
 
     pending = get_command(pending_command_id) if pending_command_id else None
@@ -1123,6 +1379,7 @@ def build_status(
             else None
         ),
         "pending_command": command_to_json(pending) if pending is not None else None,
+        "pending_next_issue": dict(next_issue) if next_issue is not None else None,
         "stop_plan": dict(stop_plan) if stop_plan is not None else None,
         "commands": {record.request_id: command_to_json(record) for record in recent_commands()},
     }

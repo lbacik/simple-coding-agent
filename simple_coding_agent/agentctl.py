@@ -56,6 +56,14 @@ def run_stop_after(socket_path: Path, request_id: str, after: int) -> dict:
     )
 
 
+def run_next_issue(socket_path: Path, request_id: str, issue: int) -> dict:
+    """Submit ``next issue`` once; never present a failure as accepted."""
+
+    return send_request(
+        socket_path, {"op": "next_issue", "request_id": request_id, "issue": issue}
+    )
+
+
 def run_resume(socket_path: Path, request_id: str) -> dict:
     """Submit ``resume`` once; never present a failure as accepted."""
 
@@ -174,6 +182,14 @@ def format_status(status: dict) -> str:
             f" remaining {plan.get('remaining')}, {inclusion},"
             f" last counted: {last_counted})"
         )
+    pending_next = status.get("pending_next_issue")
+    if pending_next is None:
+        lines.append("pending_next_issue: none")
+    else:
+        lines.append(
+            f"pending_next_issue: #{pending_next.get('issue_number')}"
+            f" ({pending_next.get('request_id')})"
+        )
     commands = status.get("commands") or {}
     if commands:
         lines.append("recent_commands:")
@@ -224,6 +240,23 @@ def build_parser() -> argparse.ArgumentParser:
         help="Retry a previously generated request ID with the identical payload.",
     )
 
+    next_parser = subparsers.add_parser(
+        "next", help="Prioritize one eligible issue for the next permitted claim."
+    )
+    next_subparsers = next_parser.add_subparsers(dest="next_command", required=True)
+    next_issue_parser = next_subparsers.add_parser(
+        "issue", help="Prioritize one eligible issue for the next permitted claim."
+    )
+    next_issue_parser.add_argument(
+        "issue_number", help="The implementation issue number to prioritize."
+    )
+    next_issue_parser.add_argument(
+        "--request-id",
+        dest="request_id",
+        default=None,
+        help="Retry a previously generated request ID with the identical payload.",
+    )
+
     subparsers.add_parser("status", help="Show one consistent live status snapshot.")
     command_parser = subparsers.add_parser(
         "command", help="Show one command's current durable acknowledgement."
@@ -258,6 +291,24 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "resume":
             request_id = args.request_id or generate_request_id()
             return submit_mutating(socket_path, "resume", request_id, run_resume)
+        if args.command == "next" and args.next_command == "issue":
+            from simple_coding_agent.control import (
+                NextIssueRejectedError,
+                parse_next_issue,
+            )
+
+            request_id = args.request_id or generate_request_id()
+            try:
+                issue = parse_next_issue(args.issue_number)
+            except NextIssueRejectedError as error:
+                print(f"{request_id} rejected — {error}", file=sys.stderr)
+                return 1
+            return submit_mutating(
+                socket_path,
+                f"next issue {issue}",
+                request_id,
+                lambda path, rid: run_next_issue(path, rid, issue),
+            )
         if args.command == "status":
             print(format_status(run_status(socket_path)))
             return 0

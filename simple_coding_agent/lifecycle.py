@@ -27,8 +27,10 @@ from simple_coding_agent.control import (
     ControlStore,
     ControlStoreError,
     IntakeState,
+    NextIssueRejectedError,
     RecoveryHold,
     build_status,
+    parse_next_issue,
 )
 from simple_coding_agent.completion import (
     AttemptOutcome,
@@ -48,7 +50,12 @@ from simple_coding_agent.git_workspace import (
     GitWorkspaceRecoveryError,
     RebaseConflictError,
 )
-from simple_coding_agent.github_tracker import ROUND_FINISHED, Claim, TrackerIssue
+from simple_coding_agent.github_tracker import (
+    ROUND_FINISHED,
+    Claim,
+    TrackerIssue,
+    ineligibility_reason,
+)
 from simple_coding_agent.model_execution import ModelExecutionStatus, ModelExecutor
 from simple_coding_agent.observability import AttemptArchive
 from simple_coding_agent.operating import ConsecutiveErrorStore
@@ -152,6 +159,12 @@ class AttemptTracker(Protocol):
     """Claim and idempotently release the GitHub state owned by this agent."""
 
     def claim_next(self) -> Claim | None: ...
+
+    def fetch_issue(self, number: int) -> TrackerIssue | None: ...
+
+    def is_self_assigned(self, issue: TrackerIssue) -> bool: ...
+
+    def claim_verified(self, issue: TrackerIssue) -> Claim: ...
 
     def recover_claim(self, issue_number: int) -> Claim | None: ...
 
@@ -687,6 +700,60 @@ class AgentLifecycle:
                 recovery_hold=self._recovery_hold_locked(checkpoint),
             )
 
+    def submit_next_issue(self, request_id: str, issue: object) -> CommandRecord:
+        """Durably prioritize one eligible issue for the next permitted claim.
+
+        The target is fetched and checked against the ordinary eligibility
+        rules (open, unassigned, labelled ``ready-for-agent``, with a
+        non-empty body and no open blocker) before anything is recorded; an
+        invalid, ineligible, or unverifiable target is rejected without
+        changing the intake state or an existing priority. A newer accepted
+        priority supersedes only the earlier priority, never a stop plan,
+        and never resumes intake. Retrying the same request ID with the
+        identical payload returns the stored acknowledgement without
+        re-fetching GitHub or applying the command twice.
+        """
+
+        if self._control_store is None:
+            raise ControlStoreError("Operator control is not configured")
+        with self._control_lock:
+            store = self._control_store
+            if not isinstance(request_id, str) or not request_id.strip():
+                return store.submit_next_issue(request_id, issue)
+            try:
+                existing = store.get_command(request_id)
+            except ControlStoreError:
+                raise
+            except Exception as error:
+                raise ControlStoreError("Control command could not be read") from error
+            if existing is not None:
+                # Idempotent retry: let the store enforce the
+                # identical-payload rule without touching GitHub, so an
+                # eligibility change after acceptance cannot alter history.
+                return store.submit_next_issue(request_id, issue)
+            number = parse_next_issue(issue)
+            fetcher = _tracker_method(self._tracker, "fetch_issue")
+            if fetcher is None:
+                raise NextIssueRejectedError(
+                    f"issue #{number} cannot be verified: the tracker cannot"
+                    " fetch issues. No control change was accepted."
+                )
+            try:
+                fresh = fetcher(number)
+            except NextIssueRejectedError:
+                raise
+            except Exception as error:
+                raise NextIssueRejectedError(
+                    f"issue #{number} could not be verified: {error}."
+                    " No control change was accepted."
+                ) from error
+            reason = ineligibility_reason(fresh, number)
+            if reason is not None:
+                raise NextIssueRejectedError(
+                    f"{reason}. No control change was accepted."
+                )
+            return store.submit_next_issue(request_id, number)
+
     def _recovery_hold_locked(
         self, checkpoint: AttemptCheckpoint | None
     ) -> RecoveryHold | None:
@@ -758,6 +825,19 @@ class AgentLifecycle:
         except Exception:
             return True
 
+    def _is_self_assignment(self, found: TrackerIssue) -> bool:
+        """Whether a revalidated target is assigned to this agent itself.
+
+        Missing tracker support degrades to ``False`` (the assignment is
+        then treated as ordinary ineligibility); a failed identity read
+        propagates as ambiguity with the priority preserved.
+        """
+
+        probe = _tracker_method(self._tracker, "is_self_assigned")
+        if probe is None:
+            return False
+        return bool(probe(found))
+
     def get_command(self, request_id: str) -> CommandRecord | None:
         """Return one command's current durable acknowledgement."""
 
@@ -792,6 +872,7 @@ class AgentLifecycle:
                 pending_command_id=store.pending_command_id(),
                 get_command=store.get_command,
                 recent_commands=store.recent_commands,
+                next_issue=store.next_issue_snapshot(),
                 stop_plan=store.stop_plan_snapshot(),
             )
 
@@ -1014,9 +1095,13 @@ class AgentLifecycle:
         The intake check, the GitHub claim, and the checkpoint start share
         the control lock with command acceptance: if a stop commits first,
         no claim begins afterward; if a claim began first, a later stop
-        applies to that claim as the active attempt. Returns the claim and
-        its checkpoint, or ``(None, None)`` when idle; the caller sleeps
-        outside the lock so the control socket stays responsive.
+        applies to that claim as the active attempt. A pending one-shot
+        ``next issue`` priority is rechecked before the FIFO runnable queue
+        at the next permitted claim boundary; a successful assignment
+        consumes it once, while lost eligibility clears it as ``not
+        fulfilled`` and falls back to FIFO in the same cycle. Returns the
+        claim and its checkpoint, or ``(None, None)`` when idle; the caller
+        sleeps outside the lock so the control socket stays responsive.
         """
 
         with self._control_lock:
@@ -1038,6 +1123,13 @@ class AgentLifecycle:
                         level="INFO",
                     )
                     return (None, None)
+                prioritized = self._claim_prioritized_locked()
+                if prioritized is not None:
+                    return prioritized
+                if self._control_store.next_issue_snapshot() is not None:
+                    # The priority was cleared as not fulfilled above; the
+                    # FIFO selection below runs in the same intake cycle.
+                    pass
             self._event_log("polling_for_issue", "", level="INFO")
             claim = self._tracker.claim_next()
             if claim is None:
@@ -1057,6 +1149,123 @@ class AgentLifecycle:
                 # and an empty queue preserves the remaining count untouched.
                 self._control_store.enter_stopping_for_final_claim()
             return (claim, checkpoint)
+
+    def _claim_prioritized_locked(
+        self,
+    ) -> tuple[Claim | None, AttemptCheckpoint | None] | None:
+        """Attempt the pending priority claim; ``None`` means use FIFO.
+
+        The caller holds the control lock with intake already permitted.
+        Returns the prioritized ``(claim, checkpoint)`` on success, or
+        ``None`` when no priority is pending or when the target lost
+        eligibility (the priority is then terminal ``not fulfilled`` and the
+        caller falls back to FIFO). A transport or assignment failure
+        propagates with the priority preserved: it is never reported as
+        completed and no other claim may begin until reconciled.
+        """
+
+        store = self._control_store
+        if store is None:  # pragma: no cover - guarded by the caller
+            return None
+        snapshot = store.next_issue_snapshot()
+        if snapshot is None:
+            return None
+        target_number = int(snapshot["issue_number"])
+        fetcher = _tracker_method(self._tracker, "fetch_issue")
+        if fetcher is None:
+            raise ControlStoreError(
+                "The tracker cannot revalidate the prioritized issue"
+            )
+        try:
+            fresh = fetcher(target_number)
+        except Exception as error:
+            self._event_log(
+                "next_issue_claim_ambiguous",
+                f"issue #{target_number} could not be revalidated: {error};"
+                " the priority stays pending and no other claim may begin"
+                " until reconciled",
+                level="ERROR",
+                issue_number=target_number,
+            )
+            raise
+        if fresh is not None and fresh.number != target_number:  # pragma: no cover - keyed fetch
+            raise ControlStoreError(
+                "The tracker returned a different issue than the pending priority"
+            )
+        reason = ineligibility_reason(fresh, target_number)
+        if reason is not None:
+            if fresh is not None and self._is_self_assignment(fresh):
+                # Our own assignment is an ambiguous prior claim (the
+                # target was unassigned at acceptance and only this
+                # process claims through the serialized boundary), never
+                # lost eligibility: hold it for reconciliation instead of
+                # failing the priority and falling back to FIFO.
+                self._event_log(
+                    "next_issue_claim_ambiguous",
+                    f"issue #{target_number} is assigned to this agent after"
+                    " an unconfirmed assignment; the priority stays pending"
+                    " and no other claim may begin until reconciled",
+                    level="ERROR",
+                    issue_number=target_number,
+                )
+                raise ControlStoreError(
+                    f"Issue #{target_number} has an ambiguous assignment to"
+                    " this agent; the priority stays pending until reconciled."
+                )
+            store.fail_next_issue(reason)
+            self._event_log(
+                "next_issue_not_fulfilled",
+                f"issue #{target_number} not fulfilled: {reason};"
+                " falling back to the runnable queue",
+                level="WARNING",
+                issue_number=target_number,
+            )
+            return None
+        assert fresh is not None  # eligibility implies presence
+        claim_verified = _tracker_method(self._tracker, "claim_verified")
+        if claim_verified is None:
+            raise ControlStoreError(
+                "The tracker cannot claim the prioritized issue"
+            )
+        try:
+            claim = claim_verified(fresh)
+        except Exception as error:
+            self._event_log(
+                "next_issue_claim_ambiguous",
+                f"issue #{target_number} assignment is ambiguous: {error};"
+                " the priority stays pending and no other claim may begin"
+                " until reconciled",
+                level="ERROR",
+                issue_number=target_number,
+            )
+            raise
+        completed = store.complete_next_issue(claim.issue.number)
+        if completed is None:
+            # The claimed issue does not match the pending priority: never
+            # report a confused assignment as a completed priority claim.
+            self._event_log(
+                "next_issue_claim_ambiguous",
+                f"claimed issue #{claim.issue.number} does not match the"
+                f" prioritized issue #{target_number}; the priority stays"
+                " pending and no other claim may begin until reconciled",
+                level="ERROR",
+                issue_number=target_number,
+            )
+            raise ControlStoreError(
+                "The prioritized claim does not match the pending priority"
+            )
+        self._event_log(
+            "next_issue_claimed",
+            f"title={claim.issue.title!r} (prioritized next issue"
+            f" #{target_number})",
+            level="INFO",
+            issue_number=claim.issue.number,
+        )
+        checkpoint = self._attempt_state.start(
+            issue_number=claim.issue.number, branch=f"agent/issue-{claim.issue.number}"
+        )
+        self._attempt_processing = True
+        return (claim, checkpoint)
 
     def _record_control_finalization(
         self, attempt_id: str, outcome: AttemptOutcome
@@ -1506,6 +1715,13 @@ class AgentLifecycle:
                     "duration_seconds": (completed_at - started).total_seconds(),
                 }
             )
+
+
+def _tracker_method(tracker: object, name: str) -> Callable[..., object] | None:
+    """Return the tracker's ``name`` method, if it provides a callable one."""
+
+    probe = getattr(tracker, name, None)
+    return probe if callable(probe) else None
 
 
 def _final_check_was_interrupted(archive: AttemptArchive | None) -> bool:

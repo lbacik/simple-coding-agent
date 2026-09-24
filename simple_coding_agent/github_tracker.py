@@ -17,6 +17,32 @@ READY_FOR_AGENT = "ready-for-agent"
 ROUND_FINISHED = "round-finished"
 
 
+def ineligibility_reason(issue: TrackerIssue | None, number: int) -> str | None:
+    """Explain why a ``next issue`` target cannot be accepted or claimed.
+
+    Returns ``None`` when the issue is currently eligible under the ordinary
+    queue rules (open, unassigned, labelled ``ready-for-agent``, with a
+    non-empty body and no open blocker); otherwise returns a visible reason
+    naming the observed state.
+    """
+
+    if issue is None:
+        return f"issue #{number} was not found"
+    if issue.state != "OPEN":
+        return f"issue #{number} is not open (state {issue.state})"
+    if READY_FOR_AGENT not in issue.labels:
+        return f"issue #{number} is not labelled `{READY_FOR_AGENT}`"
+    if issue.assignee_logins:
+        holders = ", ".join(issue.assignee_logins)
+        return f"issue #{number} is already assigned to {holders}"
+    if not issue.body.strip():
+        return f"issue #{number} has an empty body"
+    if issue.blocked_by != 0:
+        noun = "blocker" if issue.blocked_by == 1 else "blockers"
+        return f"issue #{number} has {issue.blocked_by} open {noun}"
+    return None
+
+
 class GitHubTrackerError(RuntimeError):
     """Raised when the GitHub tracker cannot complete an API operation."""
 
@@ -128,6 +154,38 @@ class GitHubTracker:
                 break
             cursor = page.next_cursor
         return tuple(sorted(issues, key=lambda issue: (issue.created_at, issue.number)))
+
+    def fetch_issue(self, number: int) -> TrackerIssue | None:
+        """Re-read one issue's current state for ``next issue`` validation."""
+
+        return self._transport.get_issue(self._target_repo, number)
+
+    def is_self_assigned(self, issue: TrackerIssue) -> bool:
+        """Whether the issue is currently assigned to this agent's identity.
+
+        A priority target that revalidates as self-assigned is an ambiguous
+        prior assignment (it was unassigned when the priority was accepted,
+        and only this process claims through the serialized boundary), never
+        ordinary ineligibility: the caller must hold it for reconciliation
+        instead of marking the priority ``not fulfilled``.
+        """
+
+        return self._transport.viewer().login in issue.assignee_logins
+
+    def claim_verified(self, issue: TrackerIssue) -> Claim:
+        """Assign an already revalidated priority target.
+
+        The caller re-fetched the issue and confirmed eligibility immediately
+        before this call, so no second eligibility read happens here: the
+        existing assignment-based claim check runs exactly once. A stale
+        ``round-finished`` label is removed as in :meth:`claim_next`.
+        """
+
+        identity = self._transport.viewer()
+        assignment = self._transport.assign_issue(issue.id, identity.id)
+        if ROUND_FINISHED in issue.labels:
+            self._transport.remove_label(issue.id, ROUND_FINISHED)
+        return Claim(issue=issue, assignment=assignment)
 
     def claim_next(self) -> Claim | None:
         """Claim the first issue that remains eligible at assignment time.
