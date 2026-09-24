@@ -1,0 +1,269 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Operator control CLI — throwaway prototype</title>
+<style>
+  :root { font: 16px/1.5 system-ui, sans-serif; color: #17212b; background: #f5f7f8; }
+  body { max-width: 1050px; margin: 2rem auto; padding: 0 1rem; }
+  h1, h2 { line-height: 1.2; }
+  .hint { color: #52606c; }
+  .panel { background: white; border: 1px solid #d4dde4; border-radius: 8px; padding: 1rem; margin: 1rem 0; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: .6rem; }
+  .field { border-left: 3px solid #177a65; padding-left: .7rem; }
+  .field strong, .field span { display: block; }
+  button { background: #fff; border: 1px solid #879aa7; border-radius: 5px; padding: .5rem .75rem; cursor: pointer; text-align: left; }
+  button:hover, button:focus { border-color: #087561; background: #eef9f5; }
+  button:disabled { color: #87919b; cursor: default; }
+  input { width: 4rem; padding: .4rem; }
+  .controls { display: flex; flex-wrap: wrap; gap: .5rem; align-items: center; }
+  pre { white-space: pre-wrap; overflow-wrap: anywhere; background: #152331; color: #e7f4f1; padding: 1rem; border-radius: 6px; min-height: 10rem; }
+  .tabs { display: flex; flex-wrap: wrap; gap: .5rem; }
+  .tabs button[aria-selected="true"] { background: #177a65; color: white; border-color: #177a65; }
+  .step { margin: .4rem .5rem .4rem 0; }
+</style>
+<main>
+  <h1>Operator control CLI</h1>
+  <p class="hint"><strong>Throwaway prototype.</strong> Open this file locally. It explores whether an operator can understand command acceptance, progress, completion, and replacement for one agent instance. The terminal examples are proposed syntax and output, not a working CLI or production state machine.</p>
+  <section class="panel">
+    <h2>Current instance</h2>
+    <div id="state" class="grid"></div>
+  </section>
+  <section class="panel">
+    <h2>Try a command</h2>
+    <div class="controls">
+      <button data-action="status">status</button>
+      <button data-action="stop">stop</button>
+      <button data-action="resume">resume</button>
+      <label>Attempts <input id="count" type="number" min="1" value="2"></label>
+      <button data-action="stopAfter">stop after N attempts</button>
+      <label>Issue <input id="issue" type="number" min="1" value="217"></label>
+      <button data-action="nextIssue">next issue</button>
+      <button data-action="handoff">handoff now</button>
+      <button data-action="lookup">inspect latest command</button>
+    </div>
+    <p class="hint">Issue 217 is eligible in this mock; issue 218 is ineligible. Commands are simulated in memory.</p>
+    <h3>Simulate lifecycle</h3>
+    <div class="controls">
+      <button data-action="claim">claim eligible issue</button>
+      <button data-action="phase">advance phase</button>
+      <button data-action="finish">finish attempt</button>
+      <button data-action="publish">publish handoff</button>
+      <button data-action="reset">reset</button>
+    </div>
+  </section>
+  <section class="panel">
+    <h2>Guided walkthroughs</h2>
+    <div id="tabs" class="tabs" role="tablist"></div>
+    <p id="scenarioDescription"></p>
+    <div id="steps"></div>
+  </section>
+  <section class="panel">
+    <h2>CLI transcript</h2>
+    <pre id="terminal" aria-live="polite"></pre>
+  </section>
+</main>
+<script>
+  // Pure, deliberately small model for reviewing the CLI contract.
+  const initial = () => ({ intake: "running", phase: "idle", issue: null, attempt: 0,
+    plan: null, priority: null, lastCounted: null, commands: [], serial: 0, last: "No command submitted." });
+  const active = s => s.phase !== "idle";
+  const entry = (s, verb, effect) => {
+    const id = `ctl-${String(s.serial + 1).padStart(4, "0")}`;
+    const command = { id, verb, acknowledgement: "accepted", detail: effect };
+    return { ...s, serial: s.serial + 1, commands: [...s.commands, command], last: `${id} accepted — ${effect}` };
+  };
+  const update = (commands, id, acknowledgement, detail) => commands.map(c =>
+    c.id === id ? { ...c, acknowledgement, detail } : c);
+  function transition(previous, action) {
+    let s = { ...previous, commands: previous.commands.map(c => ({ ...c })) };
+    const reject = why => ({ ...s, last: `Rejected — ${why}. No control state changed.` });
+    const replacePlan = newer => {
+      if (s.plan) s.commands = update(s.commands, s.plan.id, "superseded", `replaced by ${newer}`);
+      s.plan = null;
+    };
+    switch (action.kind) {
+      case "status": return { ...s, last: "Read-only status snapshot received from the live agent." };
+      case "lookup": return { ...s, last: s.commands.at(-1) ?
+        `${s.commands.at(-1).id}: ${s.commands.at(-1).acknowledgement} — ${s.commands.at(-1).detail}` : "No command ID yet." };
+      case "stop": {
+        s = entry(s, "stop", active(s) ? "finish active attempt, then stop intake" : "intake stopped");
+        replacePlan(s.commands.at(-1).id);
+        s.intake = active(s) ? "stopping" : "stopped";
+        if (s.intake === "stopping") s.plan = { id: s.commands.at(-1).id, type: "stop" };
+        else s.commands = update(s.commands, s.commands.at(-1).id, "completed", "intake stopped");
+        return s;
+      }
+      case "resume": {
+        s = entry(s, "resume", "intake running");
+        replacePlan(s.commands.at(-1).id);
+        s.intake = "running";
+        s.commands = update(s.commands, s.commands.at(-1).id, "completed", "intake running");
+        return s;
+      }
+      case "stopAfter": {
+        if (!Number.isInteger(action.count) || action.count < 1) return reject("N must be a positive integer");
+        if (s.intake === "stopped") return reject("intake is stopped; resume first");
+        s = entry(s, `stop --after ${action.count}`, `${action.count} attempt(s) remaining`);
+        replacePlan(s.commands.at(-1).id);
+        s.plan = { id: s.commands.at(-1).id, type: "count", requested: action.count,
+          remaining: action.count, includesActive: active(s) };
+        s.intake = active(s) && action.count === 1 ? "stopping" : "running";
+        return s;
+      }
+      case "nextIssue": {
+        if (action.issue !== 217) return reject(`issue #${action.issue} is not eligible`);
+        s = entry(s, `next issue ${action.issue}`, `priority #${action.issue} pending for next permitted claim`);
+        if (s.priority) s.commands = update(s.commands, s.priority.id, "superseded", `replaced by ${s.commands.at(-1).id}`);
+        s.priority = { id: s.commands.at(-1).id, issue: action.issue };
+        return s;
+      }
+      case "handoff": {
+        if (!active(s)) return reject("handoff requires an active attempt");
+        s = entry(s, "handoff now", s.phase === "verification" || s.phase === "publication" ?
+          "finish ordinary outcome, then stop; handoff cannot start in this phase" :
+          "handoff requested at next safe model boundary; deadline 240s + 120s publication");
+        replacePlan(s.commands.at(-1).id);
+        s.plan = { id: s.commands.at(-1).id, type: "handoff",
+          progress: s.phase === "verification" || s.phase === "publication" ? "ordinary outcome finishing" : "awaiting safe model boundary",
+          tooLate: s.phase === "verification" || s.phase === "publication" };
+        s.intake = "stopping";
+        return s;
+      }
+      case "claim": {
+        if (active(s)) return { ...s, last: "Cannot claim: an attempt is active." };
+        if (s.intake !== "running") return { ...s, last: "Cannot claim: intake is stopped." };
+        s.issue = s.priority?.issue ?? 219;
+        s.attempt++;
+        s.phase = "setup";
+        if (s.priority) {
+          s.commands = update(s.commands, s.priority.id, "completed", `issue #${s.issue} claimed`);
+          s.priority = null;
+        }
+        if (s.plan?.type === "count" && s.plan.remaining === 1) {
+          s.plan.includesActive = true;
+          s.intake = "stopping";
+        }
+        s.last = `Attempt a-${s.attempt} claimed issue #${s.issue}; phase setup.`;
+        return s;
+      }
+      case "phase": {
+        const phases = ["setup", "model execution", "verification", "publication"];
+        if (!active(s) || s.phase === "publication") return { ...s, last: "No later phase available." };
+        s.phase = phases[phases.indexOf(s.phase) + 1];
+        if (s.plan?.type === "handoff" && s.phase === "model execution") s.plan.progress = "instruction pending at safe SDK boundary";
+        s.last = `Attempt a-${s.attempt} entered ${s.phase}.`;
+        return s;
+      }
+      case "finish": {
+        if (!active(s)) return { ...s, last: "No active attempt to finish." };
+        const finished = `a-${s.attempt}`;
+        s.phase = "idle";
+        s.issue = null;
+        if (s.plan?.type === "count") {
+          s.plan.remaining--;
+          s.plan.includesActive = false;
+          s.lastCounted = `${finished}: incomplete`;
+          if (s.plan.remaining === 0) {
+            s.commands = update(s.commands, s.plan.id, "completed", `intake stopped after ${s.plan.requested} attempts; latest ${finished}: incomplete`);
+            s.plan = null;
+            s.intake = "stopped";
+          } else s.intake = "running";
+        } else if (s.plan?.type === "handoff") {
+          s.commands = update(s.commands, s.plan.id, "not fulfilled", "ordinary outcome completed; no handoff published; intake stopped");
+          s.plan = null;
+          s.intake = "stopped";
+        } else if (s.plan?.type === "stop") {
+          s.commands = update(s.commands, s.plan.id, "completed", "intake stopped after active attempt");
+          s.plan = null;
+          s.intake = "stopped";
+        }
+        s.last = `Attempt ${finished} fully completed (incomplete); intake ${s.intake}.`;
+        return s;
+      }
+      case "publish": {
+        if (s.plan?.type !== "handoff" || s.plan.tooLate || !active(s)) return { ...s, last: "No publishable operator handoff is pending." };
+        const id = s.plan.id;
+        s.commands = update(s.commands, id, "completed", `handoff note published for issue #${s.issue}; intake stopped`);
+        s.plan = null;
+        s.phase = "idle";
+        s.issue = null;
+        s.intake = "stopped";
+        s.last = `${id} completed — handoff published; intake stopped.`;
+        return s;
+      }
+      case "reset": return initial();
+      default: return s;
+    }
+  }
+
+  let state = initial();
+  let transcript = [];
+  const scenarios = [
+    { title: "Stop and resume", description: "Stop during an attempt; the current attempt finishes before intake stops.",
+      steps: [["claim", "Claim"], ["stop", "Stop"], ["status", "Inspect pending state"], ["finish", "Finish attempt"], ["resume", "Resume"]] },
+    { title: "Count and replace", description: "An active attempt counts first. A newer stop plan replaces the old command.",
+      steps: [["claim", "Claim"], ["stopAfter", "Stop after 2"], ["stop", "Replace with stop"], ["status", "Inspect replacement"], ["finish", "Finish"]] },
+    { title: "Target while stopped", description: "A priority is retained while intake is stopped and used only after resume.",
+      steps: [["stop", "Stop"], ["nextIssue", "Prioritize #217"], ["status", "Inspect priority"], ["resume", "Resume"], ["claim", "Claim #217"]] },
+    { title: "Handoff and validation", description: "Reject handoff without an active attempt, then show pending and published feedback.",
+      steps: [["handoff", "Reject handoff"], ["claim", "Claim"], ["phase", "Enter model execution"], ["handoff", "Request handoff"], ["status", "Inspect progress"], ["publish", "Publish"]] }
+  ];
+  let scenarioIndex = 0;
+  let stepIndex = 0;
+  const commandText = action => ({ status: "agentctl status", stop: "agentctl stop", resume: "agentctl resume",
+    stopAfter: `agentctl stop --after ${action.count}`, nextIssue: `agentctl next issue ${action.issue}`,
+    handoff: "agentctl handoff now", lookup: `agentctl command ${state.commands.at(-1)?.id ?? "<id>"}`,
+    claim: "[agent lifecycle] claim", phase: "[agent lifecycle] next phase",
+    finish: "[agent lifecycle] finish attempt", publish: "[agent lifecycle] publish handoff", reset: "[demo] reset" })[action.kind];
+  function snapshot() {
+    const p = state.plan;
+    return [
+      `intake: ${state.intake}`,
+      `attempt: ${active(state) ? `a-${state.attempt}, issue #${state.issue}, ${state.phase}` : "none"}`,
+      `stop plan: ${p ? `${p.id} ${p.type}${p.type === "count" ? `, ${p.remaining}/${p.requested} remaining, active included: ${p.includesActive}` : p.type === "handoff" ? `, ${p.progress}` : ""}` : "none"}`,
+      `latest counted attempt: ${state.lastCounted ?? "none"}`,
+      `next issue: ${state.priority ? `#${state.priority.issue} (${state.priority.id})` : "none"}`,
+      `commands: ${state.commands.length ? state.commands.map(c => `${c.id} ${c.acknowledgement} (${c.detail})`).join("; ") : "none"}`
+    ];
+  }
+  function run(kind, values = {}) {
+    const action = { kind, count: Number(values.count ?? document.querySelector("#count").value),
+      issue: Number(values.issue ?? document.querySelector("#issue").value) };
+    const shownCommand = commandText(action);
+    state = transition(state, action);
+    transcript.push(`$ ${shownCommand}\n${state.last}${kind === "status" ? `\n${snapshot().join("\n")}` : ""}`);
+    render();
+  }
+  function render() {
+    const fields = [["Intake", state.intake], ["Attempt", active(state) ? `a-${state.attempt} / issue #${state.issue}` : "none"],
+      ["Phase", state.phase], ["Stop plan", state.plan ? `${state.plan.id}: ${state.plan.type}${state.plan.type === "count" ? `, ${state.plan.remaining}/${state.plan.requested} remaining` : state.plan.type === "handoff" ? `, ${state.plan.progress}` : ""}` : "none"],
+      ["Next issue", state.priority ? `#${state.priority.issue} (${state.priority.id})` : "none"],
+      ["Latest counted attempt", state.lastCounted ?? "none"],
+      ["Latest acknowledgement", state.commands.at(-1) ? `${state.commands.at(-1).id}: ${state.commands.at(-1).acknowledgement}` : "none"]];
+    document.querySelector("#state").replaceChildren(...fields.map(([name, value]) => {
+      const div = document.createElement("div"); div.className = "field";
+      const strong = document.createElement("strong"); strong.textContent = name;
+      const span = document.createElement("span"); span.textContent = value;
+      div.append(strong, span); return div;
+    }));
+    document.querySelector("#terminal").textContent = transcript.slice(-12).join("\n\n") || "Try a command or start a walkthrough.";
+    document.querySelector("#tabs").replaceChildren(...scenarios.map((scenario, index) => {
+      const button = document.createElement("button"); button.textContent = scenario.title;
+      button.setAttribute("aria-selected", String(index === scenarioIndex));
+      button.onclick = () => { scenarioIndex = index; stepIndex = 0; state = initial(); transcript = []; render(); };
+      return button;
+    }));
+    const scenario = scenarios[scenarioIndex];
+    document.querySelector("#scenarioDescription").textContent = scenario.description;
+    document.querySelector("#steps").replaceChildren(...scenario.steps.map(([kind, label], index) => {
+      const button = document.createElement("button"); button.className = "step";
+      button.textContent = `${index + 1}. ${label}`; button.disabled = index !== stepIndex;
+      button.onclick = () => { run(kind, kind === "nextIssue" ? { issue: 217 } : kind === "stopAfter" ? { count: 2 } : {}); stepIndex++; render(); };
+      return button;
+    }));
+  }
+  document.querySelectorAll("[data-action]").forEach(button => button.onclick = () => run(button.dataset.action));
+  render();
+</script>
+</html>
