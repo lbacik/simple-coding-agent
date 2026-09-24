@@ -24,6 +24,8 @@ class ControlSurface(Protocol):
 
     def submit_stop(self, request_id: str, *, has_active_attempt: bool = ...) -> object: ...
 
+    def submit_stop_after(self, request_id: str, after: object) -> object: ...
+
     def submit_resume(self, request_id: str) -> object: ...
 
     def get_command(self, request_id: str) -> object | None: ...
@@ -145,6 +147,8 @@ class ControlServer:
         operation = request.get("op")
         if operation == "stop":
             self._reply_stop(connection, request)
+        elif operation == "stop_after":
+            self._reply_stop_after(connection, request)
         elif operation == "resume":
             self._reply_resume(connection, request)
         elif operation == "status":
@@ -162,6 +166,21 @@ class ControlServer:
             request,
             self._control.submit_stop,
             rejected=(RequestIdError, PayloadMismatchError),
+        )
+
+    def _reply_stop_after(self, connection: socket.socket, request: dict) -> None:
+        from simple_coding_agent.control import (
+            PayloadMismatchError,
+            RequestIdError,
+            StopAfterRejectedError,
+        )
+
+        after = request.get("after")
+        _reply_mutating(
+            connection,
+            request,
+            lambda request_id: self._control.submit_stop_after(request_id, after),
+            rejected=(RequestIdError, PayloadMismatchError, StopAfterRejectedError),
         )
 
     def _reply_resume(self, connection: socket.socket, request: dict) -> None:

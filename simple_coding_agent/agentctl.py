@@ -23,6 +23,7 @@ from simple_coding_agent.control_server import (
     send_request,
     socket_path_for,
 )
+from simple_coding_agent.control import StopAfterRejectedError, parse_stop_after
 
 
 def default_socket_path() -> Path:
@@ -41,6 +42,14 @@ def run_stop(socket_path: Path, request_id: str) -> dict:
     """Submit ``stop`` once; never present a failure as accepted."""
 
     return send_request(socket_path, {"op": "stop", "request_id": request_id})
+
+
+def run_stop_after(socket_path: Path, request_id: str, after: int) -> dict:
+    """Submit ``stop --after N`` once; never present a failure as accepted."""
+
+    return send_request(
+        socket_path, {"op": "stop_after", "request_id": request_id, "after": after}
+    )
 
 
 def run_resume(socket_path: Path, request_id: str) -> dict:
@@ -134,6 +143,25 @@ def format_status(status: dict) -> str:
             f" ({pending.get('kind')}, {pending.get('acknowledgement')}"
             f" — {pending.get('detail')})"
         )
+    plan = status.get("stop_plan")
+    if plan is None:
+        lines.append("stop_plan: none")
+    else:
+        if plan.get("includes_active_attempt"):
+            inclusion = f"includes active attempt {plan.get('active_attempt_id')}"
+        else:
+            inclusion = "starts with next attempt"
+        latest_id = plan.get("latest_counted_attempt_id")
+        if latest_id is None:
+            last_counted = "none"
+        else:
+            last_counted = f"{latest_id} ({plan.get('latest_counted_outcome')})"
+        lines.append(
+            f"stop_plan: {plan.get('request_id')}"
+            f" ({plan.get('kind')}, requested {plan.get('requested')},"
+            f" remaining {plan.get('remaining')}, {inclusion},"
+            f" last counted: {last_counted})"
+        )
     commands = status.get("commands") or {}
     if commands:
         lines.append("recent_commands:")
@@ -167,6 +195,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Retry a previously generated request ID with the identical payload.",
     )
+    stop_parser.add_argument(
+        "--after",
+        dest="after",
+        default=None,
+        help="Stop intake after N fully finalized attempts, counting the active one first.",
+    )
 
     resume_parser = subparsers.add_parser(
         "resume", help="Permit issue intake again; replace any pending stop plan."
@@ -196,6 +230,18 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.command == "stop":
             request_id = args.request_id or generate_request_id()
+            if args.after is not None:
+                try:
+                    after = parse_stop_after(args.after)
+                except StopAfterRejectedError as error:
+                    print(f"rejected — {error}", file=sys.stderr)
+                    return 1
+                return submit_mutating(
+                    socket_path,
+                    f"stop --after {after}",
+                    request_id,
+                    lambda path, rid: run_stop_after(path, rid, after),
+                )
             return submit_mutating(socket_path, "stop", request_id, run_stop)
         if args.command == "resume":
             request_id = args.request_id or generate_request_id()
