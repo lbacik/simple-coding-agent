@@ -145,6 +145,59 @@ The agent adheres strictly to non-destructive cleanup:
   3. Halts execution with exit code 1.
   Cleaning the working tree is strictly the responsibility of human operators.
 
+## Per-instance operator control (`agentctl`)
+
+Each running agent container accepts operator commands through an installed
+control CLI. Container selection is the instance selector: the CLI has no
+instance flag, so opening the wrong container controls the wrong instance.
+
+1. Open a shell in the intended **running** container (for example, through
+   OrbStack) and verify its identity before any mutating command:
+
+   ```shell
+   /usr/local/bin/agentctl status
+   ```
+
+   The first line of every response names the `TARGET_REPO` configured for
+   that container (status, command acceptance, and request-ID lookup all
+   display it). If the repository is not the one you intend to control,
+   leave that container and open the correct one.
+
+2. Submit a command from the same shell, e.g.
+   `/usr/local/bin/agentctl stop`. The CLI prints a unique request ID
+   before submission; if the connection drops before the reply arrives,
+   retry the identical payload with
+   `agentctl stop --request-id <id>` and look it up later with
+   `agentctl command <id>`.
+
+Always use the absolute path `/usr/local/bin/agentctl`. The image prepends
+the target checkout's virtual environment to `PATH`, so a bare `agentctl`
+could resolve to the target repository's package instead of the running
+agent's installed entry point.
+
+Never start a second agent process or a one-shot Compose container
+(`docker compose run`) to issue a command: commands are accepted only by the
+live agent inside its own running container, and a second process would
+compete for the same persistent state. Likewise, never read or edit
+`$DATA_DIR/state/control.sqlite3` directly; the CLI talks only to the live
+process over its private socket.
+
+### Runtime socket and persistence
+
+The live agent binds `/run/simple-coding-agent/control.sock` with mode
+`0600` inside `/run/simple-coding-agent` (owner `agent`, mode `0700`).
+Only the `agent` OS user and container root can reach it. The directory and
+socket are container-local runtime state: no bind mount, published port, or
+shared socket volume exposes control to another instance, and there is no
+network listener.
+
+Accepted commands, request IDs, acknowledgements, and intake state persist
+on the instance's `/data` volume and survive container replacement; the new
+container recreates the runtime directory and socket on startup. While
+startup reconciliation is still running, live status reports `recovering`.
+When the agent process cannot be reached at all, the CLI reports a
+connection error rather than a saved snapshot.
+
 ## Persisted error-guard recovery
 
 The agent tracks consecutive `infrastructure_error` outcomes in

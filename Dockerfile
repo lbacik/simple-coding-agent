@@ -52,6 +52,13 @@ RUN pip install --no-cache-dir \
     "PyYAML>=6.0,<7" \
     && pip install --no-cache-dir -e .
 
+# The control entry point is installed by `pip install -e .` (via the
+# `agentctl` project script) as root, so it lands at its absolute path.
+# Operator instructions use that path: the image prepends the target
+# checkout's virtual environment to PATH, where a bare `agentctl` could
+# resolve to the target package instead of this agent's installed package.
+RUN test -x /usr/local/bin/agentctl
+
 # Pinned CLI runtime (installed globally so agent user can use it)
 COPY package.json ./
 RUN npm install --global @anthropic-ai/claude-code@2.1.276
@@ -71,6 +78,15 @@ RUN /usr/local/bin/install-skills.sh
 USER root
 RUN mkdir -p /data && chown agent:agent /data
 VOLUME /data
+
+# Private control-socket runtime directory: container-local state for
+# /run/simple-coding-agent/control.sock, owned by the agent user with mode
+# 0700. It is never bind-mounted or shared between instances. The live agent
+# recreates it on startup (covering tmpfs-mounted /run) and binds the socket
+# with mode 0600.
+RUN mkdir -p /run/simple-coding-agent \
+    && chown agent:agent /run/simple-coding-agent \
+    && chmod 0700 /run/simple-coding-agent
 
 USER agent
 ENV HOME=/home/agent

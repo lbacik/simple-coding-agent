@@ -12,22 +12,26 @@ connection error instead of a saved snapshot.
 from __future__ import annotations
 
 import argparse
-import os
 import sys
 import uuid
 from pathlib import Path
 
 from simple_coding_agent.control_server import (
     ControlUnavailableError,
+    resolve_socket_path,
     send_request,
-    socket_path_for,
 )
 
 
 def default_socket_path() -> Path:
-    """Resolve the instance endpoint from ``DATA_DIR``."""
+    """Resolve the instance endpoint: the container-local runtime socket.
 
-    return socket_path_for(Path(os.environ.get("DATA_DIR", "~/.simple-coding-agent/")).expanduser())
+    Container selection determines the controlled instance, so the default is
+    the fixed ``/run/simple-coding-agent/control.sock`` path. ``AGENTCTL_SOCKET``
+    overrides it for tests and local development only.
+    """
+
+    return resolve_socket_path()
 
 
 def generate_request_id() -> str:
@@ -52,16 +56,24 @@ def run_status(socket_path: Path) -> dict:
 
 
 def run_command_lookup(socket_path: Path, request_id: str) -> dict | None:
-    """Look up one command's current durable acknowledgement."""
+    """Look up one command's current durable acknowledgement.
+
+    The returned record carries the ``repository`` of the instance that
+    answered, so the operator can verify the selected container.
+    """
 
     reply = send_request(socket_path, {"op": "command", "request_id": request_id})
     if not reply.get("ok"):
         raise ControlUnavailableError(reply.get("error", "Lookup is unavailable."))
-    return reply.get("command")
+    record = reply.get("command")
+    if record is not None and reply.get("repository") is not None:
+        record = {**record, "repository": reply["repository"]}
+    return record
 
 
 def format_command(reply: dict) -> str:
     return (
+        f"repository: {reply.get('repository', 'unknown')}\n"
         f"request_id: {reply.get('request_id')}\n"
         f"sequence: {reply.get('sequence')}\n"
         f"acknowledgement: {reply.get('acknowledgement')}\n"
@@ -115,7 +127,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--socket",
         dest="socket",
         default=None,
-        help="Path to the agent control socket (defaults to $DATA_DIR/state/agentctl.sock).",
+        help="Path to the agent control socket (defaults to /run/simple-coding-agent/control.sock).",
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 

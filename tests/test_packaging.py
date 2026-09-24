@@ -491,3 +491,33 @@ class TestDockerSmoke:
             assert marker in r2.stdout
         finally:
             subprocess.run(["docker", "volume", "rm", volume_name], capture_output=True)
+
+    def test_agentctl_is_installed_at_its_absolute_path(self) -> None:
+        result = subprocess.run(
+            [
+                "docker", "run", "--rm",
+                "simple-coding-agent:smoke-test",
+                "test", "-x", "/usr/local/bin/agentctl",
+            ],
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0, (
+            "agentctl must be executable at /usr/local/bin/agentctl in every instance image"
+        )
+
+    def test_private_runtime_directory_exists_in_the_image(self) -> None:
+        result = subprocess.run(
+            [
+                "docker", "run", "--rm",
+                "simple-coding-agent:smoke-test",
+                "sh", "-c",
+                "stat -c '%U %a' /run/simple-coding-agent",
+            ],
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0, result.stderr
+        assert result.stdout.strip() == "agent 700", (
+            f"Runtime directory must be owned by agent with mode 0700; got: {result.stdout.strip()}"
+        )
