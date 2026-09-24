@@ -7,9 +7,10 @@ durable sequence assigned at commit time. Retrying the same request ID with
 an identical payload returns the stored acknowledgement without applying
 the command twice; reusing an ID with different content is rejected.
 
-This slice implements ``stop``. The record already stores the command kind
-and canonical payload so later commands (resume, stop-after, next-issue,
-handoff) can reuse the same ordering, retry, and acknowledgement rules.
+This slice implements ``stop`` and ``resume``. The record already stores
+the command kind and canonical payload so later commands (stop-after,
+next-issue, handoff) can reuse the same ordering, retry, and
+acknowledgement rules.
 """
 
 from __future__ import annotations
@@ -53,6 +54,15 @@ class PayloadMismatchError(ValueError):
     """Raised when a request ID is reused with different content (never re-applied)."""
 
 
+class ResumeBlockedError(ValueError):
+    """Raised when ``resume`` is rejected by an unresolved recovery hold.
+
+    The hold (startup reconciliation or retained work/finalization) leaves
+    intake and the command record unchanged, and the message names the
+    affected attempt and the reason.
+    """
+
+
 @dataclass(frozen=True)
 class CommandRecord:
     """One durably recorded operator command."""
@@ -76,8 +86,23 @@ class ActiveAttemptInfo:
     started_at: str
 
 
+@dataclass(frozen=True)
+class RecoveryHold:
+    """An unresolved recovery state that blocks ``resume`` without claiming."""
+
+    issue_number: int | None
+    attempt_id: str | None
+    branch: str | None
+    phase: str | None
+    reason: str
+
+
 _STORE_FILENAME = "control.sqlite3"
 _STOP_KIND = "stop"
+_RESUME_KIND = "resume"
+# Stop-plan kinds a newer ``resume`` (or a newer stop plan) replaces. Later
+# commands extend this tuple without changing the replacement rules.
+_STOP_PLAN_KINDS = (_STOP_KIND,)
 
 
 class ControlStore:
@@ -160,12 +185,103 @@ class ControlStore:
             except sqlite3.Error as error:
                 raise ControlStoreError("Control command could not be committed") from error
 
+    def submit_resume(
+        self,
+        request_id: str,
+        *,
+        has_active_attempt: bool,
+        recovery_hold: RecoveryHold | None = None,
+    ) -> CommandRecord:
+        """Durably record ``resume`` and permit later issue intake.
+
+        From ``stopped`` the instance enters ``running``; while a stop plan
+        is pending the plan is durably replaced (the earlier accepted stops
+        become ``superseded`` naming this request) and the active attempt
+        continues with its ordinary outcome. In ``running`` with no pending
+        plan the command completes idempotently. A ``recovery_hold`` rejects
+        the command without changing intake or the command record, and the
+        rejection names the affected attempt and reason. Resume never
+        requeues an issue: it only changes the intake state.
+        """
+
+        _check_request_id(request_id)
+        with self.lock:
+            try:
+                with self._connect() as connection:
+                    connection.execute("BEGIN IMMEDIATE")
+                    existing = self._find_locked(connection, request_id)
+                    if existing is not None:
+                        self._ensure_payload_identical(
+                            connection, existing, _RESUME_KIND, {}
+                        )
+                        connection.execute("ROLLBACK")
+                        return existing
+                    if recovery_hold is not None:
+                        connection.execute("ROLLBACK")
+                        raise ResumeBlockedError(_describe_hold(recovery_hold))
+                    intake = self._intake_locked(connection)
+                    pending = self._pending_locked(connection)
+                    superseded_ids = self._accepted_stop_plans_locked(connection)
+                    if (
+                        intake is IntakeState.RUNNING
+                        and pending is None
+                        and not superseded_ids
+                    ):
+                        acknowledgement = CommandAcknowledgement.COMPLETED
+                        detail = "intake already running"
+                    else:
+                        timestamp = self._timestamp()
+                        if superseded_ids:
+                            connection.execute(
+                                "UPDATE commands SET acknowledgement = ?, detail = ?,"
+                                " updated_at = ? WHERE kind IN (%s)"
+                                " AND acknowledgement = ?"
+                                % ",".join("?" * len(_STOP_PLAN_KINDS)),
+                                (
+                                    CommandAcknowledgement.SUPERSEDED.value,
+                                    f"superseded by {request_id}",
+                                    timestamp,
+                                    *_STOP_PLAN_KINDS,
+                                    CommandAcknowledgement.ACCEPTED.value,
+                                ),
+                            )
+                        if pending is not None and pending not in superseded_ids:
+                            superseded_ids = [pending, *superseded_ids]
+                        if superseded_ids:
+                            detail = (
+                                "intake resumed; stop plan "
+                                f"{', '.join(superseded_ids)} superseded"
+                            )
+                        else:
+                            detail = "intake resumed"
+                        if has_active_attempt:
+                            detail += "; active attempt continues"
+                        acknowledgement = CommandAcknowledgement.COMPLETED
+                        intake = IntakeState.RUNNING
+                        pending = None
+                    record = self._insert_locked(
+                        connection,
+                        request_id,
+                        _RESUME_KIND,
+                        {},
+                        acknowledgement,
+                        detail,
+                    )
+                    self._set_intake_locked(connection, intake, pending)
+                    connection.execute("COMMIT")
+                    return record
+            except (PayloadMismatchError, RequestIdError, ResumeBlockedError):
+                raise
+            except sqlite3.Error as error:
+                raise ControlStoreError("Control command could not be committed") from error
+
     def submit_command(self, kind: str, request_id: str, payload: dict) -> CommandRecord:
         """Generic command entry used to detect request-ID reuse.
 
-        Only ``stop`` applies a control change in this slice; any other kind
-        with a fresh ID is rejected without altering control state, while a
-        repeated ID returns (or rejects on mismatch) the stored record.
+        Only ``stop`` and ``resume`` apply a control change in this slice;
+        any other kind with a fresh ID is rejected without altering control
+        state, while a repeated ID returns (or rejects on mismatch) the
+        stored record.
         """
 
         _check_request_id(request_id)
@@ -374,6 +490,19 @@ class ControlStore:
             (intake.value, pending),
         )
 
+    def _accepted_stop_plans_locked(
+        self, connection: sqlite3.Connection
+    ) -> list[str]:
+        """Return the request IDs of accepted stop-plan commands, oldest first."""
+
+        rows = connection.execute(
+            "SELECT request_id FROM commands WHERE kind IN (%s)"
+            " AND acknowledgement = ? ORDER BY sequence"
+            % ",".join("?" * len(_STOP_PLAN_KINDS)),
+            (*_STOP_PLAN_KINDS, CommandAcknowledgement.ACCEPTED.value),
+        ).fetchall()
+        return [row[0] for row in rows]
+
     def _find_locked(
         self, connection: sqlite3.Connection, request_id: str
     ) -> CommandRecord | None:
@@ -474,6 +603,28 @@ def _check_request_id(request_id: object) -> None:
         raise RequestIdError("Request ID must be a non-empty string")
     if len(request_id) > 128:
         raise RequestIdError("Request ID must be at most 128 characters")
+
+
+def _describe_hold(hold: RecoveryHold) -> str:
+    """Render a resume rejection naming the affected attempt and reason."""
+
+    if hold.issue_number is not None:
+        where = f"issue #{hold.issue_number}"
+        if hold.attempt_id:
+            where += f" (attempt {hold.attempt_id})"
+        if hold.branch:
+            where += f" on {hold.branch}"
+        if hold.phase:
+            where += f" (phase {hold.phase})"
+        return (
+            f"Resume is blocked by the retained attempt for {where}:"
+            f" {hold.reason}. Resolve recovery before resuming intake;"
+            " no control change was accepted."
+        )
+    return (
+        f"Resume is blocked: {hold.reason}."
+        " No control change was accepted."
+    )
 
 
 def command_to_json(record: CommandRecord) -> dict:

@@ -25,6 +25,9 @@ class StubControl:
     def submit_stop(self, request_id: str, *, has_active_attempt: bool = False):
         return self._store.submit_stop(request_id, has_active_attempt=has_active_attempt)
 
+    def submit_resume(self, request_id: str):
+        return self._store.submit_resume(request_id, has_active_attempt=False)
+
     def get_command(self, request_id: str):
         return self._store.get_command(request_id)
 
@@ -197,3 +200,110 @@ def test_failed_submission_keeps_its_request_id_for_retry(
     err = capsys.readouterr().err
     assert "req-retry-1" in err
     assert "--request-id req-retry-1" in err
+
+
+# ---------------------------------------------------------------------------
+# resume (issue #81)
+# ---------------------------------------------------------------------------
+
+
+def test_resume_replaces_a_pending_stop_over_the_socket(tmp_path: Path) -> None:
+    from simple_coding_agent.control import CommandAcknowledgement
+
+    server, control, socket_path = start_server(tmp_path)
+    try:
+        stopped = control.submit_stop("req-stop", has_active_attempt=True)
+        assert stopped.acknowledgement == CommandAcknowledgement.ACCEPTED
+
+        reply = send(socket_path, {"op": "resume", "request_id": "req-resume"})
+        assert reply["ok"] is True
+        assert reply["request_id"] == "req-resume"
+        assert reply["kind"] == "resume"
+        assert reply["acknowledgement"] == "completed"
+        assert "req-stop" in reply["detail"]
+
+        status = send(socket_path, {"op": "status"})
+        assert status["ok"] is True
+        assert status["status"]["intake"] == "running"
+        assert status["status"]["pending_command"] is None
+
+        lookup = send(socket_path, {"op": "command", "request_id": "req-stop"})
+        assert lookup["ok"] is True
+        assert lookup["command"]["acknowledgement"] == "superseded"
+        assert "req-resume" in lookup["command"]["detail"]
+    finally:
+        server.stop()
+
+
+def test_resume_with_a_blank_request_id_is_rejected(tmp_path: Path) -> None:
+    server, _, socket_path = start_server(tmp_path)
+    try:
+        reply = send(socket_path, {"op": "resume", "request_id": "  "})
+        assert reply["ok"] is False
+        assert "request_id" in reply
+    finally:
+        server.stop()
+
+
+def test_agentctl_resume_cli_prints_the_ack(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    server, _, socket_path = start_server(tmp_path)
+    try:
+        from simple_coding_agent.agentctl import main as agentctl_main
+
+        code = agentctl_main(["--socket", str(socket_path), "resume"])
+        assert code == 0
+        out = capsys.readouterr().out
+        assert "completed" in out
+        assert "sequence" in out
+    finally:
+        server.stop()
+
+
+def test_agentctl_resume_reports_rejection_without_a_control_change(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from simple_coding_agent.agentctl import main as agentctl_main
+
+    server, control, socket_path = start_server(tmp_path)
+    try:
+        assert agentctl_main(["--socket", str(socket_path), "stop"]) == 0
+        capsys.readouterr()
+
+        # Reusing the stop's request ID with the resume payload is rejected:
+        # the ID is taken, so look it up from the socket state instead.
+        status_reply = send(socket_path, {"op": "status"})
+        stop_id = next(
+            request_id
+            for request_id, entry in status_reply["status"]["commands"].items()
+            if entry["kind"] == "stop"
+        )
+        code = agentctl_main(
+            ["--socket", str(socket_path), "resume", "--request-id", stop_id]
+        )
+
+        assert code == 1
+        err = capsys.readouterr().err
+        assert stop_id in err
+        assert "rejected" in err
+        assert "No control change was accepted" in err
+        stored = control.get_command(stop_id)
+        assert stored is not None
+        assert stored.kind == "stop"
+    finally:
+        server.stop()
+
+
+def test_failed_resume_keeps_its_request_id_for_retry(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from simple_coding_agent.agentctl import main as agentctl_main
+
+    missing = tmp_path / "state" / "agentctl.sock"
+    code = agentctl_main(["--socket", str(missing), "resume", "--request-id", "req-retry-r"])
+
+    assert code == 2
+    err = capsys.readouterr().err
+    assert "req-retry-r" in err
+    assert "--request-id req-retry-r" in err

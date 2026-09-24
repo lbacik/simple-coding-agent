@@ -27,6 +27,7 @@ from simple_coding_agent.control import (
     ControlStore,
     ControlStoreError,
     IntakeState,
+    RecoveryHold,
     build_status,
 )
 from simple_coding_agent.completion import (
@@ -603,6 +604,11 @@ class AgentLifecycle:
         self._startup_reconciled = False
         self._recovering = False
         self._active_issue_number: int | None = None
+        # True while this process is working through a claimed attempt (from
+        # the serialized claim until its processing finishes, including
+        # startup reconciliation). A checkpoint without in-progress work is a
+        # retained hold: resume must be rejected until recovery finishes it.
+        self._attempt_processing = False
 
     @property
     def active_issue_number(self) -> int | None:
@@ -630,6 +636,100 @@ class AgentLifecycle:
             return self._control_store.submit_stop(
                 request_id, has_active_attempt=has_active_attempt
             )
+
+    def submit_resume(self, request_id: str) -> CommandRecord:
+        """Durably record ``resume`` and permit later issue intake.
+
+        A pending stop plan is replaced without interrupting the active
+        attempt, which continues with its ordinary outcome. While startup
+        reconciliation or retained work/finalization remains unresolved the
+        command is rejected with the affected attempt and reason, and intake
+        is unchanged. Resume never requeues an issue: the next claim still
+        goes through the serialized intake check and the ordinary runnable
+        queue, so a ``round-finished`` issue stays ineligible until a
+        separate human-approved requeue.
+        """
+
+        if self._control_store is None:
+            raise ControlStoreError("Operator control is not configured")
+        with self._control_lock:
+            checkpoint = self._attempt_state.read()
+            return self._control_store.submit_resume(
+                request_id,
+                has_active_attempt=checkpoint is not None,
+                recovery_hold=self._recovery_hold_locked(checkpoint),
+            )
+
+    def _recovery_hold_locked(
+        self, checkpoint: AttemptCheckpoint | None
+    ) -> RecoveryHold | None:
+        """Return the hold blocking ``resume``, if any (caller holds the lock)."""
+
+        if self._recovering:
+            if checkpoint is not None:
+                return RecoveryHold(
+                    issue_number=checkpoint.issue_number,
+                    attempt_id=checkpoint.started_at,
+                    branch=checkpoint.branch,
+                    phase=checkpoint.phase.value,
+                    reason=(
+                        "startup reconciliation is still running for"
+                        f" issue #{checkpoint.issue_number}; intake is held"
+                        " until its outcome, publication, release, cleanup,"
+                        " and accounting are durable"
+                    ),
+                )
+            return RecoveryHold(
+                issue_number=None,
+                attempt_id=None,
+                branch=None,
+                phase=None,
+                reason="startup reconciliation is still running",
+            )
+        if checkpoint is not None and not self._attempt_processing:
+            return RecoveryHold(
+                issue_number=checkpoint.issue_number,
+                attempt_id=checkpoint.started_at,
+                branch=checkpoint.branch,
+                phase=checkpoint.phase.value,
+                reason=(
+                    "attempt finalization is unresolved; the branch,"
+                    " checkpoint, and working tree are preserved for recovery"
+                ),
+            )
+        if not self._attempt_processing and self._workspace_is_dirty():
+            # No checkpoint and no work in flight, yet the tree is dirty:
+            # unexplained work that requires manual repair before intake.
+            # (While an attempt is processing, dirt is its own work and
+            # resume stays permitted.)
+            return RecoveryHold(
+                issue_number=None,
+                attempt_id=None,
+                branch=None,
+                phase=None,
+                reason=(
+                    "the working tree holds unexplained dirty or untracked"
+                    " work with no active attempt; manual repair is required"
+                    " before intake"
+                ),
+            )
+        return None
+
+    def _workspace_is_dirty(self) -> bool:
+        """Whether the tree holds work outside any active attempt.
+
+        Mirrors the pre-claim dirt guard in ``run_once``: only workspaces
+        exposing ``is_clean`` are inspected. An unreadable tree fails closed
+        as a hold so resume never bypasses it.
+        """
+
+        probe = getattr(self._workspace, "is_clean", None)
+        if not callable(probe):
+            return False
+        try:
+            return not probe()
+        except Exception:
+            return True
 
     def get_command(self, request_id: str) -> CommandRecord | None:
         """Return one command's current durable acknowledgement."""
@@ -872,6 +972,11 @@ class AgentLifecycle:
                             level="WARNING",
                             issue_number=claim.issue.number,
                         )
+                    # The attempt's processing is finished (finalized or held
+                    # for recovery); a later resume sees a retained checkpoint
+                    # here instead of an active attempt.
+                    with self._control_lock:
+                        self._attempt_processing = False
         self._active_issue_number = None
         return LifecycleResult(LifecycleStatus.ATTEMPTED, outcome)
 
@@ -917,6 +1022,7 @@ class AgentLifecycle:
             checkpoint = self._attempt_state.start(
                 issue_number=claim.issue.number, branch=f"agent/issue-{claim.issue.number}"
             )
+            self._attempt_processing = True
             return (claim, checkpoint)
 
     def _complete_control_stop_if_pending(self) -> None:
@@ -1032,6 +1138,8 @@ class AgentLifecycle:
         if claim is None:
             raise RuntimeError("Interrupted attempt issue is unavailable for recovery")
         self._active_issue_number = claim.issue.number
+        with self._control_lock:
+            self._attempt_processing = True
         archive = self._archive_for(claim.issue.number, checkpoint.started_at)
 
         prepared: object | None = None
@@ -1232,6 +1340,11 @@ class AgentLifecycle:
                             level="WARNING",
                             issue_number=claim.issue.number,
                         )
+                    # Reconciliation is finished (finalized or held); a later
+                    # resume sees a retained checkpoint here, not an active
+                    # attempt.
+                    with self._control_lock:
+                        self._attempt_processing = False
         self._active_issue_number = None
         return outcome
 

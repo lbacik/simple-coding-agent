@@ -5,12 +5,15 @@ from __future__ import annotations
 import threading
 from pathlib import Path
 
+import pytest
+
 from simple_coding_agent.attempt_state import AttemptPhase, AttemptStateStore
 from simple_coding_agent.completion import AttemptOutcome, CompletionDecision, PublicationPath
 from simple_coding_agent.control import (
     CommandAcknowledgement,
     ControlStore,
     IntakeState,
+    ResumeBlockedError,
 )
 from simple_coding_agent.github_tracker import Assignment, Claim, TrackerIssue
 from simple_coding_agent.lifecycle import AgentLifecycle, LifecycleStatus
@@ -317,6 +320,10 @@ class FakeWorkspace:
 
     def __init__(self) -> None:
         self.cleanup_calls: list[tuple[str, bool]] = []
+        self.dirty = False
+
+    def is_clean(self) -> bool:
+        return not self.dirty
 
     def prepare_for_profile_read(self, *, base_branch: str = "main") -> None:
         return None
@@ -359,3 +366,223 @@ def make_lifecycle(tmp_path: Path, *, next_claim: Claim | None):
 
 def workspace_of(lifecycle: AgentLifecycle):
     return lifecycle._workspace  # noqa: SLF001 - test seam
+
+
+# ---------------------------------------------------------------------------
+# resume (issue #81)
+# ---------------------------------------------------------------------------
+
+
+def test_resume_from_stopped_permits_a_later_claim(tmp_path: Path) -> None:
+    lifecycle, tracker, store = make_lifecycle(tmp_path, next_claim=claim(24))
+
+    lifecycle.submit_stop("req-stop")
+    assert store.intake_state() is IntakeState.STOPPED
+    assert lifecycle.run_once().status is LifecycleStatus.IDLE
+    assert tracker.claimed == []
+
+    record = lifecycle.submit_resume("req-resume")
+
+    assert record.acknowledgement is CommandAcknowledgement.COMPLETED
+    assert store.intake_state() is IntakeState.RUNNING
+    result = lifecycle.run_once()
+
+    assert result.status is LifecycleStatus.ATTEMPTED
+    assert tracker.claimed == [24]
+
+
+def test_resume_during_an_active_attempt_cancels_the_stop_plan(
+    tmp_path: Path,
+) -> None:
+    lifecycle, tracker, store = make_lifecycle(tmp_path, next_claim=claim(24))
+    started = threading.Event()
+    release = threading.Event()
+    lifecycle.set_attempt_runner(blocking_evidence(started, release, AttemptOutcome.COMPLETE))
+    worker = threading.Thread(target=lifecycle.run_once)
+    worker.start()
+    assert started.wait(timeout=30)
+
+    stop = lifecycle.submit_stop("req-stop")
+    assert stop.acknowledgement is CommandAcknowledgement.ACCEPTED
+
+    resume = lifecycle.submit_resume("req-resume")
+
+    assert resume.acknowledgement is CommandAcknowledgement.COMPLETED
+    assert "req-stop" in resume.detail
+    assert store.intake_state() is IntakeState.RUNNING
+    replaced = store.get_command("req-stop")
+    assert replaced is not None
+    assert replaced.acknowledgement is CommandAcknowledgement.SUPERSEDED
+    assert "req-resume" in replaced.detail
+
+    release.set()
+    worker.join(timeout=30)
+    assert not worker.is_alive()
+
+    # The attempt keeps its ordinary outcome and finalizes without stopping.
+    assert tracker.cleanup == [(24, "ready-for-agent", "agent-id")]
+    assert store.intake_state() is IntakeState.RUNNING
+
+    tracker.next_claim = claim(25)
+    assert lifecycle.run_once().status is LifecycleStatus.ATTEMPTED
+    assert tracker.claimed == [24, 25]
+
+
+def test_resume_while_running_without_a_plan_is_idempotent(tmp_path: Path) -> None:
+    lifecycle, tracker, store = make_lifecycle(tmp_path, next_claim=None)
+
+    first = lifecycle.submit_resume("req-r1")
+    second = lifecycle.submit_resume("req-r2")
+
+    assert first.acknowledgement is CommandAcknowledgement.COMPLETED
+    assert second.acknowledgement is CommandAcknowledgement.COMPLETED
+    assert store.intake_state() is IntakeState.RUNNING
+    assert tracker.claimed == []
+
+
+def test_resume_rejected_while_retained_finalization_is_unresolved(
+    tmp_path: Path,
+) -> None:
+    lifecycle, tracker, store = make_lifecycle(tmp_path, next_claim=claim(24))
+    AttemptStateStore(tmp_path).start(issue_number=24, branch="agent/issue-24")
+
+    with pytest.raises(ResumeBlockedError, match=r"issue #24"):
+        lifecycle.submit_resume("req-resume")
+
+    assert store.intake_state() is IntakeState.RUNNING
+    assert store.get_command("req-resume") is None
+    assert tracker.claimed == []
+
+
+def test_resume_rejected_while_startup_reconciliation_runs(tmp_path: Path) -> None:
+    state = AttemptStateStore(tmp_path)
+    state.start(issue_number=24, branch="agent/issue-24")
+    lifecycle, tracker, store = make_lifecycle(tmp_path, next_claim=None)
+    entered = threading.Event()
+    release = threading.Event()
+    original_recover = tracker.recover_claim
+
+    def blocking_recover(issue_number: int):
+        entered.set()
+        assert release.wait(timeout=30)
+        return original_recover(issue_number)
+
+    tracker.recover_claim = blocking_recover  # type: ignore[method-assign]
+    worker = threading.Thread(target=lifecycle.run_once)
+    worker.start()
+    assert entered.wait(timeout=30)
+
+    try:
+        with pytest.raises(ResumeBlockedError, match="reconciliation"):
+            lifecycle.submit_resume("req-resume")
+    finally:
+        release.set()
+        worker.join(timeout=30)
+
+    assert store.get_command("req-resume") is None
+
+
+def test_resume_never_requeues_a_round_finished_issue(tmp_path: Path) -> None:
+    from simple_coding_agent.lifecycle import AttemptEvidence
+
+    lifecycle, tracker, store = make_lifecycle(tmp_path, next_claim=claim(24))
+
+    def handoff_workflow(received_claim: Claim, profile: object, prepared: object):
+        return AttemptEvidence(
+            decision=CompletionDecision(
+                AttemptOutcome.HANDOFF, False, PublicationPath.PARTIAL, ("handoff note",)
+            ),
+            check_command="pytest",
+            check_exit_code=None,
+            review_cycles=0,
+            review_findings="not run",
+            details="handoff note",
+        )
+
+    lifecycle.set_attempt_runner(handoff_workflow)
+    assert lifecycle.run_once().status is LifecycleStatus.ATTEMPTED
+    assert tracker.cleanup == [(24, "round-finished", "agent-id")]
+
+    claimed_before = list(tracker.claimed)
+    cleanup_before = list(tracker.cleanup)
+    record = lifecycle.submit_resume("req-resume")
+
+    assert record.acknowledgement is CommandAcknowledgement.COMPLETED
+    # Resume performs no claim, release, or label change of its own.
+    assert tracker.claimed == claimed_before
+    assert tracker.cleanup == cleanup_before
+
+    # The round-finished issue stays out of the runnable queue.
+    tracker.next_claim = None
+    assert lifecycle.run_once().status is LifecycleStatus.IDLE
+    assert tracker.cleanup == cleanup_before
+
+
+def test_restart_after_resume_reconciles_before_claim(tmp_path: Path) -> None:
+    from simple_coding_agent.lifecycle import AgentLifecycle
+
+    first, _, store = make_lifecycle(tmp_path, next_claim=claim(24))
+    first.submit_stop("req-stop")
+    first.submit_resume("req-resume")
+    assert store.intake_state() is IntakeState.RUNNING
+
+    tracker = FakeTracker(claim(25))
+    workspace = FakeWorkspace()
+    restarted = AgentLifecycle(
+        tracker=tracker,
+        attempt_state=AttemptStateStore(tmp_path),
+        workspace=workspace,
+        profile_loader=lambda _: type("Profile", (), {"base_branch": "main"})(),
+        publisher=FakePublisher(),
+        attempt_runner=lambda received_claim, profile, prepared: _evidence(None),
+        control_store=store,
+        sleeper=lambda seconds: None,
+    )
+    result = restarted.run_once()
+
+    assert result.status is LifecycleStatus.ATTEMPTED
+    assert tracker.claimed == [25]
+
+
+def test_resume_rejected_while_unexplained_dirt_has_no_attempt(
+    tmp_path: Path,
+) -> None:
+    lifecycle, tracker, store = make_lifecycle(tmp_path, next_claim=claim(24))
+    workspace_of(lifecycle).dirty = True
+
+    with pytest.raises(ResumeBlockedError, match="dirty or untracked"):
+        lifecycle.submit_resume("req-resume")
+
+    assert store.intake_state() is IntakeState.RUNNING
+    assert store.get_command("req-resume") is None
+    assert tracker.claimed == []
+
+    # After manual repair, resume is accepted again.
+    workspace_of(lifecycle).dirty = False
+    record = lifecycle.submit_resume("req-resume")
+    assert record.acknowledgement is CommandAcknowledgement.COMPLETED
+
+
+def test_resume_during_an_active_attempt_ignores_the_attempts_own_dirt(
+    tmp_path: Path,
+) -> None:
+    lifecycle, tracker, store = make_lifecycle(tmp_path, next_claim=claim(24))
+    started = threading.Event()
+    release = threading.Event()
+    lifecycle.set_attempt_runner(blocking_evidence(started, release, AttemptOutcome.COMPLETE))
+    worker = threading.Thread(target=lifecycle.run_once)
+    worker.start()
+    assert started.wait(timeout=30)
+
+    # Dirt appearing while the attempt runs is the attempt's own work.
+    workspace_of(lifecycle).dirty = True
+    try:
+        resume = lifecycle.submit_resume("req-resume")
+    finally:
+        release.set()
+        worker.join(timeout=30)
+
+    assert resume.acknowledgement is CommandAcknowledgement.COMPLETED
+    assert not worker.is_alive()
+    assert tracker.cleanup == [(24, "ready-for-agent", "agent-id")]
+    assert store.intake_state() is IntakeState.RUNNING

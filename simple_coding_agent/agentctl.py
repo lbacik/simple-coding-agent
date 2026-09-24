@@ -15,6 +15,7 @@ import argparse
 import os
 import sys
 import uuid
+from collections.abc import Callable
 from pathlib import Path
 
 from simple_coding_agent.control_server import (
@@ -42,6 +43,12 @@ def run_stop(socket_path: Path, request_id: str) -> dict:
     return send_request(socket_path, {"op": "stop", "request_id": request_id})
 
 
+def run_resume(socket_path: Path, request_id: str) -> dict:
+    """Submit ``resume`` once; never present a failure as accepted."""
+
+    return send_request(socket_path, {"op": "resume", "request_id": request_id})
+
+
 def run_status(socket_path: Path) -> dict:
     """Read one consistent live snapshot; raise when the process is down."""
 
@@ -67,6 +74,40 @@ def format_command(reply: dict) -> str:
         f"acknowledgement: {reply.get('acknowledgement')}\n"
         f"effect: {reply.get('detail')}"
     )
+
+
+def submit_mutating(
+    socket_path: Path,
+    kind: str,
+    request_id: str,
+    submit: Callable[[Path, str], dict],
+) -> int:
+    """Submit one mutating command; return the process exit code.
+
+    A lost connection keeps the request ID for an identical retry; a
+    rejection reports the reason with no control change accepted.
+    """
+
+    try:
+        reply = submit(socket_path, request_id)
+    except ControlUnavailableError as error:
+        # The ambiguous-loss case: the command may or may not have
+        # committed, so the ID must survive for an identical retry.
+        print(
+            f"{request_id} not submitted — cannot connect to the agent process:"
+            f" {error} Retry with: agentctl {kind} --request-id {request_id}",
+            file=sys.stderr,
+        )
+        return 2
+    if not reply.get("ok"):
+        print(
+            f"{request_id} rejected — {reply.get('error', 'unknown error')}. "
+            "No control change was accepted.",
+            file=sys.stderr,
+        )
+        return 1
+    print(format_command(reply))
+    return 0
 
 
 def format_status(status: dict) -> str:
@@ -127,6 +168,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="Retry a previously generated request ID with the identical payload.",
     )
 
+    resume_parser = subparsers.add_parser(
+        "resume", help="Permit issue intake again; replace any pending stop plan."
+    )
+    resume_parser.add_argument(
+        "--request-id",
+        dest="request_id",
+        default=None,
+        help="Retry a previously generated request ID with the identical payload.",
+    )
+
     subparsers.add_parser("status", help="Show one consistent live status snapshot.")
     command_parser = subparsers.add_parser(
         "command", help="Show one command's current durable acknowledgement."
@@ -145,26 +196,10 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.command == "stop":
             request_id = args.request_id or generate_request_id()
-            try:
-                reply = run_stop(socket_path, request_id)
-            except ControlUnavailableError as error:
-                # The ambiguous-loss case: the command may or may not have
-                # committed, so the ID must survive for an identical retry.
-                print(
-                    f"{request_id} not submitted — cannot connect to the agent process:"
-                    f" {error} Retry with: agentctl stop --request-id {request_id}",
-                    file=sys.stderr,
-                )
-                return 2
-            if not reply.get("ok"):
-                print(
-                    f"{request_id} rejected — {reply.get('error', 'unknown error')}. "
-                    "No control change was accepted.",
-                    file=sys.stderr,
-                )
-                return 1
-            print(format_command(reply))
-            return 0
+            return submit_mutating(socket_path, "stop", request_id, run_stop)
+        if args.command == "resume":
+            request_id = args.request_id or generate_request_id()
+            return submit_mutating(socket_path, "resume", request_id, run_resume)
         if args.command == "status":
             print(format_status(run_status(socket_path)))
             return 0
