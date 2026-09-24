@@ -643,6 +643,27 @@ class AgentLifecycle:
                 request_id, has_active_attempt=has_active_attempt
             )
 
+    def submit_stop_after(self, request_id: str, after: object) -> CommandRecord:
+        """Durably record ``stop --after N`` against the current attempt liveness.
+
+        The attempt active at acceptance, if any, is count one under the new
+        plan; otherwise counting starts with the next attempt. A replacement
+        plan starts a fresh count without interrupting the active attempt.
+        Invalid counts and a stopped instance are rejected without changing
+        an existing plan.
+        """
+
+        if self._control_store is None:
+            raise ControlStoreError("Operator control is not configured")
+        with self._control_lock:
+            checkpoint = self._attempt_state.read()
+            return self._control_store.submit_stop_after(
+                request_id,
+                after,
+                has_active_attempt=checkpoint is not None,
+                active_attempt_id=checkpoint.started_at if checkpoint is not None else None,
+            )
+
     def submit_resume(self, request_id: str) -> CommandRecord:
         """Durably record ``resume`` and permit later issue intake.
 
@@ -771,6 +792,7 @@ class AgentLifecycle:
                 pending_command_id=store.pending_command_id(),
                 get_command=store.get_command,
                 recent_commands=store.recent_commands,
+                stop_plan=store.stop_plan_snapshot(),
             )
 
     def run_once(self) -> LifecycleResult:
@@ -1029,25 +1051,37 @@ class AgentLifecycle:
                 issue_number=claim.issue.number, branch=f"agent/issue-{claim.issue.number}"
             )
             self._attempt_processing = True
+            if self._control_store is not None:
+                # The final counted attempt of a ``stop --after`` plan enters
+                # ``stopping`` at claim; earlier claims leave intake running
+                # and an empty queue preserves the remaining count untouched.
+                self._control_store.enter_stopping_for_final_claim()
             return (claim, checkpoint)
 
-    def _complete_control_stop_if_pending(self) -> None:
-        """Complete the pending stop after its attempt fully finalized.
+    def _record_control_finalization(
+        self, attempt_id: str, outcome: AttemptOutcome
+    ) -> None:
+        """Count one fully finalized attempt against the pending stop plan.
 
         Called only on the durable completion boundary (outcome published,
-        issue released, cleanup durable, checkpoint removed). A held
-        finalization never reaches this, so its stop stays accepted and
+        issue released, cleanup durable). The at-most-once decrement, the
+        ``stopped`` transition, and the stop-command completion commit in one
+        control transaction keyed by the stable attempt ID, so no claim can
+        intervene and a replayed attempt cannot count twice. A held
+        finalization never reaches this, so its stop plan stays pending and
         intake stays ``stopping`` until recovery finishes the attempt.
         """
 
         if self._control_store is None:
             return
         with self._control_lock:
-            completed = self._control_store.complete_pending_stop()
+            completed = self._control_store.record_attempt_finalized(
+                attempt_id, outcome.value
+            )
         for record in completed:
             self._event_log(
                 "intake_stopped",
-                f"stop {record.request_id} completed after the active attempt finished",
+                f"stop plan {record.request_id} completed after the final counted attempt finished",
                 level="INFO",
             )
 
@@ -1077,13 +1111,17 @@ class AgentLifecycle:
         """Record the durable completion boundary, then remove the checkpoint.
 
         Accounting and the outcome archive precede the ledger entry, which is
-        written immediately before checkpoint removal. A crash before the
-        ledger entry replays safely on restart: publication is deduplicated by
-        the attempt marker, release re-reads remote state before mutating, and
-        accounting is keyed by the stable attempt ID. A crash between the
-        ledger entry and checkpoint removal is reconciled as "already
-        finalized, only delete" instead of replaying the result comment, the
-        issue release, or the accounting. Checkpoint deletion alone is never
+        written immediately before the control accounting transaction. The
+        at-most-once stop-plan decrement, the ``stopped`` transition, and the
+        stop-command completion commit in one control transaction keyed by
+        the stable attempt ID, immediately before checkpoint removal. A crash
+        before the ledger entry replays safely on restart: publication is
+        deduplicated by the attempt marker, release re-reads remote state
+        before mutating, and accounting is keyed by the stable attempt ID. A
+        crash between the ledger entry or the control transaction and
+        checkpoint removal is reconciled as "already finalized, only count
+        once and delete" instead of replaying the result comment, the issue
+        release, or the accounting. Checkpoint deletion alone is never
         evidence of completion.
         """
 
@@ -1097,8 +1135,8 @@ class AgentLifecycle:
                 branch=branch,
                 outcome=outcome,
             )
+        self._record_control_finalization(attempt_id, outcome)
         self._attempt_state.delete()
-        self._complete_control_stop_if_pending()
 
     def _reconcile_startup(self) -> AttemptOutcome | None:
         """Finish one durable attempt without recreating its SDK execution context."""
@@ -1134,10 +1172,17 @@ class AgentLifecycle:
             # the attempt, then crashed before removing the checkpoint.
             # Replaying any side effect here would duplicate the result
             # comment, the issue release, or the completed-attempt accounting,
-            # so only the leftover checkpoint is removed. A stop that waited
-            # for this attempt completes here: its whole boundary is durable.
+            # so the saved accounting is applied at most once and only the
+            # leftover checkpoint is removed. A stop plan that waited for
+            # this attempt completes here: its whole boundary is durable.
+            if self._completion_store is not None:
+                completions = self._completion_store.read_all()
+                terminal = completions.get(checkpoint.started_at)
+                if terminal is not None:
+                    self._record_control_finalization(
+                        checkpoint.started_at, terminal.outcome
+                    )
             self._attempt_state.delete()
-            self._complete_control_stop_if_pending()
             self._active_issue_number = None
             return None
         claim = self._tracker.recover_claim(checkpoint.issue_number)
@@ -1146,6 +1191,11 @@ class AgentLifecycle:
         self._active_issue_number = claim.issue.number
         with self._control_lock:
             self._attempt_processing = True
+            if self._control_store is not None:
+                # A crash between the final claim and its ``stopping``
+                # transition must not lose the boundary: the recovered final
+                # counted attempt enters ``stopping`` here instead.
+                self._control_store.enter_stopping_for_final_claim()
         archive = self._archive_for(claim.issue.number, checkpoint.started_at)
 
         prepared: object | None = None

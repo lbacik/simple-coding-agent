@@ -7,9 +7,9 @@ durable sequence assigned at commit time. Retrying the same request ID with
 an identical payload returns the stored acknowledgement without applying
 the command twice; reusing an ID with different content is rejected.
 
-This slice implements ``stop`` and ``resume``. The record already stores
-the command kind and canonical payload so later commands (stop-after,
-next-issue, handoff) can reuse the same ordering, retry, and
+This slice implements ``stop``, ``resume``, and ``stop --after N``. The
+record already stores the command kind and canonical payload so later
+commands (next-issue, handoff) can reuse the same ordering, retry, and
 acknowledgement rules.
 """
 
@@ -20,6 +20,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
 import json
+import re
 import sqlite3
 import threading
 from pathlib import Path
@@ -63,6 +64,14 @@ class ResumeBlockedError(ValueError):
     """
 
 
+class StopAfterRejectedError(ValueError):
+    """Raised when ``stop --after N`` is rejected without a control change.
+
+    Nonpositive or noninteger counts and a stopped instance are rejected;
+    neither the intake state nor an existing stop plan is altered.
+    """
+
+
 @dataclass(frozen=True)
 class CommandRecord:
     """One durably recorded operator command."""
@@ -99,10 +108,45 @@ class RecoveryHold:
 
 _STORE_FILENAME = "control.sqlite3"
 _STOP_KIND = "stop"
+_STOP_AFTER_KIND = "stop_after"
 _RESUME_KIND = "resume"
 # Stop-plan kinds a newer ``resume`` (or a newer stop plan) replaces. Later
 # commands extend this tuple without changing the replacement rules.
-_STOP_PLAN_KINDS = (_STOP_KIND,)
+_STOP_PLAN_KINDS = (_STOP_KIND, _STOP_AFTER_KIND)
+
+
+def parse_stop_after(value: object) -> int:
+    """Validate a ``stop --after N`` count; raise without side effects."""
+
+    if isinstance(value, bool):
+        raise StopAfterRejectedError(
+            f"Invalid --after value {value!r}: must be a positive integer number"
+            " of attempts. No control change was accepted."
+        )
+    if isinstance(value, int):
+        count = value
+    elif isinstance(value, str):
+        if re.fullmatch(r"[+-]?\d+", value.strip()) is None:
+            raise StopAfterRejectedError(
+                f"Invalid --after value {value!r}: must be a positive integer number"
+                " of attempts. No control change was accepted."
+            )
+        count = int(value.strip(), 10)
+    else:
+        raise StopAfterRejectedError(
+            f"Invalid --after value {value!r}: must be a positive integer number"
+            " of attempts. No control change was accepted."
+        )
+    if count <= 0:
+        raise StopAfterRejectedError(
+            f"Invalid --after value {value!r}: must be a positive integer number"
+            " of attempts. No control change was accepted."
+        )
+    return count
+
+
+def _attempts_noun(count: int) -> str:
+    return "1 attempt" if count == 1 else f"{count} attempts"
 
 
 class ControlStore:
@@ -159,14 +203,42 @@ class ControlStore:
                         acknowledgement = CommandAcknowledgement.ACCEPTED
                         detail = "stop already pending; completes when the active attempt finishes"
                         pending = self._pending_locked(connection)
+                        superseded_after = self._supersede_plans_locked(
+                            connection, (_STOP_AFTER_KIND,), request_id
+                        )
+                        if superseded_after:
+                            # A stop-after plan waited for this same attempt:
+                            # the plain stop takes over the wait without
+                            # consuming a count.
+                            pending = request_id
+                            detail += (
+                                "; stop plan " + ", ".join(superseded_after) + " superseded"
+                            )
+                            self._clear_stop_plan_locked(connection)
                     elif has_active_attempt:
                         acknowledgement = CommandAcknowledgement.ACCEPTED
                         detail = "finish active attempt, then stop intake"
+                        superseded_after = self._supersede_plans_locked(
+                            connection, (_STOP_AFTER_KIND,), request_id
+                        )
+                        if superseded_after:
+                            detail += (
+                                "; stop plan " + ", ".join(superseded_after) + " superseded"
+                            )
+                            self._clear_stop_plan_locked(connection)
                         intake = IntakeState.STOPPING
                         pending = request_id
                     else:
                         acknowledgement = CommandAcknowledgement.COMPLETED
                         detail = "intake stopped"
+                        superseded_after = self._supersede_plans_locked(
+                            connection, (_STOP_AFTER_KIND,), request_id
+                        )
+                        if superseded_after:
+                            detail += (
+                                "; stop plan " + ", ".join(superseded_after) + " superseded"
+                            )
+                            self._clear_stop_plan_locked(connection)
                         intake = IntakeState.STOPPED
                         pending = None
                     record = self._insert_locked(
@@ -268,6 +340,7 @@ class ControlStore:
                         detail,
                     )
                     self._set_intake_locked(connection, intake, pending)
+                    self._clear_stop_plan_locked(connection)
                     connection.execute("COMMIT")
                     return record
             except (PayloadMismatchError, RequestIdError, ResumeBlockedError):
@@ -275,10 +348,100 @@ class ControlStore:
             except sqlite3.Error as error:
                 raise ControlStoreError("Control command could not be committed") from error
 
+    def submit_stop_after(
+        self,
+        request_id: str,
+        after: object,
+        *,
+        has_active_attempt: bool,
+        active_attempt_id: str | None = None,
+    ) -> CommandRecord:
+        """Durably record ``stop --after N`` and persist its countdown plan.
+
+        The attempt active at acceptance, if any, is count one; otherwise
+        counting starts with the next attempt. With ``N == 1`` and an active
+        attempt intake enters ``stopping`` at acceptance, otherwise it stays
+        ``running`` with a visible pending plan until the final counted
+        attempt is claimed. A new accepted plan replaces any pending stop
+        plan and resets the count; ``stop``, ``resume``, and ``handoff now``
+        replace it the same way without consuming a count. Rejections leave
+        intake and any existing plan unchanged.
+        """
+
+        _check_request_id(request_id)
+        count = parse_stop_after(after)
+        with self.lock:
+            try:
+                with self._connect() as connection:
+                    connection.execute("BEGIN IMMEDIATE")
+                    existing = self._find_locked(connection, request_id)
+                    if existing is not None:
+                        self._ensure_payload_identical(
+                            connection, existing, _STOP_AFTER_KIND, {"after": count}
+                        )
+                        connection.execute("ROLLBACK")
+                        return existing
+                    if has_active_attempt and (
+                        not isinstance(active_attempt_id, str)
+                        or not active_attempt_id.strip()
+                    ):
+                        connection.execute("ROLLBACK")
+                        raise ControlStoreError(
+                            "An active attempt must carry a stable attempt identity"
+                        )
+                    intake = self._intake_locked(connection)
+                    if intake is IntakeState.STOPPED:
+                        connection.execute("ROLLBACK")
+                        raise StopAfterRejectedError(
+                            "stop --after N is rejected while intake is stopped;"
+                            " resume first. No control change was accepted."
+                        )
+                    superseded_ids = self._supersede_plans_locked(
+                        connection, _STOP_PLAN_KINDS, request_id
+                    )
+                    if has_active_attempt:
+                        assert active_attempt_id is not None
+                        detail = (
+                            f"stop after {_attempts_noun(count)};"
+                            f" active attempt {active_attempt_id} is count one"
+                        )
+                    else:
+                        detail = (
+                            f"stop after {_attempts_noun(count)};"
+                            " counting starts with the next attempt"
+                        )
+                    if superseded_ids:
+                        detail += "; stop plan " + ", ".join(superseded_ids) + " superseded"
+                    record = self._insert_locked(
+                        connection,
+                        request_id,
+                        _STOP_AFTER_KIND,
+                        {"after": count},
+                        CommandAcknowledgement.ACCEPTED,
+                        detail,
+                    )
+                    if has_active_attempt and count == 1:
+                        intake = IntakeState.STOPPING
+                    else:
+                        intake = IntakeState.RUNNING
+                    self._set_intake_locked(connection, intake, request_id)
+                    self._set_stop_plan_locked(
+                        connection,
+                        requested=count,
+                        remaining=count,
+                        active_attempt_id=active_attempt_id if has_active_attempt else None,
+                    )
+                    connection.execute("COMMIT")
+                    return record
+            except (PayloadMismatchError, RequestIdError, StopAfterRejectedError):
+                raise
+            except sqlite3.Error as error:
+                raise ControlStoreError("Control command could not be committed") from error
+
     def submit_command(self, kind: str, request_id: str, payload: dict) -> CommandRecord:
         """Generic command entry used to detect request-ID reuse.
 
-        Only ``stop`` and ``resume`` apply a control change in this slice;
+        Only ``stop``, ``resume``, and ``stop_after`` apply a control change;
         any other kind with a fresh ID is rejected without altering control
         state, while a repeated ID returns (or rejects on mismatch) the
         stored record.
@@ -357,7 +520,9 @@ class ControlStore:
         Returns the completed records, or an empty list when no stop is
         pending. A held finalization (unconfirmed publication, release, or
         cleanup) must not call this: the stops stay accepted and intake
-        stays ``stopping`` until the attempt is durably finished.
+        stays ``stopping`` until the attempt is durably finished. A pending
+        ``stop --after`` plan is never completed here; it is counted down by
+        :meth:`record_attempt_finalized` instead.
         """
 
         with self.lock:
@@ -368,44 +533,246 @@ class ControlStore:
                     if pending is None:
                         connection.execute("ROLLBACK")
                         return []
-                    timestamp = self._timestamp()
-                    rows = connection.execute(
-                        "SELECT request_id, sequence, kind, acknowledgement, detail,"
-                        " created_at, updated_at FROM commands"
-                        " WHERE kind = ? AND acknowledgement = ? ORDER BY sequence",
-                        (_STOP_KIND, CommandAcknowledgement.ACCEPTED.value),
-                    ).fetchall()
-                    connection.execute(
-                        "UPDATE commands SET acknowledgement = ?, detail = ?,"
-                        " updated_at = ? WHERE kind = ? AND acknowledgement = ?",
-                        (
-                            CommandAcknowledgement.COMPLETED.value,
-                            "intake stopped after active attempt",
-                            timestamp,
-                            _STOP_KIND,
-                            CommandAcknowledgement.ACCEPTED.value,
-                        ),
-                    )
-                    connection.execute(
-                        "UPDATE control_state SET intake = ?, pending_command_id = NULL"
-                        " WHERE id = 1",
-                        (IntakeState.STOPPED.value,),
-                    )
-                    connection.execute("COMMIT")
-                    return [
-                        CommandRecord(
-                            request_id=row[0],
-                            sequence=int(row[1]),
-                            kind=row[2],
-                            acknowledgement=CommandAcknowledgement.COMPLETED,
-                            detail="intake stopped after active attempt",
-                            created_at=row[5],
-                            updated_at=timestamp,
-                        )
-                        for row in rows
-                    ]
+                    pending_record = self._find_locked(connection, pending)
+                    if pending_record is None or pending_record.kind != _STOP_KIND:
+                        connection.execute("ROLLBACK")
+                        return []
+                    return self._complete_plain_stops_in_txn(connection)
             except sqlite3.Error as error:
                 raise ControlStoreError("Control command could not be committed") from error
+
+    # -- stop-after accounting ------------------------------------------------
+
+    def record_attempt_finalized(self, attempt_id: str, outcome: str) -> list[CommandRecord]:
+        """Count one fully finalized attempt against the pending stop plan.
+
+        Every terminal attempt outcome counts exactly once: the decrement of
+        the current plan, the ``stopped`` transition, and the completion of
+        the stop command commit in one SQLite transaction keyed by the
+        stable attempt ID. Replaying an already counted attempt returns an
+        empty list without changing anything, so restart reconciliation can
+        neither lose nor double-count it. A held finalization (unconfirmed
+        publication, release, or cleanup) must not call this. Returns the
+        stop-plan commands completed by this count, if any.
+        """
+
+        if not isinstance(attempt_id, str) or not attempt_id.strip():
+            raise ControlStoreError("A finalized attempt must carry a stable attempt identity")
+        if not isinstance(outcome, str) or not outcome.strip():
+            raise ControlStoreError("A finalized attempt must carry a terminal outcome")
+        with self.lock:
+            try:
+                with self._connect() as connection:
+                    connection.execute("BEGIN IMMEDIATE")
+                    already = connection.execute(
+                        "SELECT 1 FROM counted_attempts WHERE attempt_id = ?",
+                        (attempt_id,),
+                    ).fetchone()
+                    if already is not None:
+                        connection.execute("ROLLBACK")
+                        return []
+                    row = connection.execute(
+                        "SELECT intake, pending_command_id, stop_after_requested,"
+                        " stop_after_remaining FROM control_state WHERE id = 1"
+                    ).fetchone()
+                    if row is None:  # pragma: no cover - initialized above
+                        raise ControlStoreError("Control state is missing")
+                    intake_value, pending, requested, remaining = row
+                    if requested is not None and pending is None:
+                        # Unreachable through the public API (the plan and its
+                        # pending pointer are always written and cleared
+                        # together); fail closed without touching the count.
+                        connection.execute("ROLLBACK")
+                        return []
+                    if requested is not None:
+                        try:
+                            intake = IntakeState(intake_value)
+                        except ValueError as error:
+                            raise ControlStoreError("Control state is malformed") from error
+                        timestamp = self._timestamp()
+                        connection.execute(
+                            "INSERT INTO counted_attempts"
+                            " (attempt_id, plan_request_id, outcome, counted_at)"
+                            " VALUES (?, ?, ?, ?)",
+                            (attempt_id, pending, outcome, timestamp),
+                        )
+                        left = int(remaining) - 1
+                        if left <= 0:
+                            detail = (
+                                f"stopped after {_attempts_noun(int(requested))};"
+                                f" last counted attempt {attempt_id} ({outcome})"
+                            )
+                            if pending is not None:
+                                connection.execute(
+                                    "UPDATE commands SET acknowledgement = ?, detail = ?,"
+                                    " updated_at = ? WHERE request_id = ?"
+                                    " AND acknowledgement = ?",
+                                    (
+                                        CommandAcknowledgement.COMPLETED.value,
+                                        detail,
+                                        timestamp,
+                                        pending,
+                                        CommandAcknowledgement.ACCEPTED.value,
+                                    ),
+                                )
+                                completed_row = connection.execute(
+                                    "SELECT request_id, sequence, kind, acknowledgement,"
+                                    " detail, created_at, updated_at FROM commands"
+                                    " WHERE request_id = ?",
+                                    (pending,),
+                                ).fetchone()
+                            else:  # pragma: no cover - plan always has a command
+                                completed_row = None
+                            connection.execute(
+                                "UPDATE control_state SET intake = ?,"
+                                " pending_command_id = NULL,"
+                                " stop_after_requested = NULL,"
+                                " stop_after_remaining = NULL,"
+                                " stop_after_active_attempt_id = NULL,"
+                                " latest_counted_attempt_id = ?,"
+                                " latest_counted_outcome = ? WHERE id = 1",
+                                (IntakeState.STOPPED.value, attempt_id, outcome),
+                            )
+                            connection.execute("COMMIT")
+                            if completed_row is None:
+                                return []
+                            return [self._record_from_row(completed_row)]
+                        connection.execute(
+                            "UPDATE control_state SET stop_after_remaining = ?,"
+                            " latest_counted_attempt_id = ?,"
+                            " latest_counted_outcome = ? WHERE id = 1",
+                            (left, attempt_id, outcome),
+                        )
+                        if intake is not IntakeState.STOPPED:
+                            # The counted attempt just finished, so no attempt
+                            # is active: intake runs until the final claim.
+                            connection.execute(
+                                "UPDATE control_state SET intake = ? WHERE id = 1",
+                                (IntakeState.RUNNING.value,),
+                            )
+                        connection.execute("COMMIT")
+                        return []
+                    if pending is None:
+                        connection.execute("ROLLBACK")
+                        return []
+                    pending_record = self._find_locked(connection, pending)
+                    if pending_record is None or pending_record.kind != _STOP_KIND:
+                        connection.execute("ROLLBACK")
+                        return []
+                    completed = self._complete_plain_stops_in_txn(connection)
+                    return completed
+            except sqlite3.Error as error:
+                raise ControlStoreError("Control command could not be committed") from error
+        raise AssertionError("unreachable")  # pragma: no cover
+
+    def _complete_plain_stops_in_txn(
+        self, connection: sqlite3.Connection
+    ) -> list[CommandRecord]:
+        """Complete accepted plain stops; caller holds the lock and a transaction."""
+
+        timestamp = self._timestamp()
+        rows = connection.execute(
+            "SELECT request_id, sequence, kind, acknowledgement, detail,"
+            " created_at, updated_at FROM commands"
+            " WHERE kind = ? AND acknowledgement = ? ORDER BY sequence",
+            (_STOP_KIND, CommandAcknowledgement.ACCEPTED.value),
+        ).fetchall()
+        connection.execute(
+            "UPDATE commands SET acknowledgement = ?, detail = ?,"
+            " updated_at = ? WHERE kind = ? AND acknowledgement = ?",
+            (
+                CommandAcknowledgement.COMPLETED.value,
+                "intake stopped after active attempt",
+                timestamp,
+                _STOP_KIND,
+                CommandAcknowledgement.ACCEPTED.value,
+            ),
+        )
+        connection.execute(
+            "UPDATE control_state SET intake = ?, pending_command_id = NULL"
+            " WHERE id = 1",
+            (IntakeState.STOPPED.value,),
+        )
+        connection.execute("COMMIT")
+        return [
+            CommandRecord(
+                request_id=row[0],
+                sequence=int(row[1]),
+                kind=row[2],
+                acknowledgement=CommandAcknowledgement.COMPLETED,
+                detail="intake stopped after active attempt",
+                created_at=row[5],
+                updated_at=timestamp,
+            )
+            for row in rows
+        ]
+
+    def enter_stopping_for_final_claim(self) -> bool:
+        """Enter ``stopping`` when the final counted attempt is claimed.
+
+        Returns True when the transition was applied. While more than the
+        final attempt remains, or with no pending ``stop --after`` plan,
+        intake stays ``running`` and an empty runnable queue preserves the
+        remaining count untouched.
+        """
+
+        with self.lock:
+            try:
+                with self._connect() as connection:
+                    connection.execute("BEGIN IMMEDIATE")
+                    row = connection.execute(
+                        "SELECT intake, pending_command_id, stop_after_requested,"
+                        " stop_after_remaining FROM control_state WHERE id = 1"
+                    ).fetchone()
+                    if row is None:  # pragma: no cover - initialized above
+                        raise ControlStoreError("Control state is missing")
+                    intake_value, pending, requested, remaining = row
+                    if (
+                        pending is not None
+                        and requested is not None
+                        and int(remaining) == 1
+                        and intake_value == IntakeState.RUNNING.value
+                    ):
+                        connection.execute(
+                            "UPDATE control_state SET intake = ? WHERE id = 1",
+                            (IntakeState.STOPPING.value,),
+                        )
+                        connection.execute("COMMIT")
+                        return True
+                    connection.execute("ROLLBACK")
+                    return False
+            except sqlite3.Error as error:
+                raise ControlStoreError("Control command could not be committed") from error
+
+    def stop_plan_snapshot(self) -> dict | None:
+        """Return the pending ``stop --after`` plan for status, if any."""
+
+        with self.lock:
+            try:
+                with self._connect() as connection:
+                    row = connection.execute(
+                        "SELECT pending_command_id, stop_after_requested,"
+                        " stop_after_remaining, stop_after_active_attempt_id,"
+                        " latest_counted_attempt_id, latest_counted_outcome"
+                        " FROM control_state WHERE id = 1"
+                    ).fetchone()
+            except sqlite3.Error as error:
+                raise ControlStoreError("Control state could not be read") from error
+        if row is None:  # pragma: no cover - initialized above
+            raise ControlStoreError("Control state is missing")
+        pending, requested, remaining, active_attempt_id, latest_id, latest_outcome = row
+        if requested is None or pending is None:
+            return None
+        return {
+            "request_id": pending,
+            "kind": _STOP_AFTER_KIND,
+            "requested": int(requested),
+            "remaining": int(remaining),
+            "includes_active_attempt": active_attempt_id is not None,
+            "active_attempt_id": active_attempt_id,
+            "latest_counted_attempt_id": latest_id,
+            "latest_counted_outcome": latest_outcome,
+        }
 
     # -- internals --------------------------------------------------------
 
@@ -449,6 +816,32 @@ class ControlStore:
                     "INSERT OR IGNORE INTO control_state (id, intake, pending_command_id)"
                     " VALUES (1, ?, NULL)",
                     (IntakeState.RUNNING.value,),
+                )
+                for column_ddl in (
+                    "stop_after_requested INTEGER NULL",
+                    "stop_after_remaining INTEGER NULL",
+                    "stop_after_active_attempt_id TEXT NULL",
+                    "latest_counted_attempt_id TEXT NULL",
+                    "latest_counted_outcome TEXT NULL",
+                ):
+                    column = column_ddl.split(" ", 1)[0]
+                    known = {
+                        row[1]
+                        for row in connection.execute(
+                            "PRAGMA table_info(control_state)"
+                        ).fetchall()
+                    }
+                    if column not in known:
+                        connection.execute(
+                            f"ALTER TABLE control_state ADD COLUMN {column_ddl}"
+                        )
+                connection.execute(
+                    "CREATE TABLE IF NOT EXISTS counted_attempts ("
+                    " attempt_id TEXT PRIMARY KEY,"
+                    " plan_request_id TEXT NOT NULL,"
+                    " outcome TEXT NOT NULL,"
+                    " counted_at TEXT NOT NULL"
+                    ")"
                 )
                 connection.commit()
         except sqlite3.Error as error:
@@ -495,13 +888,67 @@ class ControlStore:
     ) -> list[str]:
         """Return the request IDs of accepted stop-plan commands, oldest first."""
 
+        return self._accepted_plans_of_kinds_locked(connection, _STOP_PLAN_KINDS)
+
+    def _accepted_plans_of_kinds_locked(
+        self, connection: sqlite3.Connection, kinds: tuple[str, ...]
+    ) -> list[str]:
+        """Return accepted command IDs for the given stop-plan kinds, oldest first."""
+
         rows = connection.execute(
             "SELECT request_id FROM commands WHERE kind IN (%s)"
-            " AND acknowledgement = ? ORDER BY sequence"
-            % ",".join("?" * len(_STOP_PLAN_KINDS)),
-            (*_STOP_PLAN_KINDS, CommandAcknowledgement.ACCEPTED.value),
+            " AND acknowledgement = ? ORDER BY sequence" % ",".join("?" * len(kinds)),
+            (*kinds, CommandAcknowledgement.ACCEPTED.value),
         ).fetchall()
         return [row[0] for row in rows]
+
+    def _supersede_plans_locked(
+        self, connection: sqlite3.Connection, kinds: tuple[str, ...], replacement_id: str
+    ) -> list[str]:
+        """Mark accepted plans of the given kinds superseded; return their IDs."""
+
+        superseded = self._accepted_plans_of_kinds_locked(connection, kinds)
+        if superseded:
+            connection.execute(
+                "UPDATE commands SET acknowledgement = ?, detail = ?,"
+                " updated_at = ? WHERE kind IN (%s) AND acknowledgement = ?"
+                % ",".join("?" * len(kinds)),
+                (
+                    CommandAcknowledgement.SUPERSEDED.value,
+                    f"superseded by {replacement_id}",
+                    self._timestamp(),
+                    *kinds,
+                    CommandAcknowledgement.ACCEPTED.value,
+                ),
+            )
+        return superseded
+
+    def _set_stop_plan_locked(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        requested: int,
+        remaining: int,
+        active_attempt_id: str | None,
+    ) -> None:
+        """Persist a fresh ``stop --after`` countdown, clearing past progress."""
+
+        connection.execute(
+            "UPDATE control_state SET stop_after_requested = ?,"
+            " stop_after_remaining = ?, stop_after_active_attempt_id = ?,"
+            " latest_counted_attempt_id = NULL, latest_counted_outcome = NULL"
+            " WHERE id = 1",
+            (requested, remaining, active_attempt_id),
+        )
+
+    def _clear_stop_plan_locked(self, connection: sqlite3.Connection) -> None:
+        """Remove the pending ``stop --after`` countdown, if any."""
+
+        connection.execute(
+            "UPDATE control_state SET stop_after_requested = NULL,"
+            " stop_after_remaining = NULL, stop_after_active_attempt_id = NULL"
+            " WHERE id = 1"
+        )
 
     def _find_locked(
         self, connection: sqlite3.Connection, request_id: str
@@ -650,11 +1097,14 @@ def build_status(
     pending_command_id: str | None,
     get_command: Callable[[str], CommandRecord | None],
     recent_commands: Callable[[], list[CommandRecord]],
+    stop_plan: dict | None = None,
 ) -> dict:
     """Build one consistent live status snapshot.
 
     Read-only: it never opens the database directly but renders records the
-    caller already serialized under the control lock.
+    caller already serialized under the control lock. ``stop_plan`` carries
+    the pending ``stop --after`` countdown (requested and remaining count,
+    active-attempt inclusion, and latest counted attempt and outcome).
     """
 
     pending = get_command(pending_command_id) if pending_command_id else None
@@ -673,5 +1123,6 @@ def build_status(
             else None
         ),
         "pending_command": command_to_json(pending) if pending is not None else None,
+        "stop_plan": dict(stop_plan) if stop_plan is not None else None,
         "commands": {record.request_id: command_to_json(record) for record in recent_commands()},
     }
