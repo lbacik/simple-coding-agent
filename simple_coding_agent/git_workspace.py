@@ -128,16 +128,32 @@ class GitWorkspace:
             return True
         return bool(self._git("ls-files", "--unmerged").strip())
 
+    def prepare_for_profile_read(self, *, base_branch: str = "main") -> str:
+        """Fetch and check out the base branch so the repository profile can be read.
+
+        Unlike ``prepare_attempt``, this never touches attempt branches: no
+        branch is created, checked out, or rebased. It exists so callers can
+        load the profile (which names the real base branch) before preparing
+        the attempt exactly once onto that base. Returns the verified base
+        revision.
+        """
+
+        self._ensure_clone()
+        if not self.is_clean():
+            raise DirtyWorkspaceError(
+                f"Repository working tree contains uncommitted or untracked changes:\n{self.dirty_status()}"
+            )
+        self._git("fetch", "origin")
+        base_revision = self._ensure_verified_base(base_branch)
+        self._git("checkout", base_branch)
+        return base_revision
+
     def prepare_attempt(self, *, base_branch: str, issue_number: int) -> PreparedAttempt:
         """Fetch, verify, and check out the branch used by an attempt.
 
-        A local base that differs from ``origin/<base_branch>`` is never used
-        as-is: setup must never run against stale or divergent code. This is
-        normally just a leftover from an interrupted previous run, so it is
-        first repaired by resetting the local base to match origin. Only a
-        base that still disagrees after that repair is a broken workspace,
-        raised as ``GitWorkspaceRecoveryError`` for the caller to handle
-        separately from an ordinary attempt failure.
+        The local base is first repaired to match origin (see
+        ``_ensure_verified_base``): setup must never run against stale or
+        divergent code.
 
         A previously published attempt branch (for example, a handoff) is
         always preferred over whatever the local clone happens to have: the
@@ -153,15 +169,7 @@ class GitWorkspace:
                 f"Repository working tree contains uncommitted or untracked changes:\n{self.dirty_status()}"
             )
         self._git("fetch", "origin")
-        base_revision = self._revision(f"origin/{base_branch}", remote=True)
-        local_base_revision = self._revision(base_branch, remote=False)
-        if local_base_revision != base_revision:
-            self._reset_local_base(base_branch)
-            local_base_revision = self._revision(base_branch, remote=False)
-            if local_base_revision != base_revision:
-                raise GitWorkspaceRecoveryError(
-                    "Local base branch has diverged from origin and could not be repaired"
-                )
+        base_revision = self._ensure_verified_base(base_branch)
 
         remote_branch_revision = self._fetch_attempt_branch(branch)
         if remote_branch_revision is not None:
@@ -179,6 +187,33 @@ class GitWorkspace:
             base_revision=base_revision,
             restored_from_remote=remote_branch_revision is not None,
         )
+
+    def _ensure_verified_base(self, base_branch: str) -> str:
+        """Fetch-verified revision of the base branch, repairing a stale local base.
+
+        A local base that differs from ``origin/<base_branch>`` is never used
+        as-is: setup must never run against stale or divergent code. This is
+        normally just a leftover from an interrupted previous run, so it is
+        first repaired by resetting the local base to match origin. Only a
+        base that still disagrees after that repair is a broken workspace,
+        raised as ``GitWorkspaceRecoveryError``.
+        """
+
+        base_revision = self._revision(f"origin/{base_branch}", remote=True)
+        try:
+            local_base_revision: str | None = self._revision(base_branch, remote=False)
+        except GitWorkspaceError:
+            # A fresh clone has no local branch for a non-default base yet;
+            # repairing below creates it from origin.
+            local_base_revision = None
+        if local_base_revision != base_revision:
+            self._reset_local_base(base_branch)
+            local_base_revision = self._revision(base_branch, remote=False)
+            if local_base_revision != base_revision:
+                raise GitWorkspaceRecoveryError(
+                    "Local base branch has diverged from origin and could not be repaired"
+                )
+        return base_revision
 
     def _fetch_attempt_branch(self, branch: str) -> str | None:
         """Best-effort fetch of a published attempt branch; a missing ref is not an error."""

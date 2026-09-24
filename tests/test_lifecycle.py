@@ -120,7 +120,9 @@ def test_setup_failure_posts_result_then_releases_only_the_agent_claim(
     assert publisher.outcomes == [AttemptOutcome.INFRASTRUCTURE_ERROR]
     assert tracker.cleanup == [(24, "ready-for-agent", "agent-id")]
     assert state.read() is None
-    assert workspace.cleanup_calls == [("main", False)]
+    # The profile never loaded, so no attempt branch was ever prepared and
+    # there is nothing to clean up.
+    assert workspace.cleanup_calls == []
 
 
 def test_empty_queue_sleeps_once_without_attempting_work(tmp_path: Path) -> None:
@@ -170,7 +172,7 @@ def test_stops_after_the_persisted_consecutive_infrastructure_error_limit(tmp_pa
     assert [event for event, _, _ in events] == [
         "polling_for_issue",
         "issue_claimed",
-        "workspace_prepared",
+        "workspace_prepared_for_profile_read",
         "attempt_exception",
         "consecutive_error_limit_reached",
     ]
@@ -343,7 +345,8 @@ def test_startup_recovers_a_missing_profile_with_standard_cleanup(tmp_path: Path
 
     assert publisher.outcomes == [AttemptOutcome.INFRASTRUCTURE_ERROR]
     assert tracker.cleanup == [(24, "ready-for-agent", "agent-id")]
-    assert workspace.cleanup_calls == [("main", False)]
+    # The profile never loaded, so no attempt branch was ever prepared.
+    assert workspace.cleanup_calls == []
     assert state.read() is None
 
 
@@ -546,8 +549,9 @@ def test_logs_every_stage_from_claiming_the_issue_to_dispatching_the_model(
     assert [event for event, _ in events] == [
         "polling_for_issue",
         "issue_claimed",
-        "workspace_prepared",
+        "workspace_prepared_for_profile_read",
         "profile_loaded",
+        "workspace_prepared",
         "attempt_phase_transitioned",
     ]
     assert all(issue_number == 24 for _, issue_number in events[1:])
@@ -582,8 +586,11 @@ def test_recreates_the_attempt_branch_from_a_profile_base_branch(tmp_path: Path)
 
     lifecycle.run_once()
 
-    assert workspace.prepared_bases == ["main", "release"]
-    assert workspace.cleanup_calls == [("main", False), ("release", False)]
+    # The profile names the base, so the attempt is prepared exactly once,
+    # onto that base; the bootstrap for the profile read never prepares.
+    assert workspace.bootstrap_bases == ["main"]
+    assert workspace.prepared_bases == ["release"]
+    assert workspace.cleanup_calls == [("release", False)]
 
 
 def test_does_not_start_cleanup_when_the_result_comment_was_not_posted(tmp_path: Path) -> None:
@@ -602,7 +609,8 @@ def test_does_not_start_cleanup_when_the_result_comment_was_not_posted(tmp_path:
 
     assert tracker.cleanup == []
     assert state.read() is not None
-    assert workspace.cleanup_calls == [("main", True)]
+    # The profile never loaded, so no attempt branch was ever prepared.
+    assert workspace.cleanup_calls == []
 
 
 def test_stops_without_touching_the_issue_when_the_workspace_cannot_be_repaired(
@@ -671,7 +679,7 @@ def test_rebase_conflict_during_reprepare_reports_infrastructure_error_without_s
     assert result.outcome is AttemptOutcome.INFRASTRUCTURE_ERROR
     assert calls == []
     assert any(event == "rebase_conflict" for event, _, _ in events)
-    assert "workspace_reprepared" not in [event for event, _, _ in events]
+    assert "workspace_prepared" not in [event for event, _, _ in events]
     assert "setup_started" not in [event for event, _, _ in events]
     assert publisher.outcomes == [AttemptOutcome.INFRASTRUCTURE_ERROR]
     details = publisher.requests[0].details
@@ -679,7 +687,14 @@ def test_rebase_conflict_during_reprepare_reports_infrastructure_error_without_s
     assert "Setup was not started" in details
 
 
-def test_rebase_conflict_on_first_prepare_reports_infrastructure_error(tmp_path: Path) -> None:
+def test_rebase_conflict_on_the_profile_base_reports_infrastructure_error(tmp_path: Path) -> None:
+    """A conflict on the single preparation onto the profile base fails fast.
+
+    The bootstrap for the profile read never touches the attempt branch, so
+    by the time ``prepare_attempt`` runs the profile is already loaded and a
+    conflict there is reported without setup running.
+    """
+
     events: list[tuple[str, str, str]] = []
     claim = Claim(issue(24), Assignment("issue-24", "agent-id"))
     workspace = RebaseConflictingWorkspace(conflict_bases=("main",))
@@ -688,7 +703,7 @@ def test_rebase_conflict_on_first_prepare_reports_infrastructure_error(tmp_path:
         tracker=FakeTracker(claim),
         attempt_state=AttemptStateStore(tmp_path),
         workspace=workspace,
-        profile_loader=lambda _: (_ for _ in ()).throw(AssertionError("profile must not load")),
+        profile_loader=lambda _: profile("main"),
         publisher=publisher,
         attempt_runner=lambda *args: (_ for _ in ()).throw(
             AssertionError("setup must not run after a rebase conflict")
@@ -702,7 +717,57 @@ def test_rebase_conflict_on_first_prepare_reports_infrastructure_error(tmp_path:
 
     assert result.outcome is AttemptOutcome.INFRASTRUCTURE_ERROR
     assert any(event == "rebase_conflict" for event, _, _ in events)
+    assert workspace.bootstrap_bases == ["main"]
+    assert workspace.prepared_bases == ["main"]
     assert publisher.outcomes == [AttemptOutcome.INFRASTRUCTURE_ERROR]
+
+
+def test_non_main_profile_prepares_the_attempt_only_onto_the_profile_base(
+    tmp_path: Path,
+) -> None:
+    """The attempt branch must be rebased only onto the profile base branch.
+
+    Regression test: bootstrapping the workspace to read the profile used to
+    run a full ``prepare_attempt`` on ``main`` first, which rebased a
+    ``develop``-based attempt branch onto ``main`` and failed with a rebase
+    conflict before the profile was ever loaded.
+    """
+
+    workspace = FakeWorkspace()
+    lifecycle = AgentLifecycle(
+        tracker=FakeTracker(Claim(issue(24), Assignment("issue-24", "agent-id"))),
+        attempt_state=AttemptStateStore(tmp_path),
+        workspace=workspace,
+        profile_loader=lambda _: profile("develop"),
+        publisher=FakePublisher(),
+    )
+
+    lifecycle.run_once()
+
+    assert workspace.bootstrap_bases == ["main"]
+    assert workspace.prepared_bases == ["develop"]
+    assert workspace.cleanup_calls == [("develop", False)]
+
+
+def test_startup_recovery_prepares_only_onto_the_profile_base(tmp_path: Path) -> None:
+    """The continuation path must share the single-prepare bootstrap behavior."""
+
+    state = state_at(tmp_path, AttemptPhase.SETUP)
+    workspace = FakeWorkspace()
+    lifecycle = AgentLifecycle(
+        tracker=FakeTracker(None),
+        attempt_state=state,
+        workspace=workspace,
+        profile_loader=lambda _: profile("develop"),
+        publisher=FakePublisher(),
+        sleeper=lambda _: None,
+    )
+
+    lifecycle.run_once()
+
+    assert workspace.bootstrap_bases == ["main"]
+    assert workspace.prepared_bases == ["develop"]
+    assert workspace.cleanup_calls == [("develop", False)]
 
 
 @dataclass
@@ -736,8 +801,12 @@ class FakeWorkspace:
 
     def __init__(self, *, commits: tuple[str, ...] = ()) -> None:
         self.cleanup_calls: list[tuple[str, bool]] = []
+        self.bootstrap_bases: list[str] = []
         self.prepared_bases: list[str] = []
         self._commits = commits
+
+    def prepare_for_profile_read(self, *, base_branch: str = "main") -> None:
+        self.bootstrap_bases.append(base_branch)
 
     def prepare_attempt(self, *, base_branch: str, issue_number: int):
         self.prepared_bases.append(base_branch)
@@ -751,6 +820,9 @@ class FakeWorkspace:
 
 
 class RecoveryFailingWorkspace(FakeWorkspace):
+    def prepare_for_profile_read(self, *, base_branch: str = "main") -> None:
+        raise GitWorkspaceRecoveryError("workspace is broken")
+
     def prepare_attempt(self, *, base_branch: str, issue_number: int):
         raise GitWorkspaceRecoveryError("workspace is broken")
 
