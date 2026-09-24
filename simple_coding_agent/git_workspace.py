@@ -30,6 +30,30 @@ class DirtyWorkspaceError(GitWorkspaceError):
     """Raised when the working tree has uncommitted changes before an attempt starts."""
 
 
+class RebaseConflictError(GitWorkspaceError):
+    """Raised when a reused attempt branch conflicts with the verified base.
+
+    The conflicting rebase is aborted before this is raised, so the working
+    tree is restored to the pre-rebase branch state and never left with
+    conflict markers. Setup must not run after this error: the branch is
+    stale relative to base and needs human or model resolution outside the
+    normal setup-then-model order.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        branch: str,
+        base_branch: str,
+        conflicted_files: tuple[str, ...] = (),
+    ) -> None:
+        super().__init__(message)
+        self.branch = branch
+        self.base_branch = base_branch
+        self.conflicted_files = conflicted_files
+
+
 @dataclass(frozen=True)
 class PreparedAttempt:
     """The branch and verified base revision for one implementation attempt."""
@@ -309,17 +333,67 @@ class GitWorkspace:
         failure) must never keep running against the base as it stood back
         then: repository-owned config such as the setup profile has to be
         read fresh. Rebasing preserves any commits on the branch, published
-        or not. A conflicting rebase is left in its conflicted state rather
-        than aborted and recreated from base: discarding the branch here
-        would destroy exactly the work a resumed handoff exists to preserve,
-        so the conflict is left for the attempt's model session to resolve
-        as ordinary remaining work, using normal git commands.
+        or not.
+
+        A conflicting rebase is aborted immediately and reported as
+        ``RebaseConflictError``. The working tree must never be left with
+        conflict markers: setup commands (e.g. ``composer install`` with a
+        ``cache:clear`` post-install script) parse checked-in source files,
+        so running them against a half-merged tree fails with a misleading
+        syntax error instead of the real cause. The abort restores the
+        pre-rebase branch state with its commits intact for operator
+        inspection; the attempt fails fast as an infrastructure error with
+        a ``rebase_conflict`` cause instead of running setup.
         """
 
         try:
             self._git("rebase", base_branch)
+        except GitWorkspaceError as error:
+            conflicted = self._conflicted_files()
+            was_rebasing = self._rebase_in_progress()
+            try:
+                self._git("rebase", "--abort")
+            except GitWorkspaceError:
+                pass
+            if self._rebase_in_progress():
+                raise GitWorkspaceRecoveryError(
+                    f"Rebase of {branch} onto {base_branch} hit conflicts"
+                    " and the rebase could not be aborted; human cleanup is required"
+                ) from error
+            if conflicted or was_rebasing:
+                files = f" Conflicting files: {', '.join(conflicted)}." if conflicted else ""
+                raise RebaseConflictError(
+                    f"Rebase of {branch} onto {base_branch} hit conflicts"
+                    f" (rebase_conflict).{files} The rebase was aborted and"
+                    " setup was not started.",
+                    branch=branch,
+                    base_branch=base_branch,
+                    conflicted_files=conflicted,
+                ) from error
+            raise
+
+    def _conflicted_files(self) -> tuple[str, ...]:
+        """Return paths with unresolved merge conflicts, or () when unavailable."""
+
+        try:
+            output = self._git("diff", "--name-only", "--diff-filter=U")
         except GitWorkspaceError:
-            pass
+            return ()
+        return tuple(line for line in output.splitlines() if line.strip())
+
+    def _rebase_in_progress(self) -> bool:
+        """Return True if git still reports an unresolved rebase state."""
+
+        git_dir = self._clone_dir / ".git"
+        if git_dir.is_dir() and (
+            (git_dir / "rebase-merge").exists() or (git_dir / "rebase-apply").exists()
+        ):
+            return True
+        try:
+            self._git("rev-parse", "--verify", "REBASE_HEAD")
+        except GitWorkspaceError:
+            return False
+        return True
 
     def _reset_local_base(self, base_branch: str) -> None:
         """Best-effort repair of a local base branch that fell out of sync with origin."""
