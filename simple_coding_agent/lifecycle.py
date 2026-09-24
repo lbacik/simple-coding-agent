@@ -211,6 +211,19 @@ class ModelAttemptRunner:
                     review=ReviewEvidence((), 0),
                     final_check=None,
                 )
+            details = decision.reasons[0] if decision.reasons else None
+            if not preparation.setup.succeeded:
+                failure_detail = _command_failure_detail(preparation.setup)
+            elif preparation.baseline is not None and not preparation.baseline.succeeded:
+                failure_detail = _command_failure_detail(preparation.baseline)
+            else:
+                failure_detail = None
+            if details and failure_detail:
+                details = f"{details} {failure_detail}"
+            elif failure_detail:
+                details = failure_detail
+            if details:
+                return _attempt_evidence(decision, profile, None, 0, "not run", details)
             return _attempt_evidence(decision, profile, None, 0, "not run")
 
         self._attempt_state.transition(AttemptPhase.MODEL_RUNNING)
