@@ -189,12 +189,14 @@ def test_repeated_handoff_keeps_both_comments_in_the_filtered_feed() -> None:
 
 
 def test_rebase_conflict_on_continuation_is_reported_before_setup(tmp_path: Path) -> None:
-    """A stale continuation branch that conflicts must fail before setup runs.
+    """A stale continuation branch that conflicts reaches the model first.
 
-    Previously the conflicting rebase was left in the tree for the model to
-    resolve, so setup ran against ``<<<<<<<`` markers and failed with a
-    misleading ParseError. Now the rebase is aborted and reported as a
-    ``rebase_conflict`` infrastructure error with the branch preserved.
+    Preparation leaves the conflicting rebase in place and the model gets
+    its chance to resolve it as ordinary work in the same session. When the
+    model leaves the conflict unresolved, the rebase is aborted, the branch
+    restored to its pre-rebase state, and the attempt reports a
+    ``rebase_conflict`` infrastructure error with the branch preserved --
+    setup never runs against the ``<<<<<<<`` markers.
     """
 
     remote, seed = repository_with_main(tmp_path)
@@ -202,27 +204,77 @@ def test_rebase_conflict_on_continuation_is_reported_before_setup(tmp_path: Path
     write_and_commit(seed, "README.md", "upstream fix\n", "Conflicting upstream commit")
     git(seed, "push", "origin", "main")
 
-    def resolve(working_directory: Path) -> None:
-        raise AssertionError("model must not run after a rebase conflict")
+    def leave_unresolved(working_directory: Path) -> None:
+        return None
 
     github = FakeGitHub(
         issue(24, body="Fix the README workflow.", labels=frozenset({"ready-for-agent", "round-finished"})),
         comments=(IssueComment(author_login="agent", body="## Agent Attempt Result: incomplete\n\nhanded off"),),
     )
-    executor = FakeModelExecutor(actions=[resolve])
+    executor = FakeModelExecutor(actions=[leave_unresolved])
     lifecycle = build_lifecycle(remote, tmp_path / "clone", tmp_path / "data", github, executor)
 
     result = lifecycle.run_once()
 
     assert result.outcome is AttemptOutcome.INFRASTRUCTURE_ERROR
-    assert executor.calls == 0
+    assert executor.calls == 1
+    assert "git rebase --continue" in executor.captured_prompts[0]
     assert "agent/issue-24" not in github.pull_requests
     [comment] = [c for c in github.comments if "rebase_conflict" in c.body]
     assert "rebase_conflict" in comment.body
     assert "Setup was not started" in comment.body
     clone = tmp_path / "clone"
     assert "<<<<<<<" not in (clone / "README.md").read_text()
+    assert git(clone, "show", "agent/issue-24:README.md") == "branch change"
     assert remote_branch_subjects(remote, "agent/issue-24")[0] == "Conflicting branch commit"
+
+
+def test_model_resolved_rebase_conflict_continues_to_completion(tmp_path: Path) -> None:
+    """A conflict the model resolves proceeds through setup to a pull request."""
+
+    remote, seed = repository_with_main(tmp_path)
+    publish_attempt_branch(tmp_path, remote, 24, {"README.md": "branch change\n"}, "Conflicting branch commit")
+    write_and_commit(seed, "README.md", "upstream fix\n", "Conflicting upstream commit")
+    git(seed, "push", "origin", "main")
+
+    def resolve_and_finish(working_directory: Path) -> None:
+        (working_directory / "README.md").write_text("resolved content\n")
+        git(working_directory, "add", "README.md")
+        git(
+            working_directory,
+            "-c",
+            "user.name=Test User",
+            "-c",
+            "user.email=test@example.com",
+            "rebase",
+            "--continue",
+        )
+        write_and_commit(working_directory, "fix.py", "fixed\n", "Fix the workflow")
+
+    github = FakeGitHub(
+        issue(24, body="Fix the README workflow.", labels=frozenset({"ready-for-agent", "round-finished"})),
+        comments=(IssueComment(author_login="agent", body="## Agent Attempt Result: incomplete\n\nhanded off"),),
+    )
+    executor = FakeModelExecutor(actions=[resolve_and_finish])
+    lifecycle = build_lifecycle(remote, tmp_path / "clone", tmp_path / "data", github, executor)
+
+    result = lifecycle.run_once()
+
+    assert result.outcome is AttemptOutcome.COMPLETE
+    assert executor.calls == 1
+    assert "git rebase --continue" in executor.captured_prompts[0]
+    assert "agent/issue-24" in github.pull_requests
+    assert remote_branch_subjects(remote, "agent/issue-24")[:2] == [
+        "Fix the workflow",
+        "Conflicting branch commit",
+    ]
+    output = subprocess.run(
+        ("git", "-C", str(remote), "show", "agent/issue-24:README.md"),
+        check=True,
+        text=True,
+        capture_output=True,
+    ).stdout
+    assert output == "resolved content\n"
 
 
 # --- Scenario 7: missing branch despite continuation signals ----------------

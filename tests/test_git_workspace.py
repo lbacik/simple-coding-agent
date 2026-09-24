@@ -11,7 +11,6 @@ from simple_coding_agent.git_workspace import (
     GitWorkspace,
     GitWorkspaceError,
     GitWorkspaceRecoveryError,
-    RebaseConflictError,
 )
 
 
@@ -103,10 +102,63 @@ def test_rebases_a_reused_attempt_branch_onto_an_advanced_base(tmp_path: Path) -
     assert [commit.subject for commit in workspace.commits_added(prepared)] == ["Retain me"]
 
 
-def test_aborts_a_reused_attempt_branch_that_conflicts_with_an_advanced_base(
+def test_leaves_a_conflicting_rebase_in_place_for_the_model_to_resolve(
     tmp_path: Path,
 ) -> None:
-    """A conflicting rebase must never leave markers for setup to trip over."""
+    """A conflicting rebase is left in progress instead of aborted.
+
+    The model session gets a chance to resolve the conflict as the first
+    step of its normal session; aborting happens only later, when the model
+    leaves the conflict unresolved.
+    """
+
+    remote, seed = repository_with_main(tmp_path)
+    clone = tmp_path / "clone"
+    workspace = GitWorkspace(clone, str(remote), token_provider=lambda: "secret-token")
+    workspace.prepare_attempt(base_branch="main", issue_number=19)
+    write_and_commit(clone, "README.md", "branch change", "Conflicting branch commit")
+    pre_rebase_revision = git(clone, "rev-parse", "agent/issue-19")
+
+    write_and_commit(seed, "README.md", "upstream fix", "Conflicting upstream commit")
+    git(seed, "push", "origin", "main")
+
+    prepared = workspace.prepare_attempt(base_branch="main", issue_number=19)
+
+    assert prepared.branch == "agent/issue-19"
+    assert prepared.rebase_conflicts == ("README.md",)
+    assert prepared.pre_rebase_revision == pre_rebase_revision
+    # The rebase is still in progress and the markers are visible ...
+    assert workspace.has_unresolved_conflicts() is True
+    assert "<<<<<<<" in (clone / "README.md").read_text()
+    assert workspace.conflicted_files() == ("README.md",)
+    # ... while the branch ref still points at the pre-rebase tip.
+    assert git(clone, "rev-parse", "agent/issue-19") == pre_rebase_revision
+
+
+def test_clean_rebase_reports_no_conflicts_and_no_pre_rebase_revision(
+    tmp_path: Path,
+) -> None:
+    remote, seed = repository_with_main(tmp_path)
+    clone = tmp_path / "clone"
+    workspace = GitWorkspace(clone, str(remote), token_provider=lambda: "secret-token")
+    workspace.prepare_attempt(base_branch="main", issue_number=19)
+    write_and_commit(clone, "local.txt", "unpublished work", "Retain me")
+
+    write_and_commit(seed, "README.md", "upstream fix", "Upstream commit")
+    git(seed, "push", "origin", "main")
+
+    prepared = workspace.prepare_attempt(base_branch="main", issue_number=19)
+
+    assert prepared.rebase_conflicts == ()
+    assert prepared.pre_rebase_revision is None
+    assert workspace.has_unresolved_conflicts() is False
+    assert workspace.rebase_resolution_problems() == ()
+
+
+def test_resolution_problems_are_empty_once_the_model_resolves_the_rebase(
+    tmp_path: Path,
+) -> None:
+    """Simulate a model resolving the conflicted rebase, then verify clean."""
 
     remote, seed = repository_with_main(tmp_path)
     clone = tmp_path / "clone"
@@ -117,34 +169,104 @@ def test_aborts_a_reused_attempt_branch_that_conflicts_with_an_advanced_base(
     write_and_commit(seed, "README.md", "upstream fix", "Conflicting upstream commit")
     git(seed, "push", "origin", "main")
 
-    with pytest.raises(RebaseConflictError, match="rebase_conflict"):
-        workspace.prepare_attempt(base_branch="main", issue_number=19)
+    workspace.prepare_attempt(base_branch="main", issue_number=19)
+
+    assert workspace.rebase_resolution_problems() != ()
+
+    (clone / "README.md").write_text("resolved content")
+    git(clone, "add", "README.md")
+    git(
+        clone,
+        "-c",
+        "user.name=Test User",
+        "-c",
+        "user.email=test@example.com",
+        "rebase",
+        "--continue",
+    )
+
+    assert workspace.has_unresolved_conflicts() is False
+    assert workspace.conflicted_files() == ()
+    assert workspace.conflict_marker_files() == ()
+    assert workspace.diff_check_clean() is True
+    assert workspace.rebase_resolution_problems() == ()
+
+
+def test_resolution_problems_report_markers_and_whitespace_errors(tmp_path: Path) -> None:
+    remote, _ = repository_with_main(tmp_path)
+    clone = tmp_path / "clone"
+    workspace = GitWorkspace(clone, str(remote), token_provider=lambda: "secret-token")
+    workspace.prepare_attempt(base_branch="main", issue_number=19)
+
+    assert workspace.conflict_marker_files() == ()
+    assert workspace.diff_check_clean() is True
+
+    write_and_commit(clone, "notes.txt", "clean content", "Add notes")
+    with (clone / "notes.txt").open("a", encoding="utf-8") as handle:
+        handle.write("<<<<<<< HEAD\nstale marker\n=======\nother side\n>>>>>>> branch\n")
+    with (clone / "other.txt").open("w", encoding="utf-8") as handle:
+        handle.write("trailing whitespace \n")
+
+    assert workspace.conflict_marker_files() == ("notes.txt",)
+    git(clone, "add", "-A")
+    assert workspace.diff_check_clean() is False
+    problems = workspace.rebase_resolution_problems()
+    assert any("notes.txt" in problem for problem in problems)
+    assert any("diff --check" in problem for problem in problems)
+
+
+def test_abort_unresolved_rebase_restores_the_pre_rebase_branch_state(
+    tmp_path: Path,
+) -> None:
+    """The fallback after an unresolvable conflict matches the old behavior."""
+
+    remote, seed = repository_with_main(tmp_path)
+    clone = tmp_path / "clone"
+    workspace = GitWorkspace(clone, str(remote), token_provider=lambda: "secret-token")
+    workspace.prepare_attempt(base_branch="main", issue_number=19)
+    write_and_commit(clone, "README.md", "branch change", "Conflicting branch commit")
+    pre_rebase_revision = git(clone, "rev-parse", "agent/issue-19")
+
+    write_and_commit(seed, "README.md", "upstream fix", "Conflicting upstream commit")
+    git(seed, "push", "origin", "main")
+
+    prepared = workspace.prepare_attempt(base_branch="main", issue_number=19)
+
+    workspace.abort_unresolved_rebase(prepared)
 
     assert "<<<<<<<" not in (clone / "README.md").read_text()
     assert git(clone, "status", "--porcelain") == ""
     with pytest.raises(subprocess.CalledProcessError):
         git(clone, "rev-parse", "--verify", "REBASE_HEAD")
     assert (clone / "README.md").read_text() == "branch change"
+    assert git(clone, "rev-parse", "agent/issue-19") == pre_rebase_revision
+    assert workspace.has_unresolved_conflicts() is False
     assert workspace.is_clean()
 
 
-def test_rebase_conflict_error_carries_the_conflicting_files(tmp_path: Path) -> None:
+def test_abort_unresolved_rebase_restores_after_rebase_quit(tmp_path: Path) -> None:
+    """Even a rebase state the model dropped with --quit is restored."""
+
     remote, seed = repository_with_main(tmp_path)
     clone = tmp_path / "clone"
     workspace = GitWorkspace(clone, str(remote), token_provider=lambda: "secret-token")
     workspace.prepare_attempt(base_branch="main", issue_number=19)
     write_and_commit(clone, "README.md", "branch change", "Conflicting branch commit")
+    pre_rebase_revision = git(clone, "rev-parse", "agent/issue-19")
 
     write_and_commit(seed, "README.md", "upstream fix", "Conflicting upstream commit")
     git(seed, "push", "origin", "main")
 
-    with pytest.raises(RebaseConflictError) as caught:
-        workspace.prepare_attempt(base_branch="main", issue_number=19)
+    prepared = workspace.prepare_attempt(base_branch="main", issue_number=19)
+    git(clone, "rebase", "--quit")
 
-    assert caught.value.branch == "agent/issue-19"
-    assert caught.value.base_branch == "main"
-    assert caught.value.conflicted_files == ("README.md",)
-    assert "setup was not started" in str(caught.value)
+    assert workspace.has_unresolved_conflicts() is True
+
+    workspace.abort_unresolved_rebase(prepared)
+
+    assert workspace.has_unresolved_conflicts() is False
+    assert git(clone, "rev-parse", "agent/issue-19") == pre_rebase_revision
+    assert (clone / "README.md").read_text() == "branch change"
 
 
 def test_reports_no_unresolved_conflicts_on_a_clean_worktree(tmp_path: Path) -> None:
@@ -168,8 +290,8 @@ def test_cleanup_aborts_an_unresolved_rebase_left_by_the_model_session(tmp_path:
     git(seed, "push", "origin", "main")
     git(clone, "fetch", "origin")
     # Simulate the model leaving an unresolved rebase behind: start the
-    # rebase directly instead of going through prepare_attempt (which now
-    # aborts conflicts itself before setup could ever run).
+    # rebase directly instead of going through prepare_attempt (which leaves
+    # the same state in place when the reused branch conflicts with base).
     with pytest.raises(subprocess.CalledProcessError):
         git(clone, "rebase", "origin/main")
     git(clone, "rev-parse", "--verify", "REBASE_HEAD")
