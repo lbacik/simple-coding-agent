@@ -108,6 +108,26 @@ class GitWorkspace:
         """Return porcelain status of dirty or untracked changes."""
         return self._git("status", "--porcelain")
 
+    def has_unresolved_conflicts(self) -> bool:
+        """Return True when the working tree holds an unfinished rebase/merge.
+
+        ``prepare_attempt`` deliberately leaves a conflicting rebase in place
+        for the model session to resolve, so callers must not run repository
+        setup commands against such a tree: the conflict markers look like
+        syntax errors to every parser the setup may invoke.
+        """
+
+        git_dir = self._clone_dir / ".git"
+        if not git_dir.is_dir():
+            return False
+        if (
+            (git_dir / "rebase-merge").exists()
+            or (git_dir / "rebase-apply").exists()
+            or (git_dir / "MERGE_HEAD").exists()
+        ):
+            return True
+        return bool(self._git("ls-files", "--unmerged").strip())
+
     def prepare_attempt(self, *, base_branch: str, issue_number: int) -> PreparedAttempt:
         """Fetch, verify, and check out the branch used by an attempt.
 

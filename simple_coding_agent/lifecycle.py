@@ -7,8 +7,10 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from enum import StrEnum
+import os
 from pathlib import Path
 import re
+import signal
 import time
 from typing import Protocol
 
@@ -17,6 +19,7 @@ from simple_coding_agent.completion import (
     AttemptOutcome,
     CompletionDecision,
     CompletionEvaluator,
+    PreparationEvidence,
     PublicationPath,
     ReviewEvidence,
     VerificationOrderError,
@@ -34,6 +37,71 @@ from simple_coding_agent.model_execution import ModelExecutionStatus, ModelExecu
 from simple_coding_agent.observability import AttemptArchive
 from simple_coding_agent.operating import ConsecutiveErrorStore
 from simple_coding_agent.publication import PublicationRequest
+
+
+class AttemptInterruptionHandler:
+    """Turn SIGTERM/SIGINT into one terminal event instead of a silent death.
+
+    The interpreter's default SIGTERM action terminates the process without
+    running any handler, and ``except Exception`` does not cover
+    KeyboardInterrupt — either gap lets a stop/restart during the final check
+    end the attempt with no issue-tagged event at all. This handler emits a
+    single best-effort ``attempt_interrupted`` event, then resignals the
+    process so the usual exit code/signal semantics are preserved.
+    """
+
+    def __init__(
+        self,
+        *,
+        event_log: Callable[..., None],
+        issue_number_provider: Callable[[], int | None],
+        resignal: Callable[[int], None] | None = None,
+    ) -> None:
+        self._event_log = event_log
+        self._issue_number_provider = issue_number_provider
+        self._resignal = resignal or _resignal_self
+
+    def install(
+        self, signals: Sequence[int] = (signal.SIGTERM, signal.SIGINT)
+    ) -> Callable[[], None]:
+        """Install the handler; return a callable restoring prior handlers."""
+
+        previous = {signum: signal.signal(signum, self) for signum in signals}
+
+        def restore() -> None:
+            for signum, handler in previous.items():
+                signal.signal(signum, handler)
+
+        return restore
+
+    def __call__(self, signum: int, frame: object) -> None:
+        try:
+            name = signal.Signals(signum).name
+        except ValueError:
+            name = str(signum)
+        try:
+            issue_number = self._issue_number_provider()
+        except Exception:
+            issue_number = None
+        try:
+            self._event_log(
+                "attempt_interrupted",
+                f"Process received {name} during the attempt.",
+                level="ERROR",
+                issue_number=issue_number,
+            )
+        except Exception:
+            pass
+        for candidate in (signal.SIGTERM, signal.SIGINT):
+            try:
+                signal.signal(candidate, signal.SIG_DFL)
+            except Exception:
+                pass
+        self._resignal(signum)
+
+
+def _resignal_self(signum: int) -> None:
+    os.kill(os.getpid(), signum)
 
 
 class LifecycleStatus(StrEnum):
@@ -151,7 +219,244 @@ class ModelAttemptRunner:
             else ()
         )
         continuation = bool(initial_commits)
-        self._event_log("setup_started", "", level="INFO", issue_number=claim.issue.number)
+        # A retained branch rebased onto its base can be left with conflict
+        # markers for the model to resolve. Setup commands parse every source
+        # file, so they must never run against that half-rebased tree; they
+        # are deferred until after the model resolves the conflicts.
+        setup_deferred = _has_unresolved_conflicts(self._workspace)
+        preparation: PreparationEvidence | None = None
+        if setup_deferred:
+            self._event_log(
+                "setup_deferred_unresolved_conflicts",
+                f"The attempt branch holds unresolved merge conflicts from rebasing onto "
+                f"`{profile.base_branch}`; setup and the baseline check run after the "
+                "model resolves them.",
+                level="WARNING",
+                issue_number=claim.issue.number,
+            )
+        else:
+            early = self._run_preparation(
+                claim, profile, archive, continuation=continuation, deferred=False
+            )
+            if isinstance(early, AttemptEvidence):
+                return early
+            preparation = early
+
+        self._attempt_state.transition(AttemptPhase.MODEL_RUNNING)
+        # Snapshot before dispatch: any commit already on the branch at this
+        # point is carried over from a resumed attempt, not produced by this
+        # run. `commits_added` is read again after the model runs to count
+        # what this run itself added.
+        prompt_body = _build_starting_prompt(
+            claim.issue.body,
+            self._issue_comments(claim.issue),
+            continuation=continuation,
+            issue_number=claim.issue.number,
+        )
+        if setup_deferred:
+            prompt_body = (
+                f"{prompt_body}\n\nThe attempt branch has unresolved merge conflicts from rebasing onto "
+                f"`{profile.base_branch}`. Resolve them first (inspect with git status, edit the conflicted "
+                "files, stage with git add, and run git rebase --continue), commit the resolution, then "
+                "continue the implementation."
+            )
+        self._event_log(
+            "model_dispatch_starting",
+            f"continuation={continuation}",
+            level="INFO",
+            issue_number=claim.issue.number,
+        )
+        execution = asyncio.run(
+            self._model_executor.execute(
+                issue_body=prompt_body,
+                working_directory=getattr(self._workspace, "working_directory"),
+                issue_number=claim.issue.number,
+                archive=archive,
+            )
+        )
+        if archive is not None:
+            archive.write_attempt(
+                {
+                    "model_usage": execution.model_usage,
+                    "skill_events": [event.__dict__ for event in execution.skill_events],
+                    "model_stop_reason": execution.stop_reason,
+                }
+            )
+        if execution.status in (
+            ModelExecutionStatus.HANDOFF_REQUESTED,
+            ModelExecutionStatus.MODEL_LIMIT_REACHED,
+            ModelExecutionStatus.SUCCEEDED,
+        ):
+            # Always preserve dirty/untracked work as a commit rather than
+            # letting it get silently discarded. This also covers a model
+            # that reports success but stops before its own final commit:
+            # without this, commit_count and the final check would be
+            # evaluated against work that never makes it into the push.
+            commit_fn = getattr(self._workspace, "commit_dirty_work", None)
+            if callable(commit_fn):
+                message = (
+                    "Preserve uncommitted work before handoff"
+                    if execution.status is not ModelExecutionStatus.SUCCEEDED
+                    else "Preserve uncommitted work left after model completion"
+                )
+                try:
+                    commit_fn(message)
+                except GitWorkspaceError as error:
+                    decision = CompletionDecision(
+                        outcome=AttemptOutcome.INFRASTRUCTURE_ERROR,
+                        publication_eligible=False,
+                        publication_path=PublicationPath.NONE,
+                        reasons=(f"Failed to preserve dirty work after model completion: {error}",),
+                    )
+                    return _attempt_evidence(decision, profile, None, 0, "not run", str(error))
+        if setup_deferred:
+            # Setup was skipped before the model so it would not parse a
+            # half-rebased tree; run it now that the model had its chance to
+            # resolve the conflicts. The deferred baseline is not a true
+            # pre-work baseline, so its failure stays tolerated.
+            early = self._run_preparation(
+                claim, profile, archive, continuation=True, deferred=True
+            )
+            if isinstance(early, AttemptEvidence):
+                return early
+            preparation = early
+        commits = getattr(self._workspace, "commits_added")(prepared)
+        if execution.status is ModelExecutionStatus.MODEL_LIMIT_REACHED:
+            # Emergency handoff: synthesize and commit a handoff note so
+            # progress is preserved for human review with round-finished.
+            if not commits or not _is_handoff_note_commit(commits[0]):
+                note_content = _build_emergency_handoff_note(
+                    issue_number=claim.issue.number,
+                    started_at=checkpoint.started_at,
+                    reason=_classify_handoff_reason(execution),
+                    last_work_commit=getattr(commits[0], "revision", str(commits[0])) if commits else getattr(prepared, "base_revision", "0" * 40),
+                    explanation=execution.explanation,
+                )
+                working_dir = getattr(self._workspace, "working_directory", None)
+                if working_dir is not None:
+                    try:
+                        note_path = working_dir / ".agent" / "handoff" / f"{claim.issue.number}.md"
+                        note_path.parent.mkdir(parents=True, exist_ok=True)
+                        note_path.write_text(note_content)
+                    except OSError:
+                        pass
+                commit_fn = getattr(self._workspace, "commit_dirty_work", None)
+                if callable(commit_fn):
+                    commit_fn(f"Handoff note: issue #{claim.issue.number}")
+                commits = getattr(self._workspace, "commits_added")(prepared)
+            execution = replace(execution, status=ModelExecutionStatus.HANDOFF_REQUESTED)
+        commit_count = len(commits)
+        review_count = sum(
+            event.name == "code-review" and event.phase == "PreToolUse"
+            for event in execution.skill_events
+        )
+        review_cycles = max(0, review_count - 1)
+        review = ReviewEvidence((), review_cycles)
+        final_check = None
+        if execution.status is ModelExecutionStatus.SUCCEEDED and commits:
+            try:
+                self._verifier.mark_review_complete(
+                    model_status=execution.status, commit_count=len(commits), review=review
+                )
+                self._event_log(
+                    "final_check_started",
+                    f"check={' && '.join(profile.check)}",
+                    level="INFO",
+                    issue_number=claim.issue.number,
+                )
+                if archive is not None:
+                    archive.write_attempt({"final_check_started": _utc_timestamp()})
+                final_check = self._verifier.final_check(profile, getattr(self._workspace, "working_directory"))
+                if archive is not None:
+                    archive.write_attempt({"final_check_finished": _utc_timestamp()})
+            except VerificationOrderError:
+                final_check = None
+        if final_check is not None:
+            _archive_commands(archive, "check", final_check)
+            if not final_check.succeeded:
+                self._event_log(
+                    "final_check_failed",
+                    _command_failure_detail(final_check),
+                    level="ERROR",
+                    issue_number=claim.issue.number,
+                )
+            else:
+                self._event_log(
+                    "final_check_succeeded", "", level="INFO", issue_number=claim.issue.number
+                )
+        try:
+            decision = self._evaluator.evaluate(
+                setup=preparation.setup,
+                baseline=preparation.baseline,
+                model_status=execution.status,
+                commit_count=commit_count,
+                acceptance_criteria_satisfied=(
+                    review_count > 0 and self._acceptance_criteria_satisfied(claim)
+                ),
+                review=review,
+                final_check=final_check,
+                continuation=continuation,
+            )
+        except TypeError:
+            decision = self._evaluator.evaluate(
+                setup=preparation.setup,
+                baseline=preparation.baseline,
+                model_status=execution.status,
+                commit_count=commit_count,
+                acceptance_criteria_satisfied=(
+                    review_count > 0 and self._acceptance_criteria_satisfied(claim)
+                ),
+                review=review,
+                final_check=final_check,
+            )
+        handoff_rejection_reason: str | None = None
+        if decision.outcome is AttemptOutcome.HANDOFF:
+            validation = _validate_handoff_note(
+                commits,
+                claim.issue.number,
+                getattr(self._workspace, "working_directory"),
+                getattr(prepared, "base_revision"),
+            )
+            if not validation.valid:
+                decision = CompletionDecision(
+                    outcome=AttemptOutcome.INFRASTRUCTURE_ERROR,
+                    publication_eligible=False,
+                    publication_path=PublicationPath.NONE,
+                    reasons=(validation.reason,),
+                )
+                handoff_rejection_reason = validation.reason
+        if decision.publication_eligible or decision.publication_path is PublicationPath.PARTIAL:
+            self._attempt_state.transition(AttemptPhase.PUSHING)
+        findings = "all clear" if not review.findings else "; ".join(finding.summary for finding in review.findings)
+        details = execution.explanation
+        note_commit_sha = None
+        if decision.outcome is AttemptOutcome.HANDOFF:
+            details = _read_handoff_note(
+                getattr(self._workspace, "working_directory"), claim.issue.number
+            )
+            if commits and _is_handoff_note_commit(commits[0]):
+                note_commit_sha = commits[0].revision
+        elif handoff_rejection_reason is not None:
+            details = handoff_rejection_reason
+        return _attempt_evidence(
+            decision, profile, final_check, review_cycles, findings, details, note_commit_sha
+        )
+
+    def _run_preparation(
+        self,
+        claim: Claim,
+        profile: RepositoryProfile,
+        archive: AttemptArchive | None,
+        *,
+        continuation: bool,
+        deferred: bool,
+    ) -> PreparationEvidence | AttemptEvidence:
+        """Run setup and the baseline check once; return early evidence on failure."""
+
+        deferral = " (deferred until conflicts were resolved)" if deferred else ""
+        self._event_log(
+            "setup_started", deferral.strip(), level="INFO", issue_number=claim.issue.number
+        )
         try:
             preparation = self._verifier.prepare(
                 profile,
@@ -226,174 +531,7 @@ class ModelAttemptRunner:
             if details:
                 return _attempt_evidence(decision, profile, None, 0, "not run", details)
             return _attempt_evidence(decision, profile, None, 0, "not run")
-
-        self._attempt_state.transition(AttemptPhase.MODEL_RUNNING)
-        # Snapshot before dispatch: any commit already on the branch at this
-        # point is carried over from a resumed attempt, not produced by this
-        # run. `commits_added` is read again after the model runs to count
-        # what this run itself added.
-        prompt_body = _build_starting_prompt(
-            claim.issue.body,
-            self._issue_comments(claim.issue),
-            continuation=continuation,
-            issue_number=claim.issue.number,
-        )
-        self._event_log(
-            "model_dispatch_starting",
-            f"continuation={continuation}",
-            level="INFO",
-            issue_number=claim.issue.number,
-        )
-        execution = asyncio.run(
-            self._model_executor.execute(
-                issue_body=prompt_body,
-                working_directory=getattr(self._workspace, "working_directory"),
-                issue_number=claim.issue.number,
-                archive=archive,
-            )
-        )
-        if archive is not None:
-            archive.write_attempt(
-                {
-                    "model_usage": execution.model_usage,
-                    "skill_events": [event.__dict__ for event in execution.skill_events],
-                    "model_stop_reason": execution.stop_reason,
-                }
-            )
-        if execution.status in (
-            ModelExecutionStatus.HANDOFF_REQUESTED,
-            ModelExecutionStatus.MODEL_LIMIT_REACHED,
-            ModelExecutionStatus.SUCCEEDED,
-        ):
-            # Always preserve dirty/untracked work as a commit rather than
-            # letting it get silently discarded. This also covers a model
-            # that reports success but stops before its own final commit:
-            # without this, commit_count and the final check would be
-            # evaluated against work that never makes it into the push.
-            commit_fn = getattr(self._workspace, "commit_dirty_work", None)
-            if callable(commit_fn):
-                message = (
-                    "Preserve uncommitted work before handoff"
-                    if execution.status is not ModelExecutionStatus.SUCCEEDED
-                    else "Preserve uncommitted work left after model completion"
-                )
-                try:
-                    commit_fn(message)
-                except GitWorkspaceError as error:
-                    decision = CompletionDecision(
-                        outcome=AttemptOutcome.INFRASTRUCTURE_ERROR,
-                        publication_eligible=False,
-                        publication_path=PublicationPath.NONE,
-                        reasons=(f"Failed to preserve dirty work after model completion: {error}",),
-                    )
-                    return _attempt_evidence(decision, profile, None, 0, "not run", str(error))
-        commits = getattr(self._workspace, "commits_added")(prepared)
-        if execution.status is ModelExecutionStatus.MODEL_LIMIT_REACHED:
-            # Emergency handoff: synthesize and commit a handoff note so
-            # progress is preserved for human review with round-finished.
-            if not commits or not _is_handoff_note_commit(commits[0]):
-                note_content = _build_emergency_handoff_note(
-                    issue_number=claim.issue.number,
-                    started_at=checkpoint.started_at,
-                    reason=_classify_handoff_reason(execution),
-                    last_work_commit=getattr(commits[0], "revision", str(commits[0])) if commits else getattr(prepared, "base_revision", "0" * 40),
-                    explanation=execution.explanation,
-                )
-                working_dir = getattr(self._workspace, "working_directory", None)
-                if working_dir is not None:
-                    try:
-                        note_path = working_dir / ".agent" / "handoff" / f"{claim.issue.number}.md"
-                        note_path.parent.mkdir(parents=True, exist_ok=True)
-                        note_path.write_text(note_content)
-                    except OSError:
-                        pass
-                commit_fn = getattr(self._workspace, "commit_dirty_work", None)
-                if callable(commit_fn):
-                    commit_fn(f"Handoff note: issue #{claim.issue.number}")
-                commits = getattr(self._workspace, "commits_added")(prepared)
-            execution = replace(execution, status=ModelExecutionStatus.HANDOFF_REQUESTED)
-        commit_count = len(commits)
-        review_count = sum(
-            event.name == "code-review" and event.phase == "PreToolUse"
-            for event in execution.skill_events
-        )
-        review_cycles = max(0, review_count - 1)
-        review = ReviewEvidence((), review_cycles)
-        final_check = None
-        if execution.status is ModelExecutionStatus.SUCCEEDED and commits:
-            try:
-                self._verifier.mark_review_complete(
-                    model_status=execution.status, commit_count=len(commits), review=review
-                )
-                final_check = self._verifier.final_check(profile, getattr(self._workspace, "working_directory"))
-            except VerificationOrderError:
-                final_check = None
-        if final_check is not None:
-            _archive_commands(archive, "check", final_check)
-            if not final_check.succeeded:
-                self._event_log(
-                    "final_check_failed",
-                    _command_failure_detail(final_check),
-                    level="ERROR",
-                    issue_number=claim.issue.number,
-                )
-        try:
-            decision = self._evaluator.evaluate(
-                setup=preparation.setup,
-                baseline=preparation.baseline,
-                model_status=execution.status,
-                commit_count=commit_count,
-                acceptance_criteria_satisfied=(
-                    review_count > 0 and self._acceptance_criteria_satisfied(claim)
-                ),
-                review=review,
-                final_check=final_check,
-                continuation=continuation,
-            )
-        except TypeError:
-            decision = self._evaluator.evaluate(
-                setup=preparation.setup,
-                baseline=preparation.baseline,
-                model_status=execution.status,
-                commit_count=commit_count,
-                acceptance_criteria_satisfied=(
-                    review_count > 0 and self._acceptance_criteria_satisfied(claim)
-                ),
-                review=review,
-                final_check=final_check,
-            )
-        handoff_rejection_reason: str | None = None
-        if decision.outcome is AttemptOutcome.HANDOFF:
-            validation = _validate_handoff_note(
-                commits,
-                claim.issue.number,
-                getattr(self._workspace, "working_directory"),
-                getattr(prepared, "base_revision"),
-            )
-            if not validation.valid:
-                decision = CompletionDecision(
-                    outcome=AttemptOutcome.INFRASTRUCTURE_ERROR,
-                    publication_eligible=False,
-                    publication_path=PublicationPath.NONE,
-                    reasons=(validation.reason,),
-                )
-                handoff_rejection_reason = validation.reason
-        if decision.publication_eligible or decision.publication_path is PublicationPath.PARTIAL:
-            self._attempt_state.transition(AttemptPhase.PUSHING)
-        findings = "all clear" if not review.findings else "; ".join(finding.summary for finding in review.findings)
-        details = execution.explanation
-        note_commit_sha = None
-        if decision.outcome is AttemptOutcome.HANDOFF:
-            details = _read_handoff_note(
-                getattr(self._workspace, "working_directory"), claim.issue.number
-            )
-            if commits and _is_handoff_note_commit(commits[0]):
-                note_commit_sha = commits[0].revision
-        elif handoff_rejection_reason is not None:
-            details = handoff_rejection_reason
-        return _attempt_evidence(
-            decision, profile, final_check, review_cycles, findings, details, note_commit_sha
-        )
+        return preparation
 
 
 class AgentLifecycle:
@@ -434,6 +572,13 @@ class AgentLifecycle:
         self._event_log = event_log
         self._attempt_archive_factory = attempt_archive_factory
         self._startup_reconciled = False
+        self._active_issue_number: int | None = None
+
+    @property
+    def active_issue_number(self) -> int | None:
+        """The issue owned by the in-flight attempt, for interruption reporting."""
+
+        return self._active_issue_number
 
     def run_once(self) -> LifecycleResult:
         """Claim and process one issue, or sleep once when the queue is empty."""
@@ -469,6 +614,7 @@ class AgentLifecycle:
             level="INFO",
             issue_number=claim.issue.number,
         )
+        self._active_issue_number = claim.issue.number
         checkpoint = self._attempt_state.start(
             issue_number=claim.issue.number, branch=f"agent/issue-{claim.issue.number}"
         )
@@ -574,6 +720,8 @@ class AgentLifecycle:
             comment_posted = False
             prepared = None
             raise SystemExit(1) from error
+        except SystemExit:
+            raise
         except RebaseConflictError as error:
             published = self._publish_rebase_conflict(
                 claim, checkpoint.started_at, prepared, profile, error
@@ -588,6 +736,22 @@ class AgentLifecycle:
                 claim, checkpoint.started_at, prepared, profile, outcome
             )
             comment_posted = getattr(published, "comment_posted", True)
+        except BaseException as error:
+            # KeyboardInterrupt and friends bypass `except Exception` (which is
+            # deliberately ordered first); without this the attempt would die
+            # with no terminal event or comment. The original is always
+            # re-raised after best-effort reporting.
+            self._event_log(
+                "attempt_exception", _exception_detail(error), level="ERROR", issue_number=claim.issue.number
+            )
+            try:
+                published = self._publish_terminal(
+                    claim, checkpoint.started_at, prepared, profile, outcome
+                )
+                comment_posted = getattr(published, "comment_posted", True)
+            except Exception:
+                comment_posted = False
+            raise
         finally:
             remote_cleanup_complete = False
             try:
@@ -607,6 +771,7 @@ class AgentLifecycle:
                         self._attempt_state.delete()
         self._write_outcome(archive, outcome, checkpoint.started_at)
         self._record_terminal_outcome(outcome, checkpoint.started_at, issue_number=claim.issue.number)
+        self._active_issue_number = None
         return LifecycleResult(LifecycleStatus.ATTEMPTED, outcome)
 
     def _release(self, claim: Claim, outcome: AttemptOutcome) -> None:
@@ -633,6 +798,7 @@ class AgentLifecycle:
         claim = self._tracker.recover_claim(checkpoint.issue_number)
         if claim is None:
             raise RuntimeError("Interrupted attempt issue is unavailable for recovery")
+        self._active_issue_number = claim.issue.number
         archive = self._archive_for(claim.issue.number, checkpoint.started_at)
 
         prepared: object | None = None
@@ -653,11 +819,33 @@ class AgentLifecycle:
                 commits = getattr(self._workspace, "commits_added")(prepared)
                 has_commits = bool(commits)
                 if commits:
-                    self._attempt_state.transition(AttemptPhase.PUSHING)
-                    decision = CompletionDecision(
-                        AttemptOutcome.INCOMPLETE, False, PublicationPath.PARTIAL,
-                        ("Model execution was interrupted; preserved committed work.",),
-                    )
+                    if _final_check_was_interrupted(archive):
+                        # The previous process logged final_check_started but
+                        # never finished the check (kill, crash, or container
+                        # restart). Report that honestly instead of blaming
+                        # model execution; the branch is retained for resume.
+                        self._event_log(
+                            "final_check_interrupted",
+                            "The final check started but never finished; the attempt process "
+                            "died mid-check.",
+                            level="ERROR",
+                            issue_number=claim.issue.number,
+                        )
+                        decision = CompletionDecision(
+                            AttemptOutcome.INFRASTRUCTURE_ERROR,
+                            False,
+                            PublicationPath.PARTIAL,
+                            (
+                                "Final check was interrupted before completing; committed work "
+                                "is preserved on the branch.",
+                            ),
+                        )
+                    else:
+                        self._attempt_state.transition(AttemptPhase.PUSHING)
+                        decision = CompletionDecision(
+                            AttemptOutcome.INCOMPLETE, False, PublicationPath.PARTIAL,
+                            ("Model execution was interrupted; preserved committed work.",),
+                        )
                 else:
                     decision = _infrastructure_decision("Model execution was interrupted without commits.")
             elif checkpoint.phase in (AttemptPhase.PUSHING, AttemptPhase.PUBLISHING):
@@ -731,6 +919,8 @@ class AgentLifecycle:
             comment_posted = False
             prepared = None
             raise SystemExit(1) from error
+        except SystemExit:
+            raise
         except RebaseConflictError as error:
             published = self._publish_rebase_conflict(
                 claim, checkpoint.started_at, prepared, profile, error
@@ -746,6 +936,19 @@ class AgentLifecycle:
             )
             outcome = AttemptOutcome.INFRASTRUCTURE_ERROR
             comment_posted = getattr(published, "comment_posted", True)
+        except BaseException as error:
+            self._event_log(
+                "attempt_exception", _exception_detail(error), level="ERROR", issue_number=claim.issue.number
+            )
+            try:
+                published = self._publish_terminal(
+                    claim, checkpoint.started_at, prepared, profile, AttemptOutcome.INFRASTRUCTURE_ERROR
+                )
+                comment_posted = getattr(published, "comment_posted", True)
+            except Exception:
+                comment_posted = False
+            outcome = AttemptOutcome.INFRASTRUCTURE_ERROR
+            raise
         finally:
             remote_cleanup_complete = False
             try:
@@ -765,6 +968,7 @@ class AgentLifecycle:
                         self._attempt_state.delete()
         self._write_outcome(archive, outcome, checkpoint.started_at)
         self._record_terminal_outcome(outcome, checkpoint.started_at, issue_number=claim.issue.number)
+        self._active_issue_number = None
         return outcome
 
     def run_forever(self, *, stop: Callable[[], bool]) -> None:
@@ -869,6 +1073,34 @@ class AgentLifecycle:
                     "duration_seconds": (completed_at - started).total_seconds(),
                 }
             )
+
+
+def _final_check_was_interrupted(archive: AttemptArchive | None) -> bool:
+    """Whether a previous process died after starting the final check.
+
+    The runner records ``final_check_started`` immediately before running the
+    check and ``final_check_finished`` right after it returns, so a marker
+    without its finish means the process never survived the check — the one
+    signature a SIGKILL/OOM leaves behind.
+    """
+
+    if archive is None:
+        return False
+    record = archive.read_attempt()
+    return bool(record.get("final_check_started")) and not record.get("final_check_finished")
+
+
+def _has_unresolved_conflicts(workspace: object) -> bool:
+    """Whether the workspace holds a rebase/merge the model must resolve first."""
+
+    probe = getattr(workspace, "has_unresolved_conflicts", None)
+    if not callable(probe):
+        return False
+    return bool(probe())
+
+
+def _utc_timestamp() -> str:
+    return datetime.now(UTC).isoformat().replace("+00:00", "Z")
 
 
 def _attempt_evidence(

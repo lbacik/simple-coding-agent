@@ -11,7 +11,7 @@ from simple_coding_agent.completion import CompletionEvaluator, VerificationRunn
 from simple_coding_agent.config import load_repository_profile, load_runtime_config
 from simple_coding_agent.git_workspace import GitWorkspace
 from simple_coding_agent.github_tracker import GitHubGraphQLTransport, GitHubTracker
-from simple_coding_agent.lifecycle import AgentLifecycle, ModelAttemptRunner
+from simple_coding_agent.lifecycle import AgentLifecycle, AttemptInterruptionHandler, ModelAttemptRunner
 from simple_coding_agent.model_execution import ModelExecutor
 from simple_coding_agent.observability import AttemptArchive, JsonEventLogger
 from simple_coding_agent.operating import ConsecutiveErrorStore
@@ -114,7 +114,17 @@ def main() -> None:
         ),
         attempt_archive_factory=archive_factory,
     )
-    lifecycle.run_forever(stop=lambda: False)
+    interruption_handler = AttemptInterruptionHandler(
+        event_log=lambda event, detail="", level="INFO", issue_number=None: logger.emit(
+            event, phase="interruption", detail=detail, level=level, issue_number=issue_number
+        ),
+        issue_number_provider=lambda: lifecycle.active_issue_number,
+    )
+    restore_interruption_handler = interruption_handler.install()
+    try:
+        lifecycle.run_forever(stop=lambda: False)
+    finally:
+        restore_interruption_handler()
 
 
 if __name__ == "__main__":

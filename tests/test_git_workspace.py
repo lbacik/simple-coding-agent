@@ -147,6 +147,16 @@ def test_rebase_conflict_error_carries_the_conflicting_files(tmp_path: Path) -> 
     assert "setup was not started" in str(caught.value)
 
 
+def test_reports_no_unresolved_conflicts_on_a_clean_worktree(tmp_path: Path) -> None:
+    remote, _ = repository_with_main(tmp_path)
+    workspace = GitWorkspace(tmp_path / "clone", str(remote), token_provider=lambda: "secret-token")
+
+    prepared = workspace.prepare_attempt(base_branch="main", issue_number=19)
+
+    assert workspace.has_unresolved_conflicts() is False
+    assert workspace.is_clean()
+
+
 def test_cleanup_aborts_an_unresolved_rebase_left_by_the_model_session(tmp_path: Path) -> None:
     remote, seed = repository_with_main(tmp_path)
     clone = tmp_path / "clone"

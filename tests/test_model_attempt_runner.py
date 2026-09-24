@@ -107,6 +107,91 @@ def test_normal_claim_with_no_continuation_signal_runs_the_model_normally(tmp_pa
     assert executor.captured_prompt is not None
 
 
+def test_defers_setup_until_after_the_model_resolves_conflicts(tmp_path: Path) -> None:
+    """Setup commands must never observe a half-rebased tree.
+
+    A retained branch rebased onto a new base can be left with conflict
+    markers; running setup (which parses every source file) against that
+    tree fails spuriously, e.g. a PHP ParseError on `<<<<<<<`. The model
+    must run first to resolve the conflicts, and setup runs after.
+    """
+
+    calls: list[str] = []
+    executor = FakeModelExecutor(status=ModelExecutionStatus.SUCCEEDED, calls=calls)
+    workspace = FakeWorkspace(commits=("Retained work",), conflicts=True)
+    verifier = FakeVerifier(calls=calls)
+    events: list[tuple[str, str]] = []
+    runner = build_runner(
+        tmp_path,
+        model_executor=executor,
+        workspace=workspace,
+        verifier=verifier,
+        event_log=lambda event, detail="", level="INFO", issue_number=None: events.append(
+            (event, level)
+        ),
+    )
+
+    runner(claim(issue_number=24, issue_body="Fix the parser."), profile(), FakePrepared())
+
+    assert calls == ["execute", "prepare"]
+    assert ("setup_deferred_unresolved_conflicts", "WARNING") in events
+    assert "unresolved merge conflicts" in executor.captured_prompt
+    assert "setup_succeeded" in [event for event, _ in events]
+
+
+def test_deferred_setup_failure_still_reports_without_a_final_check(tmp_path: Path) -> None:
+    calls: list[str] = []
+    executor = FakeModelExecutor(status=ModelExecutionStatus.SUCCEEDED, calls=calls)
+    workspace = FakeWorkspace(commits=("Retained work",), conflicts=True)
+    verifier = FakeVerifier(calls=calls, setup_succeeded=False)
+    events: list[str] = []
+    runner = build_runner(
+        tmp_path,
+        model_executor=executor,
+        workspace=workspace,
+        verifier=verifier,
+        event_log=lambda event, detail="", level="INFO", issue_number=None: events.append(event),
+    )
+
+    evidence = runner(
+        claim(issue_number=24, issue_body="Fix the parser."), profile(), FakePrepared()
+    )
+
+    assert calls == ["execute", "prepare"]
+    assert "setup_failed" in events
+    assert "final_check_started" not in events
+    assert evidence.check_exit_code is None
+
+
+def test_logs_final_check_start_and_success(tmp_path: Path) -> None:
+    executor = FakeModelExecutor(status=ModelExecutionStatus.SUCCEEDED)
+    workspace = FakeWorkspace(commits=("Implemented",))
+    events: list[str] = []
+    runner = build_runner(
+        tmp_path,
+        model_executor=executor,
+        workspace=workspace,
+        event_log=lambda event, detail="", level="INFO", issue_number=None: events.append(event),
+    )
+
+    runner(claim(issue_number=24, issue_body="Fix the parser."), profile(), FakePrepared())
+
+    assert events[-2:] == ["final_check_started", "final_check_succeeded"]
+
+
+def test_writes_final_check_markers_to_the_archive(tmp_path: Path) -> None:
+    executor = FakeModelExecutor(status=ModelExecutionStatus.SUCCEEDED)
+    workspace = FakeWorkspace(commits=("Implemented",))
+    archive = FakeArchive()
+    runner = build_runner(tmp_path, model_executor=executor, workspace=workspace)
+    runner._attempt_archive_factory = lambda issue_number, started_at: archive
+
+    runner(claim(issue_number=24, issue_body="Fix the parser."), profile(), FakePrepared())
+
+    assert "final_check_started" in archive.merged
+    assert "final_check_finished" in archive.merged
+
+
 def build_runner(
     tmp_path: Path,
     *,
@@ -212,13 +297,21 @@ def test_baseline_failure_aborts_on_fresh_attempt_and_logs_error(tmp_path: Path)
 
 
 class FakeModelExecutor:
-    def __init__(self, *, status: ModelExecutionStatus = ModelExecutionStatus.MODEL_LIMIT_REACHED) -> None:
+    def __init__(
+        self,
+        *,
+        status: ModelExecutionStatus = ModelExecutionStatus.MODEL_LIMIT_REACHED,
+        calls: "list[str] | None" = None,
+    ) -> None:
         self.captured_prompt: str | None = None
         self._status = status
+        self._calls = calls
 
     async def execute(
         self, *, issue_body: str, working_directory: Path, issue_number: int | None = None, archive=None
     ) -> ModelExecution:
+        if self._calls is not None:
+            self._calls.append("execute")
         self.captured_prompt = issue_body
         return ModelExecution(
             status=self._status,
@@ -231,11 +324,26 @@ class FakeModelExecutor:
 
 
 class FakeVerifier:
-    def __init__(self, *, baseline_succeeded: bool = True) -> None:
+    def __init__(
+        self,
+        *,
+        baseline_succeeded: bool = True,
+        setup_succeeded: bool = True,
+        calls: "list[str] | None" = None,
+    ) -> None:
         self._baseline_succeeded = baseline_succeeded
+        self._setup_succeeded = setup_succeeded
+        self._calls = calls
 
     def prepare(self, profile: object, working_directory: Path, **kwargs: object):
-        setup = SimpleNamespace(succeeded=True, commands=())
+        if self._calls is not None:
+            self._calls.append("prepare")
+        setup = SimpleNamespace(
+            succeeded=self._setup_succeeded,
+            commands=(
+                SimpleNamespace(command="setup", exit_code=0 if self._setup_succeeded else 1, stdout="", stderr="broken" if not self._setup_succeeded else ""),
+            ),
+        )
         baseline = SimpleNamespace(
             succeeded=self._baseline_succeeded,
             commands=(),
@@ -250,6 +358,19 @@ class FakeVerifier:
         return SimpleNamespace(succeeded=True, commands=(), exit_code=0)
 
 
+class FakeArchive:
+    def __init__(self) -> None:
+        self.merged: dict[str, object] = {}
+        self.texts: dict[str, str] = {}
+
+    def write_attempt(self, metadata: dict[str, object]) -> None:
+        self.merged.update(metadata)
+
+    def write_text(self, name: str, content: str) -> Path:
+        self.texts[name] = content
+        return Path(name)
+
+
 class FakeEvaluator:
     def evaluate(self, **kwargs: object) -> CompletionDecision:
         return CompletionDecision(AttemptOutcome.INCOMPLETE, False, PublicationPath.NONE, ("stub",))
@@ -258,11 +379,15 @@ class FakeEvaluator:
 class FakeWorkspace:
     working_directory = Path("/repository")
 
-    def __init__(self, *, commits: tuple[str, ...] = ()) -> None:
+    def __init__(self, *, commits: tuple[str, ...] = (), conflicts: bool = False) -> None:
         self._commits = commits
+        self._conflicts = conflicts
 
     def commits_added(self, prepared: object) -> tuple[str, ...]:
         return self._commits
+
+    def has_unresolved_conflicts(self) -> bool:
+        return self._conflicts
 
 
 class FakePrepared:
