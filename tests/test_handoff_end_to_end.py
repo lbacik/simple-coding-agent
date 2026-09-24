@@ -188,18 +188,22 @@ def test_repeated_handoff_keeps_both_comments_in_the_filtered_feed() -> None:
 # --- Scenario 6: rebase conflict on continuation -----------------------------
 
 
-def test_rebase_conflict_on_continuation_is_resolved_by_the_model(tmp_path: Path) -> None:
+def test_rebase_conflict_on_continuation_is_reported_before_setup(tmp_path: Path) -> None:
+    """A stale continuation branch that conflicts must fail before setup runs.
+
+    Previously the conflicting rebase was left in the tree for the model to
+    resolve, so setup ran against ``<<<<<<<`` markers and failed with a
+    misleading ParseError. Now the rebase is aborted and reported as a
+    ``rebase_conflict`` infrastructure error with the branch preserved.
+    """
+
     remote, seed = repository_with_main(tmp_path)
     publish_attempt_branch(tmp_path, remote, 24, {"README.md": "branch change\n"}, "Conflicting branch commit")
     write_and_commit(seed, "README.md", "upstream fix\n", "Conflicting upstream commit")
     git(seed, "push", "origin", "main")
 
     def resolve(working_directory: Path) -> None:
-        assert "<<<<<<<" in (working_directory / "README.md").read_text()
-        (working_directory / "README.md").write_text("resolved\n")
-        git(working_directory, "add", "README.md")
-        git(working_directory, "rebase", "--continue")
-        write_and_commit(working_directory, "feature.txt", "done", "Finish after resolving conflict")
+        raise AssertionError("model must not run after a rebase conflict")
 
     github = FakeGitHub(
         issue(24, body="Fix the README workflow.", labels=frozenset({"ready-for-agent", "round-finished"})),
@@ -210,10 +214,15 @@ def test_rebase_conflict_on_continuation_is_resolved_by_the_model(tmp_path: Path
 
     result = lifecycle.run_once()
 
-    assert result.outcome is AttemptOutcome.COMPLETE
-    subjects = remote_branch_subjects(remote, "agent/issue-24")
-    assert "Finish after resolving conflict" in subjects
-    assert "Conflicting branch commit" in subjects
+    assert result.outcome is AttemptOutcome.INFRASTRUCTURE_ERROR
+    assert executor.calls == 0
+    assert "agent/issue-24" not in github.pull_requests
+    [comment] = [c for c in github.comments if "rebase_conflict" in c.body]
+    assert "rebase_conflict" in comment.body
+    assert "Setup was not started" in comment.body
+    clone = tmp_path / "clone"
+    assert "<<<<<<<" not in (clone / "README.md").read_text()
+    assert remote_branch_subjects(remote, "agent/issue-24")[0] == "Conflicting branch commit"
 
 
 # --- Scenario 7: missing branch despite continuation signals ----------------

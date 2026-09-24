@@ -11,6 +11,7 @@ from simple_coding_agent.git_workspace import (
     GitWorkspace,
     GitWorkspaceError,
     GitWorkspaceRecoveryError,
+    RebaseConflictError,
 )
 
 
@@ -102,9 +103,11 @@ def test_rebases_a_reused_attempt_branch_onto_an_advanced_base(tmp_path: Path) -
     assert [commit.subject for commit in workspace.commits_added(prepared)] == ["Retain me"]
 
 
-def test_preserves_a_reused_attempt_branch_that_conflicts_with_an_advanced_base(
+def test_aborts_a_reused_attempt_branch_that_conflicts_with_an_advanced_base(
     tmp_path: Path,
 ) -> None:
+    """A conflicting rebase must never leave markers for setup to trip over."""
+
     remote, seed = repository_with_main(tmp_path)
     clone = tmp_path / "clone"
     workspace = GitWorkspace(clone, str(remote), token_provider=lambda: "secret-token")
@@ -114,26 +117,51 @@ def test_preserves_a_reused_attempt_branch_that_conflicts_with_an_advanced_base(
     write_and_commit(seed, "README.md", "upstream fix", "Conflicting upstream commit")
     git(seed, "push", "origin", "main")
 
-    prepared = workspace.prepare_attempt(base_branch="main", issue_number=19)
+    with pytest.raises(RebaseConflictError, match="rebase_conflict"):
+        workspace.prepare_attempt(base_branch="main", issue_number=19)
 
-    assert prepared.branch == "agent/issue-19"
-    assert "<<<<<<<" in (clone / "README.md").read_text()
-    assert "UU README.md" in git(clone, "status", "--porcelain")
-    git(clone, "rev-parse", "--verify", "REBASE_HEAD")
-    assert git(clone, "rev-parse", "agent/issue-19") != git(clone, "rev-parse", "HEAD")
+    assert "<<<<<<<" not in (clone / "README.md").read_text()
+    assert git(clone, "status", "--porcelain") == ""
+    with pytest.raises(subprocess.CalledProcessError):
+        git(clone, "rev-parse", "--verify", "REBASE_HEAD")
+    assert (clone / "README.md").read_text() == "branch change"
+    assert workspace.is_clean()
+
+
+def test_rebase_conflict_error_carries_the_conflicting_files(tmp_path: Path) -> None:
+    remote, seed = repository_with_main(tmp_path)
+    clone = tmp_path / "clone"
+    workspace = GitWorkspace(clone, str(remote), token_provider=lambda: "secret-token")
+    workspace.prepare_attempt(base_branch="main", issue_number=19)
+    write_and_commit(clone, "README.md", "branch change", "Conflicting branch commit")
+
+    write_and_commit(seed, "README.md", "upstream fix", "Conflicting upstream commit")
+    git(seed, "push", "origin", "main")
+
+    with pytest.raises(RebaseConflictError) as caught:
+        workspace.prepare_attempt(base_branch="main", issue_number=19)
+
+    assert caught.value.branch == "agent/issue-19"
+    assert caught.value.base_branch == "main"
+    assert caught.value.conflicted_files == ("README.md",)
+    assert "setup was not started" in str(caught.value)
 
 
 def test_cleanup_aborts_an_unresolved_rebase_left_by_the_model_session(tmp_path: Path) -> None:
     remote, seed = repository_with_main(tmp_path)
     clone = tmp_path / "clone"
     workspace = GitWorkspace(clone, str(remote), token_provider=lambda: "secret-token")
-    workspace.prepare_attempt(base_branch="main", issue_number=19)
+    prepared = workspace.prepare_attempt(base_branch="main", issue_number=19)
     write_and_commit(clone, "README.md", "branch change", "Conflicting branch commit")
 
     write_and_commit(seed, "README.md", "upstream fix", "Conflicting upstream commit")
     git(seed, "push", "origin", "main")
-
-    prepared = workspace.prepare_attempt(base_branch="main", issue_number=19)
+    git(clone, "fetch", "origin")
+    # Simulate the model leaving an unresolved rebase behind: start the
+    # rebase directly instead of going through prepare_attempt (which now
+    # aborts conflicts itself before setup could ever run).
+    with pytest.raises(subprocess.CalledProcessError):
+        git(clone, "rebase", "origin/main")
     git(clone, "rev-parse", "--verify", "REBASE_HEAD")
 
     workspace.cleanup(base_branch="main", prepared=prepared, retain_branch=False)
