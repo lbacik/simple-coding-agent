@@ -9,6 +9,7 @@ from simple_coding_agent.attempt_state import AttemptStateStore
 from simple_coding_agent.command_runner import CommandRunner
 from simple_coding_agent.completion import CompletionEvaluator, VerificationRunner
 from simple_coding_agent.config import load_repository_profile, load_runtime_config
+from simple_coding_agent.finalization import AttemptCompletionStore
 from simple_coding_agent.git_workspace import GitWorkspace
 from simple_coding_agent.github_tracker import GitHubGraphQLTransport, GitHubTracker
 from simple_coding_agent.lifecycle import AgentLifecycle, AttemptInterruptionHandler, ModelAttemptRunner
@@ -113,6 +114,7 @@ def main() -> None:
             event, phase="polling", detail=detail, level=level, issue_number=issue_number
         ),
         attempt_archive_factory=archive_factory,
+        completion_store=AttemptCompletionStore(config.data_dir),
     )
     interruption_handler = AttemptInterruptionHandler(
         event_log=lambda event, detail="", level="INFO", issue_number=None: logger.emit(
