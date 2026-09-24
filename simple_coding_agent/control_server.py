@@ -16,7 +16,7 @@ import socket
 import stat
 import threading
 from pathlib import Path
-from typing import Protocol
+from typing import Callable, Protocol
 
 
 class ControlSurface(Protocol):
@@ -26,6 +26,8 @@ class ControlSurface(Protocol):
     def repository(self) -> str: ...
 
     def submit_stop(self, request_id: str, *, has_active_attempt: bool = ...) -> object: ...
+
+    def submit_resume(self, request_id: str) -> object: ...
 
     def get_command(self, request_id: str) -> object | None: ...
 
@@ -172,6 +174,8 @@ class ControlServer:
         operation = request.get("op")
         if operation == "stop":
             self._reply_stop(connection, request)
+        elif operation == "resume":
+            self._reply_resume(connection, request)
         elif operation == "status":
             self._reply_status(connection)
         elif operation == "command":
@@ -187,39 +191,30 @@ class ControlServer:
             )
 
     def _reply_stop(self, connection: socket.socket, request: dict) -> None:
-        from simple_coding_agent.control import (
-            ControlStoreError,
-            PayloadMismatchError,
-            RequestIdError,
-            command_to_json,
+        from simple_coding_agent.control import PayloadMismatchError, RequestIdError
+
+        _reply_mutating(
+            connection,
+            request,
+            self._control.submit_stop,
+            rejected=(RequestIdError, PayloadMismatchError),
+            repository=self._repository(),
         )
 
-        request_id = request.get("request_id")
-        try:
-            record = self._control.submit_stop(request_id)
-        except (RequestIdError, PayloadMismatchError) as error:
-            _send(
-                connection,
-                {
-                    "ok": False,
-                    "repository": self._repository(),
-                    "error": str(error),
-                    "request_id": request_id,
-                },
-            )
-            return
-        except (ControlStoreError, RuntimeError, OSError) as error:
-            _send(
-                connection,
-                {
-                    "ok": False,
-                    "repository": self._repository(),
-                    "error": f"Command could not be committed: {error}",
-                    "request_id": request_id,
-                },
-            )
-            return
-        _send(connection, {"ok": True, "repository": self._repository(), **command_to_json(record)})
+    def _reply_resume(self, connection: socket.socket, request: dict) -> None:
+        from simple_coding_agent.control import (
+            PayloadMismatchError,
+            RequestIdError,
+            ResumeBlockedError,
+        )
+
+        _reply_mutating(
+            connection,
+            request,
+            self._control.submit_resume,
+            rejected=(RequestIdError, PayloadMismatchError, ResumeBlockedError),
+            repository=self._repository(),
+        )
 
     def _reply_status(self, connection: socket.socket) -> None:
         from simple_coding_agent.control import ControlStoreError
@@ -317,6 +312,50 @@ def socket_path_for(data_dir: Path | None = None) -> Path:
     """
 
     return resolve_socket_path()
+
+
+def _reply_mutating(
+    connection: socket.socket,
+    request: dict,
+    submit: Callable[[object], object],
+    *,
+    rejected: tuple[type[Exception], ...],
+    repository: str,
+) -> None:
+    """Reply to one mutating command with its durable acknowledgement.
+
+    Rejections (bad IDs, reused IDs, recovery holds) report the reason with
+    no control change; storage or liveness failures never appear accepted.
+    """
+
+    from simple_coding_agent.control import ControlStoreError, command_to_json
+
+    request_id = request.get("request_id")
+    try:
+        record = submit(request_id)
+    except rejected as error:
+        _send(
+            connection,
+            {
+                "ok": False,
+                "repository": repository,
+                "error": str(error),
+                "request_id": request_id,
+            },
+        )
+        return
+    except (ControlStoreError, RuntimeError, OSError) as error:
+        _send(
+            connection,
+            {
+                "ok": False,
+                "repository": repository,
+                "error": f"Command could not be committed: {error}",
+                "request_id": request_id,
+            },
+        )
+        return
+    _send(connection, {"ok": True, "repository": repository, **command_to_json(record)})
 
 
 def send_request(socket_path: Path, request: dict) -> dict:
