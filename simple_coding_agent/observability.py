@@ -103,6 +103,16 @@ class AttemptArchive:
         evidence["token_estimate_authority"] = "non-authoritative"
         self._write_json("attempt.json", evidence)
 
+    def read_attempt(self) -> dict[str, object]:
+        """Return the merged attempt.json record, or {} when it is missing."""
+
+        path = self.directory / "attempt.json"
+        try:
+            value = json.loads(path.read_text())
+        except (OSError, json.JSONDecodeError):
+            return {}
+        return value if isinstance(value, dict) else {}
+
     def append_event(self, record: dict[str, object]) -> None:
         """Append one emitted log record to this attempt's agent_output.json."""
 

@@ -14,6 +14,89 @@ from simple_coding_agent.lifecycle import AgentLifecycle, AttemptEvidence, Lifec
 from simple_coding_agent.operating import ConsecutiveErrorStore
 
 
+def test_interruption_handler_logs_a_terminal_event_then_resignals(tmp_path: Path) -> None:
+    """SIGTERM/SIGINT must not kill the process silently mid-attempt."""
+
+    import signal
+
+    from simple_coding_agent.lifecycle import AttemptInterruptionHandler
+
+    events: list[tuple[str, str, str, int | None]] = []
+    resignalled: list[int] = []
+    handler = AttemptInterruptionHandler(
+        event_log=lambda event, detail="", level="INFO", issue_number=None: events.append(
+            (event, detail, level, issue_number)
+        ),
+        issue_number_provider=lambda: 24,
+        resignal=resignalled.append,
+    )
+
+    handler(signal.SIGTERM, None)
+
+    assert events == [
+        ("attempt_interrupted", "Process received SIGTERM during the attempt.", "ERROR", 24)
+    ]
+    assert resignalled == [signal.SIGTERM]
+
+
+def test_interruption_handler_restores_previous_handlers(tmp_path: Path) -> None:
+    import signal
+
+    from simple_coding_agent.lifecycle import AttemptInterruptionHandler
+
+    before_term = signal.getsignal(signal.SIGTERM)
+    before_int = signal.getsignal(signal.SIGINT)
+    handler = AttemptInterruptionHandler(
+        event_log=lambda *args, **kwargs: None,
+        issue_number_provider=lambda: None,
+        resignal=lambda signum: None,
+    )
+
+    restore = handler.install()
+    try:
+        assert signal.getsignal(signal.SIGTERM) is handler
+        assert signal.getsignal(signal.SIGINT) is handler
+    finally:
+        restore()
+
+    assert signal.getsignal(signal.SIGTERM) == before_term
+    assert signal.getsignal(signal.SIGINT) == before_int
+
+
+def test_keyboard_interrupt_still_publishes_a_terminal_outcome(tmp_path: Path) -> None:
+    """KeyboardInterrupt bypasses `except Exception`; it must still log and publish."""
+
+    claim = Claim(issue(24), Assignment("issue-24", "agent-id"))
+    tracker = FakeTracker(claim)
+    workspace = FakeWorkspace()
+    publisher = FakePublisher()
+    events: list[tuple[str, str, int | None]] = []
+    state = AttemptStateStore(tmp_path)
+
+    def interrupted_workflow(received_claim: Claim, profile: object, prepared: object):
+        raise KeyboardInterrupt("operator stop")
+
+    lifecycle = AgentLifecycle(
+        tracker=tracker,
+        attempt_state=state,
+        workspace=workspace,
+        profile_loader=lambda _: profile(),
+        publisher=publisher,
+        attempt_runner=interrupted_workflow,
+        event_log=lambda event, detail="", level="INFO", issue_number=None: events.append(
+            (event, detail, issue_number)
+        ),
+    )
+
+    with pytest.raises(KeyboardInterrupt):
+        lifecycle.run_once()
+
+    assert ("attempt_exception", "KeyboardInterrupt: operator stop", 24) in events
+    assert publisher.outcomes == [AttemptOutcome.INFRASTRUCTURE_ERROR]
+    assert tracker.cleanup == [(24, "ready-for-agent", "agent-id")]
+    assert state.read() is None
+
+
 def test_setup_failure_posts_result_then_releases_only_the_agent_claim(
     tmp_path: Path,
 ) -> None:
@@ -121,6 +204,83 @@ def test_startup_recovers_pre_model_checkpoint_before_claiming_new_work(
     assert tracker.claimed == []
     assert state.read() is None
     assert workspace.cleanup_calls[0] == ("main", False)
+
+
+def test_startup_recovers_an_interrupted_final_check_as_infrastructure_error(
+    tmp_path: Path,
+) -> None:
+    """A process that dies mid final-check must still produce a terminal event.
+
+    The runner records `final_check_started` in the attempt archive before
+    running the check; when recovery sees that marker without a matching
+    finish, the outcome is infrastructure_error (not a mislabelled
+    model-interruption), with committed work preserved.
+    """
+
+    from simple_coding_agent.observability import AttemptArchive
+
+    state = state_at(tmp_path, AttemptPhase.MODEL_RUNNING)
+    checkpoint = state.read()
+    assert checkpoint is not None
+    AttemptArchive(tmp_path, issue_number=24, started_at=checkpoint.started_at).write_attempt(
+        {"final_check_started": "2026-09-24T08:15:00Z"}
+    )
+    events: list[tuple[str, int | None]] = []
+    workspace = FakeWorkspace(commits=("completed",))
+    publisher = FakePublisher()
+    lifecycle = AgentLifecycle(
+        tracker=FakeTracker(None),
+        attempt_state=state,
+        workspace=workspace,
+        profile_loader=lambda _: profile(),
+        publisher=publisher,
+        sleeper=lambda _: None,
+        event_log=lambda event, detail="", level="INFO", issue_number=None: events.append(
+            (event, issue_number)
+        ),
+        attempt_archive_factory=lambda issue_number, started_at: AttemptArchive(
+            tmp_path, issue_number=issue_number, started_at=started_at
+        ),
+    )
+
+    lifecycle.run_once()
+
+    assert publisher.outcomes == [AttemptOutcome.INFRASTRUCTURE_ERROR]
+    assert ("final_check_interrupted", 24) in events
+    assert "interrupted before completing" in publisher.requests[0].decision.reasons[0]
+    assert workspace.cleanup_calls == [("main", True)]
+    assert state.read() is None
+
+
+def test_startup_recovers_a_finished_final_check_as_model_work(tmp_path: Path) -> None:
+    from simple_coding_agent.observability import AttemptArchive
+
+    state = state_at(tmp_path, AttemptPhase.MODEL_RUNNING)
+    checkpoint = state.read()
+    assert checkpoint is not None
+    AttemptArchive(tmp_path, issue_number=24, started_at=checkpoint.started_at).write_attempt(
+        {
+            "final_check_started": "2026-09-24T08:15:00Z",
+            "final_check_finished": "2026-09-24T08:16:00Z",
+        }
+    )
+    workspace = FakeWorkspace(commits=("completed",))
+    publisher = FakePublisher()
+    lifecycle = AgentLifecycle(
+        tracker=FakeTracker(None),
+        attempt_state=state,
+        workspace=workspace,
+        profile_loader=lambda _: profile(),
+        publisher=publisher,
+        sleeper=lambda _: None,
+        attempt_archive_factory=lambda issue_number, started_at: AttemptArchive(
+            tmp_path, issue_number=issue_number, started_at=started_at
+        ),
+    )
+
+    lifecycle.run_once()
+
+    assert publisher.outcomes == [AttemptOutcome.INCOMPLETE]
 
 
 def test_startup_recovers_model_work_by_publishing_partial_branch_without_sdk_resume(
