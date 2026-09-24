@@ -11,10 +11,24 @@ import os
 from pathlib import Path
 import re
 import signal
+import threading
 import time
 from typing import Protocol
 
-from simple_coding_agent.attempt_state import AttemptPhase, AttemptStateError, AttemptStateStore
+from simple_coding_agent.attempt_state import (
+    AttemptCheckpoint,
+    AttemptPhase,
+    AttemptStateError,
+    AttemptStateStore,
+)
+from simple_coding_agent.control import (
+    ActiveAttemptInfo,
+    CommandRecord,
+    ControlStore,
+    ControlStoreError,
+    IntakeState,
+    build_status,
+)
 from simple_coding_agent.completion import (
     AttemptOutcome,
     CompletionDecision,
@@ -562,6 +576,8 @@ class AgentLifecycle:
         ),
         attempt_archive_factory: Callable[[int, str], AttemptArchive] | None = None,
         completion_store: AttemptCompletionStore | None = None,
+        control_store: ControlStore | None = None,
+        repository: str = "",
     ) -> None:
         self._tracker = tracker
         self._attempt_state = attempt_state
@@ -576,7 +592,16 @@ class AgentLifecycle:
         self._event_log = event_log
         self._attempt_archive_factory = attempt_archive_factory
         self._completion_store = completion_store
+        self._control_store = control_store
+        self._repository = repository
+        # The claim boundary and command acceptance share this lock: either
+        # a stop commits first and no claim begins, or a claim begins first
+        # and the stop applies to the resulting active attempt.
+        self._control_lock = (
+            control_store.lock if control_store is not None else threading.RLock()
+        )
         self._startup_reconciled = False
+        self._recovering = False
         self._active_issue_number: int | None = None
 
     @property
@@ -585,12 +610,73 @@ class AgentLifecycle:
 
         return self._active_issue_number
 
+    def set_attempt_runner(
+        self,
+        attempt_runner: Callable[[Claim, RepositoryProfile, object], AttemptEvidence] | None,
+    ) -> None:
+        """Replace the injected model/review workflow (a test seam)."""
+
+        self._attempt_runner = attempt_runner
+
+    # -- operator control -------------------------------------------------
+
+    def submit_stop(self, request_id: str) -> CommandRecord:
+        """Durably record ``stop`` against the current attempt liveness."""
+
+        if self._control_store is None:
+            raise ControlStoreError("Operator control is not configured")
+        with self._control_lock:
+            has_active_attempt = self._attempt_state.read() is not None
+            return self._control_store.submit_stop(
+                request_id, has_active_attempt=has_active_attempt
+            )
+
+    def get_command(self, request_id: str) -> CommandRecord | None:
+        """Return one command's current durable acknowledgement."""
+
+        if self._control_store is None:
+            raise ControlStoreError("Operator control is not configured")
+        with self._control_lock:
+            return self._control_store.get_command(request_id)
+
+    def control_status(self, repository: str | None = None) -> dict:
+        """Return one consistent live snapshot for ``status`` and the socket."""
+
+        if self._control_store is None:
+            raise ControlStoreError("Operator control is not configured")
+        with self._control_lock:
+            store = self._control_store
+            checkpoint = self._attempt_state.read()
+            active = (
+                ActiveAttemptInfo(
+                    issue_number=checkpoint.issue_number,
+                    branch=checkpoint.branch,
+                    phase=checkpoint.phase.value,
+                    started_at=checkpoint.started_at,
+                )
+                if checkpoint is not None
+                else None
+            )
+            return build_status(
+                repository=repository or self._repository,
+                intake=store.intake_state(),
+                recovering=self._recovering,
+                active_attempt=active,
+                pending_command_id=store.pending_command_id(),
+                get_command=store.get_command,
+                recent_commands=store.recent_commands,
+            )
+
     def run_once(self) -> LifecycleResult:
         """Claim and process one issue, or sleep once when the queue is empty."""
 
         if not self._startup_reconciled:
             self._startup_reconciled = True
-            recovered = self._reconcile_startup()
+            self._recovering = True
+            try:
+                recovered = self._reconcile_startup()
+            finally:
+                self._recovering = False
             if recovered is not None:
                 return LifecycleResult(LifecycleStatus.ATTEMPTED, recovered)
 
@@ -602,14 +688,8 @@ class AgentLifecycle:
             )
             raise SystemExit(1)
 
-        self._event_log("polling_for_issue", "", level="INFO")
-        claim = self._tracker.claim_next()
+        claim, checkpoint = self._gated_claim()
         if claim is None:
-            self._event_log(
-                "no_eligible_issue_found",
-                f"no ready-for-agent issue available; sleeping {self._poll_interval}s",
-                level="INFO",
-            )
             self._sleeper(self._poll_interval)
             return LifecycleResult(LifecycleStatus.IDLE)
 
@@ -620,9 +700,7 @@ class AgentLifecycle:
             issue_number=claim.issue.number,
         )
         self._active_issue_number = claim.issue.number
-        checkpoint = self._attempt_state.start(
-            issue_number=claim.issue.number, branch=f"agent/issue-{claim.issue.number}"
-        )
+        assert checkpoint is not None  # _gated_claim starts it atomically with the claim
         archive = self._archive_for(claim.issue.number, checkpoint.started_at)
         prepared: object | None = None
         profile: RepositoryProfile | None = None
@@ -797,6 +875,70 @@ class AgentLifecycle:
         self._active_issue_number = None
         return LifecycleResult(LifecycleStatus.ATTEMPTED, outcome)
 
+    def _gated_claim(self) -> tuple[Claim | None, AttemptCheckpoint | None]:
+        """Claim the next issue unless operator control forbids intake.
+
+        The intake check, the GitHub claim, and the checkpoint start share
+        the control lock with command acceptance: if a stop commits first,
+        no claim begins afterward; if a claim began first, a later stop
+        applies to that claim as the active attempt. Returns the claim and
+        its checkpoint, or ``(None, None)`` when idle; the caller sleeps
+        outside the lock so the control socket stays responsive.
+        """
+
+        with self._control_lock:
+            if self._control_store is not None:
+                intake = self._control_store.intake_state()
+                if intake is not IntakeState.RUNNING:
+                    if (
+                        intake is IntakeState.STOPPING
+                        and self._attempt_state.read() is None
+                    ):
+                        # The waited-for attempt is gone without finalizing
+                        # through this path (e.g. it was reconciled on a
+                        # previous start); finish the stop instead of holding.
+                        self._control_store.complete_pending_stop()
+                    self._event_log(
+                        "intake_stopped",
+                        f"issue intake is {self._control_store.intake_state().value};"
+                        f" sleeping {self._poll_interval}s",
+                        level="INFO",
+                    )
+                    return (None, None)
+            self._event_log("polling_for_issue", "", level="INFO")
+            claim = self._tracker.claim_next()
+            if claim is None:
+                self._event_log(
+                    "no_eligible_issue_found",
+                    f"no ready-for-agent issue available; sleeping {self._poll_interval}s",
+                    level="INFO",
+                )
+                return (None, None)
+            checkpoint = self._attempt_state.start(
+                issue_number=claim.issue.number, branch=f"agent/issue-{claim.issue.number}"
+            )
+            return (claim, checkpoint)
+
+    def _complete_control_stop_if_pending(self) -> None:
+        """Complete the pending stop after its attempt fully finalized.
+
+        Called only on the durable completion boundary (outcome published,
+        issue released, cleanup durable, checkpoint removed). A held
+        finalization never reaches this, so its stop stays accepted and
+        intake stays ``stopping`` until recovery finishes the attempt.
+        """
+
+        if self._control_store is None:
+            return
+        with self._control_lock:
+            completed = self._control_store.complete_pending_stop()
+        for record in completed:
+            self._event_log(
+                "intake_stopped",
+                f"stop {record.request_id} completed after the active attempt finished",
+                level="INFO",
+            )
+
     def _release(self, claim: Claim, outcome: AttemptOutcome) -> None:
         """Apply the label/assignee release sequence required by the outcome.
 
@@ -844,6 +986,7 @@ class AgentLifecycle:
                 outcome=outcome,
             )
         self._attempt_state.delete()
+        self._complete_control_stop_if_pending()
 
     def _reconcile_startup(self) -> AttemptOutcome | None:
         """Finish one durable attempt without recreating its SDK execution context."""
@@ -879,8 +1022,10 @@ class AgentLifecycle:
             # the attempt, then crashed before removing the checkpoint.
             # Replaying any side effect here would duplicate the result
             # comment, the issue release, or the completed-attempt accounting,
-            # so only the leftover checkpoint is removed.
+            # so only the leftover checkpoint is removed. A stop that waited
+            # for this attempt completes here: its whole boundary is durable.
             self._attempt_state.delete()
+            self._complete_control_stop_if_pending()
             self._active_issue_number = None
             return None
         claim = self._tracker.recover_claim(checkpoint.issue_number)
