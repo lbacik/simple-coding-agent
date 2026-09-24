@@ -9,8 +9,14 @@ services:
       # Named volume keeps clone/state/logs through container replacement.
       # Installed skills are baked into the image; they survive replacement
       # because install-skills.sh runs at build time.
+      # The operator control socket (/run/simple-coding-agent/control.sock)
+      # is deliberately NOT a volume: it is container-local runtime state,
+      # so commands sent inside this container can never reach another
+      # instance. Accepted commands persist on this volume under
+      # /data/state/control.sqlite3 and survive container replacement.
       - agent_data:/data
-    # No Docker socket is mounted.
+    # No Docker socket is mounted. No control port is published: the only
+    # control channel is the container-local Unix socket above.
     restart: unless-stopped
 
 volumes:

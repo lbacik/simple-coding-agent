@@ -22,6 +22,9 @@ from typing import Callable, Protocol
 class ControlSurface(Protocol):
     """The lifecycle-facing control operations served over the socket."""
 
+    @property
+    def repository(self) -> str: ...
+
     def submit_stop(self, request_id: str, *, has_active_attempt: bool = ...) -> object: ...
 
     def submit_resume(self, request_id: str) -> object: ...
@@ -37,6 +40,18 @@ class ControlUnavailableError(ConnectionError):
 
 _SOCKET_BACKLOG = 16
 _BUFFER_LIMIT = 1 << 20
+
+#: Container-local runtime directory holding the private control socket. It is
+#: never bind-mounted or shared: each container has its own filesystem, so the
+#: fixed path below addresses exactly one agent instance.
+RUNTIME_DIR = Path("/run/simple-coding-agent")
+
+#: The one control endpoint inside the selected container.
+DEFAULT_SOCKET_PATH = RUNTIME_DIR / "control.sock"
+
+#: Test/dev override selecting a different endpoint (e.g. per-instance
+#: temporary sockets when several instances share one host).
+SOCKET_ENV_VAR = "AGENTCTL_SOCKET"
 
 
 class ControlServer:
@@ -137,10 +152,24 @@ class ControlServer:
             raw = _read_line(connection)
             request = json.loads(raw)
         except (OSError, ValueError):
-            _send(connection, {"ok": False, "error": "Request must be one JSON object per line."})
+            _send(
+                connection,
+                {
+                    "ok": False,
+                    "repository": self._repository(),
+                    "error": "Request must be one JSON object per line.",
+                },
+            )
             return
         if not isinstance(request, dict):
-            _send(connection, {"ok": False, "error": "Request must be a JSON object."})
+            _send(
+                connection,
+                {
+                    "ok": False,
+                    "repository": self._repository(),
+                    "error": "Request must be a JSON object.",
+                },
+            )
             return
         operation = request.get("op")
         if operation == "stop":
@@ -152,7 +181,14 @@ class ControlServer:
         elif operation == "command":
             self._reply_command(connection, request)
         else:
-            _send(connection, {"ok": False, "error": f"Unknown operation: {operation!r}."})
+            _send(
+                connection,
+                {
+                    "ok": False,
+                    "repository": self._repository(),
+                    "error": f"Unknown operation: {operation!r}.",
+                },
+            )
 
     def _reply_stop(self, connection: socket.socket, request: dict) -> None:
         from simple_coding_agent.control import PayloadMismatchError, RequestIdError
@@ -162,6 +198,7 @@ class ControlServer:
             request,
             self._control.submit_stop,
             rejected=(RequestIdError, PayloadMismatchError),
+            repository=self._repository(),
         )
 
     def _reply_resume(self, connection: socket.socket, request: dict) -> None:
@@ -176,6 +213,7 @@ class ControlServer:
             request,
             self._control.submit_resume,
             rejected=(RequestIdError, PayloadMismatchError, ResumeBlockedError),
+            repository=self._repository(),
         )
 
     def _reply_status(self, connection: socket.socket) -> None:
@@ -184,7 +222,14 @@ class ControlServer:
         try:
             snapshot = self._control.control_status()
         except (ControlStoreError, RuntimeError, OSError) as error:
-            _send(connection, {"ok": False, "error": f"Status is unavailable: {error}"})
+            _send(
+                connection,
+                {
+                    "ok": False,
+                    "repository": self._repository(),
+                    "error": f"Status is unavailable: {error}",
+                },
+            )
             return
         _send(connection, {"ok": True, "status": snapshot})
 
@@ -193,27 +238,80 @@ class ControlServer:
 
         request_id = request.get("request_id")
         if not isinstance(request_id, str) or not request_id:
-            _send(connection, {"ok": False, "error": "A request ID is required."})
+            _send(
+                connection,
+                {
+                    "ok": False,
+                    "repository": self._repository(),
+                    "error": "A request ID is required.",
+                },
+            )
             return
         try:
             record = self._control.get_command(request_id)
         except (ControlStoreError, RuntimeError, OSError) as error:
-            _send(connection, {"ok": False, "error": f"Lookup is unavailable: {error}"})
+            _send(
+                connection,
+                {
+                    "ok": False,
+                    "repository": self._repository(),
+                    "error": f"Lookup is unavailable: {error}",
+                },
+            )
             return
         _send(
             connection,
             {
                 "ok": True,
                 "request_id": request_id,
+                "repository": self._repository(),
                 "command": command_to_json(record) if record is not None else None,
             },
         )
 
+    def _repository(self) -> str:
+        """The configured ``TARGET_REPO`` identifying the controlled instance."""
 
-def socket_path_for(data_dir: Path) -> Path:
-    """Return the runtime endpoint for one agent instance's data directory."""
+        repository = getattr(self._control, "repository", None)
+        if isinstance(repository, str) and repository:
+            return repository
+        try:
+            snapshot = self._control.control_status()
+        except Exception:
+            return "unknown"
+        if isinstance(snapshot, dict) and snapshot.get("repository"):
+            return str(snapshot["repository"])
+        return "unknown"
 
-    return data_dir / "state" / "agentctl.sock"
+
+def resolve_socket_path(explicit: str | Path | None = None) -> Path:
+    """Resolve the control endpoint shared by the agent and its CLI.
+
+    Production containers always use the container-local runtime socket at
+    ``/run/simple-coding-agent/control.sock``: each container owns its
+    filesystem, so that fixed path addresses exactly the selected instance.
+    An explicit path (the CLI's ``--socket``) wins; otherwise
+    ``AGENTCTL_SOCKET`` overrides the endpoint for tests and local
+    development where several instances share one host.
+    """
+
+    if explicit is not None:
+        return Path(explicit).expanduser()
+    override = os.environ.get(SOCKET_ENV_VAR)
+    if override:
+        return Path(override).expanduser()
+    return DEFAULT_SOCKET_PATH
+
+
+def socket_path_for(data_dir: Path | None = None) -> Path:
+    """Return the control endpoint for one agent instance.
+
+    ``data_dir`` is accepted for backward compatibility and otherwise unused:
+    the endpoint is container-local runtime state, not derived from the
+    persistent data directory. Prefer :func:`resolve_socket_path`.
+    """
+
+    return resolve_socket_path()
 
 
 def _reply_mutating(
@@ -222,6 +320,7 @@ def _reply_mutating(
     submit: Callable[[object], object],
     *,
     rejected: tuple[type[Exception], ...],
+    repository: str,
 ) -> None:
     """Reply to one mutating command with its durable acknowledgement.
 
@@ -235,19 +334,28 @@ def _reply_mutating(
     try:
         record = submit(request_id)
     except rejected as error:
-        _send(connection, {"ok": False, "error": str(error), "request_id": request_id})
+        _send(
+            connection,
+            {
+                "ok": False,
+                "repository": repository,
+                "error": str(error),
+                "request_id": request_id,
+            },
+        )
         return
     except (ControlStoreError, RuntimeError, OSError) as error:
         _send(
             connection,
             {
                 "ok": False,
+                "repository": repository,
                 "error": f"Command could not be committed: {error}",
                 "request_id": request_id,
             },
         )
         return
-    _send(connection, {"ok": True, **command_to_json(record)})
+    _send(connection, {"ok": True, "repository": repository, **command_to_json(record)})
 
 
 def send_request(socket_path: Path, request: dict) -> dict:

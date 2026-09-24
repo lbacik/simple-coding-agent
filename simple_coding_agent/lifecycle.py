@@ -616,6 +616,12 @@ class AgentLifecycle:
 
         return self._active_issue_number
 
+    @property
+    def repository(self) -> str:
+        """The configured ``TARGET_REPO`` identifying this agent instance."""
+
+        return self._repository
+
     def set_attempt_runner(
         self,
         attempt_runner: Callable[[Claim, RepositoryProfile, object], AttemptEvidence] | None,

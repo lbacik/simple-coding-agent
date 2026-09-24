@@ -101,6 +101,23 @@ guard still trips at `MAX_CONSECUTIVE_ERRORS`; a restart alone does not reset
 it.  See [docs/agents/operator-onboarding.md](docs/agents/operator-onboarding.md)
 for recovery procedures and full onboarding guidance.
 
+### Controlling the running instance
+
+Open a shell in the intended running container and use the installed control
+CLI at its absolute path, checking `TARGET_REPO` before any mutating command:
+
+```shell
+/usr/local/bin/agentctl status
+/usr/local/bin/agentctl stop
+```
+
+Container selection is the instance selector. The control socket is
+container-local (`/run/simple-coding-agent/control.sock`, owner `agent`,
+modes `0700`/`0600`); accepted commands persist on that instance's `/data`
+volume through container replacement. Never issue commands from a second
+agent process or a one-shot `docker compose run` container. Full procedures
+are in [docs/agents/operator-onboarding.md](docs/agents/operator-onboarding.md).
+
 ## Operating limits and evidence
 
 Transient GitHub and push operations use `MAX_RETRIES` attempts with exponential
