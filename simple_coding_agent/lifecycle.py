@@ -149,6 +149,8 @@ class Workspace(Protocol):
 
     working_directory: Path
 
+    def prepare_for_profile_read(self, *, base_branch: str = "main"): ...
+
     def prepare_attempt(self, *, base_branch: str, issue_number: int): ...
 
     def cleanup(self, *, base_branch: str, prepared: object, retain_branch: bool) -> None: ...
@@ -625,10 +627,15 @@ class AgentLifecycle:
         retain_branch = False
         comment_posted = True
         try:
-            prepared = self._workspace.prepare_attempt(base_branch="main", issue_number=claim.issue.number)
+            # Bootstrap only checks out the default base so the profile can be
+            # read. It must never touch the attempt branch: rebasing here onto
+            # "main" would corrupt (or fail on) branches built on the profile's
+            # real base branch before the profile is even loaded. The attempt
+            # is prepared exactly once below, onto profile.base_branch.
+            self._workspace.prepare_for_profile_read()
             self._event_log(
-                "workspace_prepared",
-                f"branch={getattr(prepared, 'branch', None)}; base_branch=main",
+                "workspace_prepared_for_profile_read",
+                "base_branch=main",
                 level="INFO",
                 issue_number=claim.issue.number,
             )
@@ -639,19 +646,15 @@ class AgentLifecycle:
                 level="INFO",
                 issue_number=claim.issue.number,
             )
-            if profile.base_branch != "main":
-                self._workspace.cleanup(
-                    base_branch="main", prepared=prepared, retain_branch=False
-                )
-                prepared = self._workspace.prepare_attempt(
-                    base_branch=profile.base_branch, issue_number=claim.issue.number
-                )
-                self._event_log(
-                    "workspace_reprepared",
-                    f"branch={getattr(prepared, 'branch', None)}; base_branch={profile.base_branch}",
-                    level="INFO",
-                    issue_number=claim.issue.number,
-                )
+            prepared = self._workspace.prepare_attempt(
+                base_branch=profile.base_branch, issue_number=claim.issue.number
+            )
+            self._event_log(
+                "workspace_prepared",
+                f"branch={getattr(prepared, 'branch', None)}; base_branch={profile.base_branch}",
+                level="INFO",
+                issue_number=claim.issue.number,
+            )
             self._attempt_state.transition(AttemptPhase.SETUP)
             self._event_log(
                 "attempt_phase_transitioned",
@@ -808,13 +811,11 @@ class AgentLifecycle:
         retain_branch = False
         has_commits = False
         try:
-            prepared = self._workspace.prepare_attempt(base_branch="main", issue_number=claim.issue.number)
+            self._workspace.prepare_for_profile_read()
             profile = self._profile_loader(self._workspace.working_directory)
-            if profile.base_branch != "main":
-                self._workspace.cleanup(base_branch="main", prepared=prepared, retain_branch=False)
-                prepared = self._workspace.prepare_attempt(
-                    base_branch=profile.base_branch, issue_number=claim.issue.number
-                )
+            prepared = self._workspace.prepare_attempt(
+                base_branch=profile.base_branch, issue_number=claim.issue.number
+            )
             if checkpoint.phase is AttemptPhase.MODEL_RUNNING:
                 commits = getattr(self._workspace, "commits_added")(prepared)
                 has_commits = bool(commits)

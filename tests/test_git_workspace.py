@@ -418,6 +418,46 @@ def test_refuses_reusing_a_clone_for_a_different_repository(tmp_path: Path) -> N
         workspace.prepare_attempt(base_branch="main", issue_number=19)
 
 
+def test_profile_bootstrap_never_rebases_an_attempt_branch_onto_the_wrong_base(
+    tmp_path: Path,
+) -> None:
+    """Reading the profile must not touch attempt branches.
+
+    With ``develop`` diverged from ``main`` and a remote attempt branch built
+    on ``develop``, bootstrapping the workspace for the profile read must
+    succeed without rebasing anything; the single real preparation onto
+    ``develop`` is then a clean no-op rebase instead of a conflict.
+    """
+
+    remote, seed = repository_with_main(tmp_path)
+    clone = tmp_path / "clone"
+    workspace = GitWorkspace(clone, str(remote), token_provider=lambda: "secret-token")
+
+    git(seed, "checkout", "-b", "develop")
+    write_and_commit(seed, "README.md", "develop content", "Develop work")
+    git(seed, "push", "-u", "origin", "develop")
+    git(seed, "checkout", "main")
+    write_and_commit(seed, "README.md", "main content", "Main work")
+    git(seed, "push", "origin", "main")
+
+    git(seed, "checkout", "develop")
+    git(seed, "checkout", "-b", "agent/issue-38")
+    write_and_commit(seed, "feature.txt", "attempt work", "Attempt work")
+    git(seed, "push", "-u", "origin", "agent/issue-38")
+
+    workspace.prepare_for_profile_read()
+
+    assert git(clone, "branch", "--show-current") == "main"
+    assert "agent/issue-38" not in git(clone, "branch", "--format=%(refname:short)").splitlines()
+
+    prepared = workspace.prepare_attempt(base_branch="develop", issue_number=38)
+
+    assert prepared.branch == "agent/issue-38"
+    assert (clone / "feature.txt").read_text() == "attempt work"
+    assert (clone / "README.md").read_text() == "develop content"
+    assert [commit.subject for commit in workspace.commits_added(prepared)] == ["Attempt work"]
+
+
 def repository_with_main(tmp_path: Path) -> tuple[Path, Path]:
     tmp_path.mkdir(parents=True, exist_ok=True)
     remote = tmp_path / "remote.git"
