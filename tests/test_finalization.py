@@ -237,6 +237,154 @@ def test_dirty_tree_without_checkpoint_holds_intake(tmp_path: Path) -> None:
     assert AttemptStateStore(tmp_path).read() is None
 
 
+def test_error_limit_trips_before_the_completion_record(tmp_path: Path) -> None:
+    """The circuit breaker must fire without recording a completion it never reached.
+
+    Accounting precedes the ledger entry so a limit trip leaves the checkpoint
+    present and the attempt unrecorded; otherwise a restart would see a
+    finalized ledger entry, delete the checkpoint, and claim a new issue
+    despite the tripped limit.
+    """
+    claim = Claim(_issue(24), Assignment("issue-24", "agent-id"))
+    completions = AttemptCompletionStore(tmp_path)
+    errors = ConsecutiveErrorStore(tmp_path)
+    lifecycle = AgentLifecycle(
+        tracker=_FakeTracker(claim),
+        attempt_state=AttemptStateStore(tmp_path),
+        workspace=_FakeWorkspace(),
+        profile_loader=lambda _: _profile(),
+        publisher=_FakePublisher(),
+        attempt_runner=_evidence_runner(AttemptOutcome.INFRASTRUCTURE_ERROR),
+        error_store=errors,
+        max_consecutive_errors=1,
+        completion_store=completions,
+    )
+
+    with pytest.raises(SystemExit):
+        lifecycle.run_once()
+
+    assert completions.read_all() == {}
+    assert AttemptStateStore(tmp_path).read() is not None
+    assert errors.read().count == 1
+
+
+def test_error_limit_survives_restart_replay_without_a_new_claim(tmp_path: Path) -> None:
+    """Replay after a limit trip re-trips the limit instead of claiming anew."""
+    claim = Claim(_issue(24), Assignment("issue-24", "agent-id"))
+    completions = AttemptCompletionStore(tmp_path)
+    errors = ConsecutiveErrorStore(tmp_path)
+    first = AgentLifecycle(
+        tracker=_FakeTracker(claim),
+        attempt_state=AttemptStateStore(tmp_path),
+        workspace=_FakeWorkspace(),
+        profile_loader=lambda _: _profile(),
+        publisher=_FakePublisher(),
+        attempt_runner=_evidence_runner(AttemptOutcome.INFRASTRUCTURE_ERROR),
+        error_store=errors,
+        max_consecutive_errors=1,
+        completion_store=completions,
+    )
+
+    with pytest.raises(SystemExit):
+        first.run_once()
+
+    tracker = _FakeTracker(None)
+    second = AgentLifecycle(
+        tracker=tracker,
+        attempt_state=AttemptStateStore(tmp_path),
+        workspace=_FakeWorkspace(),
+        profile_loader=lambda _: _profile(),
+        publisher=_FakePublisher(),
+        error_store=errors,
+        max_consecutive_errors=1,
+        completion_store=completions,
+    )
+
+    with pytest.raises(SystemExit):
+        second.run_once()
+
+    assert tracker.claimed == []
+    assert completions.read_all() == {}
+    assert AttemptStateStore(tmp_path).read() is not None
+
+
+def test_live_dirty_worktree_holds_without_publishing(tmp_path: Path) -> None:
+    """Dirty work found while preparing a live attempt holds like recovery does.
+
+    No result comment, no issue release, no ledger entry: the branch,
+    checkpoint, and working tree stay available for inspection.
+    """
+    claim = Claim(_issue(24), Assignment("issue-24", "agent-id"))
+    tracker = _FakeTracker(claim)
+    publisher = _FakePublisher()
+    completions = AttemptCompletionStore(tmp_path)
+    lifecycle = AgentLifecycle(
+        tracker=tracker,
+        attempt_state=AttemptStateStore(tmp_path),
+        workspace=_PrepareDirtyWorkspace(),
+        profile_loader=lambda _: _profile(),
+        publisher=publisher,
+        attempt_runner=_evidence_runner(AttemptOutcome.INCOMPLETE),
+        completion_store=completions,
+    )
+
+    with pytest.raises(SystemExit):
+        lifecycle.run_once()
+
+    assert publisher.requests == []
+    assert tracker.cleanup == []
+    assert completions.read_all() == {}
+    assert AttemptStateStore(tmp_path).read() is not None
+
+
+def test_cleanup_failure_holds_with_a_visible_event(tmp_path: Path) -> None:
+    """A confirmed comment and release with failed cleanup keeps the checkpoint visibly."""
+    claim = Claim(_issue(24), Assignment("issue-24", "agent-id"))
+    events: list[str] = []
+    lifecycle = AgentLifecycle(
+        tracker=_FakeTracker(claim),
+        attempt_state=AttemptStateStore(tmp_path),
+        workspace=_CleanupFailingWorkspace(),
+        profile_loader=lambda _: _profile(),
+        publisher=_FakePublisher(),
+        attempt_runner=_evidence_runner(AttemptOutcome.INCOMPLETE),
+        event_log=lambda event, detail="", level="INFO", issue_number=None: events.append(event),
+        completion_store=AttemptCompletionStore(tmp_path),
+    )
+
+    with pytest.raises(OSError, match="cleanup unavailable"):
+        lifecycle.run_once()
+
+    assert "attempt_finalization_held" in events
+    assert AttemptStateStore(tmp_path).read() is not None
+    assert AttemptCompletionStore(tmp_path).read_all() == {}
+
+
+def test_malformed_completion_ledger_holds_intake_without_claiming(tmp_path: Path) -> None:
+    path = tmp_path / "state" / "completed_attempts.json"
+    path.parent.mkdir(parents=True)
+    path.write_text("{not JSON")
+    _state_at(tmp_path, AttemptPhase.PUSHING)
+    events: list[str] = []
+    tracker = _FakeTracker(None)
+    lifecycle = AgentLifecycle(
+        tracker=tracker,
+        attempt_state=AttemptStateStore(tmp_path),
+        workspace=_FakeWorkspace(commits=("completed",)),
+        profile_loader=lambda _: _profile(),
+        publisher=_FakePublisher(),
+        event_log=lambda event, detail="", level="INFO", issue_number=None: events.append(event),
+        completion_store=AttemptCompletionStore(tmp_path),
+    )
+
+    with pytest.raises(SystemExit):
+        lifecycle.run_once()
+
+    assert "attempt_completion_unusable" in events
+    assert tracker.claimed == []
+    assert AttemptStateStore(tmp_path).read() is not None
+
+
 # --- Fakes ---
 
 
@@ -309,6 +457,21 @@ class _FakeWorkspace:
 class _DirtyWorkspace(_FakeWorkspace):
     def is_clean(self) -> bool:
         return False
+
+    def prepare_for_profile_read(self, *, base_branch: str = "main") -> None:
+        raise DirtyWorkspaceError("Repository working tree contains uncommitted changes")
+
+    def prepare_attempt(self, *, base_branch: str, issue_number: int):
+        raise DirtyWorkspaceError("Repository working tree contains uncommitted changes")
+
+
+class _CleanupFailingWorkspace(_FakeWorkspace):
+    def cleanup(self, *, base_branch: str, prepared: object, retain_branch: bool) -> None:
+        raise OSError("cleanup unavailable")
+
+
+class _PrepareDirtyWorkspace(_FakeWorkspace):
+    """Clean at the pre-claim check, dirty once preparation touches the tree."""
 
     def prepare_for_profile_read(self, *, base_branch: str = "main") -> None:
         raise DirtyWorkspaceError("Repository working tree contains uncommitted changes")

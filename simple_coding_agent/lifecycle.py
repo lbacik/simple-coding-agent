@@ -26,7 +26,7 @@ from simple_coding_agent.completion import (
     VerificationRunner,
 )
 from simple_coding_agent.config import RepositoryProfile
-from simple_coding_agent.finalization import AttemptCompletionStore
+from simple_coding_agent.finalization import AttemptCompletionStore, CompletionStoreError
 from simple_coding_agent.git_workspace import (
     DirtyWorkspaceError,
     GitWorkspaceError,
@@ -699,22 +699,20 @@ class AgentLifecycle:
                     )
                 )
         except DirtyWorkspaceError as error:
+            # Unexplained dirty or untracked work: hold intake and preserve
+            # the branch, checkpoint, and entire working tree for inspection.
+            # Publishing or releasing here would discard evidence about work
+            # this attempt never produced.
             self._event_log(
-                "working_tree_dirty",
-                _exception_detail(error),
+                "workspace_hold",
+                f"{_exception_detail(error)} The branch, checkpoint, and working tree "
+                "are preserved for inspection; issue intake is held until the "
+                "workspace is repaired by an operator.",
                 level="WARNING",
                 issue_number=claim.issue.number,
             )
-            published = self._publish_terminal(
-                claim,
-                checkpoint.started_at,
-                prepared,
-                profile,
-                AttemptOutcome.INFRASTRUCTURE_ERROR,
-                details="Repository working tree contains uncommitted or untracked changes. Human inspection is required.",
-            )
-            outcome = AttemptOutcome.INFRASTRUCTURE_ERROR
-            comment_posted = getattr(published, "comment_posted", True)
+            comment_posted = False
+            prepared = None
             raise SystemExit(1) from error
         except GitWorkspaceRecoveryError as error:
             self._event_log(
@@ -788,7 +786,7 @@ class AgentLifecycle:
                             ) if prepared is not None else f"agent/issue-{claim.issue.number}",
                             outcome, archive,
                         )
-                    elif not comment_posted or not released:
+                    else:
                         self._event_log(
                             "attempt_finalization_held",
                             "Publication, release, or cleanup is unconfirmed; the branch, "
@@ -824,13 +822,20 @@ class AgentLifecycle:
     ) -> None:
         """Record the durable completion boundary, then remove the checkpoint.
 
-        The ledger entry is written before checkpoint removal, so a crash in
-        between is reconciled as "already finalized, only delete" instead of
-        replaying the result comment, the issue release, or the accounting.
-        Checkpoint deletion alone is never evidence of completion.
+        Accounting and the outcome archive precede the ledger entry, which is
+        written immediately before checkpoint removal. A crash before the
+        ledger entry replays safely on restart: publication is deduplicated by
+        the attempt marker, release re-reads remote state before mutating, and
+        accounting is keyed by the stable attempt ID. A crash between the
+        ledger entry and checkpoint removal is reconciled as "already
+        finalized, only delete" instead of replaying the result comment, the
+        issue release, or the accounting. Checkpoint deletion alone is never
+        evidence of completion.
         """
 
         attempt_id = checkpoint.started_at
+        self._record_terminal_outcome(outcome, attempt_id, issue_number=issue_number)
+        self._write_outcome(archive, outcome, attempt_id)
         if self._completion_store is not None:
             self._completion_store.record(
                 attempt_id=attempt_id,
@@ -838,8 +843,6 @@ class AgentLifecycle:
                 branch=branch,
                 outcome=outcome,
             )
-        self._write_outcome(archive, outcome, attempt_id)
-        self._record_terminal_outcome(outcome, attempt_id, issue_number=issue_number)
         self._attempt_state.delete()
 
     def _reconcile_startup(self) -> AttemptOutcome | None:
@@ -857,9 +860,21 @@ class AgentLifecycle:
             raise SystemExit(1) from error
         if checkpoint is None:
             return None
-        if self._completion_store is not None and self._completion_store.is_finalized(
-            checkpoint.started_at
-        ):
+        try:
+            finalized = (
+                self._completion_store is not None
+                and self._completion_store.is_finalized(checkpoint.started_at)
+            )
+        except CompletionStoreError as error:
+            self._event_log(
+                "attempt_completion_unusable",
+                f"{_exception_detail(error)} The completion ledger is preserved for "
+                "inspection; issue intake is held until it is repaired or removed "
+                "by an operator.",
+                level="ERROR",
+            )
+            raise SystemExit(1) from error
+        if finalized:
             # The previous process finalized every boundary step and recorded
             # the attempt, then crashed before removing the checkpoint.
             # Replaying any side effect here would duplicate the result
@@ -1064,7 +1079,7 @@ class AgentLifecycle:
                             ) if prepared is not None else checkpoint.branch,
                             outcome, archive,
                         )
-                    elif not comment_posted or not released:
+                    else:
                         self._event_log(
                             "attempt_finalization_held",
                             "Publication, release, or cleanup is unconfirmed; the branch, "
