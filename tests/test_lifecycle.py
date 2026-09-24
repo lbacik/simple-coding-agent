@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 from simple_coding_agent.attempt_state import AttemptPhase, AttemptStateStore
 from simple_coding_agent.completion import AttemptOutcome, CompletionDecision, PublicationPath
-from simple_coding_agent.git_workspace import GitWorkspaceRecoveryError
+from simple_coding_agent.git_workspace import GitWorkspaceRecoveryError, RebaseConflictError
 from simple_coding_agent.github_tracker import Assignment, Claim, TrackerIssue
 from simple_coding_agent.lifecycle import AgentLifecycle, AttemptEvidence, LifecycleStatus
 from simple_coding_agent.operating import ConsecutiveErrorStore
@@ -477,6 +477,74 @@ def test_stops_without_touching_the_issue_when_the_workspace_cannot_be_repaired(
     ) in events
 
 
+def test_rebase_conflict_during_reprepare_reports_infrastructure_error_without_setup(
+    tmp_path: Path,
+) -> None:
+    """Rebasing a stale branch onto the profile base must fail before setup.
+
+    Regression test for the ordering bug where a conflicting rebase left
+    ``<<<<<<<`` markers in the tree and setup (e.g. composer cache:clear)
+    failed with a misleading ParseError instead of a rebase_conflict cause.
+    """
+
+    events: list[tuple[str, str, str]] = []
+    claim = Claim(issue(24), Assignment("issue-24", "agent-id"))
+    workspace = RebaseConflictingWorkspace()
+    publisher = FakePublisher()
+    calls: list[str] = []
+    lifecycle = AgentLifecycle(
+        tracker=FakeTracker(claim),
+        attempt_state=AttemptStateStore(tmp_path),
+        workspace=workspace,
+        profile_loader=lambda _: profile("develop"),
+        publisher=publisher,
+        attempt_runner=lambda *args: calls.append("setup") or (_ for _ in ()).throw(
+            AssertionError("setup must not run after a rebase conflict")
+        ),
+        event_log=lambda event, detail="", level="INFO", issue_number=None: events.append(
+            (event, detail, level)
+        ),
+    )
+
+    result = lifecycle.run_once()
+
+    assert result.outcome is AttemptOutcome.INFRASTRUCTURE_ERROR
+    assert calls == []
+    assert any(event == "rebase_conflict" for event, _, _ in events)
+    assert "workspace_reprepared" not in [event for event, _, _ in events]
+    assert "setup_started" not in [event for event, _, _ in events]
+    assert publisher.outcomes == [AttemptOutcome.INFRASTRUCTURE_ERROR]
+    details = publisher.requests[0].details
+    assert "rebase_conflict" in details
+    assert "Setup was not started" in details
+
+
+def test_rebase_conflict_on_first_prepare_reports_infrastructure_error(tmp_path: Path) -> None:
+    events: list[tuple[str, str, str]] = []
+    claim = Claim(issue(24), Assignment("issue-24", "agent-id"))
+    workspace = RebaseConflictingWorkspace(conflict_bases=("main",))
+    publisher = FakePublisher()
+    lifecycle = AgentLifecycle(
+        tracker=FakeTracker(claim),
+        attempt_state=AttemptStateStore(tmp_path),
+        workspace=workspace,
+        profile_loader=lambda _: (_ for _ in ()).throw(AssertionError("profile must not load")),
+        publisher=publisher,
+        attempt_runner=lambda *args: (_ for _ in ()).throw(
+            AssertionError("setup must not run after a rebase conflict")
+        ),
+        event_log=lambda event, detail="", level="INFO", issue_number=None: events.append(
+            (event, detail, level)
+        ),
+    )
+
+    result = lifecycle.run_once()
+
+    assert result.outcome is AttemptOutcome.INFRASTRUCTURE_ERROR
+    assert any(event == "rebase_conflict" for event, _, _ in events)
+    assert publisher.outcomes == [AttemptOutcome.INFRASTRUCTURE_ERROR]
+
+
 @dataclass
 class FakeTracker:
     next_claim: Claim | None
@@ -525,6 +593,29 @@ class FakeWorkspace:
 class RecoveryFailingWorkspace(FakeWorkspace):
     def prepare_attempt(self, *, base_branch: str, issue_number: int):
         raise GitWorkspaceRecoveryError("workspace is broken")
+
+
+class RebaseConflictingWorkspace(FakeWorkspace):
+    """Raise RebaseConflictError when preparing the configured base branches."""
+
+    def __init__(
+        self, *, commits: tuple[str, ...] = (), conflict_bases: tuple[str, ...] = ("develop",)
+    ) -> None:
+        super().__init__(commits=commits)
+        self._conflict_bases = conflict_bases
+
+    def prepare_attempt(self, *, base_branch: str, issue_number: int):
+        self.prepared_bases.append(base_branch)
+        if base_branch in self._conflict_bases:
+            raise RebaseConflictError(
+                f"Rebase of agent/issue-{issue_number} onto {base_branch} hit conflicts"
+                " (rebase_conflict). Conflicting files: SubscriptionController.php."
+                " The rebase was aborted and setup was not started.",
+                branch=f"agent/issue-{issue_number}",
+                base_branch=base_branch,
+                conflicted_files=("SubscriptionController.php",),
+            )
+        return type("Prepared", (), {"branch": f"agent/issue-{issue_number}"})()
 
 
 class FakePublisher:

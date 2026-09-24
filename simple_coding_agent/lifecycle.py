@@ -27,6 +27,7 @@ from simple_coding_agent.git_workspace import (
     DirtyWorkspaceError,
     GitWorkspaceError,
     GitWorkspaceRecoveryError,
+    RebaseConflictError,
 )
 from simple_coding_agent.github_tracker import ROUND_FINISHED, Claim, TrackerIssue
 from simple_coding_agent.model_execution import ModelExecutionStatus, ModelExecutor
@@ -573,6 +574,12 @@ class AgentLifecycle:
             comment_posted = False
             prepared = None
             raise SystemExit(1) from error
+        except RebaseConflictError as error:
+            published = self._publish_rebase_conflict(
+                claim, checkpoint.started_at, prepared, profile, error
+            )
+            outcome = AttemptOutcome.INFRASTRUCTURE_ERROR
+            comment_posted = getattr(published, "comment_posted", True)
         except Exception as error:
             self._event_log(
                 "attempt_exception", _exception_detail(error), level="ERROR", issue_number=claim.issue.number
@@ -724,6 +731,12 @@ class AgentLifecycle:
             comment_posted = False
             prepared = None
             raise SystemExit(1) from error
+        except RebaseConflictError as error:
+            published = self._publish_rebase_conflict(
+                claim, checkpoint.started_at, prepared, profile, error
+            )
+            outcome = AttemptOutcome.INFRASTRUCTURE_ERROR
+            comment_posted = getattr(published, "comment_posted", True)
         except Exception as error:
             self._event_log(
                 "attempt_exception", _exception_detail(error), level="ERROR", issue_number=claim.issue.number
@@ -785,6 +798,41 @@ class AgentLifecycle:
                 details=details,
                 base_branch=base_branch,
             )
+        )
+
+    def _publish_rebase_conflict(
+        self,
+        claim: Claim,
+        started_at: str,
+        prepared: object | None,
+        profile: RepositoryProfile | None,
+        error: RebaseConflictError,
+    ):
+        """Report an aborted rebase conflict as the terminal infrastructure error.
+
+        The conflicting rebase was already aborted by workspace preparation,
+        so setup never ran: the failure is classified here with its
+        ``rebase_conflict`` cause instead of surfacing later as an
+        unrelated setup error against a half-merged tree.
+        """
+
+        self._event_log(
+            "rebase_conflict",
+            _exception_detail(error),
+            level="ERROR",
+            issue_number=claim.issue.number,
+        )
+        return self._publish_terminal(
+            claim,
+            started_at,
+            prepared,
+            profile,
+            AttemptOutcome.INFRASTRUCTURE_ERROR,
+            details=(
+                f"{error} "
+                "Setup was not started so the failure is reported here "
+                "instead of as an unrelated setup error."
+            ),
         )
 
     def _record_terminal_outcome(
