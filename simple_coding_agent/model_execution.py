@@ -48,14 +48,33 @@ _CATEGORY_USD_PER_MILLION_TOKENS: Mapping[str, float] = {
 
 _HANDOFF_FOLLOWUP_TIMEOUT = 300
 
+_OPERATOR_HANDOFF_DELIVERY_WINDOW_SECONDS = 60
+_OPERATOR_HANDOFF_MODEL_DEADLINE_SECONDS = 240
+
 _COST_HANDOFF_INSTRUCTION = (
     "This attempt is approaching its cost budget. Invoke the `handoff` skill now "
     "to preserve your progress cooperatively instead of continuing further work."
+)
+_OPERATOR_HANDOFF_INSTRUCTION = (
+    "The operator requested a handoff (`agentctl handoff now`). Invoke the"
+    " `handoff` skill now to preserve your progress cooperatively instead of"
+    " continuing further work: commit any outstanding work in ordinary work"
+    " commits, then write `.agent/handoff/<issue-number>.md` with"
+    " `reason: operator_request` and commit it separately as the final commit."
+    " Do not start another implementation step."
 )
 _LIMIT_HANDOFF_FOLLOWUP_PROMPT = (
     "Execution reached its turn or time limit. Invoke the `handoff` skill now to "
     "preserve your progress: commit any outstanding work, then write and commit "
     "the handoff note. Do not attempt further implementation work."
+)
+_OPERATOR_HANDOFF_FOLLOWUP_PROMPT = (
+    "The operator requested a handoff (`agentctl handoff now`) and the safe"
+    " boundary was missed. Invoke the `handoff` skill now to preserve your"
+    " progress: commit any outstanding work in ordinary work commits, then write"
+    " `.agent/handoff/<issue-number>.md` with `reason: operator_request` and"
+    " commit it separately as the final commit. Do not attempt further"
+    " implementation work."
 )
 
 
@@ -120,6 +139,23 @@ class ModelExecutionStatus(StrEnum):
     MODEL_LIMIT_REACHED = "model_limit_reached"
     INFRASTRUCTURE_ERROR = "infrastructure_error"
     HANDOFF_REQUESTED = "handoff_requested"
+    OPERATOR_HANDOFF_EXPIRED = "operator_handoff_expired"
+
+
+@dataclass(frozen=True)
+class OperatorHandoff:
+    """An operator ``handoff now`` request the model must observe.
+
+    ``accepted_at`` is the wall-clock acceptance time of the durable command
+    commit; delivery and model-deadline windows are measured from it.
+    """
+
+    request_id: str
+    accepted_at: datetime
+
+
+OperatorHandoffProvider = Callable[[], "OperatorHandoff | None"]
+OperatorHandoffReporter = Callable[[str, str], None]
 
 
 @dataclass(frozen=True)
@@ -202,6 +238,179 @@ class ModelExecutor:
         self._handoff_context_delivered = False
         self._usage_shape_logged = False
         self._cost_estimator_observed_on_assistant = False
+        self._operator_handoff_provider: OperatorHandoffProvider | None = None
+        self._operator_handoff_reporter: OperatorHandoffReporter | None = None
+        self._operator_handoff: OperatorHandoff | None = None
+        self._operator_context_delivered = False
+        self._operator_fallback_used = False
+        self._operator_begun = False
+        self._operator_deadline_expired = False
+
+    def set_operator_handoff_provider(
+        self, provider: OperatorHandoffProvider | None
+    ) -> None:
+        """Observe ``handoff now`` requests accepted while the model runs.
+
+        The provider is polled at every safe SDK boundary (after an
+        in-flight tool finishes) and while waiting for stream messages, so a
+        request accepted during setup or mid-execution is picked up without
+        interrupting an in-flight tool early. ``None`` clears the provider.
+        """
+
+        self._operator_handoff_provider = provider
+
+    def set_operator_handoff_reporter(
+        self, reporter: OperatorHandoffReporter | None
+    ) -> None:
+        """Report ``(event, request_id)`` for ``delivered`` and ``begun``.
+
+        ``delivered`` fires once the handoff instruction reaches the model;
+        ``begun`` fires once invocation of the project-owned ``handoff``
+        skill is observed (delivery alone never counts as begun). ``None``
+        clears the reporter.
+        """
+
+        self._operator_handoff_reporter = reporter
+
+    @property
+    def operator_request_id(self) -> str | None:
+        """The operator ``handoff now`` request latched for this execution, if any."""
+
+        latched = self._operator_handoff
+        return latched.request_id if latched is not None else None
+
+    def _poll_operator_handoff(self) -> None:
+        """Latch the newest operator handoff request that may still be served.
+
+        Before the instruction is delivered the newest pending request wins
+        (an earlier one may already have been superseded); once delivered or
+        begun the latched request is pinned so a replacement cannot undo the
+        handoff mid-flight. Provider failures never disturb the stream.
+        """
+
+        provider = self._operator_handoff_provider
+        if provider is None:
+            return
+        try:
+            current = provider()
+        except Exception:
+            return
+        if current is None:
+            return
+        latched = self._operator_handoff
+        if latched is not None and (
+            latched.request_id == current.request_id
+            or self._operator_context_delivered
+            or self._operator_begun
+        ):
+            return
+        self._operator_handoff = current
+
+    def _report_operator(self, event: str) -> None:
+        """Report ``delivered``/``begun`` without ever breaking execution."""
+
+        reporter = self._operator_handoff_reporter
+        latched = self._operator_handoff
+        if reporter is None or latched is None:
+            return
+        try:
+            reporter(event, latched.request_id)
+        except Exception:
+            self._log(
+                "operator_handoff_report_failed",
+                f"event={event}; request={latched.request_id}",
+            )
+
+    def _operator_due_action(self) -> str | None:
+        """Return ``fallback``/``expire`` when an operator boundary is due now."""
+
+        self._poll_operator_handoff()
+        latched = self._operator_handoff
+        if latched is None or self._operator_deadline_expired:
+            return None
+        elapsed = (self._clock() - latched.accepted_at).total_seconds()
+        if elapsed >= _OPERATOR_HANDOFF_MODEL_DEADLINE_SECONDS:
+            return "expire"
+        if (
+            not self._operator_fallback_used
+            and not self._operator_context_delivered
+            and not self._operator_begun
+            and elapsed >= _OPERATOR_HANDOFF_DELIVERY_WINDOW_SECONDS
+        ):
+            return "fallback"
+        return None
+
+    def _operator_stream_wait(self) -> float | None:
+        """How long the stream may wait before the next operator boundary.
+
+        ``None`` waits indefinitely (no provider is watching). Otherwise the
+        wait ends at the next due action — the single fallback or the model
+        deadline — or at the delivery-window cadence that re-polls the
+        provider, so a request accepted mid-stream is picked up within 60
+        seconds even on an idle stream.
+        """
+
+        self._poll_operator_handoff()
+        latched = self._operator_handoff
+        if latched is None:
+            if self._operator_handoff_provider is None:
+                return None
+            return float(_OPERATOR_HANDOFF_DELIVERY_WINDOW_SECONDS)
+        elapsed = (self._clock() - latched.accepted_at).total_seconds()
+        targets = [_OPERATOR_HANDOFF_MODEL_DEADLINE_SECONDS - elapsed]
+        if (
+            not self._operator_fallback_used
+            and not self._operator_context_delivered
+            and not self._operator_begun
+        ):
+            targets.append(_OPERATOR_HANDOFF_DELIVERY_WINDOW_SECONDS - elapsed)
+        return max(min(targets), 0.0)
+
+    def _operator_fallback_blocked(self) -> bool:
+        """Whether the single fallback query would bypass the hard cost limit."""
+
+        return (
+            self._cost_estimator.estimated_cost_usd >= self._config.max_budget_usd
+        )
+
+    async def _run_operator_fallback(
+        self, client: SDKClient, observed_models: list[str]
+    ) -> tuple[ResultMessage | None, tuple[str, ...]] | None:
+        """Interrupt, drain, and issue the single follow-up handoff query.
+
+        Returns the follow-up terminal result (and merged models) to
+        propagate, or ``None`` to keep reading the original stream. A blocked
+        fallback (hard cost limit) consumes the single attempt without
+        querying: the stream's own terminal result then decides the outcome.
+        """
+
+        latched = self._operator_handoff
+        self._operator_fallback_used = True
+        if latched is None:
+            return None
+        if self._operator_fallback_blocked():
+            self._log(
+                "operator_handoff_fallback_blocked",
+                f"request={latched.request_id}; estimated cost reached the hard"
+                " cost limit, so no follow-up query is issued and the stream's"
+                " own terminal result decides the outcome",
+            )
+            return None
+        self._operator_context_delivered = True
+        self._report_operator("delivered")
+        self._log(
+            "operator_handoff_fallback",
+            f"request={latched.request_id}; the safe boundary was missed, so the"
+            " single follow-up handoff prompt is issued",
+        )
+        await client.interrupt()
+        await self._drain(client)
+        try:
+            await client.query(_OPERATOR_HANDOFF_FOLLOWUP_PROMPT)
+            followup_terminal, followup_models = await self._receive_terminal(client)
+        except Exception:
+            return None
+        return followup_terminal, tuple([*observed_models, *followup_models])
 
     @property
     def skill_events(self) -> tuple[SkillEvent, ...]:
@@ -250,6 +459,11 @@ class ModelExecutor:
         self._handoff_context_delivered = False
         self._usage_shape_logged = False
         self._cost_estimator_observed_on_assistant = False
+        self._operator_handoff = None
+        self._operator_context_delivered = False
+        self._operator_fallback_used = False
+        self._operator_begun = False
+        self._operator_deadline_expired = False
         soft_threshold = self._config.max_budget_usd * (1 - self._config.soft_threshold_percentage)
         self._log(
             "model_execution_started",
@@ -293,6 +507,16 @@ class ModelExecutor:
             )
 
         if terminal is None:
+            if self._operator_deadline_expired and self._operator_handoff is not None:
+                return self._evidence(
+                    ModelExecutionStatus.OPERATOR_HANDOFF_EXPIRED,
+                    f"Operator handoff {self._operator_handoff.request_id} reached"
+                    f" its {_OPERATOR_HANDOFF_MODEL_DEADLINE_SECONDS}-second model"
+                    " deadline without the model invoking the handoff skill.",
+                    None,
+                    None,
+                    observed_models,
+                )
             return self._evidence(
                 ModelExecutionStatus.INFRASTRUCTURE_ERROR,
                 "Claude SDK stream ended without a terminal ResultMessage.",
@@ -404,7 +628,37 @@ class ModelExecutor:
         self, client: SDKClient
     ) -> tuple[ResultMessage | None, tuple[str, ...]]:
         observed_models: list[str] = []
-        async for message in client.receive_response():
+        stream = client.receive_response().__aiter__()
+        while True:
+            action = self._operator_due_action()
+            if action == "fallback":
+                outcome = await self._run_operator_fallback(client, observed_models)
+                if outcome is not None:
+                    return outcome
+                continue
+            if action == "expire":
+                await client.interrupt()
+                await self._drain(client)
+                self._operator_deadline_expired = True
+                self._log(
+                    "operator_handoff_model_deadline_expired",
+                    f"request={self._operator_handoff.request_id if self._operator_handoff else None}; "
+                    f"deadline_seconds={_OPERATOR_HANDOFF_MODEL_DEADLINE_SECONDS}",
+                )
+                return None, tuple(observed_models)
+            wait = self._operator_stream_wait()
+            try:
+                if wait is None:
+                    message = await stream.__anext__()
+                else:
+                    async with asyncio.timeout(wait):
+                        message = await stream.__anext__()
+            except StopAsyncIteration:
+                return None, tuple(observed_models)
+            except TimeoutError:
+                # Awaited longer than the next operator boundary without a
+                # message; loop back so the due action runs above.
+                continue
             if isinstance(message, ResultMessage) or _looks_like_result(message):
                 return message, tuple(observed_models)
             if isinstance(message, AssistantMessage):
@@ -415,7 +669,6 @@ class ModelExecutor:
             model = getattr(message, "model", None)
             if isinstance(model, str):
                 observed_models.append(model)
-        return None, tuple(observed_models)
 
     def _observe_cost(self, usage: Any) -> None:
         """Latch a one-time soft-threshold crossing from estimated cumulative cost."""
@@ -480,6 +733,17 @@ class ModelExecutor:
         subtype = getattr(terminal, "subtype", None)
         total_cost_usd = getattr(terminal, "total_cost_usd", None)
 
+        if self._operator_context_delivered and any(
+            event.name == "handoff" for event in self._skill_events
+        ):
+            return self._evidence(
+                ModelExecutionStatus.HANDOFF_REQUESTED,
+                "Model invoked the handoff skill after an operator handoff request.",
+                stop_reason,
+                model_usage,
+                all_models,
+                terminal_reason=terminal_reason,
+            )
         if self._handoff_context_delivered and any(
             event.name == "handoff" for event in self._skill_events
         ):
@@ -620,6 +884,31 @@ class ModelExecutor:
                         "Cost soft threshold reached. Further implementation work is disabled. "
                         "You must invoke the `handoff` skill now to preserve your progress."
                     )
+        if self._operator_context_delivered:
+            tool_name = _hook_field(hook_input, "tool_name")
+            if tool_name == "Skill":
+                if _skill_name(hook_input) != "handoff":
+                    return _deny(
+                        "Operator handoff in progress. Further implementation work is"
+                        " disabled. Invoke the `handoff` skill now to preserve your"
+                        " progress."
+                    )
+            elif tool_name in ("Edit", "Write"):
+                file_path = str(_hook_field(hook_input, "tool_input", {}).get("file_path", ""))
+                if ".agent/handoff" not in file_path:
+                    return _deny(
+                        "Operator handoff in progress. Further implementation work is"
+                        " disabled. Invoke the `handoff` skill now to preserve your"
+                        " progress."
+                    )
+            elif tool_name == "Bash":
+                command = str(_hook_field(hook_input, "tool_input", {}).get("command", ""))
+                if not _is_handoff_command(command):
+                    return _deny(
+                        "Operator handoff in progress. Further implementation work is"
+                        " disabled. Invoke the `handoff` skill now to preserve your"
+                        " progress."
+                    )
         return await publication_guard(hook_input, tool_use_id, context)
 
     async def _record_post_tool_use(
@@ -633,13 +922,25 @@ class ModelExecutor:
             per_turn_cost = self._config.max_budget_usd / max(self._config.max_turns, 1)
             self._cost_estimator.observe_turn(per_turn_cost)
         self._check_limits()
+        self._poll_operator_handoff()
+        contexts: list[str] = []
         if self._soft_threshold_crossed and not self._handoff_context_delivered:
             self._handoff_context_delivered = True
             self._log("cost_soft_threshold_handoff_context_injected")
+            contexts.append(_COST_HANDOFF_INSTRUCTION)
+        if self._operator_handoff is not None and not self._operator_context_delivered:
+            self._operator_context_delivered = True
+            self._report_operator("delivered")
+            self._log(
+                "operator_handoff_context_delivered",
+                f"request={self._operator_handoff.request_id}",
+            )
+            contexts.append(_OPERATOR_HANDOFF_INSTRUCTION)
+        if contexts:
             return {
                 "hookSpecificOutput": {
                     "hookEventName": "PostToolUse",
-                    "additionalContext": _COST_HANDOFF_INSTRUCTION,
+                    "additionalContext": "\n\n".join(contexts),
                 }
             }
         return {}
@@ -703,6 +1004,17 @@ class ModelExecutor:
                 timestamp=_timestamp(self._clock()),
             )
         )
+        if (
+            name == "handoff"
+            and self._operator_handoff is not None
+            and not self._operator_begun
+        ):
+            self._operator_begun = True
+            self._report_operator("begun")
+            self._log(
+                "operator_handoff_begun",
+                f"request={self._operator_handoff.request_id}",
+            )
         return {}
 
 

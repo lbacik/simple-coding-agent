@@ -57,7 +57,7 @@ from simple_coding_agent.github_tracker import (
     TrackerIssue,
     ineligibility_reason,
 )
-from simple_coding_agent.model_execution import ModelExecutionStatus, ModelExecutor
+from simple_coding_agent.model_execution import ModelExecutionStatus, ModelExecutor, OperatorHandoff
 from simple_coding_agent.observability import AttemptArchive
 from simple_coding_agent.operating import ConsecutiveErrorStore
 from simple_coding_agent.publication import PublicationRequest
@@ -156,6 +156,73 @@ class AttemptEvidence:
     note_commit_sha: str | None = None
 
 
+#: The handoff-note reason an operator ``handoff now`` request requires.
+_OPERATOR_HANDOFF_REASON = "operator_request"
+
+
+class OperatorHandoffControl(Protocol):
+    """The control boundary a model attempt uses to serve one handoff request."""
+
+    def snapshot(self) -> dict | None: ...
+
+    def mark_delivering(self, request_id: str) -> bool: ...
+
+    def mark_begun(self, request_id: str) -> bool: ...
+
+    def complete(self, request_id: str, detail: str) -> None: ...
+
+    def fail(self, request_id: str, reason: str) -> None: ...
+
+
+def _parse_operator_accepted_at(value: object) -> datetime | None:
+    """Parse a control ``accepted_at`` timestamp for executor windows."""
+
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return None
+    return parsed
+
+
+class _ControlOperatorHandoff:
+    """Adapt the durable control store to the runner's operator boundary."""
+
+    def __init__(self, store: ControlStore, event_log: Callable[..., None]) -> None:
+        self._store = store
+        self._event_log = event_log
+
+    def snapshot(self) -> dict | None:
+        return self._store.handoff_snapshot()
+
+    def mark_delivering(self, request_id: str) -> bool:
+        return self._store.mark_handoff_delivering(request_id)
+
+    def mark_begun(self, request_id: str) -> bool:
+        return self._store.mark_handoff_begun(request_id)
+
+    def complete(self, request_id: str, detail: str) -> None:
+        record = self._store.complete_handoff(request_id, detail)
+        if record is None:
+            self._event_log(
+                "operator_handoff_resolution_unknown",
+                f"request={request_id}; the handoff command is no longer recorded",
+                level="WARNING",
+            )
+
+    def fail(self, request_id: str, reason: str) -> None:
+        record = self._store.fail_handoff(request_id, reason)
+        if record is None:
+            self._event_log(
+                "operator_handoff_resolution_unknown",
+                f"request={request_id}; the handoff command is no longer recorded",
+                level="WARNING",
+            )
+
+
 class AttemptTracker(Protocol):
     """Claim and idempotently release the GitHub state owned by this agent."""
 
@@ -211,6 +278,7 @@ class ModelAttemptRunner:
         event_log: Callable[..., None] = (
             lambda event, detail="", level="INFO", issue_number=None: None
         ),
+        operator_handoff: OperatorHandoffControl | None = None,
     ) -> None:
         self._attempt_state = attempt_state
         self._workspace = workspace
@@ -221,6 +289,17 @@ class ModelAttemptRunner:
         self._issue_comments = issue_comments
         self._attempt_archive_factory = attempt_archive_factory
         self._event_log = event_log
+        self._operator_handoff = operator_handoff
+
+    def set_operator_handoff(self, control: OperatorHandoffControl | None) -> None:
+        """Attach (or detach) the operator handoff served by the next execution.
+
+        A request accepted during setup waits here: the provider is only
+        consulted once model execution starts, so setup-phase requests are
+        delivered at the first model boundary instead of interrupting setup.
+        """
+
+        self._operator_handoff = control
 
     def __call__(self, claim: Claim, profile: RepositoryProfile, prepared: object) -> AttemptEvidence:
         """Run the local evidence gates in their mandated phase order."""
@@ -298,6 +377,7 @@ class ModelAttemptRunner:
             level="INFO",
             issue_number=claim.issue.number,
         )
+        self._wire_operator_handoff()
         execution = asyncio.run(
             self._model_executor.execute(
                 issue_body=prompt_body,
@@ -314,9 +394,11 @@ class ModelAttemptRunner:
                     "model_stop_reason": execution.stop_reason,
                 }
             )
+        served_operator_request, late_operator_snapshot = self._read_operator_request()
         if execution.status in (
             ModelExecutionStatus.HANDOFF_REQUESTED,
             ModelExecutionStatus.MODEL_LIMIT_REACHED,
+            ModelExecutionStatus.OPERATOR_HANDOFF_EXPIRED,
             ModelExecutionStatus.SUCCEEDED,
         ):
             # Always preserve dirty/untracked work as a commit rather than
@@ -450,13 +532,23 @@ class ModelAttemptRunner:
                 getattr(prepared, "base_revision"),
             )
             if not validation.valid:
+                # A committed-but-untrustworthy note is ordinary evidence,
+                # not an infrastructure failure: the branch still publishes
+                # for human review when it carries work. Only commit, push,
+                # or transport failures stay infrastructure errors.
                 decision = CompletionDecision(
-                    outcome=AttemptOutcome.INFRASTRUCTURE_ERROR,
+                    outcome=AttemptOutcome.INCOMPLETE,
                     publication_eligible=False,
-                    publication_path=PublicationPath.NONE,
+                    publication_path=PublicationPath.PARTIAL if commits else PublicationPath.NONE,
                     reasons=(validation.reason,),
                 )
                 handoff_rejection_reason = validation.reason
+        self._settle_operator_request(
+            claim,
+            served_operator_request,
+            late_operator_snapshot,
+            decision,
+        )
         if decision.publication_eligible or decision.publication_path is PublicationPath.PARTIAL:
             self._attempt_state.transition(AttemptPhase.PUSHING)
         findings = "all clear" if not review.findings else "; ".join(finding.summary for finding in review.findings)
@@ -473,6 +565,144 @@ class ModelAttemptRunner:
         return _attempt_evidence(
             decision, profile, final_check, review_cycles, findings, details, note_commit_sha
         )
+
+    def _wire_operator_handoff(self) -> None:
+        """Serve the pending operator handoff through this model execution.
+
+        The provider reads the live control snapshot on every poll, so a
+        request accepted during setup is picked up once execution starts;
+        executors without the operator seams (older fakes) are left alone.
+        """
+
+        control = self._operator_handoff
+        if control is None:
+            return
+
+        def provider() -> OperatorHandoff | None:
+            try:
+                snapshot = control.snapshot()
+            except Exception:
+                return None
+            if snapshot is None or snapshot.get("acknowledgement") != "accepted":
+                return None
+            request_id = snapshot.get("request_id")
+            accepted_at = _parse_operator_accepted_at(snapshot.get("accepted_at"))
+            if not isinstance(request_id, str) or not request_id or accepted_at is None:
+                return None
+            return OperatorHandoff(request_id=request_id, accepted_at=accepted_at)
+
+        def reporter(event: str, request_id: str) -> None:
+            try:
+                if event == "delivered":
+                    control.mark_delivering(request_id)
+                elif event == "begun":
+                    control.mark_begun(request_id)
+            except Exception as error:
+                self._event_log(
+                    "operator_handoff_report_failed",
+                    f"event={event}; request={request_id}; {_exception_detail(error)}",
+                    level="WARNING",
+                )
+
+        set_provider = getattr(
+            self._model_executor, "set_operator_handoff_provider", None
+        )
+        if callable(set_provider):
+            set_provider(provider)
+        set_reporter = getattr(
+            self._model_executor, "set_operator_handoff_reporter", None
+        )
+        if callable(set_reporter):
+            set_reporter(reporter)
+
+    def _read_operator_request(
+        self,
+    ) -> tuple[str | None, dict | None]:
+        """Split the pending handoff into served vs never-delivered.
+
+        Returns the served request ID (this execution latched it) and, when a
+        request is still accepted but this execution never observed it — it
+        arrived after model execution or the executor has no operator seams —
+        that late snapshot for ordinary handling.
+        """
+
+        control = self._operator_handoff
+        if control is None:
+            return None, None
+        try:
+            snapshot = control.snapshot()
+        except Exception:
+            return None, None
+        if snapshot is None or snapshot.get("acknowledgement") != "accepted":
+            return None, None
+        latched = getattr(self._model_executor, "operator_request_id", None)
+        if isinstance(latched, str) and latched == snapshot.get("request_id"):
+            return snapshot["request_id"], None
+        return None, snapshot
+
+    def _settle_operator_request(
+        self,
+        claim: Claim,
+        served_request_id: str | None,
+        late_snapshot: dict | None,
+        decision: CompletionDecision,
+    ) -> None:
+        """Fail operator handoffs this attempt cannot fulfill.
+
+        A served request whose valid ``operator_request`` note published as a
+        handoff stays pending: the lifecycle completes it only after the
+        durable publication boundary. Everything else is failed here with its
+        reason and the ordinary outcome, so intake still stops with the work
+        retained. A late request never changes the attempt decision.
+        """
+
+        control = self._operator_handoff
+        if control is None:
+            return
+        outcome_name = (
+            decision.outcome.value if decision.outcome is not None else "unknown"
+        )
+        if late_snapshot is not None:
+            request_id = late_snapshot.get("request_id", "unknown")
+            control.fail(
+                request_id,
+                f"Operator handoff {request_id} was not delivered to model"
+                f" execution, so it is not fulfilled; the attempt finalized"
+                f" with the ordinary outcome {outcome_name}.",
+            )
+            return
+        if served_request_id is None:
+            return
+        if decision.outcome is AttemptOutcome.HANDOFF:
+            reason = self._operator_note_reason(claim.issue.number)
+            if reason != _OPERATOR_HANDOFF_REASON:
+                control.fail(
+                    served_request_id,
+                    f"Operator handoff {served_request_id} is not fulfilled: the"
+                    f" committed handoff note cites reason {reason!r} instead of"
+                    f" `{_OPERATOR_HANDOFF_REASON}`; the valid handoff still"
+                    " publishes for human-approved continuation.",
+                )
+            return
+        control.fail(
+            served_request_id,
+            f"Operator handoff {served_request_id} is not fulfilled: model"
+            f" execution ended with the ordinary outcome {outcome_name}"
+            " without a valid operator handoff note.",
+        )
+
+    def _operator_note_reason(self, issue_number: int) -> str | None:
+        """Read the committed handoff note's reason, if it can be read."""
+
+        try:
+            text = _read_handoff_note(
+                getattr(self._workspace, "working_directory"), issue_number
+            )
+        except Exception:
+            return None
+        if not isinstance(text, str) or not text:
+            return None
+        return _parse_handoff_note_fields(text).get("reason")
 
     def _run_preparation(
         self,
@@ -704,6 +934,27 @@ class AgentLifecycle:
                 request_id,
                 has_active_attempt=checkpoint is not None,
                 recovery_hold=self._recovery_hold_locked(checkpoint),
+            )
+
+    def submit_handoff(self, request_id: str) -> CommandRecord:
+        """Durably record ``handoff now`` against the active attempt.
+
+        Without an active attempt the command is rejected with no control
+        change. With one, intake enters ``stopping`` and the request waits
+        for the bounded model handoff: the model attempt runner delivers it
+        at the next safe SDK boundary (or its single fallback) and observes
+        the project-owned ``handoff`` skill. The command completes only after
+        the handoff outcome, publication, issue release, and cleanup are
+        durably finished; anything short of that marks it ``not fulfilled``
+        with the branch, checkpoint, and working tree retained for recovery.
+        """
+
+        if self._control_store is None:
+            raise ControlStoreError("Operator control is not configured")
+        with self._control_lock:
+            has_active_attempt = self._attempt_state.read() is not None
+            return self._control_store.submit_handoff(
+                request_id, has_active_attempt=has_active_attempt
             )
 
     def submit_next_issue(self, request_id: str, issue: object) -> CommandRecord:
@@ -1187,6 +1438,11 @@ class AgentLifecycle:
                 outcome,
                 archive,
             )
+            self._resolve_pending_handoff(
+                issue_number=claim.issue.number,
+                outcome=outcome,
+                prepared=prepared,
+            )
         except SystemExit as error:
             return False, (
                 f"recovery retry for attempt {attempt_id} not fulfilled:"
@@ -1316,6 +1572,11 @@ class AgentLifecycle:
             archive = self._archive_for(claim.issue.number, attempt_id)
             self._commit_finalization(
                 checkpoint, claim.issue.number, branch, actual_outcome, archive
+            )
+            self._resolve_pending_handoff(
+                issue_number=claim.issue.number,
+                outcome=actual_outcome,
+                prepared=prepared,
             )
         except SystemExit as error:
             return False, (
@@ -1750,6 +2011,7 @@ class AgentLifecycle:
                 next_issue=store.next_issue_snapshot(),
                 stop_plan=store.stop_plan_snapshot(),
                 recovery=self._recovery_snapshot_locked(checkpoint),
+                handoff=store.handoff_snapshot(),
             )
 
     def run_once(self) -> LifecycleResult:
@@ -1835,6 +2097,7 @@ class AgentLifecycle:
                 )
                 comment_posted = getattr(published, "comment_posted", True)
             else:
+                self._wire_attempt_runner_handoff()
                 evidence = self._attempt_runner(claim, profile, prepared)
                 published = self._publisher.publish(
                     PublicationRequest(
@@ -1949,6 +2212,11 @@ class AgentLifecycle:
                             ) if prepared is not None else f"agent/issue-{claim.issue.number}",
                             outcome, archive,
                         )
+                        self._resolve_pending_handoff(
+                            issue_number=claim.issue.number,
+                            outcome=outcome,
+                            prepared=prepared,
+                        )
                     else:
                         self._event_log(
                             "attempt_finalization_held",
@@ -1996,6 +2264,9 @@ class AgentLifecycle:
                         # The waited-for attempt is gone without finalizing
                         # through this path (e.g. it was reconciled on a
                         # previous start); finish the stop instead of holding.
+                        # A pending handoff can never still be observed, so
+                        # it is failed rather than waited on forever.
+                        self._fail_orphan_handoff_locked()
                         self._control_store.complete_pending_stop()
                     self._event_log(
                         "intake_stopped",
@@ -2163,6 +2434,165 @@ class AgentLifecycle:
         self._attempt_processing = True
         return (claim, checkpoint)
 
+    def _wire_attempt_runner_handoff(self) -> None:
+        """Attach the live operator handoff to a runner that can serve it.
+
+        Plain-function runners (older test doubles) have no operator seam and
+        are left alone: any pending handoff then resolves as unserved at the
+        durable finalization boundary.
+        """
+
+        setter = getattr(self._attempt_runner, "set_operator_handoff", None)
+        if not callable(setter):
+            return
+        if self._control_store is None:
+            setter(None)
+            return
+        setter(_ControlOperatorHandoff(self._control_store, self._event_log))
+
+    def _resolve_pending_handoff(
+        self,
+        *,
+        issue_number: int,
+        outcome: AttemptOutcome,
+        prepared: object | None,
+    ) -> None:
+        """Complete or fail the pending operator handoff after finalization.
+
+        A handoff completes only when the attempt outcome is a published
+        handoff, the model began its skill, and the committed note is a
+        valid ``operator_request`` note; everything else is marked ``not
+        fulfilled`` with its reason. Both close intake to ``stopped`` while
+        the branch, checkpoint, and working tree stay retained for recovery.
+        Already-terminal commands are returned untouched, so crash replays
+        and recovery retries resolve at most once.
+        """
+
+        store = self._control_store
+        if store is None:
+            return
+        try:
+            snapshot = store.handoff_snapshot()
+        except (ControlStoreError, RuntimeError, OSError) as error:
+            self._event_log(
+                "operator_handoff_resolution_unavailable",
+                f"{_exception_detail(error)} The pending handoff keeps waiting;",
+                level="ERROR",
+                issue_number=issue_number,
+            )
+            return
+        if snapshot is None or snapshot.get("acknowledgement") != "accepted":
+            return
+        request_id = snapshot.get("request_id")
+        if not isinstance(request_id, str) or not request_id:
+            return
+        note_valid, note_why = self._check_operator_note(issue_number, prepared)
+        if (
+            outcome is AttemptOutcome.HANDOFF
+            and snapshot.get("begun") is True
+            and note_valid
+        ):
+            store.complete_handoff(
+                request_id,
+                f"operator handoff fulfilled for issue #{issue_number}: a valid"
+                " `operator_request` handoff note was published, the issue was"
+                " released, and cleanup is durable",
+            )
+            self._event_log(
+                "operator_handoff_completed",
+                f"request={request_id}; issue #{issue_number} handed off",
+                level="INFO",
+                issue_number=issue_number,
+            )
+            return
+        if outcome is not AttemptOutcome.HANDOFF:
+            cause = f"the attempt finalized with the ordinary outcome {outcome.value}"
+        elif snapshot.get("begun") is not True:
+            cause = "model execution never began the handoff skill"
+        else:
+            cause = f"the committed handoff note is not a valid operator note ({note_why})"
+        store.fail_handoff(
+            request_id,
+            f"Operator handoff {request_id} is not fulfilled: {cause}; the"
+            " branch, checkpoint, and working tree are retained for recovery.",
+        )
+        self._event_log(
+            "operator_handoff_not_fulfilled",
+            f"request={request_id}; {cause}",
+            level="WARNING",
+            issue_number=issue_number,
+        )
+
+    def _check_operator_note(
+        self, issue_number: int, prepared: object | None
+    ) -> tuple[bool, str]:
+        """Whether the branch carries a valid ``operator_request`` note.
+
+        Without the prepared working tree (a crash replay after every other
+        boundary went durable) prior validation is trusted: only a begun
+        handoff with a handoff outcome reaches here.
+        """
+
+        if prepared is None:
+            return True, "not rechecked after a crash replay"
+        try:
+            commits = getattr(self._workspace, "commits_added")(prepared)
+            working_directory = getattr(self._workspace, "working_directory")
+        except Exception as error:
+            return False, f"the branch state could not be read ({_exception_detail(error)})"
+        try:
+            validation = _validate_handoff_note(
+                commits,
+                issue_number,
+                working_directory,
+                getattr(prepared, "base_revision", ""),
+            )
+        except Exception as error:
+            return False, f"the handoff note could not be validated ({_exception_detail(error)})"
+        if not validation.valid:
+            return False, validation.reason
+        try:
+            text = _read_handoff_note(working_directory, issue_number)
+        except Exception as error:
+            return False, f"the handoff note could not be read ({_exception_detail(error)})"
+        fields = _parse_handoff_note_fields(text if isinstance(text, str) else "")
+        if fields.get("reason") != _OPERATOR_HANDOFF_REASON:
+            return (
+                False,
+                f"the note cites reason {fields.get('reason')!r} instead of"
+                f" `{_OPERATOR_HANDOFF_REASON}`",
+            )
+        return True, "valid"
+
+    def _fail_orphan_handoff_locked(self) -> None:
+        """Fail a pending handoff whose active attempt is already gone.
+
+        Caller holds the control lock. With no checkpoint left, no model
+        execution can still observe the request, so it is marked ``not
+        fulfilled`` and intake stops instead of waiting forever.
+        """
+
+        store = self._control_store
+        if store is None:
+            return
+        snapshot = store.handoff_snapshot()
+        if snapshot is None or snapshot.get("acknowledgement") != "accepted":
+            return
+        request_id = snapshot.get("request_id")
+        if not isinstance(request_id, str) or not request_id:
+            return
+        store.fail_handoff(
+            request_id,
+            f"Operator handoff {request_id} is not fulfilled: the active"
+            " attempt ended without finalizing through the agent, so no model"
+            " execution can still observe the request.",
+        )
+        self._event_log(
+            "operator_handoff_not_fulfilled",
+            f"request={request_id}; the active attempt is gone",
+            level="WARNING",
+        )
+
     def _record_control_finalization(
         self, attempt_id: str, outcome: AttemptOutcome
     ) -> None:
@@ -2286,6 +2716,14 @@ class AgentLifecycle:
                 if terminal is not None:
                     self._record_control_finalization(
                         checkpoint.started_at, terminal.outcome
+                    )
+                    # The previous process recorded every boundary but may
+                    # have crashed before resolving the handoff it waited
+                    # for; without a prepared tree prior validation stands.
+                    self._resolve_pending_handoff(
+                        issue_number=checkpoint.issue_number,
+                        outcome=terminal.outcome,
+                        prepared=None,
                     )
             self._attempt_state.delete()
             self._active_issue_number = None
@@ -2492,6 +2930,11 @@ class AgentLifecycle:
                                 prepared, "branch", checkpoint.branch
                             ) if prepared is not None else checkpoint.branch,
                             outcome, archive,
+                        )
+                        self._resolve_pending_handoff(
+                            issue_number=claim.issue.number,
+                            outcome=outcome,
+                            prepared=prepared,
                         )
                     else:
                         self._event_log(
@@ -2779,7 +3222,7 @@ def _is_handoff_recovery(commits: Sequence[object]) -> bool:
 
 
 _ALLOWED_HANDOFF_REASONS = frozenset(
-    {"cost_soft_threshold", "cost_hard_limit", "turn_limit", "time_limit"}
+    {"cost_soft_threshold", "cost_hard_limit", "turn_limit", "time_limit", "operator_request"}
 )
 
 
