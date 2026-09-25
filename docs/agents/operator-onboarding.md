@@ -198,6 +198,30 @@ startup reconciliation is still running, live status reports `recovering`.
 When the agent process cannot be reached at all, the CLI reports a
 connection error rather than a saved snapshot.
 
+### Retained-attempt recovery hold
+
+When an attempt cannot finish its completion boundary (confirmed result
+comment, issue release, local cleanup, and accounting), the agent preserves
+the branch, checkpoint, and working tree and holds intake: `status` shows a
+`recovery` block with the attempt identity, phase, confirmed publication
+progress, branch/workspace/checkpoint, hold reason, and the next operator
+action. `resume` cannot bypass the hold, and no new issue is claimed until
+an operator clears it:
+
+- `/usr/local/bin/agentctl recovery retry <attempt-id>` rechecks local and
+  remote evidence and retries only the unconfirmed publication, release,
+  cleanup, and accounting steps. It never reruns the model. Ambiguous
+  remote state, conflicting human changes, and persistent failures keep the
+  hold.
+- `/usr/local/bin/agentctl recovery release <attempt-id> --saved-at
+  <path-or-url>` abandons the attempt after you secured its work elsewhere.
+  It confirms a deduplicated issue comment stating the actual outcome and
+  the saved-work reference before changing labels or assignee, and it never
+  claims a successful handoff.
+
+Both commands print a durable request ID and accept `--request-id` for an
+identical retry after an ambiguous connection loss, like `stop`.
+
 ## Persisted error-guard recovery
 
 The agent tracks consecutive `infrastructure_error` outcomes in

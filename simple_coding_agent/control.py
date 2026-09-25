@@ -120,6 +120,8 @@ _STOP_KIND = "stop"
 _STOP_AFTER_KIND = "stop_after"
 _RESUME_KIND = "resume"
 _NEXT_ISSUE_KIND = "next_issue"
+_RECOVERY_RETRY_KIND = "recovery_retry"
+_RECOVERY_RELEASE_KIND = "recovery_release"
 # Stop-plan kinds a newer ``resume`` (or a newer stop plan) replaces. Later
 # commands extend this tuple without changing the replacement rules.
 # ``next issue`` is intentionally absent: it neither replaces a stop plan
@@ -659,6 +661,159 @@ class ControlStore:
                     if row is None:  # pragma: no cover - just updated above
                         raise ControlStoreError("Control command is missing")
                     return self._record_from_row(row)
+            except sqlite3.Error as error:
+                raise ControlStoreError("Control command could not be committed") from error
+
+    # -- recovery ---------------------------------------------------------
+
+    def submit_recovery_retry(self, request_id: str, attempt_id: str) -> CommandRecord:
+        """Durably record ``recovery retry`` as accepted for one attempt identity.
+
+        The command itself never changes intake; the lifecycle applies the
+        safe finalization after acceptance and then marks this record
+        ``completed`` (hold cleared) or ``not fulfilled`` (hold remains).
+        Retrying the same request ID with the identical attempt returns the
+        stored record; reuse with different content is rejected.
+        """
+
+        from simple_coding_agent.recovery import parse_attempt_id
+
+        _check_request_id(request_id)
+        parsed = parse_attempt_id(attempt_id)
+        with self.lock:
+            try:
+                with self._connect() as connection:
+                    connection.execute("BEGIN IMMEDIATE")
+                    existing = self._find_locked(connection, request_id)
+                    if existing is not None:
+                        self._ensure_payload_identical(
+                            connection,
+                            existing,
+                            _RECOVERY_RETRY_KIND,
+                            {"attempt_id": parsed},
+                        )
+                        connection.execute("ROLLBACK")
+                        return existing
+                    record = self._insert_locked(
+                        connection,
+                        request_id,
+                        _RECOVERY_RETRY_KIND,
+                        {"attempt_id": parsed},
+                        CommandAcknowledgement.ACCEPTED,
+                        f"recovery retry for attempt {parsed} accepted",
+                    )
+                    connection.execute("COMMIT")
+                    return record
+            except (PayloadMismatchError, RequestIdError):
+                raise
+            except sqlite3.Error as error:
+                raise ControlStoreError("Control command could not be committed") from error
+
+    def submit_recovery_release(
+        self, request_id: str, attempt_id: str, saved_at: str
+    ) -> CommandRecord:
+        """Durably record ``recovery release`` as accepted for one attempt.
+
+        The operator-provided ``saved-at`` reference is stored in the payload
+        and surfaced in the detail so it remains visible in the command
+        record. Like retry, the lifecycle completes or fails the record after
+        attempting the abandonment path.
+        """
+
+        from simple_coding_agent.recovery import parse_attempt_id, parse_saved_at
+
+        _check_request_id(request_id)
+        parsed_attempt = parse_attempt_id(attempt_id)
+        parsed_saved = parse_saved_at(saved_at)
+        payload = {"attempt_id": parsed_attempt, "saved_at": parsed_saved}
+        with self.lock:
+            try:
+                with self._connect() as connection:
+                    connection.execute("BEGIN IMMEDIATE")
+                    existing = self._find_locked(connection, request_id)
+                    if existing is not None:
+                        self._ensure_payload_identical(
+                            connection, existing, _RECOVERY_RELEASE_KIND, payload
+                        )
+                        connection.execute("ROLLBACK")
+                        return existing
+                    record = self._insert_locked(
+                        connection,
+                        request_id,
+                        _RECOVERY_RELEASE_KIND,
+                        payload,
+                        CommandAcknowledgement.ACCEPTED,
+                        f"recovery release for attempt {parsed_attempt} accepted;"
+                        f" retained work secured at {parsed_saved}",
+                    )
+                    connection.execute("COMMIT")
+                    return record
+            except (PayloadMismatchError, RequestIdError):
+                raise
+            except sqlite3.Error as error:
+                raise ControlStoreError("Control command could not be committed") from error
+
+    def complete_recovery_command(self, request_id: str, detail: str) -> CommandRecord | None:
+        """Mark an accepted recovery command ``completed`` with its outcome detail."""
+
+        if not isinstance(detail, str) or not detail.strip():
+            raise ControlStoreError("A completed recovery command must carry a detail")
+        with self.lock:
+            try:
+                with self._connect() as connection:
+                    connection.execute("BEGIN IMMEDIATE")
+                    existing = self._find_locked(connection, request_id)
+                    if existing is None:
+                        connection.execute("ROLLBACK")
+                        return None
+                    if existing.acknowledgement is not CommandAcknowledgement.ACCEPTED:
+                        connection.execute("ROLLBACK")
+                        return existing
+                    timestamp = self._timestamp()
+                    connection.execute(
+                        "UPDATE commands SET acknowledgement = ?, detail = ?,"
+                        " updated_at = ? WHERE request_id = ?",
+                        (
+                            CommandAcknowledgement.COMPLETED.value,
+                            detail.strip(),
+                            timestamp,
+                            request_id,
+                        ),
+                    )
+                    connection.execute("COMMIT")
+                    return self._find_locked(self._connect(), request_id)
+            except sqlite3.Error as error:
+                raise ControlStoreError("Control command could not be committed") from error
+
+    def fail_recovery_command(self, request_id: str, detail: str) -> CommandRecord | None:
+        """Mark an accepted recovery command ``not fulfilled`` with the hold reason."""
+
+        if not isinstance(detail, str) or not detail.strip():
+            raise ControlStoreError("A not-fulfilled recovery command must carry a reason")
+        with self.lock:
+            try:
+                with self._connect() as connection:
+                    connection.execute("BEGIN IMMEDIATE")
+                    existing = self._find_locked(connection, request_id)
+                    if existing is None:
+                        connection.execute("ROLLBACK")
+                        return None
+                    if existing.acknowledgement is not CommandAcknowledgement.ACCEPTED:
+                        connection.execute("ROLLBACK")
+                        return existing
+                    timestamp = self._timestamp()
+                    connection.execute(
+                        "UPDATE commands SET acknowledgement = ?, detail = ?,"
+                        " updated_at = ? WHERE request_id = ?",
+                        (
+                            CommandAcknowledgement.NOT_FULFILLED.value,
+                            detail.strip(),
+                            timestamp,
+                            request_id,
+                        ),
+                    )
+                    connection.execute("COMMIT")
+                    return self._find_locked(self._connect(), request_id)
             except sqlite3.Error as error:
                 raise ControlStoreError("Control command could not be committed") from error
 
@@ -1352,6 +1507,7 @@ def build_status(
     recent_commands: Callable[[], list[CommandRecord]],
     next_issue: dict | None = None,
     stop_plan: dict | None = None,
+    recovery: dict | None = None,
 ) -> dict:
     """Build one consistent live status snapshot.
 
@@ -1360,7 +1516,10 @@ def build_status(
     the pending one-shot priority (``request_id`` and ``issue_number``), and
     ``stop_plan`` carries the pending ``stop --after`` countdown (requested
     and remaining count, active-attempt inclusion, and latest counted
-    attempt and outcome).
+    attempt and outcome). ``recovery`` carries the retained-attempt hold
+    (attempt identity, phase, outcome, confirmed publication progress,
+    branch/workspace/checkpoint, hold reason, and the next operator action)
+    or ``None`` when no hold blocks intake.
     """
 
     pending = get_command(pending_command_id) if pending_command_id else None
@@ -1381,5 +1540,6 @@ def build_status(
         "pending_command": command_to_json(pending) if pending is not None else None,
         "pending_next_issue": dict(next_issue) if next_issue is not None else None,
         "stop_plan": dict(stop_plan) if stop_plan is not None else None,
+        "recovery": dict(recovery) if recovery is not None else None,
         "commands": {record.request_id: command_to_json(record) for record in recent_commands()},
     }

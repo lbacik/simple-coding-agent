@@ -33,6 +33,12 @@ class ControlSurface(Protocol):
 
     def submit_resume(self, request_id: str) -> object: ...
 
+    def submit_recovery_retry(self, request_id: str, attempt_id: object) -> object: ...
+
+    def submit_recovery_release(
+        self, request_id: str, attempt_id: object, saved_at: object
+    ) -> object: ...
+
     def get_command(self, request_id: str) -> object | None: ...
 
     def control_status(self, repository: str | None = ...) -> dict: ...
@@ -184,6 +190,10 @@ class ControlServer:
             self._reply_next_issue(connection, request)
         elif operation == "resume":
             self._reply_resume(connection, request)
+        elif operation == "recovery_retry":
+            self._reply_recovery_retry(connection, request)
+        elif operation == "recovery_release":
+            self._reply_recovery_release(connection, request)
         elif operation == "status":
             self._reply_status(connection)
         elif operation == "command":
@@ -253,6 +263,37 @@ class ControlServer:
             request,
             self._control.submit_resume,
             rejected=(RequestIdError, PayloadMismatchError, ResumeBlockedError),
+            repository=self._repository(),
+        )
+
+    def _reply_recovery_retry(self, connection: socket.socket, request: dict) -> None:
+        from simple_coding_agent.control import PayloadMismatchError, RequestIdError
+        from simple_coding_agent.recovery import RecoveryRejectedError
+
+        attempt_id = request.get("attempt_id")
+        _reply_mutating(
+            connection,
+            request,
+            lambda request_id: self._control.submit_recovery_retry(
+                request_id, attempt_id
+            ),
+            rejected=(RequestIdError, PayloadMismatchError, RecoveryRejectedError),
+            repository=self._repository(),
+        )
+
+    def _reply_recovery_release(self, connection: socket.socket, request: dict) -> None:
+        from simple_coding_agent.control import PayloadMismatchError, RequestIdError
+        from simple_coding_agent.recovery import RecoveryRejectedError
+
+        attempt_id = request.get("attempt_id")
+        saved_at = request.get("saved_at")
+        _reply_mutating(
+            connection,
+            request,
+            lambda request_id: self._control.submit_recovery_release(
+                request_id, attempt_id, saved_at
+            ),
+            rejected=(RequestIdError, PayloadMismatchError, RecoveryRejectedError),
             repository=self._repository(),
         )
 
