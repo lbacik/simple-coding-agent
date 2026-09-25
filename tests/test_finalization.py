@@ -100,6 +100,7 @@ def test_crash_between_finalization_and_checkpoint_removal_does_not_republish(tm
         profile_loader=lambda _: _profile(),
         publisher=publisher,
         completion_store=completions,
+        sleeper=lambda seconds: None,
     )
 
     lifecycle.run_once()
@@ -148,6 +149,7 @@ def test_comment_failure_holds_without_ledger_then_recovers_once(tmp_path: Path)
         publisher=_CommentFailingPublisher(),
         error_store=errors,
         completion_store=completions,
+        sleeper=lambda seconds: None,
     )
 
     first.run_once()
@@ -165,6 +167,7 @@ def test_comment_failure_holds_without_ledger_then_recovers_once(tmp_path: Path)
         publisher=_FakePublisher(),
         error_store=errors,
         completion_store=completions,
+        sleeper=lambda seconds: None,
     )
 
     second.run_once()
