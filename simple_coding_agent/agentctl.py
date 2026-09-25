@@ -70,6 +70,31 @@ def run_resume(socket_path: Path, request_id: str) -> dict:
     return send_request(socket_path, {"op": "resume", "request_id": request_id})
 
 
+def run_recovery_retry(socket_path: Path, request_id: str, attempt_id: str) -> dict:
+    """Submit ``recovery retry`` once; never present a failure as accepted."""
+
+    return send_request(
+        socket_path,
+        {"op": "recovery_retry", "request_id": request_id, "attempt_id": attempt_id},
+    )
+
+
+def run_recovery_release(
+    socket_path: Path, request_id: str, attempt_id: str, saved_at: str
+) -> dict:
+    """Submit ``recovery release`` once; never present a failure as accepted."""
+
+    return send_request(
+        socket_path,
+        {
+            "op": "recovery_release",
+            "request_id": request_id,
+            "attempt_id": attempt_id,
+            "saved_at": saved_at,
+        },
+    )
+
+
 def run_status(socket_path: Path) -> dict:
     """Read one consistent live snapshot; raise when the process is down."""
 
@@ -190,6 +215,41 @@ def format_status(status: dict) -> str:
             f"pending_next_issue: #{pending_next.get('issue_number')}"
             f" ({pending_next.get('request_id')})"
         )
+    recovery = status.get("recovery")
+    if recovery is None:
+        lines.append("recovery: none")
+    else:
+        attempt_id = recovery.get("attempt_id") or "unknown"
+        issue_number = recovery.get("issue_number")
+        phase = recovery.get("phase") or "unknown"
+        outcome = recovery.get("outcome") or "unknown"
+        branch = recovery.get("branch") or "unknown"
+        workspace = recovery.get("workspace") or "unknown"
+        publication = recovery.get("publication") or {}
+        comment_confirmed = publication.get("comment_confirmed")
+        if comment_confirmed is True:
+            comment_state = "comment confirmed"
+        elif comment_confirmed is False:
+            comment_state = "comment unconfirmed"
+        else:
+            comment_state = "comment unknown"
+        pull_request = publication.get("pull_request")
+        if isinstance(pull_request, dict) and pull_request.get("number") is not None:
+            pr_state = f"PR #{pull_request.get('number')}"
+        else:
+            pr_state = "PR none/unknown"
+        lines.append(
+            f"recovery: attempt {attempt_id}"
+            f" issue #{issue_number}"
+            f" phase {phase}"
+            f" outcome {outcome}"
+            f" branch {branch}"
+            f" workspace {workspace}"
+            f" checkpoint {'present' if recovery.get('checkpoint') else 'absent'}"
+            f" ({comment_state}; {pr_state})"
+        )
+        lines.append(f"hold_reason: {recovery.get('hold_reason')}")
+        lines.append(f"next_action: {recovery.get('next_action')}")
     commands = status.get("commands") or {}
     if commands:
         lines.append("recent_commands:")
@@ -262,6 +322,41 @@ def build_parser() -> argparse.ArgumentParser:
         "command", help="Show one command's current durable acknowledgement."
     )
     command_parser.add_argument("request_id", help="The request ID printed at submission.")
+
+    recovery_parser = subparsers.add_parser(
+        "recovery", help="Inspect or resolve a retained implementation attempt."
+    )
+    recovery_subparsers = recovery_parser.add_subparsers(
+        dest="recovery_command", required=True
+    )
+    retry_parser = recovery_subparsers.add_parser(
+        "retry",
+        help="Recheck evidence and retry unconfirmed publication, release, cleanup, and accounting.",
+    )
+    retry_parser.add_argument("attempt_id", help="The stable attempt identity to retry.")
+    retry_parser.add_argument(
+        "--request-id",
+        dest="request_id",
+        default=None,
+        help="Retry a previously generated request ID with the identical payload.",
+    )
+    release_parser = recovery_subparsers.add_parser(
+        "release",
+        help="Abandon a retained attempt after securing its work elsewhere.",
+    )
+    release_parser.add_argument("attempt_id", help="The stable attempt identity to release.")
+    release_parser.add_argument(
+        "--saved-at",
+        dest="saved_at",
+        required=True,
+        help="Path or URL where the retained work was secured.",
+    )
+    release_parser.add_argument(
+        "--request-id",
+        dest="request_id",
+        default=None,
+        help="Retry a previously generated request ID with the identical payload.",
+    )
     return parser
 
 
@@ -319,6 +414,41 @@ def main(argv: list[str] | None = None) -> int:
                 return 1
             print(format_command(record))
             return 0
+        if args.command == "recovery" and args.recovery_command == "retry":
+            from simple_coding_agent.recovery import RecoveryRejectedError, parse_attempt_id
+
+            request_id = args.request_id or generate_request_id()
+            try:
+                attempt_id = parse_attempt_id(args.attempt_id)
+            except RecoveryRejectedError as error:
+                print(f"{request_id} rejected — {error}", file=sys.stderr)
+                return 1
+            return submit_mutating(
+                socket_path,
+                f"recovery retry {attempt_id}",
+                request_id,
+                lambda path, rid: run_recovery_retry(path, rid, attempt_id),
+            )
+        if args.command == "recovery" and args.recovery_command == "release":
+            from simple_coding_agent.recovery import (
+                RecoveryRejectedError,
+                parse_attempt_id,
+                parse_saved_at,
+            )
+
+            request_id = args.request_id or generate_request_id()
+            try:
+                attempt_id = parse_attempt_id(args.attempt_id)
+                saved_at = parse_saved_at(args.saved_at)
+            except RecoveryRejectedError as error:
+                print(f"{request_id} rejected — {error}", file=sys.stderr)
+                return 1
+            return submit_mutating(
+                socket_path,
+                f"recovery release {attempt_id}",
+                request_id,
+                lambda path, rid: run_recovery_release(path, rid, attempt_id, saved_at),
+            )
     except ControlUnavailableError as error:
         print(f"Cannot connect to the agent process: {error}", file=sys.stderr)
         return 2

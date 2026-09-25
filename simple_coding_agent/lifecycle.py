@@ -23,6 +23,7 @@ from simple_coding_agent.attempt_state import (
 )
 from simple_coding_agent.control import (
     ActiveAttemptInfo,
+    CommandAcknowledgement,
     CommandRecord,
     ControlStore,
     ControlStoreError,
@@ -622,6 +623,11 @@ class AgentLifecycle:
         # startup reconciliation). A checkpoint without in-progress work is a
         # retained hold: resume must be rejected until recovery finishes it.
         self._attempt_processing = False
+        # True while a ``recovery retry`` or ``recovery release`` command is
+        # executing (it unlocks during execution so status stays live). The
+        # retained checkpoint is still a hold then: resume must stay rejected
+        # until the command finishes, even though _attempt_processing is set.
+        self._recovery_executing = False
 
     @property
     def active_issue_number(self) -> int | None:
@@ -754,6 +760,195 @@ class AgentLifecycle:
                 )
             return store.submit_next_issue(request_id, number)
 
+    # -- operator recovery --------------------------------------------------
+
+    def submit_recovery_retry(self, request_id: str, attempt_id: object) -> CommandRecord:
+        """Recheck evidence and retry only unconfirmed safe finalization steps.
+
+        The command runs through the live channel with a durable request ID.
+        It never invokes the model, renews a handoff deadline, or overwrites
+        ambiguous or conflicting evidence. Unknown, mismatched,
+        already-finalized, or concurrently changing attempt IDs are rejected
+        without a control change. On success the hold is cleared and the
+        command completes; otherwise the remaining reason is reported and
+        intake stays blocked.
+        """
+
+        from simple_coding_agent.recovery import RecoveryRejectedError, parse_attempt_id
+
+        if self._control_store is None:
+            raise ControlStoreError("Operator control is not configured")
+        parsed = parse_attempt_id(attempt_id)
+        _check_recovery_request_id(request_id)
+        with self._control_lock:
+            store = self._control_store
+            try:
+                existing = store.get_command(request_id)
+            except ControlStoreError:
+                raise
+            except Exception as error:
+                raise ControlStoreError("Control command could not be read") from error
+            if existing is not None:
+                # Idempotent retry: the store enforces the identical-payload
+                # rule; a terminal record is returned without re-executing.
+                record = store.submit_recovery_retry(request_id, parsed)
+                if record.acknowledgement is not CommandAcknowledgement.ACCEPTED:
+                    return record
+                # An accepted record for the same ID means this process already
+                # accepted it but never finished: fall through and finish it
+                # once instead of recording twice.
+                checkpoint = self._validated_recovery_checkpoint_locked(parsed)
+                self._attempt_processing = True
+                self._recovery_executing = True
+            else:
+                checkpoint = self._validated_recovery_checkpoint_locked(parsed)
+                record = store.submit_recovery_retry(request_id, parsed)
+                self._attempt_processing = True
+                self._recovery_executing = True
+        try:
+            success, detail = self._retry_retained_attempt(checkpoint)
+        finally:
+            with self._control_lock:
+                self._attempt_processing = False
+                self._recovery_executing = False
+        with self._control_lock:
+            if success:
+                completed = store.complete_recovery_command(request_id, detail)
+                return completed if completed is not None else store.get_command(request_id)  # type: ignore[return-value]
+            failed = store.fail_recovery_command(request_id, detail)
+            return failed if failed is not None else store.get_command(request_id)  # type: ignore[return-value]
+
+    def submit_recovery_release(
+        self, request_id: str, attempt_id: object, saved_at: object
+    ) -> CommandRecord:
+        """Abandon a retained attempt after the operator secured its work.
+
+        The operator-provided ``saved-at`` reference is durably recorded with
+        the attempt ID. A deduplicated issue comment stating the actual
+        attempt outcome and failure is confirmed before any label or assignee
+        change; a successful handoff or an unpublished branch is never
+        claimed. Only then do the idempotent release, local cleanup,
+        checkpoint finalization, and at-most-once accounting run. Any failure
+        keeps the hold; work is never silently discarded. The issue is not
+        requeued.
+        """
+
+        from simple_coding_agent.recovery import (
+            RecoveryRejectedError,
+            parse_attempt_id,
+            parse_saved_at,
+        )
+
+        if self._control_store is None:
+            raise ControlStoreError("Operator control is not configured")
+        parsed_attempt = parse_attempt_id(attempt_id)
+        parsed_saved = parse_saved_at(saved_at)
+        _check_recovery_request_id(request_id)
+        with self._control_lock:
+            store = self._control_store
+            try:
+                existing = store.get_command(request_id)
+            except ControlStoreError:
+                raise
+            except Exception as error:
+                raise ControlStoreError("Control command could not be read") from error
+            if existing is not None:
+                record = store.submit_recovery_release(
+                    request_id, parsed_attempt, parsed_saved
+                )
+                if record.acknowledgement is not CommandAcknowledgement.ACCEPTED:
+                    return record
+                checkpoint = self._validated_recovery_checkpoint_locked(parsed_attempt)
+                self._attempt_processing = True
+                self._recovery_executing = True
+            else:
+                checkpoint = self._validated_recovery_checkpoint_locked(parsed_attempt)
+                record = store.submit_recovery_release(
+                    request_id, parsed_attempt, parsed_saved
+                )
+                self._attempt_processing = True
+                self._recovery_executing = True
+        try:
+            success, detail = self._release_retained_attempt(checkpoint, parsed_saved)
+        finally:
+            with self._control_lock:
+                self._attempt_processing = False
+                self._recovery_executing = False
+        with self._control_lock:
+            if success:
+                completed = store.complete_recovery_command(request_id, detail)
+                return completed if completed is not None else store.get_command(request_id)  # type: ignore[return-value]
+            failed = store.fail_recovery_command(request_id, detail)
+            return failed if failed is not None else store.get_command(request_id)  # type: ignore[return-value]
+
+    def _validated_recovery_checkpoint_locked(
+        self, attempt_id: str
+    ) -> AttemptCheckpoint:
+        """Return the retained checkpoint for ``attempt_id`` or reject the command.
+
+        Caller holds the control lock. Rejections cover unknown IDs (no
+        checkpoint, or a workspace hold without a recoverable identity),
+        mismatched identities, already-finalized attempts, and attempts that
+        are concurrently changing (startup reconciliation or active work).
+        """
+
+        from simple_coding_agent.recovery import RecoveryRejectedError
+
+        if self._recovering:
+            raise RecoveryRejectedError(
+                "Recovery is rejected while startup reconciliation is still"
+                " running; intake is held until it finishes."
+                " No control change was accepted."
+            )
+        if self._attempt_processing:
+            raise RecoveryRejectedError(
+                "Recovery is rejected while the attempt is concurrently"
+                " changing; wait until the active work finishes."
+                " No control change was accepted."
+            )
+        try:
+            checkpoint = self._attempt_state.read()
+        except AttemptStateError as error:
+            raise RecoveryRejectedError(
+                f"Recovery is rejected: the attempt checkpoint cannot be read ({error})."
+                " No control change was accepted."
+            ) from error
+        if checkpoint is None:
+            if self._workspace_is_dirty():
+                raise RecoveryRejectedError(
+                    "Recovery is rejected: the working tree holds unexplained"
+                    " dirty or untracked work with no recoverable attempt"
+                    " identity; manual repair is required before intake."
+                    " No control change was accepted."
+                )
+            raise RecoveryRejectedError(
+                f"Recovery is rejected: unknown attempt ID {attempt_id!r};"
+                " no retained attempt matches it."
+                " No control change was accepted."
+            )
+        if checkpoint.started_at != attempt_id:
+            raise RecoveryRejectedError(
+                f"Recovery is rejected: attempt ID {attempt_id!r} does not match"
+                f" the retained attempt {checkpoint.started_at!r} for issue"
+                f" #{checkpoint.issue_number}. No control change was accepted."
+            )
+        if self._completion_store is not None:
+            try:
+                if self._completion_store.is_finalized(attempt_id):
+                    raise RecoveryRejectedError(
+                        f"Recovery is rejected: attempt {attempt_id!r} is already"
+                        " finalized; no retained work remains."
+                        " No control change was accepted."
+                    )
+            except RecoveryRejectedError:
+                raise
+            except Exception as error:
+                raise RecoveryRejectedError(
+                    f"Recovery is rejected: the completion ledger cannot be read ({error})."
+                    " No control change was accepted."
+                ) from error
+        return checkpoint
+
     def _recovery_hold_locked(
         self, checkpoint: AttemptCheckpoint | None
     ) -> RecoveryHold | None:
@@ -791,6 +986,22 @@ class AgentLifecycle:
                     " checkpoint, and working tree are preserved for recovery"
                 ),
             )
+        if checkpoint is not None and self._recovery_executing:
+            # A recovery command owns the retained attempt right now (it
+            # unlocks during execution so status stays live): resume stays
+            # rejected until the command finishes instead of slipping
+            # through the in-progress gap.
+            return RecoveryHold(
+                issue_number=checkpoint.issue_number,
+                attempt_id=checkpoint.started_at,
+                branch=checkpoint.branch,
+                phase=checkpoint.phase.value,
+                reason=(
+                    "a recovery command is running for the retained attempt;"
+                    " the branch, checkpoint, and working tree are preserved"
+                    " until it finishes"
+                ),
+            )
         if not self._attempt_processing and self._workspace_is_dirty():
             # No checkpoint and no work in flight, yet the tree is dirty:
             # unexplained work that requires manual repair before intake.
@@ -824,6 +1035,670 @@ class AgentLifecycle:
             return not probe()
         except Exception:
             return True
+
+    # -- recovery execution -------------------------------------------------
+
+    def _retry_retained_attempt(
+        self, checkpoint: AttemptCheckpoint
+    ) -> tuple[bool, str]:
+        """Retry only unconfirmed safe steps for a retained checkpoint.
+
+        Returns ``(cleared, detail)``: ``cleared`` is True only when the hold
+        is fully cleared (outcome published with a confirmed comment, issue
+        released, cleanup durable, accounting committed, checkpoint removed).
+        Ambiguous remote state, conflicting changes, and persistent failures
+        keep the hold with a reason. Never invokes the model.
+        """
+
+        from simple_coding_agent.recovery import retry_next_action
+
+        attempt_id = checkpoint.started_at
+        issue_number = checkpoint.issue_number
+        hold_suffix = retry_next_action(attempt_id)
+
+        try:
+            claim = self._tracker.recover_claim(issue_number)
+        except Exception as error:
+            return False, (
+                f"recovery retry for attempt {attempt_id} not fulfilled:"
+                f" issue #{issue_number} is unavailable for recovery"
+                f" ({_exception_detail(error)}); the hold remains. {hold_suffix}"
+            )
+        if claim is None:
+            return False, (
+                f"recovery retry for attempt {attempt_id} not fulfilled:"
+                f" issue #{issue_number} is unavailable for recovery;"
+                f" the hold remains. {hold_suffix}"
+            )
+        conflict = self._recovery_conflict_reason(claim, checkpoint)
+        if conflict is not None:
+            return False, (
+                f"recovery retry for attempt {attempt_id} not fulfilled:"
+                f" {conflict} The hold remains. {hold_suffix}"
+            )
+        try:
+            self._workspace.prepare_for_profile_read()
+            profile = self._profile_loader(self._workspace.working_directory)
+            prepared = self._workspace.prepare_attempt(
+                base_branch=profile.base_branch, issue_number=claim.issue.number
+            )
+        except DirtyWorkspaceError as error:
+            return False, (
+                f"recovery retry for attempt {attempt_id} not fulfilled:"
+                f" {_exception_detail(error)} The branch, checkpoint, and"
+                f" working tree are preserved for inspection. {hold_suffix}"
+            )
+        except Exception as error:
+            return False, (
+                f"recovery retry for attempt {attempt_id} not fulfilled:"
+                f" the workspace cannot be safely prepared"
+                f" ({_exception_detail(error)}); the hold remains. {hold_suffix}"
+            )
+        if _has_unresolved_conflicts(self._workspace):
+            return False, (
+                f"recovery retry for attempt {attempt_id} not fulfilled:"
+                " the worktree holds unresolved merge conflicts that the"
+                " retry must not overwrite; manual repair is required."
+                f" {hold_suffix}"
+            )
+        try:
+            decision, details, note_sha, has_commits = self._infer_retry_decision(
+                checkpoint, claim, prepared
+            )
+        except Exception as error:
+            return False, (
+                f"recovery retry for attempt {attempt_id} not fulfilled:"
+                f" local evidence is missing or invalid"
+                f" ({_exception_detail(error)}); the hold remains. {hold_suffix}"
+            )
+        try:
+            published = self._publisher.publish(
+                PublicationRequest(
+                    issue_number=claim.issue.number,
+                    issue_title=claim.issue.title,
+                    branch=getattr(prepared, "branch", checkpoint.branch),
+                    started_at=attempt_id,
+                    decision=decision,
+                    check_command="not rerun during recovery retry",
+                    check_exit_code=None,
+                    review_cycles=0,
+                    review_findings="not rerun during recovery retry",
+                    details=details,
+                    base_branch=profile.base_branch,
+                    note_commit_sha=note_sha,
+                )
+            )
+        except Exception as error:
+            return False, (
+                f"recovery retry for attempt {attempt_id} not fulfilled:"
+                f" publication failed ({_exception_detail(error)});"
+                " the hold remains."
+                f" {hold_suffix}"
+            )
+        outcome = published.outcome
+        comment_posted = getattr(published, "comment_posted", True)
+        if not comment_posted:
+            return False, (
+                f"recovery retry for attempt {attempt_id} not fulfilled:"
+                " publication is unconfirmed (the result comment could not be"
+                " verified); the hold remains."
+                f" {hold_suffix}"
+            )
+        try:
+            self._release(claim, outcome)
+        except Exception as error:
+            return False, (
+                f"recovery retry for attempt {attempt_id} not fulfilled:"
+                f" issue release failed ({_exception_detail(error)});"
+                " the hold remains."
+                f" {hold_suffix}"
+            )
+        try:
+            retain_branch = getattr(published, "branch_url", None) is None and (
+                has_commits
+                and (
+                    outcome is AttemptOutcome.INFRASTRUCTURE_ERROR
+                    or (
+                        outcome is AttemptOutcome.INCOMPLETE
+                        and decision.publication_path is PublicationPath.PARTIAL
+                    )
+                )
+            )
+            self._workspace.cleanup(
+                base_branch=profile.base_branch,
+                prepared=prepared,
+                # comment_posted is True here (the unconfirmed path returned
+                # above), so only genuinely unpublished work retains.
+                retain_branch=bool(retain_branch),
+            )
+        except Exception as error:
+            return False, (
+                f"recovery retry for attempt {attempt_id} not fulfilled:"
+                f" local cleanup failed ({_exception_detail(error)});"
+                " the hold remains."
+                f" {hold_suffix}"
+            )
+        try:
+            archive = self._archive_for(claim.issue.number, attempt_id)
+            self._commit_finalization(
+                checkpoint,
+                claim.issue.number,
+                getattr(prepared, "branch", checkpoint.branch),
+                outcome,
+                archive,
+            )
+        except SystemExit as error:
+            return False, (
+                f"recovery retry for attempt {attempt_id} not fulfilled:"
+                f" accounting is held ({_exception_detail(error)});"
+                " the hold remains."
+                f" {hold_suffix}"
+            )
+        except Exception as error:
+            return False, (
+                f"recovery retry for attempt {attempt_id} not fulfilled:"
+                f" accounting failed ({_exception_detail(error)});"
+                " the hold remains."
+                f" {hold_suffix}"
+            )
+        return True, (
+            f"recovery retry for attempt {attempt_id} completed;"
+            f" issue #{issue_number} finalized with outcome {outcome.value};"
+            " the hold is cleared"
+        )
+
+    def _release_retained_attempt(
+        self, checkpoint: AttemptCheckpoint, saved_at: str
+    ) -> tuple[bool, str]:
+        """Abandon a retained checkpoint after the operator secured its work.
+
+        Confirms a deduplicated issue comment stating the actual outcome and
+        failure before any label or assignee change, never claiming a
+        successful handoff or an unpublished branch. Only then runs the
+        idempotent release, local cleanup, checkpoint finalization, and
+        at-most-once accounting. Any failure keeps the hold.
+        """
+
+        from simple_coding_agent.recovery import (
+            attempt_marker,
+            release_comment_body,
+        )
+
+        attempt_id = checkpoint.started_at
+        issue_number = checkpoint.issue_number
+        try:
+            claim = self._tracker.recover_claim(issue_number)
+        except Exception as error:
+            return False, (
+                f"recovery release for attempt {attempt_id} not fulfilled:"
+                f" issue #{issue_number} is unavailable for recovery"
+                f" ({_exception_detail(error)}); the hold remains and no work"
+                " was discarded."
+            )
+        if claim is None:
+            return False, (
+                f"recovery release for attempt {attempt_id} not fulfilled:"
+                f" issue #{issue_number} is unavailable for recovery;"
+                " the hold remains and no work was discarded."
+            )
+        try:
+            self._workspace.prepare_for_profile_read()
+            profile = self._profile_loader(self._workspace.working_directory)
+            prepared = self._workspace.prepare_attempt(
+                base_branch=profile.base_branch, issue_number=claim.issue.number
+            )
+        except DirtyWorkspaceError as error:
+            return False, (
+                f"recovery release for attempt {attempt_id} not fulfilled:"
+                f" {_exception_detail(error)} The branch, checkpoint, and"
+                " working tree are preserved; no work was discarded."
+            )
+        except Exception as error:
+            return False, (
+                f"recovery release for attempt {attempt_id} not fulfilled:"
+                f" the workspace cannot be safely prepared"
+                f" ({_exception_detail(error)}); no work was discarded."
+            )
+        actual_outcome, failure_reason = self._infer_release_outcome(
+            checkpoint, claim, prepared
+        )
+        branch = getattr(prepared, "branch", checkpoint.branch)
+        marker = attempt_marker(attempt_id)
+        comment_body = release_comment_body(
+            issue_number=issue_number,
+            attempt_id=attempt_id,
+            actual_outcome=actual_outcome.value,
+            failure_reason=failure_reason,
+            saved_at=saved_at,
+            branch=branch,
+        )
+        confirmed = self._confirm_release_comment(
+            claim, marker, comment_body, attempt_id
+        )
+        if confirmed is None:
+            return False, (
+                f"recovery release for attempt {attempt_id} not fulfilled:"
+                " remote state is ambiguous and the result comment could not"
+                " be verified; the hold remains and no work was discarded."
+            )
+        if not confirmed:
+            return False, (
+                f"recovery release for attempt {attempt_id} not fulfilled:"
+                " the result comment could not be confirmed on GitHub;"
+                " the hold remains and no work was discarded."
+            )
+        try:
+            # Plain release only: never add ``round-finished`` here, so the
+            # release never claims a successful handoff. The comment above
+            # already states the actual outcome and the failure.
+            self._tracker.release_attempt(
+                claim.issue.number, "ready-for-agent", claim.assignment.assignee_id
+            )
+        except Exception as error:
+            return False, (
+                f"recovery release for attempt {attempt_id} not fulfilled:"
+                f" issue release failed ({_exception_detail(error)});"
+                " the hold remains and no work was discarded."
+            )
+        try:
+            self._workspace.cleanup(
+                base_branch=profile.base_branch,
+                prepared=prepared,
+                retain_branch=True,
+            )
+        except Exception as error:
+            return False, (
+                f"recovery release for attempt {attempt_id} not fulfilled:"
+                f" local cleanup failed ({_exception_detail(error)});"
+                " the hold remains and no work was discarded."
+            )
+        try:
+            archive = self._archive_for(claim.issue.number, attempt_id)
+            self._commit_finalization(
+                checkpoint, claim.issue.number, branch, actual_outcome, archive
+            )
+        except SystemExit as error:
+            return False, (
+                f"recovery release for attempt {attempt_id} not fulfilled:"
+                f" accounting is held ({_exception_detail(error)});"
+                " the hold remains and no work was discarded."
+            )
+        except Exception as error:
+            return False, (
+                f"recovery release for attempt {attempt_id} not fulfilled:"
+                f" accounting failed ({_exception_detail(error)});"
+                " the hold remains and no work was discarded."
+            )
+        return True, (
+            f"recovery release for attempt {attempt_id} completed;"
+            f" issue #{issue_number} released with outcome {actual_outcome.value};"
+            f" retained work secured at {saved_at}; the hold is cleared"
+        )
+
+    def _infer_retry_decision(
+        self, checkpoint: AttemptCheckpoint, claim: Claim, prepared: object
+    ) -> tuple[CompletionDecision, str, str | None, bool]:
+        """Infer the safe republication decision without invoking the model."""
+
+        archive = self._archive_for(claim.issue.number, checkpoint.started_at)
+        commits_added = getattr(self._workspace, "commits_added", None)
+        commits = (
+            tuple(commits_added(prepared)) if callable(commits_added) else ()
+        )
+        has_commits = bool(commits)
+        if checkpoint.phase is AttemptPhase.MODEL_RUNNING:
+            if commits:
+                if _final_check_was_interrupted(archive):
+                    decision = CompletionDecision(
+                        AttemptOutcome.INFRASTRUCTURE_ERROR,
+                        False,
+                        PublicationPath.PARTIAL,
+                        (
+                            "Final check was interrupted before completing;"
+                            " committed work is preserved on the branch.",
+                        ),
+                    )
+                else:
+                    try:
+                        self._attempt_state.transition(AttemptPhase.PUSHING)
+                    except AttemptStateError:
+                        pass
+                    decision = CompletionDecision(
+                        AttemptOutcome.INCOMPLETE,
+                        False,
+                        PublicationPath.PARTIAL,
+                        ("Model execution was interrupted; preserved committed work.",),
+                    )
+            else:
+                decision = _infrastructure_decision(
+                    "Model execution was interrupted without commits."
+                )
+            return (decision, decision.reasons[0], None, has_commits)
+        if checkpoint.phase in (AttemptPhase.PUSHING, AttemptPhase.PUBLISHING):
+            if _is_handoff_recovery(commits):
+                base_revision = getattr(prepared, "base_revision", "")
+                validation = _validate_handoff_note(
+                    commits,
+                    claim.issue.number,
+                    self._workspace.working_directory,
+                    base_revision if isinstance(base_revision, str) else "",
+                )
+                if validation.valid:
+                    decision = CompletionDecision(
+                        AttemptOutcome.HANDOFF,
+                        False,
+                        PublicationPath.PARTIAL,
+                        (
+                            "Recovered a previously committed handoff note"
+                            " for publication.",
+                        ),
+                    )
+                    details = _read_handoff_note(
+                        self._workspace.working_directory, claim.issue.number
+                    )
+                    return (decision, details, commits[0].revision, has_commits)
+                decision = CompletionDecision(
+                    AttemptOutcome.INFRASTRUCTURE_ERROR,
+                    False,
+                    PublicationPath.NONE,
+                    (validation.reason,),
+                )
+                return (decision, validation.reason, None, has_commits)
+            decision = CompletionDecision(
+                None,
+                True,
+                PublicationPath.COMPLETE,
+                ("Recovered previously completed local evidence for publication.",),
+            )
+            return (decision, decision.reasons[0], None, has_commits)
+        decision = _infrastructure_decision(
+            "Attempt was interrupted before model execution."
+        )
+        return (decision, decision.reasons[0], None, has_commits)
+
+    def _infer_release_outcome(
+        self, checkpoint: AttemptCheckpoint, claim: Claim, prepared: object
+    ) -> tuple[AttemptOutcome, str]:
+        """Infer the actual outcome recorded by ``recovery release``."""
+
+        commits_added = getattr(self._workspace, "commits_added", None)
+        try:
+            commits = (
+                tuple(commits_added(prepared)) if callable(commits_added) else ()
+            )
+        except Exception:
+            commits = ()
+        if _is_handoff_recovery(commits):
+            base_revision = getattr(prepared, "base_revision", "")
+            try:
+                validation = _validate_handoff_note(
+                    commits,
+                    claim.issue.number,
+                    self._workspace.working_directory,
+                    base_revision if isinstance(base_revision, str) else "",
+                )
+            except Exception:
+                validation = None
+            if validation is not None and validation.valid:
+                return (
+                    AttemptOutcome.HANDOFF,
+                    "The handoff note was committed but finalization never"
+                    f" completed in phase {checkpoint.phase.value}; the handoff"
+                    " is recorded as not fulfilled (not a successful handoff),"
+                    " and the retained branch is not published as a success.",
+                )
+        if commits:
+            return (
+                AttemptOutcome.INCOMPLETE,
+                "Local work was preserved on the branch but finalization never"
+                f" completed in phase {checkpoint.phase.value}; the operator"
+                " secured the retained work and released the attempt.",
+            )
+        if checkpoint.phase in (AttemptPhase.CLAIMED, AttemptPhase.SETUP):
+            return (
+                AttemptOutcome.INFRASTRUCTURE_ERROR,
+                "The attempt was interrupted before model execution produced"
+                f" commits (phase {checkpoint.phase.value}); the operator"
+                " secured the retained state and released the attempt.",
+            )
+        return (
+            AttemptOutcome.INFRASTRUCTURE_ERROR,
+            "Finalization was interrupted before its completion boundary"
+            f" (phase {checkpoint.phase.value}); the operator secured the"
+            " retained work and released the attempt.",
+        )
+
+    def _confirm_release_comment(
+        self, claim: Claim, marker: str, body: str, attempt_id: str
+    ) -> bool | None:
+        """Confirm the deduplicated release comment; ``None`` means ambiguous.
+
+        Uses the publisher's GitHub transport when it exposes the
+        comment operations; otherwise falls back to the publisher boundary
+        (which owns the same deduplication). Never claims a successful
+        handoff or an unpublished branch.
+        """
+
+        github = getattr(self._publisher, "_github", None)
+        repository = getattr(self._publisher, "_repository", None) or self._repository
+        find = getattr(github, "find_attempt_comment", None)
+        add = getattr(github, "add_comment", None)
+        if callable(find) and callable(add):
+            try:
+                if find(repository, claim.issue.number, marker):
+                    return True
+            except Exception:
+                return None
+            try:
+                add(repository, claim.issue.number, body)
+            except Exception:
+                return False
+            try:
+                return bool(find(repository, claim.issue.number, marker))
+            except Exception:
+                return None
+        # Test fakes (and transports without comment operations): delegate to
+        # the publisher boundary, which deduplicates by the same marker.
+        try:
+            published = self._publisher.publish(
+                PublicationRequest(
+                    issue_number=claim.issue.number,
+                    issue_title=claim.issue.title,
+                    branch=getattr(claim, "branch", f"agent/issue-{claim.issue.number}"),
+                    started_at=attempt_id,
+                    decision=CompletionDecision(
+                        AttemptOutcome.INFRASTRUCTURE_ERROR,
+                        False,
+                        PublicationPath.NONE,
+                        (body,),
+                    ),
+                    check_command="not run during recovery release",
+                    check_exit_code=None,
+                    review_cycles=0,
+                    review_findings="not run during recovery release",
+                    details=body,
+                    base_branch="main",
+                )
+            )
+        except Exception:
+            return False
+        return bool(getattr(published, "comment_posted", True))
+
+    def _recovery_conflict_reason(
+        self, claim: Claim, checkpoint: AttemptCheckpoint
+    ) -> str | None:
+        """Detect conflicting human changes or ambiguous state before a retry.
+
+        Returns a hold reason, or ``None`` when no conflict blocks the retry.
+        A fetch failure is ambiguous (the hold remains); a confidently
+        observed human change (assignment or labels moved by someone else) is
+        conflicting (the retry must not overwrite it).
+        """
+
+        fetcher = _tracker_method(self._tracker, "fetch_issue") or _tracker_method(
+            self._tracker, "get_issue"
+        )
+        if fetcher is None:
+            return None
+        try:
+            fresh = fetcher(checkpoint.issue_number)
+        except Exception as error:
+            return (
+                "remote issue state is ambiguous"
+                f" ({_exception_detail(error)}); the retry must not replay"
+                " a side effect it cannot verify."
+            )
+        if fresh is None:
+            return (
+                f"issue #{checkpoint.issue_number} is unavailable on GitHub;"
+                " the retry must not replay a side effect it cannot verify."
+            )
+        probe = _tracker_method(self._tracker, "is_self_assigned")
+        if probe is not None:
+            try:
+                self_assigned = bool(probe(fresh))
+            except Exception as error:
+                return (
+                    "remote assignment is ambiguous"
+                    f" ({_exception_detail(error)}); the retry must not replay"
+                    " a side effect it cannot verify."
+                )
+            if not self_assigned:
+                holders = ", ".join(getattr(fresh, "assignee_logins", ()) or ())
+                if holders:
+                    return (
+                        f"issue #{checkpoint.issue_number} shows conflicting"
+                        f" human changes (assigned to {holders}); the retry"
+                        " must not overwrite them and requires operator repair."
+                    )
+                return (
+                    f"issue #{checkpoint.issue_number} shows conflicting human"
+                    " changes (it is no longer assigned to this agent); the"
+                    " retry must not overwrite them and requires operator repair."
+                )
+        return None
+
+    def _recovery_snapshot_locked(
+        self, checkpoint: AttemptCheckpoint | None
+    ) -> dict | None:
+        """Build the status ``recovery`` section (caller holds the lock)."""
+
+        from simple_coding_agent.recovery import (
+            describe_hold,
+            release_next_action,
+            retry_next_action,
+        )
+
+        if checkpoint is None:
+            if not self._workspace_is_dirty():
+                return None
+            reason = (
+                "the working tree holds unexplained dirty or untracked work"
+                " with no active attempt; manual repair is required before intake"
+            )
+            return {
+                "attempt_id": None,
+                "issue_number": None,
+                "phase": None,
+                "outcome": None,
+                "branch": None,
+                "workspace": str(
+                    getattr(self._workspace, "working_directory", "")
+                ),
+                "checkpoint": False,
+                "publication": {
+                    "phase": None,
+                    "comment_confirmed": None,
+                    "pull_request": None,
+                },
+                "hold_reason": reason,
+                "next_action": (
+                    "Inspect the working tree and repair or remove the"
+                    " unexplained changes before intake can resume."
+                ),
+            }
+        hold = self._recovery_hold_locked(checkpoint)
+        if hold is None and not self._recovering:
+            return None
+        reason = hold.reason if hold is not None else "startup reconciliation is still running"
+        outcome: str | None = None
+        if self._completion_store is not None:
+            try:
+                completions = self._completion_store.read_all()
+                terminal = completions.get(checkpoint.started_at)
+                if terminal is not None:
+                    outcome = terminal.outcome.value
+            except Exception:
+                outcome = None
+        publication = self._publication_progress_locked(checkpoint)
+        if self._recovering:
+            next_action = (
+                "Wait for startup reconciliation to finish; do not run recovery"
+                " commands while it is still running."
+            )
+        elif outcome is not None:
+            next_action = (
+                "The attempt is finalized in the ledger; wait for the leftover"
+                " checkpoint to be removed on the next intake cycle."
+            )
+        else:
+            next_action = retry_next_action(checkpoint.started_at)
+        return {
+            "attempt_id": checkpoint.started_at,
+            "issue_number": checkpoint.issue_number,
+            "phase": checkpoint.phase.value,
+            "outcome": outcome,
+            "branch": checkpoint.branch,
+            "workspace": str(getattr(self._workspace, "working_directory", "")),
+            "checkpoint": True,
+            "publication": publication,
+            "hold_reason": describe_hold(
+                issue_number=checkpoint.issue_number,
+                attempt_id=checkpoint.started_at,
+                phase=checkpoint.phase.value,
+                reason=reason,
+            ),
+            "next_action": next_action
+            if self._recovering or outcome is not None
+            else f"{next_action} {release_next_action()}",
+        }
+
+    def _publication_progress_locked(
+        self, checkpoint: AttemptCheckpoint
+    ) -> dict:
+        """Best-effort confirmed publication progress for status (read-only)."""
+
+        from simple_coding_agent.recovery import attempt_marker
+
+        progress: dict = {
+            "phase": checkpoint.phase.value,
+            "comment_confirmed": None,
+            "pull_request": None,
+        }
+        github = getattr(self._publisher, "_github", None)
+        repository = getattr(self._publisher, "_repository", None) or self._repository
+        find_comment = getattr(github, "find_attempt_comment", None)
+        if callable(find_comment):
+            try:
+                progress["comment_confirmed"] = bool(
+                    find_comment(
+                        repository, checkpoint.issue_number, attempt_marker(checkpoint.started_at)
+                    )
+                )
+            except Exception:
+                progress["comment_confirmed"] = None
+        find_pr = getattr(github, "find_pull_request", None)
+        if callable(find_pr):
+            try:
+                existing = find_pr(repository, checkpoint.branch)
+                if existing is not None:
+                    progress["pull_request"] = {
+                        "number": getattr(existing, "number", None),
+                        "url": getattr(existing, "url", None),
+                    }
+            except Exception:
+                progress["pull_request"] = None
+        return progress
 
     def _is_self_assignment(self, found: TrackerIssue) -> bool:
         """Whether a revalidated target is assigned to this agent itself.
@@ -874,6 +1749,7 @@ class AgentLifecycle:
                 recent_commands=store.recent_commands,
                 next_issue=store.next_issue_snapshot(),
                 stop_plan=store.stop_plan_snapshot(),
+                recovery=self._recovery_snapshot_locked(checkpoint),
             )
 
     def run_once(self) -> LifecycleResult:
@@ -1099,7 +1975,12 @@ class AgentLifecycle:
         ``next issue`` priority is rechecked before the FIFO runnable queue
         at the next permitted claim boundary; a successful assignment
         consumes it once, while lost eligibility clears it as ``not
-        fulfilled`` and falls back to FIFO in the same cycle. Returns the
+        fulfilled`` and falls back to FIFO in the same cycle. A retained
+        checkpoint from a held attempt (startup reconciliation or a live
+        attempt whose finalization is unconfirmed) blocks every claim until
+        an operator clears it with ``recovery retry`` or ``recovery
+        release``: claiming new work would collide with the retained
+        checkpoint. Returns the
         claim and its checkpoint, or ``(None, None)`` when idle; the caller
         sleeps outside the lock so the control socket stays responsive.
         """
@@ -1121,6 +2002,21 @@ class AgentLifecycle:
                         f"issue intake is {self._control_store.intake_state().value};"
                         f" sleeping {self._poll_interval}s",
                         level="INFO",
+                    )
+                    return (None, None)
+                retained = self._attempt_state.read()
+                if retained is not None:
+                    # A retained checkpoint means an earlier attempt is held
+                    # for recovery (or a recovery command is working through
+                    # it now): no new claim may begin until the operator
+                    # clears the hold, so intake sleeps instead of colliding.
+                    self._event_log(
+                        "intake_held_for_recovery",
+                        f"retained attempt {retained.started_at!r} for issue"
+                        f" #{retained.issue_number} is held for recovery;"
+                        f" sleeping {self._poll_interval}s",
+                        level="WARNING",
+                        issue_number=retained.issue_number,
                     )
                     return (None, None)
                 prioritized = self._claim_prioritized_locked()
@@ -2027,3 +2923,16 @@ def _infrastructure_decision(reason: str) -> CompletionDecision:
 
 def _exception_detail(error: Exception) -> str:
     return f"{type(error).__name__}: {error}"
+
+
+def _check_recovery_request_id(request_id: object) -> None:
+    """Validate a recovery request ID without touching control state."""
+
+    if not isinstance(request_id, str) or not request_id.strip():
+        from simple_coding_agent.control import RequestIdError
+
+        raise RequestIdError("Request ID must be a non-empty string")
+    if len(request_id) > 128:
+        from simple_coding_agent.control import RequestIdError
+
+        raise RequestIdError("Request ID must be at most 128 characters")
