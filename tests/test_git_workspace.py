@@ -612,6 +612,11 @@ def git(cwd: Path, *arguments: str) -> str:
 def run_command(
     command: tuple[str, ...], *, cwd: Path | None = None, env: dict[str, str] | None = None
 ) -> str:
+    if env is None:
+        # Never let a git subcommand (e.g. "rebase --continue") fall back to
+        # the caller's real $EDITOR: on a real terminal that spawns an
+        # interactive editor attached to it and hangs the test run.
+        env = {**os.environ, "GIT_EDITOR": "true", "GIT_SEQUENCE_EDITOR": "true"}
     return subprocess.run(
         command, cwd=cwd, env=env, check=True, text=True, capture_output=True
     ).stdout.strip()
