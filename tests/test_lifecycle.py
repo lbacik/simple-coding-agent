@@ -645,14 +645,15 @@ def test_stops_without_touching_the_issue_when_the_workspace_cannot_be_repaired(
     ) in events
 
 
-def test_rebase_conflict_during_reprepare_reports_infrastructure_error_without_setup(
+def test_unresolved_rebase_conflict_after_the_model_reports_infrastructure_error(
     tmp_path: Path,
 ) -> None:
-    """Rebasing a stale branch onto the profile base must fail before setup.
+    """A conflict the model leaves unresolved fails as rebase_conflict.
 
-    Regression test for the ordering bug where a conflicting rebase left
-    ``<<<<<<<`` markers in the tree and setup (e.g. composer cache:clear)
-    failed with a misleading ParseError instead of a rebase_conflict cause.
+    Preparation leaves the conflicting rebase in place for the model, so
+    the model session still runs; only when the attempt runner reports the
+    conflict unresolved (as RebaseConflictError) does the attempt end as an
+    infrastructure error without setup ever running on the conflicted tree.
     """
 
     events: list[tuple[str, str, str]] = []
@@ -660,15 +661,26 @@ def test_rebase_conflict_during_reprepare_reports_infrastructure_error_without_s
     workspace = RebaseConflictingWorkspace()
     publisher = FakePublisher()
     calls: list[str] = []
+
+    def attempt_runner(received_claim: Claim, profile: object, prepared: object) -> AttemptEvidence:
+        calls.append("model")
+        raise RebaseConflictError(
+            "Rebase of agent/issue-24 onto develop hit conflicts"
+            " (rebase_conflict). Conflicting files: SubscriptionController.php."
+            " The model left conflicts unresolved, so the rebase was aborted"
+            " and setup was not started.",
+            branch="agent/issue-24",
+            base_branch="develop",
+            conflicted_files=("SubscriptionController.php",),
+        )
+
     lifecycle = AgentLifecycle(
         tracker=FakeTracker(claim),
         attempt_state=AttemptStateStore(tmp_path),
         workspace=workspace,
         profile_loader=lambda _: profile("develop"),
         publisher=publisher,
-        attempt_runner=lambda *args: calls.append("setup") or (_ for _ in ()).throw(
-            AssertionError("setup must not run after a rebase conflict")
-        ),
+        attempt_runner=attempt_runner,
         event_log=lambda event, detail="", level="INFO", issue_number=None: events.append(
             (event, detail, level)
         ),
@@ -677,9 +689,11 @@ def test_rebase_conflict_during_reprepare_reports_infrastructure_error_without_s
     result = lifecycle.run_once()
 
     assert result.outcome is AttemptOutcome.INFRASTRUCTURE_ERROR
-    assert calls == []
+    assert calls == ["model"]
     assert any(event == "rebase_conflict" for event, _, _ in events)
-    assert "workspace_prepared" not in [event for event, _, _ in events]
+    prepared_details = [detail for event, detail, _ in events if event == "workspace_prepared"]
+    assert len(prepared_details) == 1
+    assert "SubscriptionController.php" in prepared_details[0]
     assert "setup_started" not in [event for event, _, _ in events]
     assert publisher.outcomes == [AttemptOutcome.INFRASTRUCTURE_ERROR]
     details = publisher.requests[0].details
@@ -691,23 +705,34 @@ def test_rebase_conflict_on_the_profile_base_reports_infrastructure_error(tmp_pa
     """A conflict on the single preparation onto the profile base fails fast.
 
     The bootstrap for the profile read never touches the attempt branch, so
-    by the time ``prepare_attempt`` runs the profile is already loaded and a
-    conflict there is reported without setup running.
+    by the time ``prepare_attempt`` runs the profile is already loaded. The
+    conflict is left for the model; when the runner reports it unresolved,
+    the attempt ends as an infrastructure error without setup running.
     """
 
     events: list[tuple[str, str, str]] = []
     claim = Claim(issue(24), Assignment("issue-24", "agent-id"))
     workspace = RebaseConflictingWorkspace(conflict_bases=("main",))
     publisher = FakePublisher()
+    calls: list[str] = []
+
+    def attempt_runner(received_claim: Claim, profile: object, prepared: object) -> AttemptEvidence:
+        calls.append("model")
+        raise RebaseConflictError(
+            "Rebase of agent/issue-24 onto main hit conflicts (rebase_conflict)."
+            " The model left conflicts unresolved, so the rebase was aborted"
+            " and setup was not started.",
+            branch="agent/issue-24",
+            base_branch="main",
+        )
+
     lifecycle = AgentLifecycle(
         tracker=FakeTracker(claim),
         attempt_state=AttemptStateStore(tmp_path),
         workspace=workspace,
         profile_loader=lambda _: profile("main"),
         publisher=publisher,
-        attempt_runner=lambda *args: (_ for _ in ()).throw(
-            AssertionError("setup must not run after a rebase conflict")
-        ),
+        attempt_runner=attempt_runner,
         event_log=lambda event, detail="", level="INFO", issue_number=None: events.append(
             (event, detail, level)
         ),
@@ -716,10 +741,51 @@ def test_rebase_conflict_on_the_profile_base_reports_infrastructure_error(tmp_pa
     result = lifecycle.run_once()
 
     assert result.outcome is AttemptOutcome.INFRASTRUCTURE_ERROR
+    assert calls == ["model"]
     assert any(event == "rebase_conflict" for event, _, _ in events)
     assert workspace.bootstrap_bases == ["main"]
     assert workspace.prepared_bases == ["main"]
     assert publisher.outcomes == [AttemptOutcome.INFRASTRUCTURE_ERROR]
+
+
+def test_conflicted_prepare_still_dispatches_the_model(tmp_path: Path) -> None:
+    """A reused branch whose rebase conflicts reaches the model session.
+
+    The attempt no longer always ends as infrastructure_error: preparation
+    succeeds with the conflict left in place and the model gets its chance
+    to resolve it before setup runs.
+    """
+
+    claim = Claim(issue(24), Assignment("issue-24", "agent-id"))
+    workspace = RebaseConflictingWorkspace()
+    publisher = FakePublisher()
+    calls: list[str] = []
+
+    def attempt_runner(received_claim: Claim, profile: object, prepared: object) -> AttemptEvidence:
+        calls.append("model")
+        assert tuple(getattr(prepared, "rebase_conflicts", ())) == ("SubscriptionController.php",)
+        return AttemptEvidence(
+            decision=CompletionDecision(None, True, PublicationPath.COMPLETE, ("ready",)),
+            check_command="pytest",
+            check_exit_code=0,
+            review_cycles=1,
+            review_findings="all clear",
+            details="Resolved the conflict and implemented the issue.",
+        )
+
+    lifecycle = AgentLifecycle(
+        tracker=FakeTracker(claim),
+        attempt_state=AttemptStateStore(tmp_path),
+        workspace=workspace,
+        profile_loader=lambda _: profile("develop"),
+        publisher=publisher,
+        attempt_runner=attempt_runner,
+    )
+
+    result = lifecycle.run_once()
+
+    assert calls == ["model"]
+    assert result.outcome is AttemptOutcome.COMPLETE
 
 
 def test_non_main_profile_prepares_the_attempt_only_onto_the_profile_base(
@@ -828,7 +894,7 @@ class RecoveryFailingWorkspace(FakeWorkspace):
 
 
 class RebaseConflictingWorkspace(FakeWorkspace):
-    """Raise RebaseConflictError when preparing the configured base branches."""
+    """Leave a conflicting rebase in place on the configured base branches."""
 
     def __init__(
         self, *, commits: tuple[str, ...] = (), conflict_bases: tuple[str, ...] = ("develop",)
@@ -839,14 +905,15 @@ class RebaseConflictingWorkspace(FakeWorkspace):
     def prepare_attempt(self, *, base_branch: str, issue_number: int):
         self.prepared_bases.append(base_branch)
         if base_branch in self._conflict_bases:
-            raise RebaseConflictError(
-                f"Rebase of agent/issue-{issue_number} onto {base_branch} hit conflicts"
-                " (rebase_conflict). Conflicting files: SubscriptionController.php."
-                " The rebase was aborted and setup was not started.",
-                branch=f"agent/issue-{issue_number}",
-                base_branch=base_branch,
-                conflicted_files=("SubscriptionController.php",),
-            )
+            return type(
+                "Prepared",
+                (),
+                {
+                    "branch": f"agent/issue-{issue_number}",
+                    "rebase_conflicts": ("SubscriptionController.php",),
+                    "pre_rebase_revision": "abc123",
+                },
+            )()
         return type("Prepared", (), {"branch": f"agent/issue-{issue_number}"})()
 
 

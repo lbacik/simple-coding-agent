@@ -339,6 +339,14 @@ class ModelAttemptRunner:
         setup_deferred = _has_unresolved_conflicts(self._workspace)
         preparation: PreparationEvidence | None = None
         if setup_deferred:
+            resolution_files = _conflict_resolution_files(self._workspace, prepared)
+            self._event_log(
+                "rebase_resolution_started",
+                "The model resolves the rebase conflicts first, before setup runs."
+                f"{_format_conflicted_files(resolution_files)}",
+                level="INFO",
+                issue_number=claim.issue.number,
+            )
             self._event_log(
                 "setup_deferred_unresolved_conflicts",
                 f"The attempt branch holds unresolved merge conflicts from rebasing onto "
@@ -376,8 +384,8 @@ class ModelAttemptRunner:
             prompt_body = (
                 f"{prompt_body}\n\nThe attempt branch has unresolved merge conflicts from rebasing onto "
                 f"`{profile.base_branch}`. Resolve them first (inspect with git status, edit the conflicted "
-                "files, stage with git add, and run git rebase --continue), commit the resolution, then "
-                "continue the implementation."
+                "files, stage with git add, and run git rebase --continue until the rebase completes), "
+                "then continue the implementation."
             )
         self._event_log(
             "model_dispatch_starting",
@@ -403,6 +411,55 @@ class ModelAttemptRunner:
                 }
             )
         served_operator_request, late_operator_snapshot = self._read_operator_request()
+        if setup_deferred:
+            # The model had its chance to resolve the conflicts left in
+            # place by preparation. Setup must never run against a
+            # half-merged tree, so the resolution is verified
+            # deterministically first: any remaining rebase/merge state,
+            # unmerged path, conflict marker, or whitespace error falls
+            # back to the pre-rebase branch state and the attempt reports
+            # a rebase_conflict infrastructure error, exactly as if the
+            # rebase had been aborted up front.
+            problems = _resolution_problems(self._workspace)
+            if problems:
+                remaining = _conflict_resolution_files(self._workspace, prepared)
+                branch = getattr(prepared, "branch", f"agent/issue-{claim.issue.number}")
+                abort = getattr(self._workspace, "abort_unresolved_rebase", None)
+                if callable(abort):
+                    try:
+                        abort(prepared)
+                    except GitWorkspaceError:
+                        self._event_log(
+                            "rebase_resolution_failed",
+                            f"{' '.join(problems)} The branch could not be restored.",
+                            level="ERROR",
+                            issue_number=claim.issue.number,
+                        )
+                        raise
+                self._event_log(
+                    "rebase_resolution_failed",
+                    f"{' '.join(problems)}"
+                    " The rebase was aborted and the branch restored to its"
+                    " pre-rebase state.",
+                    level="ERROR",
+                    issue_number=claim.issue.number,
+                )
+                files = f" Conflicting files: {', '.join(remaining)}." if remaining else ""
+                raise RebaseConflictError(
+                    f"Rebase of {branch} onto {profile.base_branch} hit conflicts"
+                    f" (rebase_conflict).{files} The model left conflicts"
+                    " unresolved, so the rebase was aborted and setup was not started.",
+                    branch=branch,
+                    base_branch=profile.base_branch,
+                    conflicted_files=remaining,
+                )
+            self._event_log(
+                "rebase_resolution_succeeded",
+                "The model resolved the rebase conflicts; setup runs normally."
+                f"{_format_conflicted_files(resolution_files)}",
+                level="INFO",
+                issue_number=claim.issue.number,
+            )
         if execution.status in (
             ModelExecutionStatus.HANDOFF_REQUESTED,
             ModelExecutionStatus.MODEL_LIMIT_REACHED,
@@ -2098,9 +2155,15 @@ class AgentLifecycle:
             prepared = self._workspace.prepare_attempt(
                 base_branch=profile.base_branch, issue_number=claim.issue.number
             )
+            rebase_conflicts = tuple(getattr(prepared, "rebase_conflicts", None) or ())
+            prepared_detail = (
+                f"branch={getattr(prepared, 'branch', None)}; base_branch={profile.base_branch}"
+            )
+            if rebase_conflicts:
+                prepared_detail += f"; rebase_conflicts={', '.join(rebase_conflicts)}"
             self._event_log(
                 "workspace_prepared",
-                f"branch={getattr(prepared, 'branch', None)}; base_branch={profile.base_branch}",
+                prepared_detail,
                 level="INFO",
                 issue_number=claim.issue.number,
             )
@@ -3310,12 +3373,14 @@ class AgentLifecycle:
         error: RebaseConflictError,
         timeout: float | None = None,
     ):
-        """Report an aborted rebase conflict as the terminal infrastructure error.
+        """Report an unresolvable rebase conflict as the terminal infrastructure error.
 
-        The conflicting rebase was already aborted by workspace preparation,
-        so setup never ran: the failure is classified here with its
+        The model already had its chance to resolve the conflict that
+        workspace preparation left in place; the rebase was aborted and the
+        branch restored to its pre-rebase state, so setup never ran against
+        a half-merged tree. The failure is classified here with its
         ``rebase_conflict`` cause instead of surfacing later as an
-        unrelated setup error against a half-merged tree.
+        unrelated setup error.
         """
 
         self._event_log(
@@ -3402,7 +3467,52 @@ def _has_unresolved_conflicts(workspace: object) -> bool:
     probe = getattr(workspace, "has_unresolved_conflicts", None)
     if not callable(probe):
         return False
-    return bool(probe())
+    try:
+        return bool(probe())
+    except Exception:
+        # An unreadable worktree is not a clean one: fail safe so setup
+        # never runs against a tree whose state could not be verified.
+        return True
+
+
+def _conflict_resolution_files(workspace: object, prepared: object) -> tuple[str, ...]:
+    """The files the model must resolve, from live probes or the prepare snapshot."""
+
+    probe = getattr(workspace, "conflicted_files", None)
+    if callable(probe):
+        try:
+            files = tuple(str(path) for path in probe() if str(path).strip())
+        except Exception:
+            files = ()
+        if files:
+            return files
+    snapshot = getattr(prepared, "rebase_conflicts", None) or ()
+    return tuple(str(path) for path in snapshot if str(path).strip())
+
+
+def _resolution_problems(workspace: object) -> tuple[str, ...]:
+    """Deterministic post-model verification that a left-in-place rebase resolved."""
+
+    problems: list[str] = []
+    probe = getattr(workspace, "rebase_resolution_problems", None)
+    if callable(probe):
+        try:
+            problems.extend(str(problem) for problem in probe())
+        except Exception as error:
+            # Verification itself failed: fall back to abort-and-restore
+            # rather than running setup against an unverified tree.
+            problems.append(f"Conflict-resolution verification failed: {error}.")
+    if _has_unresolved_conflicts(workspace) and not problems:
+        problems.append("A rebase or merge is still in progress or paths remain unmerged.")
+    return tuple(problems)
+
+
+def _format_conflicted_files(files: tuple[str, ...]) -> str:
+    """Render the conflicted file list for event details, or "" when unknown."""
+
+    if not files:
+        return ""
+    return f" Conflicting files: {', '.join(files)}."
 
 
 def _utc_timestamp() -> str:

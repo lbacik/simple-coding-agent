@@ -6,6 +6,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 from simple_coding_agent.attempt_state import AttemptPhase, AttemptStateStore
 from simple_coding_agent.completion import (
     AttemptOutcome,
@@ -14,6 +16,7 @@ from simple_coding_agent.completion import (
 )
 from simple_coding_agent.config import RepositoryProfile
 from simple_coding_agent.github_tracker import Assignment, Claim, TrackerIssue
+from simple_coding_agent.git_workspace import RebaseConflictError
 from simple_coding_agent.lifecycle import ModelAttemptRunner
 from simple_coding_agent.model_execution import ModelExecution, ModelExecutionStatus
 
@@ -214,6 +217,7 @@ def test_defers_setup_until_after_the_model_resolves_conflicts(tmp_path: Path) -
     calls: list[str] = []
     executor = FakeModelExecutor(status=ModelExecutionStatus.SUCCEEDED, calls=calls)
     workspace = FakeWorkspace(commits=("Retained work",), conflicts=True)
+    executor.after_execute = workspace.note_model_finished
     verifier = FakeVerifier(calls=calls)
     events: list[tuple[str, str]] = []
     runner = build_runner(
@@ -234,10 +238,153 @@ def test_defers_setup_until_after_the_model_resolves_conflicts(tmp_path: Path) -
     assert "setup_succeeded" in [event for event, _ in events]
 
 
+def test_successful_conflict_resolution_logs_started_and_succeeded_with_files(
+    tmp_path: Path,
+) -> None:
+    """The attempt record shows the model resolved a rebase conflict."""
+
+    executor = FakeModelExecutor(status=ModelExecutionStatus.SUCCEEDED)
+    workspace = FakeWorkspace(commits=("Retained work",), conflicts=True)
+    executor.after_execute = workspace.note_model_finished
+    events: list[tuple[str, str, str]] = []
+    runner = build_runner(
+        tmp_path,
+        model_executor=executor,
+        workspace=workspace,
+        event_log=lambda event, detail="", level="INFO", issue_number=None: events.append(
+            (event, detail, level)
+        ),
+    )
+
+    runner(claim(issue_number=24, issue_body="Fix the parser."), profile(), FakePrepared())
+
+    started = [detail for event, detail, _ in events if event == "rebase_resolution_started"]
+    succeeded = [detail for event, detail, _ in events if event == "rebase_resolution_succeeded"]
+    assert len(started) == 1
+    assert "SubscriptionController.php" in started[0]
+    assert len(succeeded) == 1
+    assert "SubscriptionController.php" in succeeded[0]
+    assert workspace.abort_calls == []
+    assert "git rebase --continue" in (executor.captured_prompt or "")
+
+
+def test_unresolved_conflicts_after_the_model_abort_restore_and_raise(
+    tmp_path: Path,
+) -> None:
+    """The fallback matches the old abort-and-report behavior exactly.
+
+    When the model leaves any unresolved state behind, the rebase is
+    aborted, the branch restored, and the attempt reports
+    infrastructure_error with a rebase_conflict cause — without setup ever
+    running against the half-merged tree.
+    """
+
+    calls: list[str] = []
+    executor = FakeModelExecutor(status=ModelExecutionStatus.SUCCEEDED, calls=calls)
+    workspace = FakeWorkspace(
+        commits=("Retained work",), conflicts=True, resolve_after_model=False
+    )
+    executor.after_execute = workspace.note_model_finished
+    verifier = FakeVerifier(calls=calls)
+    events: list[tuple[str, str, str]] = []
+    runner = build_runner(
+        tmp_path,
+        model_executor=executor,
+        workspace=workspace,
+        verifier=verifier,
+        event_log=lambda event, detail="", level="INFO", issue_number=None: events.append(
+            (event, detail, level)
+        ),
+    )
+    prepared = FakePrepared()
+
+    with pytest.raises(RebaseConflictError) as caught:
+        runner(claim(issue_number=24, issue_body="Fix the parser."), profile(), prepared)
+
+    assert calls == ["execute"]
+    assert len(workspace.abort_calls) == 1
+    assert workspace.abort_calls[0] is prepared
+    assert any(event == "rebase_resolution_started" for event, _, _ in events)
+    failed = [detail for event, detail, _ in events if event == "rebase_resolution_failed"]
+    assert len(failed) == 1
+    assert "SubscriptionController.php" in failed[0]
+    assert "rebase_conflict" in str(caught.value)
+    assert "setup was not started" in str(caught.value).lower() or "Setup was not started" in str(
+        caught.value
+    )
+    assert caught.value.branch == "agent/issue-24"
+    assert caught.value.base_branch == "main"
+    assert caught.value.conflicted_files == ("SubscriptionController.php",)
+
+
+def test_fallback_falls_back_to_the_prepare_snapshot_for_the_file_list(
+    tmp_path: Path,
+) -> None:
+    """Workspaces without live conflict probes still report the file list."""
+
+    executor = FakeModelExecutor(status=ModelExecutionStatus.SUCCEEDED)
+    workspace = MinimalConflictingWorkspace()
+    events: list[tuple[str, str, str]] = []
+    runner = build_runner(
+        tmp_path,
+        model_executor=executor,
+        workspace=workspace,
+        event_log=lambda event, detail="", level="INFO", issue_number=None: events.append(
+            (event, detail, level)
+        ),
+    )
+    prepared = FakePrepared(rebase_conflicts=("SubscriptionController.php",))
+
+    with pytest.raises(RebaseConflictError) as caught:
+        runner(claim(issue_number=24, issue_body="Fix the parser."), profile(), prepared)
+
+    assert caught.value.conflicted_files == ("SubscriptionController.php",)
+    started = [detail for event, detail, _ in events if event == "rebase_resolution_started"]
+    assert len(started) == 1
+    assert "SubscriptionController.php" in started[0]
+    assert workspace.abort_calls == [prepared]
+
+
+def test_unreadable_verification_state_falls_back_without_running_setup(
+    tmp_path: Path,
+) -> None:
+    """A verification probe failure must fail safe, never fail open.
+
+    When the post-model conflict verification cannot be read, the attempt
+    aborts the rebase, restores the branch, and reports a rebase conflict
+    instead of running setup against an unverified tree.
+    """
+
+    calls: list[str] = []
+    executor = FakeModelExecutor(status=ModelExecutionStatus.SUCCEEDED, calls=calls)
+    workspace = ExplodingVerificationWorkspace()
+    verifier = FakeVerifier(calls=calls)
+    events: list[tuple[str, str, str]] = []
+    runner = build_runner(
+        tmp_path,
+        model_executor=executor,
+        workspace=workspace,
+        verifier=verifier,
+        event_log=lambda event, detail="", level="INFO", issue_number=None: events.append(
+            (event, detail, level)
+        ),
+    )
+    prepared = FakePrepared(rebase_conflicts=("SubscriptionController.php",))
+
+    with pytest.raises(RebaseConflictError):
+        runner(claim(issue_number=24, issue_body="Fix the parser."), profile(), prepared)
+
+    assert calls == ["execute"]
+    assert workspace.abort_calls == [prepared]
+    assert any(event == "rebase_resolution_started" for event, _, _ in events)
+    assert any(event == "rebase_resolution_failed" for event, _, _ in events)
+
+
 def test_deferred_setup_failure_still_reports_without_a_final_check(tmp_path: Path) -> None:
     calls: list[str] = []
     executor = FakeModelExecutor(status=ModelExecutionStatus.SUCCEEDED, calls=calls)
     workspace = FakeWorkspace(commits=("Retained work",), conflicts=True)
+    executor.after_execute = workspace.note_model_finished
     verifier = FakeVerifier(calls=calls, setup_succeeded=False)
     events: list[str] = []
     runner = build_runner(
@@ -401,6 +548,7 @@ class FakeModelExecutor:
         self.captured_prompt: str | None = None
         self._status = status
         self._calls = calls
+        self.after_execute = None
 
     async def execute(
         self, *, issue_body: str, working_directory: Path, issue_number: int | None = None, archive=None
@@ -408,6 +556,8 @@ class FakeModelExecutor:
         if self._calls is not None:
             self._calls.append("execute")
         self.captured_prompt = issue_body
+        if self.after_execute is not None:
+            self.after_execute()
         return ModelExecution(
             status=self._status,
             explanation="stub",
@@ -474,21 +624,113 @@ class FakeEvaluator:
 class FakeWorkspace:
     working_directory = Path("/repository")
 
-    def __init__(self, *, commits: tuple[str, ...] = (), conflicts: bool = False) -> None:
+    def __init__(
+        self,
+        *,
+        commits: tuple[str, ...] = (),
+        conflicts: bool = False,
+        resolve_after_model: bool = True,
+    ) -> None:
         self._commits = commits
         self._conflicts = conflicts
+        self._resolve_after_model = resolve_after_model
+        self._model_finished = False
+        self.abort_calls: list[object] = []
+
+    def note_model_finished(self) -> None:
+        """Simulate the model's turn ending so resolution can take effect."""
+
+        self._model_finished = True
+
+    def _resolved(self) -> bool:
+        return self._model_finished and self._resolve_after_model
 
     def commits_added(self, prepared: object) -> tuple[str, ...]:
         return self._commits
 
     def has_unresolved_conflicts(self) -> bool:
-        return self._conflicts
+        return self._conflicts and not self._resolved()
+
+    def conflicted_files(self) -> tuple[str, ...]:
+        if self.has_unresolved_conflicts():
+            return ("SubscriptionController.php",)
+        return ()
+
+    def rebase_resolution_problems(self) -> tuple[str, ...]:
+        if self.has_unresolved_conflicts():
+            return (
+                "A rebase or merge is still in progress."
+                " Conflicting files: SubscriptionController.php.",
+            )
+        return ()
+
+    def abort_unresolved_rebase(self, prepared: object) -> None:
+        self.abort_calls.append(prepared)
+
+
+class MinimalConflictingWorkspace:
+    """A workspace with conflicts but without the newer conflict probes.
+
+    Pins the runner's fallback chain: the file list comes from the prepared
+    attempt snapshot when live probes are unavailable.
+    """
+
+    working_directory = Path("/repository")
+
+    def __init__(self) -> None:
+        self.abort_calls: list[object] = []
+
+    def commits_added(self, prepared: object) -> tuple[str, ...]:
+        return ("Retained work",)
+
+    def has_unresolved_conflicts(self) -> bool:
+        return True
+
+    def abort_unresolved_rebase(self, prepared: object) -> None:
+        self.abort_calls.append(prepared)
+
+
+class ExplodingVerificationWorkspace:
+    """A workspace whose post-model verification probe is unreadable.
+
+    Pins the fail-safe rule: an unverifiable tree falls back to
+    abort-and-restore instead of running setup.
+    """
+
+    working_directory = Path("/repository")
+
+    def __init__(self) -> None:
+        self.abort_calls: list[object] = []
+
+    def commits_added(self, prepared: object) -> tuple[str, ...]:
+        return ("Retained work",)
+
+    def has_unresolved_conflicts(self) -> bool:
+        return True
+
+    def conflicted_files(self) -> tuple[str, ...]:
+        raise OSError("cannot read worktree state")
+
+    def rebase_resolution_problems(self) -> tuple[str, ...]:
+        raise OSError("cannot read worktree state")
+
+    def abort_unresolved_rebase(self, prepared: object) -> None:
+        self.abort_calls.append(prepared)
 
 
 class FakePrepared:
-    def __init__(self, *, branch: str = "agent/issue-24", restored_from_remote: bool = True) -> None:
+    def __init__(
+        self,
+        *,
+        branch: str = "agent/issue-24",
+        restored_from_remote: bool = True,
+        rebase_conflicts: tuple[str, ...] = (),
+        pre_rebase_revision: str | None = None,
+    ) -> None:
         self.branch = branch
         self.restored_from_remote = restored_from_remote
+        self.rebase_conflicts = rebase_conflicts
+        self.pre_rebase_revision = pre_rebase_revision
 
 
 def claim(

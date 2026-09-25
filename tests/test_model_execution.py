@@ -614,8 +614,9 @@ def test_model_timeout_gets_a_same_client_handoff_followup_that_succeeds(
                 for message in self._followup_messages:
                     yield message
                 return
-            await asyncio.sleep(10)
-            yield result()
+            while not self.interrupted:
+                await asyncio.sleep(0)
+            return
 
     def client_factory(options: object) -> FakeClient:
         return HangingClient(
