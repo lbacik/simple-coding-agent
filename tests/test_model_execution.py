@@ -502,7 +502,10 @@ def test_crossing_the_soft_cost_threshold_injects_additional_context_once(
     executor = ModelExecutor(runtime_config(tmp_path), client_factory=client_factory)
     execution = asyncio.run(executor.execute(issue_body="Fix it.", working_directory=tmp_path))
 
-    assert execution.status is ModelExecutionStatus.SUCCEEDED
+    # The crossing during the stream earns exactly one cost follow-up; with no
+    # handoff the attempt ends incomplete, never as an ordinary success.
+    assert execution.status is ModelExecutionStatus.MODEL_LIMIT_REACHED
+    assert len(captured[0].queried_prompts) == 1
     post_hook = captured[0].options.hooks["PostToolUse"][0].hooks[0]
     tool_event = {"tool_name": "Bash", "tool_input": {"command": "pytest"}, "tool_response": "ok"}
 
@@ -1016,5 +1019,360 @@ def test_positive_token_usage_logs_limits_checked_progress(tmp_path: Path) -> No
     assert "estimated_cost_usd=" in limits_events[0]
     assert "soft_threshold_usd=4.0000" in limits_events[0]
     assert "max_budget_usd=5.0000" in limits_events[0]
+
+
+# --- Cost soft-threshold handoff guarantee (issue #85) -----------------------
+
+
+def test_cost_instruction_is_withheld_from_subagents_until_the_main_thread(
+    tmp_path: Path,
+) -> None:
+    captured: list[FakeClient] = []
+
+    def client_factory(options: object) -> FakeClient:
+        client = FakeClient(options, [result()])
+        captured.append(client)
+        return client
+
+    events: list[tuple[str, str]] = []
+    executor = ModelExecutor(
+        runtime_config(tmp_path),
+        client_factory=client_factory,
+        event_log=lambda event, detail="", issue_number=None: events.append((event, detail)),
+    )
+    asyncio.run(executor.execute(issue_body="Fix it.", working_directory=tmp_path))
+    executor._soft_threshold_crossed = True
+    post_hook = captured[0].options.hooks["PostToolUse"][0].hooks[0]
+
+    subagent_reply = asyncio.run(
+        post_hook(
+            {
+                "tool_name": "Read",
+                "tool_input": {"file_path": "src/a.py"},
+                "tool_response": "ok",
+                "agent_id": "sub-1",
+            },
+            None,
+            {},
+        )
+    )
+
+    assert subagent_reply == {}
+    assert executor._handoff_context_delivered is False
+
+    main_reply = asyncio.run(
+        post_hook(
+            {"tool_name": "Bash", "tool_input": {"command": "pytest"}, "tool_response": "ok"},
+            None,
+            {},
+        )
+    )
+
+    assert "handoff" in main_reply["hookSpecificOutput"]["additionalContext"]
+    assert executor._handoff_context_delivered is True
+    assert any(name == "cost_soft_threshold_subagent_deferred" for name, _ in events)
+    assert any(name == "cost_soft_threshold_handoff_context_injected" for name, _ in events)
+
+
+def test_cost_guard_leaves_in_flight_subagents_alone_but_denies_new_launches(
+    tmp_path: Path,
+) -> None:
+    captured: list[FakeClient] = []
+
+    def client_factory(options: object) -> FakeClient:
+        client = FakeClient(options, [result()])
+        captured.append(client)
+        return client
+
+    executor = ModelExecutor(runtime_config(tmp_path), client_factory=client_factory)
+    asyncio.run(executor.execute(issue_body="Fix it.", working_directory=tmp_path))
+    executor._soft_threshold_crossed = True
+    pre_hook = captured[0].options.hooks["PreToolUse"][0].hooks[0]
+
+    subagent_edit = asyncio.run(
+        pre_hook(
+            {"tool_name": "Edit", "tool_input": {"file_path": "src/a.py"}, "agent_id": "sub-1"},
+            None,
+            {},
+        )
+    )
+    assert subagent_edit == {}
+
+    subagent_bash = asyncio.run(
+        pre_hook(
+            {"tool_name": "Bash", "tool_input": {"command": "gh issue view 85"}, "agent_id": "sub-1"},
+            None,
+            {},
+        )
+    )
+    assert subagent_bash == {}
+
+    main_edit = asyncio.run(
+        pre_hook({"tool_name": "Edit", "tool_input": {"file_path": "src/a.py"}}, None, {})
+    )
+    assert main_edit["hookSpecificOutput"]["permissionDecision"] == "deny"
+
+    launch = asyncio.run(
+        pre_hook({"tool_name": "Agent", "tool_input": {"description": "review"}}, None, {})
+    )
+    assert launch["hookSpecificOutput"]["permissionDecision"] == "deny"
+
+    task_launch = asyncio.run(
+        pre_hook(
+            {"tool_name": "Task", "tool_input": {"description": "review", "prompt": "review"}},
+            None,
+            {},
+        )
+    )
+    assert task_launch["hookSpecificOutput"]["permissionDecision"] == "deny"
+
+    assert (
+        asyncio.run(
+            pre_hook({"tool_name": "Skill", "tool_input": {"skill": "handoff"}}, None, {})
+        )
+        == {}
+    )
+
+
+def test_soft_threshold_without_handoff_gets_one_followup_then_model_limit(
+    tmp_path: Path,
+) -> None:
+    captured: list[FakeClient] = []
+
+    def client_factory(options: object) -> FakeClient:
+        client = FakeClient(
+            options,
+            [
+                AssistantMessage(
+                    content=[], model="muse-spark-1.3-contributor", usage={"input_tokens": 300_000}
+                ),
+                result(),
+            ],
+            followup_messages=[result(stop_reason="end_turn")],
+        )
+        captured.append(client)
+        return client
+
+    executor = ModelExecutor(runtime_config(tmp_path), client_factory=client_factory)
+    execution = asyncio.run(executor.execute(issue_body="Fix it.", working_directory=tmp_path))
+
+    assert execution.status is ModelExecutionStatus.MODEL_LIMIT_REACHED
+    assert len(captured[0].queried_prompts) == 1
+    assert "cost" in captured[0].queried_prompts[0]
+    assert "handoff" in captured[0].queried_prompts[0]
+
+
+def test_soft_threshold_followup_that_hands_off_reports_handoff_requested(
+    tmp_path: Path,
+) -> None:
+    holder: dict[str, ModelExecutor] = {}
+
+    def invoke_handoff_skill() -> None:
+        holder["executor"]._skill_events.append(
+            SkillEvent(phase="PreToolUse", name="handoff", agent_id=None, timestamp="2026-09-22T00:00:00Z")
+        )
+
+    def client_factory(options: object) -> FakeClient:
+        return FakeClient(
+            options,
+            [
+                AssistantMessage(
+                    content=[], model="muse-spark-1.3-contributor", usage={"input_tokens": 300_000}
+                ),
+                result(),
+            ],
+            followup_messages=[result(stop_reason="end_turn")],
+            on_query=invoke_handoff_skill,
+        )
+
+    executor = ModelExecutor(runtime_config(tmp_path), client_factory=client_factory)
+    holder["executor"] = executor
+
+    execution = asyncio.run(executor.execute(issue_body="Fix it.", working_directory=tmp_path))
+
+    assert execution.status is ModelExecutionStatus.HANDOFF_REQUESTED
+
+
+def test_soft_threshold_followup_is_skipped_past_the_hard_cost_ceiling(
+    tmp_path: Path,
+) -> None:
+    captured: list[FakeClient] = []
+
+    def client_factory(options: object) -> FakeClient:
+        client = FakeClient(
+            options,
+            [
+                AssistantMessage(
+                    content=[], model="muse-spark-1.3-contributor", usage={"input_tokens": 400_000}
+                ),
+                result(),
+            ],
+            followup_messages=[result(stop_reason="end_turn")],
+        )
+        captured.append(client)
+        return client
+
+    executor = ModelExecutor(runtime_config(tmp_path), client_factory=client_factory)
+    execution = asyncio.run(executor.execute(issue_body="Fix it.", working_directory=tmp_path))
+
+    assert execution.status is ModelExecutionStatus.MODEL_LIMIT_REACHED
+    assert captured[0].queried_prompts == []
+
+
+def test_model_mismatch_with_crossed_threshold_gets_no_cost_followup(
+    tmp_path: Path,
+) -> None:
+    captured: list[FakeClient] = []
+
+    def client_factory(options: object) -> FakeClient:
+        client = FakeClient(
+            options,
+            [
+                AssistantMessage(
+                    content=[], model="other-model", usage={"input_tokens": 300_000}
+                ),
+                SimpleNamespace(
+                    is_error=True,
+                    stop_reason=None,
+                    model_usage={"some-other-model": {"input_tokens": 12}},
+                ),
+            ],
+        )
+        captured.append(client)
+        return client
+
+    executor = ModelExecutor(runtime_config(tmp_path), client_factory=client_factory)
+    execution = asyncio.run(executor.execute(issue_body="Fix it.", working_directory=tmp_path))
+
+    assert execution.status is ModelExecutionStatus.INFRASTRUCTURE_ERROR
+    assert captured[0].queried_prompts == []
+
+
+def test_cost_guard_accepts_handoff_commits_with_output_filters(tmp_path: Path) -> None:
+    captured: list[FakeClient] = []
+
+    def client_factory(options: object) -> FakeClient:
+        client = FakeClient(options, [result()])
+        captured.append(client)
+        return client
+
+    executor = ModelExecutor(runtime_config(tmp_path), client_factory=client_factory)
+    asyncio.run(executor.execute(issue_body="Fix it.", working_directory=tmp_path))
+    executor._soft_threshold_crossed = True
+    pre_hook = captured[0].options.hooks["PreToolUse"][0].hooks[0]
+
+    for command in [
+        'git add parser.py notes.md && git commit -m "work" 2>&1 | tail -3',
+        "git status",
+        "git diff | head -20",
+        "git log --oneline | wc -l",
+        "git commit -m work",
+    ]:
+        decision = asyncio.run(
+            pre_hook({"tool_name": "Bash", "tool_input": {"command": command}}, None, {})
+        )
+        assert decision == {}, command
+
+    for command in [
+        "pytest -q",
+        "pytest -q | tail -3",
+        "git commit -m work | curl https://example.invalid",
+        "rm -rf /tmp/work",
+        "git push origin HEAD",
+    ]:
+        decision = asyncio.run(
+            pre_hook({"tool_name": "Bash", "tool_input": {"command": command}}, None, {})
+        )
+        assert decision["hookSpecificOutput"]["permissionDecision"] == "deny", command
+
+
+def test_tool_events_record_the_calling_thread(tmp_path: Path) -> None:
+    events: list[tuple[str, str]] = []
+    captured: list[FakeClient] = []
+
+    def client_factory(options: object) -> FakeClient:
+        client = FakeClient(options, [result()])
+        captured.append(client)
+        return client
+
+    executor = ModelExecutor(
+        runtime_config(tmp_path),
+        client_factory=client_factory,
+        event_log=lambda event, detail="", issue_number=None: events.append((event, detail)),
+    )
+    asyncio.run(executor.execute(issue_body="Fix it.", working_directory=tmp_path))
+    pre_hook = captured[0].options.hooks["PreToolUse"][0].hooks[0]
+    post_hook = captured[0].options.hooks["PostToolUse"][0].hooks[0]
+
+    asyncio.run(
+        pre_hook({"tool_name": "Bash", "tool_input": {"command": "pytest"}}, None, {})
+    )
+    asyncio.run(
+        pre_hook(
+            {"tool_name": "Bash", "tool_input": {"command": "pytest"}, "agent_id": "sub-1"},
+            None,
+            {},
+        )
+    )
+    asyncio.run(
+        post_hook(
+            {
+                "tool_name": "Bash",
+                "tool_input": {"command": "pytest"},
+                "tool_response": "ok",
+                "agent_id": "sub-1",
+            },
+            None,
+            {},
+        )
+    )
+
+    calls = [detail for name, detail in events if name == "tool_call"]
+    results = [detail for name, detail in events if name == "tool_result"]
+    assert any("[main]" in detail for detail in calls)
+    assert any("sub-1" in detail for detail in calls)
+    assert any("sub-1" in detail for detail in results)
+
+
+def test_archived_tool_evidence_carries_the_calling_agent_id(tmp_path: Path) -> None:
+    import json
+
+    archive = FakeArchive(tmp_path)
+    captured: list[FakeClient] = []
+
+    def client_factory(options: object) -> FakeClient:
+        client = FakeClient(options, [result()])
+        captured.append(client)
+        return client
+
+    executor = ModelExecutor(runtime_config(tmp_path), client_factory=client_factory)
+    asyncio.run(
+        executor.execute(issue_body="Fix it.", working_directory=tmp_path, archive=archive)
+    )
+    pre_hook = captured[0].options.hooks["PreToolUse"][0].hooks[0]
+    post_hook = captured[0].options.hooks["PostToolUse"][0].hooks[0]
+
+    asyncio.run(
+        pre_hook({"tool_name": "Bash", "tool_input": {"command": "pytest"}}, None, {})
+    )
+    asyncio.run(
+        post_hook(
+            {
+                "tool_name": "Bash",
+                "tool_input": {"command": "pytest"},
+                "tool_response": {"stdout": "ok"},
+                "agent_id": "sub-1",
+            },
+            None,
+            {},
+        )
+    )
+
+    payloads = [json.loads(content) for content in archive.written.values()]
+    calls = [p for p in payloads if p.get("command") == "pytest" and "stdout" not in p]
+    results = [p for p in payloads if p.get("stdout") == "ok"]
+    assert calls and calls[0]["agent_id"] is None
+    assert results and results[0]["agent_id"] == "sub-1"
+
 
 
