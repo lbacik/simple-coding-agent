@@ -3498,25 +3498,43 @@ _HANDOFF_RESULT_MARKERS = (
     "Agent Attempt Result: handoff",
 )
 
+#: Result comments carrying this branch line never published a branch, so they
+#: are not handoffs and must not trigger the continuation path (issue #84).
+_NO_PUBLISHED_BRANCH_MARKER = "no branch created"
+
+#: Detail written by the ``continuation_branch_missing`` short-circuit itself.
+#: Such a comment must never count as a continuation signal, or every later
+#: attempt would short-circuit the same way (issue #84).
+_CONTINUATION_MISSING_MARKER = "was not found on origin"
+
 
 def _continuation_expected(
     issue: TrackerIssue, issue_comments: Callable[[TrackerIssue], tuple[str, ...]]
 ) -> bool:
     """Whether this issue carries (or carried) a signal that a continuation was expected.
 
-    The ``round-finished`` label is the current signal; a prior incomplete or
-    handoff attempt-result comment is the historical one, since either is what
-    a handoff publishes. Checked in that order so a present label never
-    triggers a needless comment fetch, and so a real handoff comment is still
-    recognized once the label has been removed (e.g. on claim) or the remote
-    branch is missing.
+    The ``round-finished`` label is the current signal; a prior handoff or
+    incomplete attempt-result comment is the historical one, but only when it
+    actually published a branch. Baseline/setup failures (and the
+    ``continuation_branch_missing`` short-circuit itself) post ``incomplete``
+    with ``no branch created`` — none of them promises a remote branch, so
+    they must not trigger the continuation path. Checked in that order so a
+    present label never triggers a needless comment fetch, and so a real
+    handoff comment is still recognized once the label has been removed (e.g.
+    on claim) or the remote branch is missing.
     """
 
     if ROUND_FINISHED in issue.labels:
         return True
-    return any(
-        marker in comment for comment in issue_comments(issue) for marker in _HANDOFF_RESULT_MARKERS
-    )
+    for comment in issue_comments(issue):
+        if not any(marker in comment for marker in _HANDOFF_RESULT_MARKERS):
+            continue
+        if _CONTINUATION_MISSING_MARKER in comment:
+            continue
+        if _NO_PUBLISHED_BRANCH_MARKER in comment:
+            continue
+        return True
+    return False
 
 
 def _is_handoff_note_commit(commit: object) -> bool:
