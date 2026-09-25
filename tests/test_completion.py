@@ -170,6 +170,31 @@ def test_zero_commit_successful_skill_run_is_no_changes() -> None:
     assert decision.outcome is AttemptOutcome.NO_CHANGES
 
 
+def test_expired_operator_handoff_with_committed_progress_is_incomplete() -> None:
+    decision = CompletionEvaluator({"must-fix"}).evaluate(
+        setup=command_result(), baseline=command_result(),
+        model_status=ModelExecutionStatus.OPERATOR_HANDOFF_EXPIRED,
+        commit_count=1, acceptance_criteria_satisfied=False, review=ReviewEvidence((), 0), final_check=None,
+    )
+
+    assert decision.outcome is AttemptOutcome.INCOMPLETE
+    assert decision.publication_eligible is False
+    assert decision.publication_path is PublicationPath.PARTIAL
+    assert "deadline" in decision.reasons[0]
+
+
+def test_expired_operator_handoff_without_preserved_work_downgrades_to_no_changes() -> None:
+    decision = CompletionEvaluator({"must-fix"}).evaluate(
+        setup=command_result(), baseline=command_result(),
+        model_status=ModelExecutionStatus.OPERATOR_HANDOFF_EXPIRED,
+        commit_count=0, acceptance_criteria_satisfied=False, review=ReviewEvidence((), 0), final_check=None,
+    )
+
+    assert decision.outcome is AttemptOutcome.NO_CHANGES
+    assert decision.publication_eligible is False
+    assert decision.publication_path is PublicationPath.NONE
+
+
 def test_handoff_request_with_committed_progress_is_a_handoff_eligible_for_partial_publication() -> None:
     decision = CompletionEvaluator({"must-fix"}).evaluate(
         setup=command_result(), baseline=command_result(),

@@ -267,6 +267,11 @@ def format_status(status: dict) -> str:
             f" phase {handoff.get('phase')}"
             f" — {handoff.get('detail')})"
         )
+        lines.append(
+            f"handoff_deadlines: accepted {handoff.get('accepted_at')}"
+            f" model {handoff.get('model_deadline_at')}"
+            f" publication {handoff.get('publication_deadline_at')}"
+        )
     commands = status.get("commands") or {}
     if commands:
         lines.append("recent_commands:")
