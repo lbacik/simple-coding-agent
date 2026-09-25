@@ -31,10 +31,11 @@ class DirtyWorkspaceError(GitWorkspaceError):
 
 
 class RebaseConflictError(GitWorkspaceError):
-    """Raised when a reused attempt branch still conflicts after the model's turn.
+    """Raised when a reused attempt branch still conflicts after the attempt's turn.
 
-    Workspace preparation leaves a conflicting rebase in place for the model
-    session to resolve as the first step of its normal session. This is
+    Workspace preparation leaves a conflicting rebase in place for the
+    implementation attempt to resolve as the first step of its normal model
+    session. This is
     raised only when the conflict is still unresolved afterwards: the rebase
     has been aborted, the branch restored to its pre-rebase state, and the
     working tree no longer holds conflict markers. Setup must not run after
@@ -433,7 +434,11 @@ class GitWorkspace:
                 stripped = line.strip()
                 if (
                     stripped.startswith(b"<<<<<<<")
-                    or stripped == b"======="
+                    or (
+                        len(stripped) >= 7
+                        and stripped.startswith(b"=======")
+                        and stripped.strip(b"=") == b""
+                    )
                     or stripped.startswith(b">>>>>>>")
                 ):
                     marked.append(name)

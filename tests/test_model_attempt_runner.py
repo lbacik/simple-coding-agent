@@ -345,6 +345,41 @@ def test_fallback_falls_back_to_the_prepare_snapshot_for_the_file_list(
     assert workspace.abort_calls == [prepared]
 
 
+def test_unreadable_verification_state_falls_back_without_running_setup(
+    tmp_path: Path,
+) -> None:
+    """A verification probe failure must fail safe, never fail open.
+
+    When the post-model conflict verification cannot be read, the attempt
+    aborts the rebase, restores the branch, and reports a rebase conflict
+    instead of running setup against an unverified tree.
+    """
+
+    calls: list[str] = []
+    executor = FakeModelExecutor(status=ModelExecutionStatus.SUCCEEDED, calls=calls)
+    workspace = ExplodingVerificationWorkspace()
+    verifier = FakeVerifier(calls=calls)
+    events: list[tuple[str, str, str]] = []
+    runner = build_runner(
+        tmp_path,
+        model_executor=executor,
+        workspace=workspace,
+        verifier=verifier,
+        event_log=lambda event, detail="", level="INFO", issue_number=None: events.append(
+            (event, detail, level)
+        ),
+    )
+    prepared = FakePrepared(rebase_conflicts=("SubscriptionController.php",))
+
+    with pytest.raises(RebaseConflictError):
+        runner(claim(issue_number=24, issue_body="Fix the parser."), profile(), prepared)
+
+    assert calls == ["execute"]
+    assert workspace.abort_calls == [prepared]
+    assert any(event == "rebase_resolution_started" for event, _, _ in events)
+    assert any(event == "rebase_resolution_failed" for event, _, _ in events)
+
+
 def test_deferred_setup_failure_still_reports_without_a_final_check(tmp_path: Path) -> None:
     calls: list[str] = []
     executor = FakeModelExecutor(status=ModelExecutionStatus.SUCCEEDED, calls=calls)
@@ -650,6 +685,34 @@ class MinimalConflictingWorkspace:
 
     def has_unresolved_conflicts(self) -> bool:
         return True
+
+    def abort_unresolved_rebase(self, prepared: object) -> None:
+        self.abort_calls.append(prepared)
+
+
+class ExplodingVerificationWorkspace:
+    """A workspace whose post-model verification probe is unreadable.
+
+    Pins the fail-safe rule: an unverifiable tree falls back to
+    abort-and-restore instead of running setup.
+    """
+
+    working_directory = Path("/repository")
+
+    def __init__(self) -> None:
+        self.abort_calls: list[object] = []
+
+    def commits_added(self, prepared: object) -> tuple[str, ...]:
+        return ("Retained work",)
+
+    def has_unresolved_conflicts(self) -> bool:
+        return True
+
+    def conflicted_files(self) -> tuple[str, ...]:
+        raise OSError("cannot read worktree state")
+
+    def rebase_resolution_problems(self) -> tuple[str, ...]:
+        raise OSError("cannot read worktree state")
 
     def abort_unresolved_rebase(self, prepared: object) -> None:
         self.abort_calls.append(prepared)

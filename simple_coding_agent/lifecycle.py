@@ -384,8 +384,8 @@ class ModelAttemptRunner:
             prompt_body = (
                 f"{prompt_body}\n\nThe attempt branch has unresolved merge conflicts from rebasing onto "
                 f"`{profile.base_branch}`. Resolve them first (inspect with git status, edit the conflicted "
-                "files, stage with git add, and run git rebase --continue), commit the resolution, then "
-                "continue the implementation."
+                "files, stage with git add, and run git rebase --continue until the rebase completes), "
+                "then continue the implementation."
             )
         self._event_log(
             "model_dispatch_starting",
@@ -3467,7 +3467,12 @@ def _has_unresolved_conflicts(workspace: object) -> bool:
     probe = getattr(workspace, "has_unresolved_conflicts", None)
     if not callable(probe):
         return False
-    return bool(probe())
+    try:
+        return bool(probe())
+    except Exception:
+        # An unreadable worktree is not a clean one: fail safe so setup
+        # never runs against a tree whose state could not be verified.
+        return True
 
 
 def _conflict_resolution_files(workspace: object, prepared: object) -> tuple[str, ...]:
@@ -3493,8 +3498,10 @@ def _resolution_problems(workspace: object) -> tuple[str, ...]:
     if callable(probe):
         try:
             problems.extend(str(problem) for problem in probe())
-        except Exception:
-            pass
+        except Exception as error:
+            # Verification itself failed: fall back to abort-and-restore
+            # rather than running setup against an unverified tree.
+            problems.append(f"Conflict-resolution verification failed: {error}.")
     if _has_unresolved_conflicts(workspace) and not problems:
         problems.append("A rebase or merge is still in progress or paths remain unmerged.")
     return tuple(problems)

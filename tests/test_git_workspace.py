@@ -206,8 +206,10 @@ def test_resolution_problems_report_markers_and_whitespace_errors(tmp_path: Path
         handle.write("<<<<<<< HEAD\nstale marker\n=======\nother side\n>>>>>>> branch\n")
     with (clone / "other.txt").open("w", encoding="utf-8") as handle:
         handle.write("trailing whitespace \n")
+    with (clone / "longer.txt").open("w", encoding="utf-8") as handle:
+        handle.write("stale center marker with extra equals\n==========\n")
 
-    assert workspace.conflict_marker_files() == ("notes.txt",)
+    assert workspace.conflict_marker_files() == ("notes.txt", "longer.txt")
     git(clone, "add", "-A")
     assert workspace.diff_check_clean() is False
     problems = workspace.rebase_resolution_problems()
