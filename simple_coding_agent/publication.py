@@ -93,14 +93,21 @@ class Publisher:
         self._monotonic = monotonic
         self._event_log = event_log
 
-    def publish(self, request: PublicationRequest) -> PublicationResult:
+    def publish(
+        self, request: PublicationRequest, *, timeout: float | None = None
+    ) -> PublicationResult:
         """Publish the permitted path and always try to record its outcome.
 
         A branch is published only for a complete candidate or partial work.
         PR creation is deliberately limited to a locally complete candidate.
+        ``timeout`` overrides the configured publish timeout for this call so
+        a handoff publication can be bounded by its remaining acceptance
+        budget (at most 120 seconds after the valid local handoff and 360
+        seconds from acceptance); ``None`` keeps the configured timeout.
         """
 
-        deadline = self._monotonic() + self._publish_timeout
+        effective_timeout = self._publish_timeout if timeout is None else timeout
+        deadline = self._monotonic() + effective_timeout
         outcome = request.decision.outcome
         branch_url: str | None = None
         pull_request: PullRequest | None = None

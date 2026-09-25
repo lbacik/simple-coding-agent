@@ -255,6 +255,42 @@ def prepared() -> object:
 # --- runner: served requests -------------------------------------------------
 
 
+def test_setup_failure_settles_the_pending_request_with_its_reason(
+    tmp_path: Path,
+) -> None:
+    working_directory = tmp_path / "work"
+    working_directory.mkdir()
+    executor = ScriptedOperatorExecutor(status=ModelExecutionStatus.SUCCEEDED)
+    operator = FakeOperatorControl(accepted_snapshot("req-1"))
+
+    class SetupFailingVerifier(RunnerVerifier):
+        def prepare(self, profile: object, working_directory: Path, **kwargs: object):
+            setup = SimpleNamespace(succeeded=False, commands=())
+            return SimpleNamespace(setup=setup, baseline=None)
+
+    attempt_state = AttemptStateStore(tmp_path)
+    attempt_state.start(issue_number=ISSUE_NUMBER, branch=f"agent/issue-{ISSUE_NUMBER}")
+    attempt_state.transition(AttemptPhase.SETUP)
+    runner = ModelAttemptRunner(
+        attempt_state=attempt_state,
+        workspace=RunnerWorkspace(working_directory, ()),
+        verifier=SetupFailingVerifier(),
+        evaluator=CompletionEvaluator(frozenset()),
+        model_executor=executor,
+        operator_handoff=operator,
+    )
+
+    evidence = runner(claim(), profile(), prepared())
+
+    assert evidence.decision.outcome is AttemptOutcome.INFRASTRUCTURE_ERROR
+    assert executor.operator_request_id is None
+    assert len(operator.failed) == 1
+    request_id, reason = operator.failed[0]
+    assert request_id == "req-1"
+    assert "infrastructure_error" in reason
+    assert "Setup" in reason
+
+
 def test_setup_phase_request_waits_for_and_is_served_by_model_execution(
     tmp_path: Path,
 ) -> None:
@@ -472,9 +508,11 @@ class LifecycleWorkspace:
 class LifecyclePublisher:
     def __init__(self) -> None:
         self.requests: list[object] = []
+        self.timeouts: list[float | None] = []
 
-    def publish(self, request: object):
+    def publish(self, request: object, *, timeout: float | None = None):
         self.requests.append(request)
+        self.timeouts.append(timeout)
         outcome = request.decision.outcome or AttemptOutcome.COMPLETE
         return SimpleNamespace(outcome=outcome, branch_url="https://example.test/x")
 
@@ -497,6 +535,42 @@ def make_lifecycle(
         attempt_runner=attempt_runner,
         control_store=store,
         sleeper=lambda seconds: None,
+    )
+    return lifecycle, tracker, store
+
+
+def make_clocked_lifecycle(
+    tmp_path: Path,
+    *,
+    next_claim: Claim | None,
+    workspace: LifecycleWorkspace,
+    attempt_runner,
+    now: list,
+    store_now: list | None = None,
+    publisher=None,
+):
+    """Build a lifecycle over mutable clocks for handoff-deadline tests.
+
+    ``now`` is a single-element list holding the lifecycle's current time;
+    ``store_now`` (defaulting to ``now``) drives the control-store commit
+    clock, so acceptance can be aged by moving it before ``submit_handoff``.
+    """
+
+    from datetime import datetime
+
+    tracker = LifecycleTracker(next_claim)
+    store_clock = store_now if store_now is not None else now
+    store = ControlStore(tmp_path, clock=lambda: store_clock[0])
+    lifecycle = AgentLifecycle(
+        tracker=tracker,
+        attempt_state=AttemptStateStore(tmp_path),
+        workspace=workspace,
+        profile_loader=lambda _: SimpleNamespace(base_branch="main"),
+        publisher=publisher if publisher is not None else LifecyclePublisher(),
+        attempt_runner=attempt_runner,
+        control_store=store,
+        sleeper=lambda seconds: None,
+        clock=lambda: now[0],
     )
     return lifecycle, tracker, store
 
@@ -531,7 +605,225 @@ def test_handoff_without_an_active_attempt_is_rejected(tmp_path: Path) -> None:
     assert store.handoff_snapshot() is None
 
 
-def test_unserved_handoff_finalizes_the_ordinary_outcome_as_not_fulfilled(
+def test_failed_handoff_retains_everything_and_blocks_claims_until_recovery(
+    tmp_path: Path,
+) -> None:
+    """An unserved handoff publishes the ordinary outcome but holds the rest.
+
+    The result comment is still posted (truthful terminal acknowledgement)
+    and the command is ``not fulfilled`` with intake stopped, but the branch,
+    checkpoint, and working tree are retained: no issue release, no ledger
+    accounting, and no new claim until ``recovery retry`` or
+    ``recovery release`` resolves the hold without duplicating the comment.
+    """
+
+    from simple_coding_agent.control import ResumeBlockedError
+
+    working_directory = tmp_path / "work"
+    working_directory.mkdir()
+    workspace = LifecycleWorkspace(working_directory)
+    started = threading.Event()
+    release = threading.Event()
+
+    def blocking_workflow(received_claim: Claim, profile: object, prepared: object):
+        started.set()
+        assert release.wait(timeout=30)
+        return AttemptEvidence(
+            decision=CompletionDecision(
+                AttemptOutcome.COMPLETE, True, PublicationPath.COMPLETE, ("ready",)
+            ),
+            check_command="pytest",
+            check_exit_code=0,
+            review_cycles=1,
+            review_findings="all clear",
+            details="Implemented.",
+        )
+
+    lifecycle, tracker, store = make_lifecycle(
+        tmp_path, next_claim=claim(), workspace=workspace, attempt_runner=blocking_workflow
+    )
+    worker = threading.Thread(target=lifecycle.run_once)
+    worker.start()
+    assert started.wait(timeout=30)
+
+    record = lifecycle.submit_handoff("req-handoff")
+    assert record.acknowledgement is CommandAcknowledgement.ACCEPTED
+    release.set()
+    worker.join(timeout=30)
+
+    stored = store.get_command("req-handoff")
+    assert stored is not None
+    assert stored.acknowledgement is CommandAcknowledgement.NOT_FULFILLED
+    assert store.intake_state() is IntakeState.STOPPED
+    # The ordinary outcome was still published truthfully ...
+    assert len(lifecycle._publisher.requests) == 1
+    # ... but nothing released, finalized, or discarded:
+    assert tracker.cleanup == []
+    assert AttemptStateStore(tmp_path).read() is not None
+    assert AttemptStateStore(tmp_path).read().issue_number == ISSUE_NUMBER
+    with pytest.raises(ResumeBlockedError):
+        lifecycle.submit_resume("req-resume")
+    assert store.intake_state() is IntakeState.STOPPED
+    # Recovery can still finish the retained attempt exactly once.
+    retry = lifecycle.submit_recovery_retry(
+        "req-retry", AttemptStateStore(tmp_path).read().started_at
+    )
+    assert retry.acknowledgement is CommandAcknowledgement.COMPLETED
+    assert AttemptStateStore(tmp_path).read() is None
+
+
+def test_valid_handoff_past_its_absolute_deadline_is_not_fulfilled_and_held(
+    tmp_path: Path,
+) -> None:
+    """Original deadlines survive the wait: a valid note past 360 seconds fails."""
+
+    from datetime import timedelta
+
+    now = [datetime(2026, 9, 22, 12, 0, 0, tzinfo=UTC)]
+    store_now = [now[0]]
+    working_directory = tmp_path / "work"
+    working_directory.mkdir()
+    write_operator_note(working_directory)
+    workspace = LifecycleWorkspace(working_directory, note_commits())
+    started = threading.Event()
+    release = threading.Event()
+
+    def blocking_workflow(received_claim: Claim, profile: object, prepared: object):
+        started.set()
+        assert release.wait(timeout=30)
+        return handoff_evidence()
+
+    lifecycle, tracker, store = make_clocked_lifecycle(
+        tmp_path,
+        next_claim=claim(),
+        workspace=workspace,
+        attempt_runner=blocking_workflow,
+        now=now,
+        store_now=store_now,
+    )
+    worker = threading.Thread(target=lifecycle.run_once)
+    worker.start()
+    assert started.wait(timeout=30)
+
+    # Age the acceptance 400 seconds: the 360-second budget is already spent.
+    store_now[0] = now[0] - timedelta(seconds=400)
+    lifecycle.submit_handoff("req-handoff")
+    store_now[0] = now[0]
+    assert store.mark_handoff_begun("req-handoff") is True
+    release.set()
+    worker.join(timeout=30)
+
+    stored = store.get_command("req-handoff")
+    assert stored is not None
+    assert stored.acknowledgement is CommandAcknowledgement.NOT_FULFILLED
+    assert "360" in stored.detail
+    assert store.intake_state() is IntakeState.STOPPED
+    assert AttemptStateStore(tmp_path).read() is not None
+
+
+def test_publication_past_its_allowance_is_not_fulfilled_and_held(
+    tmp_path: Path,
+) -> None:
+    """At most 120 seconds after the valid local handoff may confirm publication."""
+
+    from datetime import timedelta
+
+    now = [datetime(2026, 9, 22, 12, 0, 0, tzinfo=UTC)]
+    working_directory = tmp_path / "work"
+    working_directory.mkdir()
+    write_operator_note(working_directory)
+    workspace = LifecycleWorkspace(working_directory, note_commits())
+    started = threading.Event()
+    release = threading.Event()
+
+    def blocking_workflow(received_claim: Claim, profile: object, prepared: object):
+        started.set()
+        assert release.wait(timeout=30)
+        return handoff_evidence()
+
+    publisher = LifecyclePublisher()
+    original_publish = publisher.publish
+
+    def slow_publish(request: object, *, timeout: float | None = None):
+        # Remote publication drags 130 seconds past the local handoff.
+        now[0] = now[0] + timedelta(seconds=130)
+        return original_publish(request, timeout=timeout)
+
+    publisher.publish = slow_publish  # type: ignore[method-assign]
+    lifecycle, tracker, store = make_clocked_lifecycle(
+        tmp_path,
+        next_claim=claim(),
+        workspace=workspace,
+        attempt_runner=blocking_workflow,
+        now=now,
+        publisher=publisher,
+    )
+    worker = threading.Thread(target=lifecycle.run_once)
+    worker.start()
+    assert started.wait(timeout=30)
+
+    lifecycle.submit_handoff("req-handoff")
+    assert store.mark_handoff_begun("req-handoff") is True
+    release.set()
+    worker.join(timeout=30)
+
+    stored = store.get_command("req-handoff")
+    assert stored is not None
+    assert stored.acknowledgement is CommandAcknowledgement.NOT_FULFILLED
+    assert "120" in stored.detail
+    assert store.intake_state() is IntakeState.STOPPED
+    assert AttemptStateStore(tmp_path).read() is not None
+
+
+def test_handoff_publication_is_bounded_by_the_remaining_acceptance_budget(
+    tmp_path: Path,
+) -> None:
+    """The driver gets min(120s, 360s-elapsed) to confirm publication."""
+
+    from datetime import timedelta
+
+    now = [datetime(2026, 9, 22, 12, 0, 0, tzinfo=UTC)]
+    store_now = [now[0]]
+    working_directory = tmp_path / "work"
+    working_directory.mkdir()
+    write_operator_note(working_directory)
+    workspace = LifecycleWorkspace(working_directory, note_commits())
+    started = threading.Event()
+    release = threading.Event()
+
+    def blocking_workflow(received_claim: Claim, profile: object, prepared: object):
+        started.set()
+        assert release.wait(timeout=30)
+        return handoff_evidence()
+
+    publisher = LifecyclePublisher()
+    lifecycle, tracker, store = make_clocked_lifecycle(
+        tmp_path,
+        next_claim=claim(),
+        workspace=workspace,
+        attempt_runner=blocking_workflow,
+        now=now,
+        store_now=store_now,
+        publisher=publisher,
+    )
+    worker = threading.Thread(target=lifecycle.run_once)
+    worker.start()
+    assert started.wait(timeout=30)
+
+    # 300 seconds already elapsed since acceptance: 60 seconds remain.
+    store_now[0] = now[0] - timedelta(seconds=300)
+    lifecycle.submit_handoff("req-handoff")
+    store_now[0] = now[0]
+    assert store.mark_handoff_begun("req-handoff") is True
+    release.set()
+    worker.join(timeout=30)
+
+    assert publisher.timeouts != []
+    assert publisher.timeouts[-1] is not None
+    assert abs(publisher.timeouts[-1] - 60) < 5
+
+
+def test_unserved_handoff_reports_the_ordinary_outcome_as_not_fulfilled(
     tmp_path: Path,
 ) -> None:
     working_directory = tmp_path / "work"
@@ -570,8 +862,12 @@ def test_unserved_handoff_finalizes_the_ordinary_outcome_as_not_fulfilled(
     stored = store.get_command("req-handoff")
     assert stored is not None
     assert stored.acknowledgement is CommandAcknowledgement.NOT_FULFILLED
+    assert "complete" in stored.detail
     assert store.intake_state() is IntakeState.STOPPED
-    assert tracker.cleanup == [(ISSUE_NUMBER, "ready-for-agent", "agent-id")]
+    # The failed handoff is held for operator recovery: the issue stays
+    # assigned and the checkpoint stays until retry or release resolves it.
+    assert tracker.cleanup == []
+    assert AttemptStateStore(tmp_path).read() is not None
 
 
 def test_served_valid_handoff_completes_after_durable_finalization(
@@ -607,6 +903,114 @@ def test_served_valid_handoff_completes_after_durable_finalization(
     assert stored.acknowledgement is CommandAcknowledgement.COMPLETED
     assert store.intake_state() is IntakeState.STOPPED
     assert tracker.cleanup == [(ISSUE_NUMBER, "round-finished", "agent-id")]
+
+
+def test_restart_with_an_invalid_recovered_note_reports_incomplete_not_infrastructure_error(
+    tmp_path: Path,
+) -> None:
+    """A crash replay keeps the ordinary outcome for an invalid handoff note.
+
+    The recovered note cites the wrong reason, so the handoff cannot complete;
+    the attempt still publishes its preserved partial work as ``incomplete``
+    (not ``infrastructure_error``) with the validation reason attached.
+    """
+
+    working_directory = tmp_path / "work"
+    working_directory.mkdir()
+    write_operator_note(working_directory, reason="bogus_reason")
+    workspace = LifecycleWorkspace(working_directory, note_commits())
+    lifecycle, tracker, store = make_lifecycle(
+        tmp_path, next_claim=None, workspace=workspace, attempt_runner=lambda c, p, r: None
+    )
+    attempt_state = AttemptStateStore(tmp_path)
+    attempt_state.start(issue_number=ISSUE_NUMBER, branch=f"agent/issue-{ISSUE_NUMBER}")
+    attempt_state.transition(AttemptPhase.SETUP)
+    attempt_state.transition(AttemptPhase.MODEL_RUNNING)
+    attempt_state.transition(AttemptPhase.PUSHING)
+
+    result = lifecycle.run_once()
+
+    assert result.status is LifecycleStatus.ATTEMPTED
+    assert result.outcome is AttemptOutcome.INCOMPLETE
+    assert len(lifecycle._publisher.requests) == 1
+    decision = lifecycle._publisher.requests[0].decision
+    assert decision.outcome is AttemptOutcome.INCOMPLETE
+    assert decision.publication_path is PublicationPath.PARTIAL
+    assert "reason" in decision.reasons[0].lower()
+
+
+def test_retry_with_an_invalid_recovered_note_reports_incomplete_not_infrastructure_error(
+    tmp_path: Path,
+) -> None:
+    """Recovery retry replays an invalid note as ordinary incomplete work."""
+
+    working_directory = tmp_path / "work"
+    working_directory.mkdir()
+    write_operator_note(working_directory, reason="bogus_reason")
+    workspace = LifecycleWorkspace(working_directory, note_commits())
+    lifecycle, _, _ = make_lifecycle(
+        tmp_path, next_claim=None, workspace=workspace, attempt_runner=lambda c, p, r: None
+    )
+    attempt_state = AttemptStateStore(tmp_path)
+    attempt_state.start(issue_number=ISSUE_NUMBER, branch=f"agent/issue-{ISSUE_NUMBER}")
+    attempt_state.transition(AttemptPhase.SETUP)
+    attempt_state.transition(AttemptPhase.MODEL_RUNNING)
+    attempt_state.transition(AttemptPhase.PUSHING)
+    checkpoint = attempt_state.read()
+    assert checkpoint is not None
+    prepared = workspace.prepare_attempt(base_branch="main", issue_number=ISSUE_NUMBER)
+
+    decision, _, _, _ = lifecycle._infer_retry_decision(checkpoint, claim(), prepared)
+
+    assert decision.outcome is AttemptOutcome.INCOMPLETE
+    assert decision.publication_path is PublicationPath.PARTIAL
+    assert "reason" in decision.reasons[0].lower()
+
+
+def test_hold_ignores_a_handoff_failure_owned_by_an_earlier_attempt(
+    tmp_path: Path,
+) -> None:
+    """A stale `not fulfilled` record never wedges a later attempt.
+
+    Only a failure naming this attempt's ID in its hold reason holds
+    finalization; a foreign failure (e.g. settled by the runner before a
+    restart) finalizes normally so intake can proceed after resume.
+    """
+
+    workspace = LifecycleWorkspace(tmp_path / "work")
+    lifecycle, _, store = make_lifecycle(
+        tmp_path, next_claim=None, workspace=workspace, attempt_runner=lambda c, p, r: None
+    )
+    foreign_id = "2026-09-22T00:00:01Z"
+    store.submit_handoff("req-old", has_active_attempt=True)
+    store.fail_handoff(
+        "req-old",
+        "Operator handoff req-old is not fulfilled: the attempt finalized"
+        " with the ordinary outcome incomplete.",
+    )
+
+    assert lifecycle._hold_failed_handoff(
+        issue_number=ISSUE_NUMBER,
+        attempt_id=foreign_id,
+        outcome=AttemptOutcome.INCOMPLETE,
+        prepared=None,
+    ) is False
+
+    own_id = "2026-09-22T00:00:02Z"
+    store.submit_handoff("req-hold", has_active_attempt=True)
+    store.fail_handoff(
+        "req-hold",
+        "Operator handoff req-hold is not fulfilled: model execution never"
+        " began the handoff skill; the branch, checkpoint, and working tree"
+        f" are retained for recovery of attempt {own_id}.",
+    )
+
+    assert lifecycle._hold_failed_handoff(
+        issue_number=ISSUE_NUMBER,
+        attempt_id=own_id,
+        outcome=AttemptOutcome.COMPLETE,
+        prepared=None,
+    ) is True
 
 
 def test_orphan_handoff_with_no_checkpoint_fails_and_stops_intake(
@@ -683,6 +1087,27 @@ def test_status_and_format_include_the_tracked_handoff(tmp_path: Path) -> None:
 
 
 # --- store -------------------------------------------------------------------
+
+
+def test_store_handoff_snapshot_carries_the_original_deadlines(tmp_path: Path) -> None:
+    store = ControlStore(tmp_path)
+    store.submit_handoff("req-1", has_active_attempt=True)
+
+    snapshot = store.handoff_snapshot()
+
+    assert snapshot is not None
+    assert snapshot["accepted_at"] == "2026-09-22T00:00:00Z" or snapshot["accepted_at"]
+    accepted = snapshot["accepted_at"]
+    assert snapshot["model_deadline_at"] != accepted
+    assert snapshot["publication_deadline_at"] != accepted
+    # 240 seconds of model work, then 120 seconds of publication: 360 total.
+    from datetime import datetime
+
+    def parse(value: str) -> datetime:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+
+    assert (parse(snapshot["model_deadline_at"]) - parse(accepted)).total_seconds() == 240
+    assert (parse(snapshot["publication_deadline_at"]) - parse(accepted)).total_seconds() == 360
 
 
 def test_store_rejects_handoff_without_an_active_attempt(tmp_path: Path) -> None:
@@ -864,3 +1289,32 @@ def test_format_status_renders_a_tracked_handoff() -> None:
 
     assert "req-1" in text
     assert "model_work" in text
+
+
+def test_format_status_renders_the_original_handoff_deadlines() -> None:
+    text = format_status(
+        {
+            "repository": "octo/example",
+            "intake": "stopping",
+            "active_attempt": None,
+            "pending_command": None,
+            "stop_plan": None,
+            "pending_next_issue": None,
+            "recovery": None,
+            "handoff": {
+                "request_id": "req-1",
+                "accepted_at": "2026-09-22T12:00:00Z",
+                "begun": True,
+                "phase": "model_work",
+                "acknowledgement": "accepted",
+                "detail": "handoff requested",
+                "model_deadline_at": "2026-09-22T12:04:00Z",
+                "publication_deadline_at": "2026-09-22T12:06:00Z",
+            },
+            "commands": {},
+        }
+    )
+
+    assert "2026-09-22T12:00:00Z" in text
+    assert "2026-09-22T12:04:00Z" in text
+    assert "2026-09-22T12:06:00Z" in text

@@ -134,6 +134,29 @@ def test_verifies_a_pull_request_created_before_an_ambiguous_response(tmp_path: 
     assert len(github.created) == 1
 
 
+def test_per_call_timeout_overrides_the_configured_publish_timeout(tmp_path: Path) -> None:
+    remote, _ = repository_with_main(tmp_path)
+    workspace = GitWorkspace(tmp_path / "clone", str(remote), token_provider=lambda: "token")
+    prepared = workspace.prepare_attempt(base_branch="main", issue_number=23)
+    write_and_commit(tmp_path / "clone", "partial.txt", "partial", "Partial work")
+    github = FakeGitHub()
+
+    result = Publisher(
+        workspace,
+        github,
+        "octo/example",
+        publish_timeout=120,
+        monotonic=lambda: 50.0,
+    ).publish(
+        request(CompletionDecision(AttemptOutcome.INCOMPLETE, False, PublicationPath.PARTIAL, ("check failed",)), prepared.branch),
+        timeout=0,
+    )
+
+    assert result.outcome is AttemptOutcome.INCOMPLETE
+    assert "PUBLISH_TIMEOUT exceeded" in result.details
+    assert not git(tmp_path / "clone", "ls-remote", "origin", "refs/heads/agent/issue-23")
+
+
 def test_enforces_the_shared_publish_timeout_across_pull_request_work(tmp_path: Path) -> None:
     remote, _ = repository_with_main(tmp_path)
     workspace = GitWorkspace(tmp_path / "clone", str(remote), token_provider=lambda: "token")

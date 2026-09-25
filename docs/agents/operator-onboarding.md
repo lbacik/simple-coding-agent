@@ -228,6 +228,24 @@ it with the repair instruction — but no `recovery` subcommand can clear it:
 inspect the working tree and repair or remove the unexplained changes
 manually.
 
+### Operator-requested handoff finalization
+
+`agentctl handoff now` asks the active attempt to hand off to you with a
+published `operator_request` note. The accepted command keeps its original
+deadlines across restarts: the model has 240 seconds from acceptance to begin
+the handoff skill, publication has 120 seconds after the valid local handoff,
+and the whole command has 360 seconds from acceptance — `status` shows all
+three in the `handoff_deadlines` line. Completion waits for publication,
+release, and cleanup; anything short of that (including a missing invocation,
+an invalid note, or an expired deadline) publishes the actual attempt outcome
+and marks the command `not fulfilled` with its reason.
+
+A failed handoff holds like a retained attempt above: the branch, checkpoint,
+and working tree stay preserved, later claims stay blocked, and `recovery
+retry` (replays only unconfirmed safe steps, never the model) or `recovery
+release --saved-at` (after you secured the work) clears it without duplicate
+remote effects.
+
 ## Persisted error-guard recovery
 
 The agent tracks consecutive `infrastructure_error` outcomes in

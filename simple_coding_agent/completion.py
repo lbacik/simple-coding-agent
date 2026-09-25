@@ -202,6 +202,24 @@ class CompletionEvaluator:
                 publication_path=PublicationPath.PARTIAL,
                 reasons=("Handoff was requested with committed progress to preserve.",),
             )
+        if model_status is ModelExecutionStatus.OPERATOR_HANDOFF_EXPIRED:
+            if commit_count <= 0:
+                return _decision(
+                    AttemptOutcome.NO_CHANGES,
+                    "Operator handoff reached its model deadline without any commits"
+                    " on the branch.",
+                    commit_count,
+                )
+            return CompletionDecision(
+                outcome=AttemptOutcome.INCOMPLETE,
+                publication_eligible=False,
+                publication_path=PublicationPath.PARTIAL,
+                reasons=(
+                    "Operator handoff reached its model deadline without the model"
+                    " invoking the handoff skill; preserved work is reported with"
+                    " its ordinary outcome.",
+                ),
+            )
         if model_status is None:
             return _decision(
                 AttemptOutcome.INCOMPLETE, "Model execution was not observed.", commit_count

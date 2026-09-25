@@ -27,6 +27,8 @@ from simple_coding_agent.control import (
     CommandRecord,
     ControlStore,
     ControlStoreError,
+    HANDOFF_ABSOLUTE_DEADLINE_SECONDS,
+    HANDOFF_PUBLICATION_ALLOWANCE_SECONDS,
     IntakeState,
     NextIssueRejectedError,
     RecoveryHold,
@@ -350,6 +352,12 @@ class ModelAttemptRunner:
                 claim, profile, archive, continuation=continuation, deferred=False
             )
             if isinstance(early, AttemptEvidence):
+                # Setup (or the mandatory baseline) failed before model
+                # execution: a pending operator handoff can never be served,
+                # so it is settled here with the ordinary outcome and its
+                # reason instead of leaking as still-accepted.
+                served, late = self._read_operator_request()
+                self._settle_operator_request(claim, served, late, early.decision)
                 return early
             preparation = early
 
@@ -664,11 +672,13 @@ class ModelAttemptRunner:
         )
         if late_snapshot is not None:
             request_id = late_snapshot.get("request_id", "unknown")
+            cause = f"the attempt finalized with the ordinary outcome {outcome_name}"
+            if decision.reasons:
+                cause += f": {decision.reasons[0]}"
             control.fail(
                 request_id,
                 f"Operator handoff {request_id} was not delivered to model"
-                f" execution, so it is not fulfilled; the attempt finalized"
-                f" with the ordinary outcome {outcome_name}.",
+                f" execution, so it is not fulfilled; {cause}.",
             )
             return
         if served_request_id is None:
@@ -823,6 +833,7 @@ class AgentLifecycle:
         completion_store: AttemptCompletionStore | None = None,
         control_store: ControlStore | None = None,
         repository: str = "",
+        clock: Callable[[], datetime] | None = None,
     ) -> None:
         self._tracker = tracker
         self._attempt_state = attempt_state
@@ -839,6 +850,10 @@ class AgentLifecycle:
         self._completion_store = completion_store
         self._control_store = control_store
         self._repository = repository
+        # Wall clock for operator-handoff deadline checks (acceptance + 240s
+        # model work, + 120s publication, 360s absolute). Injected in tests;
+        # the control store's own commit clock stamps the acceptance itself.
+        self._clock = clock or (lambda: datetime.now(UTC))
         # The claim boundary and command acceptance share this lock: either
         # a stop commits first and no claim begins, or a claim begins first
         # and the stop applies to the resulting active attempt.
@@ -1440,6 +1455,7 @@ class AgentLifecycle:
             )
             self._resolve_pending_handoff(
                 issue_number=claim.issue.number,
+                attempt_id=attempt_id,
                 outcome=outcome,
                 prepared=prepared,
             )
@@ -1575,6 +1591,7 @@ class AgentLifecycle:
             )
             self._resolve_pending_handoff(
                 issue_number=claim.issue.number,
+                attempt_id=attempt_id,
                 outcome=actual_outcome,
                 prepared=prepared,
             )
@@ -1658,10 +1675,13 @@ class AgentLifecycle:
                         self._workspace.working_directory, claim.issue.number
                     )
                     return (decision, details, commits[0].revision, has_commits)
+                # An invalid recovered note is ordinary incomplete work, not
+                # an infrastructure failure: the preserved commits still
+                # publish on the partial path with the validation reason.
                 decision = CompletionDecision(
-                    AttemptOutcome.INFRASTRUCTURE_ERROR,
+                    AttemptOutcome.INCOMPLETE,
                     False,
-                    PublicationPath.NONE,
+                    PublicationPath.PARTIAL,
                     (validation.reason,),
                 )
                 return (decision, validation.reason, None, has_commits)
@@ -2054,6 +2074,7 @@ class AgentLifecycle:
         outcome = AttemptOutcome.INFRASTRUCTURE_ERROR
         retain_branch = False
         comment_posted = True
+        publication_started_at: datetime | None = None
         try:
             # Bootstrap only checks out the default base so the profile can be
             # read. It must never touch the attempt branch: rebasing here onto
@@ -2092,14 +2113,17 @@ class AgentLifecycle:
             )
             if self._attempt_runner is None:
                 outcome = AttemptOutcome.INFRASTRUCTURE_ERROR
+                publication_started_at = self._clock()
                 published = self._publish_terminal(
-                    claim, checkpoint.started_at, prepared, profile, outcome
+                    claim, checkpoint.started_at, prepared, profile, outcome,
+                    timeout=self._handoff_publish_budget(),
                 )
                 comment_posted = getattr(published, "comment_posted", True)
             else:
                 self._wire_attempt_runner_handoff()
                 evidence = self._attempt_runner(claim, profile, prepared)
-                published = self._publisher.publish(
+                publication_started_at = self._clock()
+                published = self._publish_bounded(
                     PublicationRequest(
                         issue_number=claim.issue.number,
                         issue_title=claim.issue.title,
@@ -2153,8 +2177,10 @@ class AgentLifecycle:
         except SystemExit:
             raise
         except RebaseConflictError as error:
+            publication_started_at = self._clock()
             published = self._publish_rebase_conflict(
-                claim, checkpoint.started_at, prepared, profile, error
+                claim, checkpoint.started_at, prepared, profile, error,
+                timeout=self._handoff_publish_budget(),
             )
             outcome = AttemptOutcome.INFRASTRUCTURE_ERROR
             comment_posted = getattr(published, "comment_posted", True)
@@ -2162,8 +2188,10 @@ class AgentLifecycle:
             self._event_log(
                 "attempt_exception", _exception_detail(error), level="ERROR", issue_number=claim.issue.number
             )
+            publication_started_at = self._clock()
             published = self._publish_terminal(
-                claim, checkpoint.started_at, prepared, profile, outcome
+                claim, checkpoint.started_at, prepared, profile, outcome,
+                timeout=self._handoff_publish_budget(),
             )
             comment_posted = getattr(published, "comment_posted", True)
         except BaseException as error:
@@ -2175,8 +2203,10 @@ class AgentLifecycle:
                 "attempt_exception", _exception_detail(error), level="ERROR", issue_number=claim.issue.number
             )
             try:
+                publication_started_at = self._clock()
                 published = self._publish_terminal(
-                    claim, checkpoint.started_at, prepared, profile, outcome
+                    claim, checkpoint.started_at, prepared, profile, outcome,
+                    timeout=self._handoff_publish_budget(),
                 )
                 comment_posted = getattr(published, "comment_posted", True)
             except Exception:
@@ -2189,15 +2219,29 @@ class AgentLifecycle:
             # keeps the checkpoint, branch, and entire working tree —
             # including dirty and untracked work — for recovery or inspection.
             # Cleanup itself never deletes files or branches.
+            # A failed operator handoff holds the same boundary: the result
+            # comment is already published truthfully, but the issue stays
+            # assigned and the checkpoint, branch, and working tree stay
+            # retained for `recovery retry` or `recovery release` instead of
+            # finalizing. The hold is checked before release and again before
+            # the ledger commit, so slow remote steps cannot slip a deadline
+            # past the verdict.
+            hold = comment_posted and self._hold_failed_handoff(
+                issue_number=claim.issue.number,
+                attempt_id=checkpoint.started_at,
+                outcome=outcome,
+                prepared=prepared,
+                publication_started_at=publication_started_at,
+            )
             released = False
             try:
-                if comment_posted:
+                if comment_posted and not hold:
                     self._release(claim, outcome)
                     released = True
             finally:
                 cleanup_ok = prepared is None
                 try:
-                    if prepared is not None:
+                    if prepared is not None and not hold:
                         self._workspace.cleanup(
                             base_branch=profile.base_branch if profile is not None else "main",
                             prepared=prepared,
@@ -2205,7 +2249,19 @@ class AgentLifecycle:
                         )
                         cleanup_ok = True
                 finally:
-                    if comment_posted and released and cleanup_ok:
+                    if comment_posted and released and cleanup_ok and not hold:
+                        # Publication already confirmed (comment posted) before
+                        # release began: only the whole-command budget still
+                        # applies, not the concluded publication window.
+                        hold = self._hold_failed_handoff(
+                            issue_number=claim.issue.number,
+                            attempt_id=checkpoint.started_at,
+                            outcome=outcome,
+                            prepared=prepared,
+                            publication_started_at=publication_started_at,
+                            check_allowance=False,
+                        )
+                    if comment_posted and released and cleanup_ok and not hold:
                         self._commit_finalization(
                             checkpoint, claim.issue.number, getattr(
                                 prepared, "branch", f"agent/issue-{claim.issue.number}"
@@ -2214,13 +2270,17 @@ class AgentLifecycle:
                         )
                         self._resolve_pending_handoff(
                             issue_number=claim.issue.number,
+                            attempt_id=checkpoint.started_at,
                             outcome=outcome,
                             prepared=prepared,
+                            publication_started_at=publication_started_at,
+                            check_allowance=False,
                         )
                     else:
                         self._event_log(
                             "attempt_finalization_held",
-                            "Publication, release, or cleanup is unconfirmed; the branch, "
+                            "Publication, release, or cleanup is unconfirmed, or a failed"
+                            " operator handoff owns this attempt; the branch, "
                             "checkpoint, and working tree are preserved for recovery.",
                             level="WARNING",
                             issue_number=claim.issue.number,
@@ -2450,27 +2510,144 @@ class AgentLifecycle:
             return
         setter(_ControlOperatorHandoff(self._control_store, self._event_log))
 
-    def _resolve_pending_handoff(
-        self,
-        *,
-        issue_number: int,
-        outcome: AttemptOutcome,
-        prepared: object | None,
-    ) -> None:
-        """Complete or fail the pending operator handoff after finalization.
+    def _handoff_publish_budget(self) -> float | None:
+        """Bound one publication call by the pending handoff's remaining budget.
 
-        A handoff completes only when the attempt outcome is a published
-        handoff, the model began its skill, and the committed note is a
-        valid ``operator_request`` note; everything else is marked ``not
-        fulfilled`` with its reason. Both close intake to ``stopped`` while
-        the branch, checkpoint, and working tree stay retained for recovery.
-        Already-terminal commands are returned untouched, so crash replays
-        and recovery retries resolve at most once.
+        Returns ``min(120, 360 - elapsed-since-acceptance)`` seconds, clamped
+        at zero, while an operator handoff is accepted; otherwise None, keeping
+        the publisher's configured timeout. The budget is anchored at the
+        original acceptance stored in control, so a restart never renews it.
         """
 
         store = self._control_store
         if store is None:
-            return
+            return None
+        try:
+            snapshot = store.handoff_snapshot()
+        except (ControlStoreError, RuntimeError, OSError):
+            return None
+        if snapshot is None or snapshot.get("acknowledgement") != "accepted":
+            return None
+        accepted_at = _parse_operator_accepted_at(snapshot.get("accepted_at"))
+        if accepted_at is None:
+            return None
+        remaining = HANDOFF_ABSOLUTE_DEADLINE_SECONDS - (
+            self._clock() - accepted_at
+        ).total_seconds()
+        return max(0.0, min(float(HANDOFF_PUBLICATION_ALLOWANCE_SECONDS), remaining))
+
+    def _publish_bounded(self, request: PublicationRequest):
+        """Publish, bounding the call by the pending handoff's remaining budget."""
+
+        budget = self._handoff_publish_budget()
+        if budget is None:
+            return self._publisher.publish(request)
+        return self._publisher.publish(request, timeout=budget)
+
+    def _handoff_completion_cause(
+        self,
+        snapshot: dict,
+        *,
+        issue_number: int,
+        outcome: AttemptOutcome,
+        prepared: object | None,
+        publication_started_at: datetime | None = None,
+        check_allowance: bool = True,
+    ) -> str | None:
+        """Decide whether an accepted handoff can complete; None means it can.
+
+        The handoff completes only when the attempt outcome is a published
+        handoff, the model began its skill, the committed note is a valid
+        ``operator_request`` note, publication confirmed within 120 seconds
+        after the valid local handoff, and the whole command finished within
+        360 seconds of its original acceptance. Otherwise returns the
+        ``not fulfilled`` cause. ``check_allowance`` is False only for the
+        pre-commit recheck after a confirmed publication: the 120-second
+        window already concluded when the result comment posted, so only the
+        360-second whole-command budget still applies.
+        """
+
+        note_valid, note_why = self._check_operator_note(issue_number, prepared)
+        if outcome is not AttemptOutcome.HANDOFF:
+            return f"the attempt finalized with the ordinary outcome {outcome.value}"
+        if snapshot.get("begun") is not True:
+            return "model execution never began the handoff skill"
+        if not note_valid:
+            return f"the committed handoff note is not a valid operator note ({note_why})"
+        now = self._clock()
+        accepted_at = _parse_operator_accepted_at(snapshot.get("accepted_at"))
+        if accepted_at is None:
+            return (
+                "the original acceptance time is unavailable, so the"
+                " 360-second budget cannot be verified"
+            )
+        if (now - accepted_at).total_seconds() > HANDOFF_ABSOLUTE_DEADLINE_SECONDS:
+            return (
+                "the 360-second budget from acceptance elapsed before"
+                " publication, release, and cleanup finished"
+                f" (accepted {snapshot.get('accepted_at')})"
+            )
+        if (
+            check_allowance
+            and publication_started_at is not None
+            and (now - publication_started_at).total_seconds()
+            > HANDOFF_PUBLICATION_ALLOWANCE_SECONDS
+        ):
+            return (
+                "publication was not confirmed within 120 seconds after"
+                " the valid local handoff"
+            )
+        return None
+
+    def _handoff_owned_by_attempt(self, attempt_id: str) -> bool:
+        """Whether the tracked handoff failure was recorded for this attempt.
+
+        The hold records its retaining attempt ID in the ``not fulfilled``
+        reason, so a crash replay can tell a hold it must preserve from a
+        stale failure owned by an earlier attempt (which finalizes normally).
+        The match is anchored on the full ``of attempt <id>.`` clause the
+        hold writes, not a bare substring.
+        """
+
+        store = self._control_store
+        if store is None or not attempt_id:
+            return False
+        try:
+            snapshot = store.handoff_snapshot()
+        except (ControlStoreError, RuntimeError, OSError):
+            return False
+        if snapshot is None or snapshot.get("acknowledgement") != "not fulfilled":
+            return False
+        detail = snapshot.get("detail")
+        return isinstance(detail, str) and f"of attempt {attempt_id}." in detail
+
+    def _hold_failed_handoff(
+        self,
+        *,
+        issue_number: int,
+        attempt_id: str,
+        outcome: AttemptOutcome,
+        prepared: object | None,
+        publication_started_at: datetime | None = None,
+        check_allowance: bool = True,
+    ) -> bool:
+        """Fail the owned handoff when it cannot complete; report the hold.
+
+        Returns True when this attempt owns a handoff that is terminally ``not
+        fulfilled``: the caller must skip the issue release, workspace cleanup,
+        and ledger finalization so the branch, checkpoint, and working tree
+        stay retained for operator recovery. An accepted handoff that cannot
+        complete (wrong outcome, unbegun, invalid note, or blown deadline) is
+        marked ``not fulfilled`` here with its reason and the retaining
+        attempt ID. Anything else — no handoff, a completable handoff, a
+        completed one, or a failure owned by another attempt — returns False.
+        ``check_allowance`` is False only for the pre-commit recheck after a
+        confirmed publication (see ``_handoff_completion_cause``).
+        """
+
+        store = self._control_store
+        if store is None:
+            return False
         try:
             snapshot = store.handoff_snapshot()
         except (ControlStoreError, RuntimeError, OSError) as error:
@@ -2480,18 +2657,102 @@ class AgentLifecycle:
                 level="ERROR",
                 issue_number=issue_number,
             )
-            return
-        if snapshot is None or snapshot.get("acknowledgement") != "accepted":
-            return
+            return False
+        if snapshot is None:
+            return False
+        acknowledgement = snapshot.get("acknowledgement")
+        if acknowledgement == "completed":
+            return False
         request_id = snapshot.get("request_id")
         if not isinstance(request_id, str) or not request_id:
-            return
-        note_valid, note_why = self._check_operator_note(issue_number, prepared)
-        if (
-            outcome is AttemptOutcome.HANDOFF
-            and snapshot.get("begun") is True
-            and note_valid
-        ):
+            return False
+        if acknowledgement != "accepted":
+            if acknowledgement != "not fulfilled":
+                return False
+            return self._handoff_owned_by_attempt(attempt_id)
+        cause = self._handoff_completion_cause(
+            snapshot,
+            issue_number=issue_number,
+            outcome=outcome,
+            prepared=prepared,
+            publication_started_at=publication_started_at,
+            check_allowance=check_allowance,
+        )
+        if cause is None:
+            return False
+        store.fail_handoff(
+            request_id,
+            f"Operator handoff {request_id} is not fulfilled: {cause}; the"
+            " branch, checkpoint, and working tree are retained for recovery"
+            f" of attempt {attempt_id}.",
+        )
+        self._event_log(
+            "operator_handoff_not_fulfilled",
+            f"request={request_id}; {cause}",
+            level="WARNING",
+            issue_number=issue_number,
+        )
+        return True
+
+    def _resolve_pending_handoff(
+        self,
+        *,
+        issue_number: int,
+        outcome: AttemptOutcome,
+        prepared: object | None,
+        attempt_id: str | None = None,
+        publication_started_at: datetime | None = None,
+        check_allowance: bool = True,
+    ) -> bool | None:
+        """Complete or fail the pending operator handoff after finalization.
+
+        Returns True when the handoff completed, False when it is (or already
+        was) terminally ``not fulfilled``, and None when no handoff owns this
+        attempt. A handoff completes only when the attempt outcome is a
+        published handoff, the model began its skill, the committed note is a
+        valid ``operator_request`` note, publication confirmed within 120
+        seconds after the valid local handoff, and the whole command finished
+        within 360 seconds of its original acceptance. Anything else is marked
+        ``not fulfilled`` with its reason; the caller then retains the branch,
+        checkpoint, and working tree for operator recovery instead of
+        finalizing. Already-terminal commands are returned untouched, so crash
+        replays and recovery retries resolve at most once. Callers after a
+        confirmed publication pass ``check_allowance=False`` (see
+        ``_handoff_completion_cause``).
+        """
+
+        store = self._control_store
+        if store is None:
+            return None
+        try:
+            snapshot = store.handoff_snapshot()
+        except (ControlStoreError, RuntimeError, OSError) as error:
+            self._event_log(
+                "operator_handoff_resolution_unavailable",
+                f"{_exception_detail(error)} The pending handoff keeps waiting;",
+                level="ERROR",
+                issue_number=issue_number,
+            )
+            return None
+        if snapshot is None:
+            return None
+        acknowledgement = snapshot.get("acknowledgement")
+        if acknowledgement == "completed":
+            return True
+        if acknowledgement != "accepted":
+            return False if acknowledgement == "not fulfilled" else None
+        request_id = snapshot.get("request_id")
+        if not isinstance(request_id, str) or not request_id:
+            return None
+        cause = self._handoff_completion_cause(
+            snapshot,
+            issue_number=issue_number,
+            outcome=outcome,
+            prepared=prepared,
+            publication_started_at=publication_started_at,
+            check_allowance=check_allowance,
+        )
+        if cause is None:
             store.complete_handoff(
                 request_id,
                 f"operator handoff fulfilled for issue #{issue_number}: a valid"
@@ -2504,17 +2765,13 @@ class AgentLifecycle:
                 level="INFO",
                 issue_number=issue_number,
             )
-            return
-        if outcome is not AttemptOutcome.HANDOFF:
-            cause = f"the attempt finalized with the ordinary outcome {outcome.value}"
-        elif snapshot.get("begun") is not True:
-            cause = "model execution never began the handoff skill"
-        else:
-            cause = f"the committed handoff note is not a valid operator note ({note_why})"
+            return True
+        hold_suffix = f" of attempt {attempt_id}" if attempt_id else ""
         store.fail_handoff(
             request_id,
             f"Operator handoff {request_id} is not fulfilled: {cause}; the"
-            " branch, checkpoint, and working tree are retained for recovery.",
+            " branch, checkpoint, and working tree are retained for recovery"
+            f"{hold_suffix}.",
         )
         self._event_log(
             "operator_handoff_not_fulfilled",
@@ -2522,6 +2779,7 @@ class AgentLifecycle:
             level="WARNING",
             issue_number=issue_number,
         )
+        return False
 
     def _check_operator_note(
         self, issue_number: int, prepared: object | None
@@ -2720,11 +2978,27 @@ class AgentLifecycle:
                     # The previous process recorded every boundary but may
                     # have crashed before resolving the handoff it waited
                     # for; without a prepared tree prior validation stands.
-                    self._resolve_pending_handoff(
+                    handoff_failed = self._resolve_pending_handoff(
                         issue_number=checkpoint.issue_number,
+                        attempt_id=checkpoint.started_at,
                         outcome=terminal.outcome,
                         prepared=None,
                     )
+                    if handoff_failed is False and self._handoff_owned_by_attempt(
+                        checkpoint.started_at
+                    ):
+                        # The handoff failed for this attempt: keep the
+                        # leftover checkpoint for operator recovery instead
+                        # of deleting the last handle on the retained work.
+                        self._event_log(
+                            "attempt_finalization_held",
+                            "A failed operator handoff owns this attempt; the branch, "
+                            "checkpoint, and working tree are preserved for recovery.",
+                            level="WARNING",
+                            issue_number=checkpoint.issue_number,
+                        )
+                        self._active_issue_number = None
+                        return None
             self._attempt_state.delete()
             self._active_issue_number = None
             return None
@@ -2747,6 +3021,7 @@ class AgentLifecycle:
         comment_posted = True
         retain_branch = False
         has_commits = False
+        publication_started_at: datetime | None = None
         try:
             self._workspace.prepare_for_profile_read()
             profile = self._profile_loader(self._workspace.working_directory)
@@ -2802,8 +3077,12 @@ class AgentLifecycle:
                             ("Recovered a previously committed handoff note for publication.",),
                         )
                     else:
+                        # An invalid recovered note is ordinary incomplete
+                        # work, not an infrastructure failure: the preserved
+                        # commits still publish on the partial path with the
+                        # validation reason attached.
                         decision = CompletionDecision(
-                            AttemptOutcome.INFRASTRUCTURE_ERROR, False, PublicationPath.NONE,
+                            AttemptOutcome.INCOMPLETE, False, PublicationPath.PARTIAL,
                             (validation.reason,),
                         )
                 else:
@@ -2818,7 +3097,8 @@ class AgentLifecycle:
             if decision.outcome is AttemptOutcome.HANDOFF:
                 details = _read_handoff_note(self._workspace.working_directory, claim.issue.number)
                 note_commit_sha = recovered_commits[0].revision
-            published = self._publisher.publish(
+            publication_started_at = self._clock()
+            published = self._publish_bounded(
                 PublicationRequest(
                     issue_number=claim.issue.number,
                     issue_title=claim.issue.title,
@@ -2876,8 +3156,10 @@ class AgentLifecycle:
         except SystemExit:
             raise
         except RebaseConflictError as error:
+            publication_started_at = self._clock()
             published = self._publish_rebase_conflict(
-                claim, checkpoint.started_at, prepared, profile, error
+                claim, checkpoint.started_at, prepared, profile, error,
+                timeout=self._handoff_publish_budget(),
             )
             outcome = AttemptOutcome.INFRASTRUCTURE_ERROR
             comment_posted = getattr(published, "comment_posted", True)
@@ -2885,8 +3167,10 @@ class AgentLifecycle:
             self._event_log(
                 "attempt_exception", _exception_detail(error), level="ERROR", issue_number=claim.issue.number
             )
+            publication_started_at = self._clock()
             published = self._publish_terminal(
-                claim, checkpoint.started_at, prepared, profile, AttemptOutcome.INFRASTRUCTURE_ERROR
+                claim, checkpoint.started_at, prepared, profile, AttemptOutcome.INFRASTRUCTURE_ERROR,
+                timeout=self._handoff_publish_budget(),
             )
             outcome = AttemptOutcome.INFRASTRUCTURE_ERROR
             comment_posted = getattr(published, "comment_posted", True)
@@ -2895,8 +3179,10 @@ class AgentLifecycle:
                 "attempt_exception", _exception_detail(error), level="ERROR", issue_number=claim.issue.number
             )
             try:
+                publication_started_at = self._clock()
                 published = self._publish_terminal(
-                    claim, checkpoint.started_at, prepared, profile, AttemptOutcome.INFRASTRUCTURE_ERROR
+                    claim, checkpoint.started_at, prepared, profile, AttemptOutcome.INFRASTRUCTURE_ERROR,
+                    timeout=self._handoff_publish_budget(),
                 )
                 comment_posted = getattr(published, "comment_posted", True)
             except Exception:
@@ -2908,15 +3194,27 @@ class AgentLifecycle:
             # run_once): only a confirmed comment plus a completed release
             # plus durable cleanup may record the attempt and remove its
             # checkpoint. Anything else preserves everything for recovery.
+            # A failed operator handoff holds the same boundary: the result
+            # comment is already published truthfully, but the issue stays
+            # assigned and the checkpoint, branch, and working tree stay
+            # retained for `recovery retry` or `recovery release` instead of
+            # finalizing, across restarts with the original deadlines.
+            hold = comment_posted and self._hold_failed_handoff(
+                issue_number=claim.issue.number,
+                attempt_id=checkpoint.started_at,
+                outcome=outcome,
+                prepared=prepared,
+                publication_started_at=publication_started_at,
+            )
             released = False
             try:
-                if comment_posted:
+                if comment_posted and not hold:
                     self._release(claim, outcome)
                     released = True
             finally:
                 cleanup_ok = prepared is None
                 try:
-                    if prepared is not None:
+                    if prepared is not None and not hold:
                         self._workspace.cleanup(
                             base_branch=profile.base_branch if profile is not None else "main",
                             prepared=prepared,
@@ -2924,7 +3222,19 @@ class AgentLifecycle:
                         )
                         cleanup_ok = True
                 finally:
-                    if comment_posted and released and cleanup_ok:
+                    if comment_posted and released and cleanup_ok and not hold:
+                        # Publication already confirmed (comment posted) before
+                        # release began: only the whole-command budget still
+                        # applies, not the concluded publication window.
+                        hold = self._hold_failed_handoff(
+                            issue_number=claim.issue.number,
+                            attempt_id=checkpoint.started_at,
+                            outcome=outcome,
+                            prepared=prepared,
+                            publication_started_at=publication_started_at,
+                            check_allowance=False,
+                        )
+                    if comment_posted and released and cleanup_ok and not hold:
                         self._commit_finalization(
                             checkpoint, claim.issue.number, getattr(
                                 prepared, "branch", checkpoint.branch
@@ -2933,13 +3243,17 @@ class AgentLifecycle:
                         )
                         self._resolve_pending_handoff(
                             issue_number=claim.issue.number,
+                            attempt_id=checkpoint.started_at,
                             outcome=outcome,
                             prepared=prepared,
+                            publication_started_at=publication_started_at,
+                            check_allowance=False,
                         )
                     else:
                         self._event_log(
                             "attempt_finalization_held",
-                            "Publication, release, or cleanup is unconfirmed; the branch, "
+                            "Publication, release, or cleanup is unconfirmed, or a failed"
+                            " operator handoff owns this attempt; the branch, "
                             "checkpoint, and working tree are preserved for recovery.",
                             level="WARNING",
                             issue_number=claim.issue.number,
@@ -2966,24 +3280,26 @@ class AgentLifecycle:
         profile: RepositoryProfile | None,
         outcome: AttemptOutcome,
         details: str = "Repository profile could not be loaded or the attempt could not start.",
+        timeout: float | None = None,
     ):
         branch = getattr(prepared, "branch", f"agent/issue-{claim.issue.number}")
         base_branch = profile.base_branch if profile is not None else "main"
-        return self._publisher.publish(
-            PublicationRequest(
-                issue_number=claim.issue.number,
-                issue_title=claim.issue.title,
-                branch=branch,
-                started_at=started_at,
-                decision=CompletionDecision(outcome, False, PublicationPath.NONE, (details,)),
-                check_command="not run",
-                check_exit_code=None,
-                review_cycles=0,
-                review_findings="not run",
-                details=details,
-                base_branch=base_branch,
-            )
+        request = PublicationRequest(
+            issue_number=claim.issue.number,
+            issue_title=claim.issue.title,
+            branch=branch,
+            started_at=started_at,
+            decision=CompletionDecision(outcome, False, PublicationPath.NONE, (details,)),
+            check_command="not run",
+            check_exit_code=None,
+            review_cycles=0,
+            review_findings="not run",
+            details=details,
+            base_branch=base_branch,
         )
+        if timeout is None:
+            return self._publisher.publish(request)
+        return self._publisher.publish(request, timeout=timeout)
 
     def _publish_rebase_conflict(
         self,
@@ -2992,6 +3308,7 @@ class AgentLifecycle:
         prepared: object | None,
         profile: RepositoryProfile | None,
         error: RebaseConflictError,
+        timeout: float | None = None,
     ):
         """Report an aborted rebase conflict as the terminal infrastructure error.
 
@@ -3018,6 +3335,7 @@ class AgentLifecycle:
                 "Setup was not started so the failure is reported here "
                 "instead of as an unrelated setup error."
             ),
+            timeout=timeout,
         )
 
     def _record_terminal_outcome(
