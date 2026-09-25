@@ -81,6 +81,15 @@ class NextIssueRejectedError(ValueError):
     """
 
 
+class HandoffRejectedError(ValueError):
+    """Raised when ``handoff now`` is rejected without a control change.
+
+    Without an active attempt there is nothing to hand off, and once the
+    model has begun the handoff skill a second request cannot undo it;
+    neither case alters the intake state or an existing plan.
+    """
+
+
 @dataclass(frozen=True)
 class CommandRecord:
     """One durably recorded operator command."""
@@ -120,6 +129,7 @@ _STOP_KIND = "stop"
 _STOP_AFTER_KIND = "stop_after"
 _RESUME_KIND = "resume"
 _NEXT_ISSUE_KIND = "next_issue"
+_HANDOFF_KIND = "handoff"
 _RECOVERY_RETRY_KIND = "recovery_retry"
 _RECOVERY_RELEASE_KIND = "recovery_release"
 # Stop-plan kinds a newer ``resume`` (or a newer stop plan) replaces. Later
@@ -254,30 +264,70 @@ class ControlStore:
                                 "; stop plan " + ", ".join(superseded_after) + " superseded"
                             )
                             self._clear_stop_plan_locked(connection)
+                        if (
+                            pending is not None
+                            and self._is_tracked_handoff_locked(connection, pending)
+                            and not self._handoff_begun_locked(connection)
+                        ):
+                            # A not-yet-begun handoff owns the wait: the plain
+                            # stop replaces it and takes over the wait.
+                            superseded_handoff = self._supersede_plans_locked(
+                                connection, (_HANDOFF_KIND,), request_id
+                            )
+                            if superseded_handoff:
+                                pending = request_id
+                                detail += (
+                                    "; stop plan "
+                                    + ", ".join(superseded_handoff)
+                                    + " superseded"
+                                )
+                                self._set_handoff_locked(
+                                    connection, None, None, begun=False, phase=None
+                                )
                     elif has_active_attempt:
                         acknowledgement = CommandAcknowledgement.ACCEPTED
                         detail = "finish active attempt, then stop intake"
+                        supersede_kinds: tuple[str, ...] = (_STOP_AFTER_KIND,)
+                        if not self._handoff_begun_locked(connection):
+                            # A begun handoff already owns the model and cannot
+                            # be replaced; this branch only runs while intake
+                            # is running, where that cannot happen, but the
+                            # guard keeps the replacement fail-closed.
+                            supersede_kinds = (_STOP_AFTER_KIND, _HANDOFF_KIND)
                         superseded_after = self._supersede_plans_locked(
-                            connection, (_STOP_AFTER_KIND,), request_id
+                            connection,
+                            supersede_kinds,
+                            request_id,
                         )
                         if superseded_after:
                             detail += (
                                 "; stop plan " + ", ".join(superseded_after) + " superseded"
                             )
                             self._clear_stop_plan_locked(connection)
+                            self._set_handoff_locked(
+                                connection, None, None, begun=False, phase=None
+                            )
                         intake = IntakeState.STOPPING
                         pending = request_id
                     else:
                         acknowledgement = CommandAcknowledgement.COMPLETED
                         detail = "intake stopped"
+                        supersede_kinds = (_STOP_AFTER_KIND,)
+                        if not self._handoff_begun_locked(connection):
+                            supersede_kinds = (_STOP_AFTER_KIND, _HANDOFF_KIND)
                         superseded_after = self._supersede_plans_locked(
-                            connection, (_STOP_AFTER_KIND,), request_id
+                            connection,
+                            supersede_kinds,
+                            request_id,
                         )
                         if superseded_after:
                             detail += (
                                 "; stop plan " + ", ".join(superseded_after) + " superseded"
                             )
                             self._clear_stop_plan_locked(connection)
+                            self._set_handoff_locked(
+                                connection, None, None, begun=False, phase=None
+                            )
                         intake = IntakeState.STOPPED
                         pending = None
                     record = self._insert_locked(
@@ -330,9 +380,39 @@ class ControlStore:
                     if recovery_hold is not None:
                         connection.execute("ROLLBACK")
                         raise ResumeBlockedError(_describe_hold(recovery_hold))
+                    if self._handoff_begun_locked(connection):
+                        # The model already owns the handoff: a newer resume
+                        # cannot undo it or its publication. Record the resume
+                        # without touching the pending handoff or the intake
+                        # state; it takes effect on later intake once the
+                        # handoff finalizes and stops intake.
+                        pending_handoff = self._pending_locked(connection)
+                        detail = (
+                            "handoff"
+                            f" {pending_handoff} already begun; resume takes effect"
+                            " after handoff finalization, handoff continues"
+                        )
+                        record = self._insert_locked(
+                            connection,
+                            request_id,
+                            _RESUME_KIND,
+                            {},
+                            CommandAcknowledgement.COMPLETED,
+                            detail,
+                        )
+                        connection.execute("COMMIT")
+                        return record
                     intake = self._intake_locked(connection)
                     pending = self._pending_locked(connection)
                     superseded_ids = self._accepted_stop_plans_locked(connection)
+                    superseded_handoff = self._supersede_plans_locked(
+                        connection, (_HANDOFF_KIND,), request_id
+                    )
+                    if superseded_handoff:
+                        self._set_handoff_locked(
+                            connection, None, None, begun=False, phase=None
+                        )
+                    superseded_ids = [*superseded_handoff, *superseded_ids]
                     if (
                         intake is IntakeState.RUNNING
                         and pending is None
@@ -435,9 +515,25 @@ class ControlStore:
                             "stop --after N is rejected while intake is stopped;"
                             " resume first. No control change was accepted."
                         )
+                    if self._handoff_begun_locked(connection):
+                        connection.execute("ROLLBACK")
+                        raise StopAfterRejectedError(
+                            "stop --after N is rejected while a handoff owns the"
+                            " model; the handoff cannot be replaced once begun."
+                            " No control change was accepted."
+                        )
                     superseded_ids = self._supersede_plans_locked(
-                        connection, _STOP_PLAN_KINDS, request_id
+                        connection,
+                        (*_STOP_PLAN_KINDS, _HANDOFF_KIND),
+                        request_id,
                     )
+                    tracked = connection.execute(
+                        "SELECT handoff_request_id FROM control_state WHERE id = 1"
+                    ).fetchone()
+                    if tracked is not None and tracked[0] in superseded_ids:
+                        self._set_handoff_locked(
+                            connection, None, None, begun=False, phase=None
+                        )
                     if has_active_attempt:
                         assert active_attempt_id is not None
                         detail = (
@@ -550,6 +646,295 @@ class ControlStore:
                 raise
             except sqlite3.Error as error:
                 raise ControlStoreError("Control command could not be committed") from error
+
+    def submit_handoff(self, request_id: str, *, has_active_attempt: bool) -> CommandRecord:
+        """Durably record ``handoff now`` against the active attempt.
+
+        Without an active attempt the command is rejected with no control
+        change. With one, it replaces any pending stop plan, enters
+        ``stopping``, and waits for the bounded model handoff and its
+        publication: the request is delivered at the next safe model
+        boundary (or its single fallback) and completes only after the
+        handoff outcome, publication, issue release, and cleanup are
+        durably finished. A second request while a begun handoff owns the
+        model is rejected so the handoff cannot be undone mid-flight.
+        """
+
+        _check_request_id(request_id)
+        with self.lock:
+            try:
+                with self._connect() as connection:
+                    connection.execute("BEGIN IMMEDIATE")
+                    existing = self._find_locked(connection, request_id)
+                    if existing is not None:
+                        self._ensure_payload_identical(
+                            connection, existing, _HANDOFF_KIND, {}
+                        )
+                        connection.execute("ROLLBACK")
+                        return existing
+                    if not has_active_attempt:
+                        connection.execute("ROLLBACK")
+                        raise HandoffRejectedError(
+                            "handoff now is rejected without an active attempt;"
+                            " no control change was accepted."
+                        )
+                    if self._handoff_begun_locked(connection):
+                        connection.execute("ROLLBACK")
+                        raise HandoffRejectedError(
+                            "handoff now is rejected: the model has already begun"
+                            " the handoff skill and a second request cannot undo it."
+                            " No control change was accepted."
+                        )
+                    superseded = self._supersede_plans_locked(
+                        connection,
+                        (_STOP_KIND, _STOP_AFTER_KIND, _HANDOFF_KIND),
+                        request_id,
+                    )
+                    self._clear_stop_plan_locked(connection)
+                    detail = (
+                        "handoff requested; delivers at the next safe model"
+                        " boundary or its single fallback"
+                    )
+                    if superseded:
+                        detail += "; stop plan " + ", ".join(superseded) + " superseded"
+                    record = self._insert_locked(
+                        connection,
+                        request_id,
+                        _HANDOFF_KIND,
+                        {},
+                        CommandAcknowledgement.ACCEPTED,
+                        detail,
+                    )
+                    self._set_intake_locked(connection, IntakeState.STOPPING, request_id)
+                    self._set_handoff_locked(
+                        connection, request_id, self._timestamp(), begun=False, phase="accepted"
+                    )
+                    connection.execute("COMMIT")
+                    return record
+            except (PayloadMismatchError, RequestIdError, HandoffRejectedError):
+                raise
+            except sqlite3.Error as error:
+                raise ControlStoreError("Control command could not be committed") from error
+
+    def mark_handoff_delivering(self, request_id: str) -> bool:
+        """Record that the handoff instruction reached the model.
+
+        Delivery alone does not start the handoff: the command stays
+        replaceable until the model begins the handoff skill. Returns True
+        when the tracked request was updated.
+        """
+
+        with self.lock:
+            try:
+                with self._connect() as connection:
+                    connection.execute("BEGIN IMMEDIATE")
+                    if not self._is_tracked_handoff_locked(connection, request_id):
+                        connection.execute("ROLLBACK")
+                        return False
+                    connection.execute(
+                        "UPDATE control_state SET handoff_phase = ? WHERE id = 1",
+                        ("delivering",),
+                    )
+                    connection.execute("COMMIT")
+                    return True
+            except sqlite3.Error as error:
+                raise ControlStoreError("Control command could not be committed") from error
+
+    def mark_handoff_begun(self, request_id: str) -> bool:
+        """Record that the model began the handoff skill for this request.
+
+        From here a newer stop-plan command can no longer replace the
+        handoff; it controls only subsequent intake. Returns True when the
+        tracked request was updated.
+        """
+
+        with self.lock:
+            try:
+                with self._connect() as connection:
+                    connection.execute("BEGIN IMMEDIATE")
+                    if not self._is_tracked_handoff_locked(connection, request_id):
+                        connection.execute("ROLLBACK")
+                        return False
+                    connection.execute(
+                        "UPDATE control_state SET handoff_begun = 1,"
+                        " handoff_phase = ? WHERE id = 1",
+                        ("model_work",),
+                    )
+                    connection.execute("COMMIT")
+                    return True
+            except sqlite3.Error as error:
+                raise ControlStoreError("Control command could not be committed") from error
+
+    def complete_handoff(self, request_id: str, detail: str) -> CommandRecord | None:
+        """Complete a handoff after its publication, release, and cleanup.
+
+        Intake enters ``stopped`` with no further claim permitted; accepted
+        plain stops waiting alongside the handoff complete on the same
+        boundary. Returns the terminal record, or ``None`` when the request
+        is unknown.
+        """
+
+        if not isinstance(detail, str) or not detail.strip():
+            raise ControlStoreError("A completed handoff must carry a detail")
+        with self.lock:
+            try:
+                with self._connect() as connection:
+                    connection.execute("BEGIN IMMEDIATE")
+                    existing = self._find_locked(connection, request_id)
+                    if existing is None:
+                        connection.execute("ROLLBACK")
+                        return None
+                    if existing.acknowledgement is not CommandAcknowledgement.ACCEPTED:
+                        connection.execute("ROLLBACK")
+                        return existing
+                    timestamp = self._timestamp()
+                    connection.execute(
+                        "UPDATE commands SET acknowledgement = ?, detail = ?,"
+                        " updated_at = ? WHERE request_id = ?",
+                        (
+                            CommandAcknowledgement.COMPLETED.value,
+                            detail.strip(),
+                            timestamp,
+                            request_id,
+                        ),
+                    )
+                    pending = self._pending_locked(connection)
+                    if pending == request_id:
+                        self._set_intake_locked(connection, IntakeState.STOPPED, None)
+                    if existing.kind == _HANDOFF_KIND:
+                        connection.execute(
+                            "UPDATE control_state SET handoff_phase = ? WHERE id = 1",
+                            ("completed",),
+                        )
+                    if pending == request_id:
+                        plain = connection.execute(
+                            "SELECT request_id FROM commands WHERE kind = ?"
+                            " AND acknowledgement = ? ORDER BY sequence",
+                            (_STOP_KIND, CommandAcknowledgement.ACCEPTED.value),
+                        ).fetchall()
+                        if plain:
+                            connection.execute(
+                                "UPDATE commands SET acknowledgement = ?, detail = ?,"
+                                " updated_at = ? WHERE kind = ? AND acknowledgement = ?",
+                                (
+                                    CommandAcknowledgement.COMPLETED.value,
+                                    "intake stopped after handoff attempt",
+                                    timestamp,
+                                    _STOP_KIND,
+                                    CommandAcknowledgement.ACCEPTED.value,
+                                ),
+                            )
+                    row = connection.execute(
+                        "SELECT request_id, sequence, kind, acknowledgement,"
+                        " detail, created_at, updated_at FROM commands"
+                        " WHERE request_id = ?",
+                        (request_id,),
+                    ).fetchone()
+                    connection.execute("COMMIT")
+                    if row is None:  # pragma: no cover - just updated above
+                        raise ControlStoreError("Control command is missing")
+                    return self._record_from_row(row)
+            except sqlite3.Error as error:
+                raise ControlStoreError("Control command could not be committed") from error
+
+    def fail_handoff(self, request_id: str, reason: str) -> CommandRecord | None:
+        """Mark a handoff ``not fulfilled`` with its reason and actual outcome.
+
+        Intake remains stopped and the retained branch, checkpoint, and
+        working tree stay preserved for recovery. Returns the terminal
+        record, or ``None`` when the request is unknown.
+        """
+
+        if not isinstance(reason, str) or not reason.strip():
+            raise ControlStoreError("A not-fulfilled handoff must carry a reason")
+        with self.lock:
+            try:
+                with self._connect() as connection:
+                    connection.execute("BEGIN IMMEDIATE")
+                    existing = self._find_locked(connection, request_id)
+                    if existing is None:
+                        connection.execute("ROLLBACK")
+                        return None
+                    if existing.acknowledgement is not CommandAcknowledgement.ACCEPTED:
+                        connection.execute("ROLLBACK")
+                        return existing
+                    timestamp = self._timestamp()
+                    connection.execute(
+                        "UPDATE commands SET acknowledgement = ?, detail = ?,"
+                        " updated_at = ? WHERE request_id = ?",
+                        (
+                            CommandAcknowledgement.NOT_FULFILLED.value,
+                            reason.strip(),
+                            timestamp,
+                            request_id,
+                        ),
+                    )
+                    pending = self._pending_locked(connection)
+                    if pending == request_id:
+                        self._set_intake_locked(connection, IntakeState.STOPPED, None)
+                    if existing.kind == _HANDOFF_KIND:
+                        connection.execute(
+                            "UPDATE control_state SET handoff_phase = ? WHERE id = 1",
+                            ("not_fulfilled",),
+                        )
+                    if pending == request_id:
+                        plain = connection.execute(
+                            "SELECT request_id FROM commands WHERE kind = ?"
+                            " AND acknowledgement = ? ORDER BY sequence",
+                            (_STOP_KIND, CommandAcknowledgement.ACCEPTED.value),
+                        ).fetchall()
+                        if plain:
+                            connection.execute(
+                                "UPDATE commands SET acknowledgement = ?, detail = ?,"
+                                " updated_at = ? WHERE kind = ? AND acknowledgement = ?",
+                                (
+                                    CommandAcknowledgement.COMPLETED.value,
+                                    "intake stopped after handoff attempt",
+                                    timestamp,
+                                    _STOP_KIND,
+                                    CommandAcknowledgement.ACCEPTED.value,
+                                ),
+                            )
+                    row = connection.execute(
+                        "SELECT request_id, sequence, kind, acknowledgement,"
+                        " detail, created_at, updated_at FROM commands"
+                        " WHERE request_id = ?",
+                        (request_id,),
+                    ).fetchone()
+                    connection.execute("COMMIT")
+                    if row is None:  # pragma: no cover - just updated above
+                        raise ControlStoreError("Control command is missing")
+                    return self._record_from_row(row)
+            except sqlite3.Error as error:
+                raise ControlStoreError("Control command could not be committed") from error
+
+    def handoff_snapshot(self) -> dict | None:
+        """Return the tracked handoff request for status, if any."""
+
+        with self.lock:
+            try:
+                with self._connect() as connection:
+                    row = connection.execute(
+                        "SELECT handoff_request_id, handoff_accepted_at,"
+                        " handoff_begun, handoff_phase FROM control_state"
+                        " WHERE id = 1"
+                    ).fetchone()
+            except sqlite3.Error as error:
+                raise ControlStoreError("Control state could not be read") from error
+        if row is None:  # pragma: no cover - initialized above
+            raise ControlStoreError("Control state is missing")
+        request_id, accepted_at, begun, phase = row
+        if request_id is None:
+            return None
+        record = self.get_command(request_id)
+        return {
+            "request_id": request_id,
+            "accepted_at": accepted_at,
+            "begun": bool(begun),
+            "phase": phase or "accepted",
+            "acknowledgement": record.acknowledgement.value if record is not None else None,
+            "detail": record.detail if record is not None else None,
+        }
 
     def next_issue_snapshot(self) -> dict | None:
         """Return the pending one-shot priority for status, if any."""
@@ -1206,6 +1591,10 @@ class ControlStore:
                     "latest_counted_outcome TEXT NULL",
                     "next_issue_number INTEGER NULL",
                     "next_issue_request_id TEXT NULL",
+                    "handoff_request_id TEXT NULL",
+                    "handoff_accepted_at TEXT NULL",
+                    "handoff_begun INTEGER NULL",
+                    "handoff_phase TEXT NULL",
                 ):
                     column = column_ddl.split(" ", 1)[0]
                     known = {
@@ -1332,6 +1721,61 @@ class ControlStore:
             " stop_after_remaining = NULL, stop_after_active_attempt_id = NULL"
             " WHERE id = 1"
         )
+
+    def _set_handoff_locked(
+        self,
+        connection: sqlite3.Connection,
+        request_id: str | None,
+        accepted_at: str | None,
+        *,
+        begun: bool,
+        phase: str | None,
+    ) -> None:
+        """Track (or clear) the handoff request owning the active attempt."""
+
+        connection.execute(
+            "UPDATE control_state SET handoff_request_id = ?,"
+            " handoff_accepted_at = ?, handoff_begun = ?, handoff_phase = ?"
+            " WHERE id = 1",
+            (request_id, accepted_at, 1 if begun else 0, phase),
+        )
+
+    def _handoff_begun_locked(self, connection: sqlite3.Connection) -> bool:
+        """Whether the tracked handoff already owns the model (not replaceable)."""
+
+        try:
+            row = connection.execute(
+                "SELECT handoff_request_id, handoff_begun FROM control_state WHERE id = 1"
+            ).fetchone()
+        except sqlite3.Error as error:
+            raise ControlStoreError("Control state could not be read") from error
+        if row is None:  # pragma: no cover - initialized above
+            raise ControlStoreError("Control state is missing")
+        request_id, begun = row
+        if request_id is None:
+            return False
+        record = self._find_locked(connection, request_id)
+        if record is None or record.acknowledgement is not CommandAcknowledgement.ACCEPTED:
+            return False
+        return bool(begun)
+
+    def _is_tracked_handoff_locked(
+        self, connection: sqlite3.Connection, request_id: str
+    ) -> bool:
+        """Whether ``request_id`` is the tracked, still-accepted handoff."""
+
+        try:
+            row = connection.execute(
+                "SELECT handoff_request_id FROM control_state WHERE id = 1"
+            ).fetchone()
+        except sqlite3.Error as error:
+            raise ControlStoreError("Control state could not be read") from error
+        if row is None:  # pragma: no cover - initialized above
+            raise ControlStoreError("Control state is missing")
+        if row[0] != request_id:
+            return False
+        record = self._find_locked(connection, request_id)
+        return record is not None and record.acknowledgement is CommandAcknowledgement.ACCEPTED
 
     def _next_issue_locked(
         self, connection: sqlite3.Connection
@@ -1508,6 +1952,7 @@ def build_status(
     next_issue: dict | None = None,
     stop_plan: dict | None = None,
     recovery: dict | None = None,
+    handoff: dict | None = None,
 ) -> dict:
     """Build one consistent live status snapshot.
 
@@ -1519,7 +1964,9 @@ def build_status(
     attempt and outcome). ``recovery`` carries the retained-attempt hold
     (attempt identity, phase, outcome, confirmed publication progress,
     branch/workspace/checkpoint, hold reason, and the next operator action)
-    or ``None`` when no hold blocks intake.
+    or ``None`` when no hold blocks intake. ``handoff`` carries the tracked
+    operator handoff (request ID, acceptance time, skill-begun flag, phase,
+    and acknowledgement) or ``None`` when no handoff owns the attempt.
     """
 
     pending = get_command(pending_command_id) if pending_command_id else None
@@ -1541,5 +1988,6 @@ def build_status(
         "pending_next_issue": dict(next_issue) if next_issue is not None else None,
         "stop_plan": dict(stop_plan) if stop_plan is not None else None,
         "recovery": dict(recovery) if recovery is not None else None,
+        "handoff": dict(handoff) if handoff is not None else None,
         "commands": {record.request_id: command_to_json(record) for record in recent_commands()},
     }

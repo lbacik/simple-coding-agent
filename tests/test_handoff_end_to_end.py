@@ -432,11 +432,11 @@ def test_real_handoff_is_produced_pushed_and_labeled_without_a_pull_request(
 
 
 # --- Scenario 11b: a stray dirty leftover after the note breaks the note-last
-# invariant, so it is preserved locally instead of silently discarded or
-# published as a trustworthy handoff.
+# invariant, so it publishes as ordinary incomplete progress, not as a
+# trustworthy handoff.
 
 
-def test_stray_dirty_leftover_after_the_note_is_preserved_not_published(
+def test_stray_dirty_leftover_after_the_note_publishes_as_ordinary_incomplete(
     tmp_path: Path,
 ) -> None:
     remote, _ = repository_with_main(tmp_path)
@@ -457,9 +457,12 @@ def test_stray_dirty_leftover_after_the_note_is_preserved_not_published(
 
     result = lifecycle.run_once()
 
-    assert result.outcome is AttemptOutcome.INFRASTRUCTURE_ERROR
-    assert not remote_has_branch(remote, "agent/issue-24")
+    assert result.outcome is AttemptOutcome.INCOMPLETE
+    assert remote_has_branch(remote, "agent/issue-24")
     assert github.added_labels == []
+    [comment] = github.comments
+    assert "## Agent Attempt Result: incomplete" in comment.body
+    assert "no committed handoff note is the final commit" in comment.body
     subjects = git(clone_dir, "log", "agent/issue-24", "--format=%s").splitlines()
     assert subjects[:3] == [
         "Preserve uncommitted work before handoff",
@@ -505,10 +508,11 @@ def test_valid_handoff_survives_locally_when_push_retries_are_exhausted(
     assert git(clone_dir, "show", "agent/issue-24:parser.py") == "half done"
 
 
-# --- Scenario 11c: a handoff without a committed note cannot publish --------
+# --- Scenario 11c: a handoff without a committed note publishes as ordinary
+# incomplete progress --------------------------------------------------------
 
 
-def test_handoff_without_a_committed_note_is_not_published(tmp_path: Path) -> None:
+def test_handoff_without_a_committed_note_publishes_as_ordinary_incomplete(tmp_path: Path) -> None:
     remote, _ = repository_with_main(tmp_path)
     github = FakeGitHub(issue(24, body="Rewrite the parser.", labels=frozenset({"ready-for-agent"})))
     clone_dir = tmp_path / "clone"
@@ -521,14 +525,15 @@ def test_handoff_without_a_committed_note_is_not_published(tmp_path: Path) -> No
 
     result = lifecycle.run_once()
 
-    assert result.outcome is AttemptOutcome.INFRASTRUCTURE_ERROR
-    assert not remote_has_branch(remote, "agent/issue-24")
+    assert result.outcome is AttemptOutcome.INCOMPLETE
+    assert remote_has_branch(remote, "agent/issue-24")
     assert github.added_labels == []
     [comment] = github.comments
-    assert "## Agent Attempt Result: infrastructure_error" in comment.body
+    assert "## Agent Attempt Result: incomplete" in comment.body
+    assert "no committed handoff note is the final commit" in comment.body
 
 
-def test_handoff_with_an_uncommitted_note_is_not_published(tmp_path: Path) -> None:
+def test_handoff_with_an_uncommitted_note_publishes_as_ordinary_incomplete(tmp_path: Path) -> None:
     remote, _ = repository_with_main(tmp_path)
     github = FakeGitHub(issue(24, body="Rewrite the parser.", labels=frozenset({"ready-for-agent"})))
     clone_dir = tmp_path / "clone"
@@ -545,16 +550,18 @@ def test_handoff_with_an_uncommitted_note_is_not_published(tmp_path: Path) -> No
 
     result = lifecycle.run_once()
 
-    assert result.outcome is AttemptOutcome.INFRASTRUCTURE_ERROR
-    assert not remote_has_branch(remote, "agent/issue-24")
+    assert result.outcome is AttemptOutcome.INCOMPLETE
+    assert remote_has_branch(remote, "agent/issue-24")
     assert github.added_labels == []
+    [comment] = github.comments
+    assert "## Agent Attempt Result: incomplete" in comment.body
     # The note content still survives locally, as an ordinary preserved commit.
     assert git(clone_dir, "show", "agent/issue-24:.agent/handoff/24.md") == (
         "# Handoff note: issue #24\n\nHalfway done."
     )
 
 
-def test_handoff_note_commit_with_the_expected_subject_but_no_note_file_is_not_published(
+def test_handoff_note_commit_with_the_expected_subject_but_no_note_file_publishes_as_ordinary_incomplete(
     tmp_path: Path,
 ) -> None:
     remote, _ = repository_with_main(tmp_path)
@@ -570,12 +577,15 @@ def test_handoff_note_commit_with_the_expected_subject_but_no_note_file_is_not_p
 
     result = lifecycle.run_once()
 
-    assert result.outcome is AttemptOutcome.INFRASTRUCTURE_ERROR
-    assert not remote_has_branch(remote, "agent/issue-24")
+    assert result.outcome is AttemptOutcome.INCOMPLETE
+    assert remote_has_branch(remote, "agent/issue-24")
     assert github.added_labels == []
+    [comment] = github.comments
+    assert "## Agent Attempt Result: incomplete" in comment.body
+    assert "could not be read from the committed branch state" in comment.body
 
 
-def test_handoff_note_with_stale_last_work_commit_is_not_published(tmp_path: Path) -> None:
+def test_handoff_note_with_stale_last_work_commit_publishes_as_ordinary_incomplete(tmp_path: Path) -> None:
     remote, _ = repository_with_main(tmp_path)
     github = FakeGitHub(issue(24, body="Rewrite the parser.", labels=frozenset({"ready-for-agent"})))
     clone_dir = tmp_path / "clone"
@@ -594,9 +604,12 @@ def test_handoff_note_with_stale_last_work_commit_is_not_published(tmp_path: Pat
 
     result = lifecycle.run_once()
 
-    assert result.outcome is AttemptOutcome.INFRASTRUCTURE_ERROR
-    assert not remote_has_branch(remote, "agent/issue-24")
+    assert result.outcome is AttemptOutcome.INCOMPLETE
+    assert remote_has_branch(remote, "agent/issue-24")
     assert github.added_labels == []
+    [comment] = github.comments
+    assert "## Agent Attempt Result: incomplete" in comment.body
+    assert "last_work_commit" in comment.body
 
 
 def test_handoff_reports_infrastructure_error_when_the_note_commit_fails(tmp_path: Path) -> None:

@@ -33,6 +33,8 @@ class ControlSurface(Protocol):
 
     def submit_resume(self, request_id: str) -> object: ...
 
+    def submit_handoff(self, request_id: str) -> object: ...
+
     def submit_recovery_retry(self, request_id: str, attempt_id: object) -> object: ...
 
     def submit_recovery_release(
@@ -190,6 +192,8 @@ class ControlServer:
             self._reply_next_issue(connection, request)
         elif operation == "resume":
             self._reply_resume(connection, request)
+        elif operation == "handoff":
+            self._reply_handoff(connection, request)
         elif operation == "recovery_retry":
             self._reply_recovery_retry(connection, request)
         elif operation == "recovery_release":
@@ -263,6 +267,21 @@ class ControlServer:
             request,
             self._control.submit_resume,
             rejected=(RequestIdError, PayloadMismatchError, ResumeBlockedError),
+            repository=self._repository(),
+        )
+
+    def _reply_handoff(self, connection: socket.socket, request: dict) -> None:
+        from simple_coding_agent.control import (
+            HandoffRejectedError,
+            PayloadMismatchError,
+            RequestIdError,
+        )
+
+        _reply_mutating(
+            connection,
+            request,
+            self._control.submit_handoff,
+            rejected=(RequestIdError, PayloadMismatchError, HandoffRejectedError),
             repository=self._repository(),
         )
 

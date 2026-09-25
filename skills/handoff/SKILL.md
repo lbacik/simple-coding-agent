@@ -4,7 +4,8 @@ description: "Pause an implementation attempt cooperatively near a resource limi
 ---
 
 Invoke this skill only when instructed to do so (a cost soft-threshold
-notice, or a turn/time limit follow-up prompt). It is the only supported way
+notice, a turn/time limit follow-up prompt, or an operator `handoff now`
+request delivered by the driving process). It is the only supported way
 to end an attempt early while keeping the work usable by a continuation.
 
 The driving process owns remote publication (push, PR, comments, labels).
@@ -28,7 +29,7 @@ other publishing command.
 
    - issue: <issue-number>
    - started_at: <UTC ISO-8601 timestamp, e.g. from `date -u +%Y-%m-%dT%H:%M:%SZ`>
-   - reason: <cost_soft_threshold | cost_hard_limit | turn_limit | time_limit>
+   - reason: <cost_soft_threshold | cost_hard_limit | turn_limit | time_limit | operator_request>
    - last_work_commit: <SHA of the last commit from step 1, or the branch's
      existing HEAD if step 1 committed nothing>
 
@@ -71,3 +72,9 @@ already on the branch beyond its base), still write and commit the note —
 the handoff note itself preserves progress (such as investigation findings
 and implementation plans), and the driving process will publish the branch and note
 for human evaluation.
+
+When the driving process delivered an operator `handoff now` request, use
+`reason: operator_request` in the note. The request reaches you at a safe
+boundary (or one follow-up prompt) and your handoff work still ends at the
+attempt's original deadline: preserve work in ordinary commits, write and
+commit the note separately as the final commit, then stop as usual.

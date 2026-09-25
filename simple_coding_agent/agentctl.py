@@ -70,6 +70,12 @@ def run_resume(socket_path: Path, request_id: str) -> dict:
     return send_request(socket_path, {"op": "resume", "request_id": request_id})
 
 
+def run_handoff(socket_path: Path, request_id: str) -> dict:
+    """Submit ``handoff now`` once; never present a failure as accepted."""
+
+    return send_request(socket_path, {"op": "handoff", "request_id": request_id})
+
+
 def run_recovery_retry(socket_path: Path, request_id: str, attempt_id: str) -> dict:
     """Submit ``recovery retry`` once; never present a failure as accepted."""
 
@@ -250,6 +256,17 @@ def format_status(status: dict) -> str:
         )
         lines.append(f"hold_reason: {recovery.get('hold_reason')}")
         lines.append(f"next_action: {recovery.get('next_action')}")
+    handoff = status.get("handoff")
+    if handoff is None:
+        lines.append("handoff: none")
+    else:
+        lines.append(
+            f"handoff: {handoff.get('request_id')}"
+            f" ({handoff.get('acknowledgement')},"
+            f" begun {handoff.get('begun')},"
+            f" phase {handoff.get('phase')}"
+            f" — {handoff.get('detail')})"
+        )
     commands = status.get("commands") or {}
     if commands:
         lines.append("recent_commands:")
@@ -294,6 +311,24 @@ def build_parser() -> argparse.ArgumentParser:
         "resume", help="Permit issue intake again; replace any pending stop plan."
     )
     resume_parser.add_argument(
+        "--request-id",
+        dest="request_id",
+        default=None,
+        help="Retry a previously generated request ID with the identical payload.",
+    )
+
+    handoff_parser = subparsers.add_parser(
+        "handoff",
+        help="Hand the active attempt to a human with a published handoff note.",
+    )
+    handoff_subparsers = handoff_parser.add_subparsers(
+        dest="handoff_command", required=True
+    )
+    handoff_now_parser = handoff_subparsers.add_parser(
+        "now",
+        help="Deliver a handoff request to the active attempt at the next safe model boundary.",
+    )
+    handoff_now_parser.add_argument(
         "--request-id",
         dest="request_id",
         default=None,
@@ -386,6 +421,9 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "resume":
             request_id = args.request_id or generate_request_id()
             return submit_mutating(socket_path, "resume", request_id, run_resume)
+        if args.command == "handoff" and args.handoff_command == "now":
+            request_id = args.request_id or generate_request_id()
+            return submit_mutating(socket_path, "handoff now", request_id, run_handoff)
         if args.command == "next" and args.next_command == "issue":
             from simple_coding_agent.control import (
                 NextIssueRejectedError,
