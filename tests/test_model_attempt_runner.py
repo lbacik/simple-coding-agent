@@ -85,6 +85,101 @@ def test_missing_continuation_branch_skips_the_model_with_a_prior_handoff_commen
     assert evidence.decision.outcome is AttemptOutcome.INCOMPLETE
 
 
+def test_incomplete_without_a_published_branch_runs_the_model_normally(tmp_path: Path) -> None:
+    """An incomplete attempt that never published a branch is not a handoff (issue #84).
+
+    A baseline or setup failure posts ``no branch created``; the next attempt
+    must start fresh from the base branch instead of short-circuiting with
+    ``continuation_branch_missing``.
+    """
+
+    executor = FakeModelExecutor()
+    comments = (
+        "## Agent Attempt Result: incomplete\n\n"
+        "**Branch**: no branch created\n"
+        "**PR**: none\n\n"
+        "### Details\n"
+        "Baseline check failed before model execution.\n\n"
+        "<!-- agent-attempt: earlier -->",
+    )
+    runner = build_runner(tmp_path, model_executor=executor, issue_comments=lambda issue: comments)
+
+    runner(claim(issue_number=24), profile(), FakePrepared(restored_from_remote=False))
+
+    assert executor.captured_prompt is not None
+
+
+def test_missing_continuation_branch_skips_the_model_with_a_prior_published_handoff(
+    tmp_path: Path,
+) -> None:
+    """A prior handoff that published a branch still expects a continuation (#48)."""
+
+    executor = FakeModelExecutor()
+    comments = (
+        "## Agent Attempt Result: handoff\n\n"
+        "**Branch**: [agent/issue-24](https://github.com/o/r/tree/agent/issue-24)\n"
+        "**PR**: none\n\n"
+        "### Details\n"
+        "Cost threshold reached; handed off.\n\n"
+        "<!-- agent-attempt: earlier -->",
+    )
+    runner = build_runner(tmp_path, model_executor=executor, issue_comments=lambda issue: comments)
+
+    evidence = runner(claim(issue_number=24), profile(), FakePrepared(restored_from_remote=False))
+
+    assert executor.captured_prompt is None
+    assert evidence.decision.outcome is AttemptOutcome.INCOMPLETE
+
+
+def test_incomplete_with_a_published_branch_still_expects_continuation(
+    tmp_path: Path,
+) -> None:
+    """An incomplete attempt that pushed partial work still promises a branch.
+
+    Only ``no branch created`` comments are excluded; a published branch link
+    keeps the #48 missing-branch short-circuit so deleted work is not silently
+    abandoned.
+    """
+
+    executor = FakeModelExecutor()
+    comments = (
+        "## Agent Attempt Result: incomplete\n\n"
+        "**Branch**: [agent/issue-24](https://github.com/o/r/tree/agent/issue-24)\n"
+        "**PR**: none\n\n"
+        "### Details\n"
+        "Final check failed with work preserved on the branch.\n\n"
+        "<!-- agent-attempt: earlier -->",
+    )
+    runner = build_runner(tmp_path, model_executor=executor, issue_comments=lambda issue: comments)
+
+    evidence = runner(claim(issue_number=24), profile(), FakePrepared(restored_from_remote=False))
+
+    assert executor.captured_prompt is None
+    assert evidence.decision.outcome is AttemptOutcome.INCOMPLETE
+
+
+def test_continuation_missing_comment_does_not_trigger_another_continuation_missing(
+    tmp_path: Path,
+) -> None:
+    """The ``continuation_branch_missing`` rejection must never feed itself (issue #84)."""
+
+    executor = FakeModelExecutor()
+    comments = (
+        "## Agent Attempt Result: incomplete\n\n"
+        "**Branch**: no branch created\n"
+        "**PR**: none\n\n"
+        "### Details\n"
+        "Expected continuation branch `agent/issue-24` was not found on origin, so it "
+        "could not be restored. A human should inspect this issue and decide next steps.\n\n"
+        "<!-- agent-attempt: earlier -->",
+    )
+    runner = build_runner(tmp_path, model_executor=executor, issue_comments=lambda issue: comments)
+
+    runner(claim(issue_number=24), profile(), FakePrepared(restored_from_remote=False))
+
+    assert executor.captured_prompt is not None
+
+
 def test_restored_continuation_branch_runs_the_model_normally(tmp_path: Path) -> None:
     executor = FakeModelExecutor()
     runner = build_runner(tmp_path, model_executor=executor)
