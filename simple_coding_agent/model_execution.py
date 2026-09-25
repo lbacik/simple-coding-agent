@@ -9,6 +9,7 @@ from datetime import UTC, datetime
 from enum import StrEnum
 import json
 from pathlib import Path
+import re
 import shlex
 from typing import Any, Protocol
 
@@ -54,6 +55,11 @@ _OPERATOR_HANDOFF_MODEL_DEADLINE_SECONDS = 240
 _COST_HANDOFF_INSTRUCTION = (
     "This attempt is approaching its cost budget. Invoke the `handoff` skill now "
     "to preserve your progress cooperatively instead of continuing further work."
+)
+_COST_HANDOFF_FOLLOWUP_PROMPT = (
+    "This attempt crossed its cost soft threshold and must now end by handing off. "
+    "Invoke the `handoff` skill now to preserve your progress: commit any outstanding "
+    "work, then write and commit the handoff note. Do not attempt further implementation work."
 )
 _OPERATOR_HANDOFF_INSTRUCTION = (
     "The operator requested a handoff (`agentctl handoff now`). Invoke the"
@@ -211,7 +217,16 @@ _MAX_LOG_DETAIL = 2000
 
 
 class ModelExecutor:
-    """Run the approved upstream skills and retain terminal stream evidence."""
+    """Run the approved upstream skills and retain terminal stream evidence.
+
+    Cost soft-threshold policy: once the estimated cost crosses the soft
+    threshold, only the main thread is steered toward the ``handoff`` skill.
+    In-flight subagent tools stay allowed (denying them would only degrade
+    already-paid-for work while still burning budget) and never receive the
+    handoff instruction; new subagent launches from the main thread are
+    denied. A ``handoff`` skill invocation counts only when observed in the
+    main thread (``agent_id is None``).
+    """
 
     def __init__(
         self,
@@ -236,6 +251,7 @@ class ModelExecutor:
         self._started_at = self._clock()
         self._soft_threshold_crossed = False
         self._handoff_context_delivered = False
+        self._cost_subagent_notice_logged = False
         self._usage_shape_logged = False
         self._cost_estimator_observed_on_assistant = False
         self._operator_handoff_provider: OperatorHandoffProvider | None = None
@@ -421,6 +437,26 @@ class ModelExecutor:
     def _log(self, event: str, detail: str = "") -> None:
         self._event_log(event, detail, issue_number=self._issue_number)
 
+    def _note_cost_subagent_activity(self, hook_input: Any) -> None:
+        """Record the chosen post-crossing subagent behaviour once.
+
+        In-flight subagent tools stay allowed and the handoff instruction is
+        withheld from subagents; this single event makes that visible in the
+        main thread's log instead of leaving degraded subagent results
+        unexplained.
+        """
+
+        if self._cost_subagent_notice_logged:
+            return
+        self._cost_subagent_notice_logged = True
+        self._log(
+            "cost_soft_threshold_subagent_deferred",
+            f"agent_id={_hook_field(hook_input, 'agent_id')}; in-flight subagent"
+            " tools stay allowed after the cost crossing and the handoff"
+            " instruction is withheld until the next main-thread tool boundary;"
+            " new subagent launches are denied.",
+        )
+
     def _archive_evidence(self, kind: str, content: str, *, extension: str) -> str | None:
         """Write full evidence to the attempt archive; return a reference or None.
 
@@ -457,6 +493,7 @@ class ModelExecutor:
         )
         self._soft_threshold_crossed = False
         self._handoff_context_delivered = False
+        self._cost_subagent_notice_logged = False
         self._usage_shape_logged = False
         self._cost_estimator_observed_on_assistant = False
         self._operator_handoff = None
@@ -495,6 +532,26 @@ class ModelExecutor:
                     )
                 if terminal is not None and self._is_model_limit(terminal, observed_models):
                     followup = await self._attempt_handoff_followup(client, observed_models)
+                    if followup is not None:
+                        return followup
+                elif terminal is not None and self._needs_cost_handoff_followup(
+                    terminal, observed_models
+                ):
+                    self._log(
+                        "cost_soft_threshold_handoff_followup",
+                        "Terminal result arrived after the cost soft-threshold"
+                        " crossing without a main-thread handoff; issuing the"
+                        " single cost follow-up handoff prompt.",
+                    )
+                    followup = await self._attempt_handoff_followup(
+                        client,
+                        observed_models,
+                        prompt=_COST_HANDOFF_FOLLOWUP_PROMPT,
+                        success_explanation=(
+                            "Model invoked the handoff skill after a cost"
+                            " soft-threshold instruction."
+                        ),
+                    )
                     if followup is not None:
                         return followup
         except Exception as error:
@@ -567,20 +624,89 @@ class ModelExecutor:
             return True
         return bool(getattr(terminal, "is_error", False))
 
+    def _main_thread_handoff_invoked(self) -> bool:
+        """Whether the ``handoff`` skill was invoked in the main thread.
+
+        Subagent skill invocations cannot perform the handoff (they share
+        neither the main transcript nor the terminal classification), so only
+        main-thread invocations (``agent_id is None``) count.
+        """
+
+        return any(
+            event.name == "handoff" and event.agent_id is None
+            for event in self._skill_events
+        )
+
+    def _cost_followup_blocked(self) -> bool:
+        """Whether the cost follow-up would bypass the hard cost limit."""
+
+        return (
+            self._cost_estimator.estimated_cost_usd >= self._config.max_budget_usd
+        )
+
+    def _needs_cost_handoff_followup(
+        self, terminal: ResultMessage, observed_models: tuple[str, ...]
+    ) -> bool:
+        """Whether a clean terminal result after the crossing deserves one handoff chance.
+
+        Only ordinary successful-looking results qualify: limits already got
+        their follow-up above (``elif``), errors/timeouts/aborts and model
+        mismatches are not handoff-able successes, and a follow-up past the
+        hard cost ceiling would itself bypass the budget.
+        """
+
+        if not self._soft_threshold_crossed or self._main_thread_handoff_invoked():
+            return False
+        if self._cost_followup_blocked():
+            self._log(
+                "cost_soft_threshold_handoff_followup_blocked",
+                "estimated cost reached the hard cost limit, so no cost"
+                " follow-up query is issued and the terminal result decides"
+                " the outcome",
+            )
+            return False
+        if getattr(terminal, "is_error", False):
+            return False
+        stop_reason = getattr(terminal, "stop_reason", None)
+        if stop_reason == "timeout" or (
+            isinstance(stop_reason, str) and stop_reason.startswith("aborted_")
+        ):
+            return False
+        if getattr(terminal, "terminal_reason", None) in (
+            "aborted_streaming",
+            "aborted_tools",
+        ):
+            return False
+        model_usage = getattr(terminal, "model_usage", None)
+        result_models = (
+            tuple(model_usage.keys()) if isinstance(model_usage, Mapping) else ()
+        )
+        all_models = tuple(dict.fromkeys((*observed_models, *result_models)))
+        if any(model != self._config.model for model in all_models):
+            return False
+        return True
+
     async def _attempt_handoff_followup(
-        self, client: SDKClient, observed_models: tuple[str, ...]
+        self,
+        client: SDKClient,
+        observed_models: tuple[str, ...],
+        *,
+        prompt: str = _LIMIT_HANDOFF_FOLLOWUP_PROMPT,
+        success_explanation: str = (
+            "Model invoked the handoff skill after reaching a turns/timeout limit."
+        ),
     ) -> ModelExecution | None:
-        """Best-effort same-client follow-up after a turns/timeout limit.
+        """Best-effort same-client follow-up after a turns/timeout/cost limit.
 
         Returns a HANDOFF_REQUESTED evidence only when the model actually
-        invoked the handoff skill during the follow-up; otherwise returns
-        None so the caller falls back to its ordinary limit classification.
-        This never retries: a follow-up that fails or times out is itself
-        evidence that handoff is not achievable right now.
+        invoked the handoff skill in the main thread during the follow-up;
+        otherwise returns None so the caller falls back to its ordinary limit
+        classification. This never retries: a follow-up that fails or times
+        out is itself evidence that handoff is not achievable right now.
         """
 
         try:
-            await client.query(_LIMIT_HANDOFF_FOLLOWUP_PROMPT)
+            await client.query(prompt)
             async with asyncio.timeout(_HANDOFF_FOLLOWUP_TIMEOUT):
                 followup_terminal, followup_models = await self._receive_terminal(client)
         except Exception:
@@ -588,11 +714,11 @@ class ModelExecutor:
         if followup_terminal is None:
             return None
         all_models = tuple(dict.fromkeys((*observed_models, *followup_models)))
-        if not any(event.name == "handoff" for event in self._skill_events):
+        if not self._main_thread_handoff_invoked():
             return None
         return self._evidence(
             ModelExecutionStatus.HANDOFF_REQUESTED,
-            "Model invoked the handoff skill after reaching a turns/timeout limit.",
+            success_explanation,
             followup_terminal.stop_reason,
             getattr(followup_terminal, "model_usage", None),
             all_models,
@@ -744,9 +870,7 @@ class ModelExecutor:
                 all_models,
                 terminal_reason=terminal_reason,
             )
-        if self._handoff_context_delivered and any(
-            event.name == "handoff" for event in self._skill_events
-        ):
+        if self._soft_threshold_crossed and self._main_thread_handoff_invoked():
             return self._evidence(
                 ModelExecutionStatus.HANDOFF_REQUESTED,
                 "Model invoked the handoff skill after a cost soft-threshold instruction.",
@@ -826,6 +950,19 @@ class ModelExecutor:
                 all_models,
                 terminal_reason=terminal_reason,
             )
+        if self._soft_threshold_crossed and not self._main_thread_handoff_invoked():
+            # The crossing was never converted into a handoff (the instruction
+            # may have gone unseen or the follow-up failed), so this must not
+            # read as an ordinary success: the attempt ends incomplete.
+            return self._evidence(
+                ModelExecutionStatus.MODEL_LIMIT_REACHED,
+                "Cost soft threshold was crossed without a main-thread handoff, "
+                "so the attempt ends incomplete instead of succeeding.",
+                stop_reason,
+                model_usage,
+                all_models,
+                terminal_reason=terminal_reason,
+            )
         return self._evidence(
             ModelExecutionStatus.SUCCEEDED,
             "Claude SDK completed the implementation workflow.",
@@ -864,26 +1001,25 @@ class ModelExecutor:
             self._review_count += 1
             if self._review_count > 3:
                 return _deny("At most two code-review repair cycles are allowed.")
-        if self._soft_threshold_crossed and not any(
-            event.name == "handoff" for event in self._skill_events
-        ):
-            tool_name = _hook_field(hook_input, "tool_name")
-            if tool_name == "Skill" and _skill_name(hook_input) == "handoff":
-                pass
-            elif tool_name in ("Edit", "Write"):
-                file_path = str(_hook_field(hook_input, "tool_input", {}).get("file_path", ""))
-                if ".agent/handoff" not in file_path:
-                    return _deny(
-                        "Cost soft threshold reached. Further implementation work is disabled. "
-                        "You must invoke the `handoff` skill now to preserve your progress."
-                    )
-            elif tool_name == "Bash":
-                command = str(_hook_field(hook_input, "tool_input", {}).get("command", ""))
-                if not _is_handoff_command(command):
-                    return _deny(
-                        "Cost soft threshold reached. Further implementation work is disabled. "
-                        "You must invoke the `handoff` skill now to preserve your progress."
-                    )
+        if self._soft_threshold_crossed and not self._main_thread_handoff_invoked():
+            if not _is_main_thread(hook_input):
+                self._note_cost_subagent_activity(hook_input)
+            else:
+                tool_name = _hook_field(hook_input, "tool_name")
+                if tool_name == "Skill" and _skill_name(hook_input) == "handoff":
+                    pass
+                elif tool_name == "Agent" or (
+                    tool_name == "Task" and _is_subagent_launch(hook_input)
+                ):
+                    return _cost_deny("New subagent launches are disabled.")
+                elif tool_name in ("Edit", "Write"):
+                    file_path = str(_hook_field(hook_input, "tool_input", {}).get("file_path", ""))
+                    if ".agent/handoff" not in file_path:
+                        return _cost_deny("Further implementation work is disabled.")
+                elif tool_name == "Bash":
+                    command = str(_hook_field(hook_input, "tool_input", {}).get("command", ""))
+                    if not _is_handoff_command(command):
+                        return _cost_deny("Further implementation work is disabled.")
         if self._operator_context_delivered:
             tool_name = _hook_field(hook_input, "tool_name")
             if tool_name == "Skill":
@@ -925,9 +1061,16 @@ class ModelExecutor:
         self._poll_operator_handoff()
         contexts: list[str] = []
         if self._soft_threshold_crossed and not self._handoff_context_delivered:
-            self._handoff_context_delivered = True
-            self._log("cost_soft_threshold_handoff_context_injected")
-            contexts.append(_COST_HANDOFF_INSTRUCTION)
+            if _is_main_thread(hook_input):
+                self._handoff_context_delivered = True
+                self._log("cost_soft_threshold_handoff_context_injected")
+                contexts.append(_COST_HANDOFF_INSTRUCTION)
+            else:
+                # A subagent cannot perform the handoff and its transcript does
+                # not flow back to the main thread, so the instruction is
+                # withheld here and delivery stays latched off until a
+                # main-thread boundary arrives.
+                self._note_cost_subagent_activity(hook_input)
         if self._operator_handoff is not None and not self._operator_context_delivered:
             self._operator_context_delivered = True
             self._report_operator("delivered")
@@ -951,36 +1094,46 @@ class ModelExecutor:
             return
         skill_name = _skill_name(hook_input) if tool_name == "Skill" else None
         label = f"skill:{skill_name}" if skill_name else tool_name
+        thread = _thread_label(hook_input)
+        agent_id = _hook_agent_id(hook_input)
         if event == "tool_result":
             event_name = "skill_result" if skill_name else event
             # Skill calls are already small; only offload plain tool payloads to disk.
             detail = (
-                f"{label}: {response!r}"
+                f"{label}{thread}: {response!r}"
                 if skill_name
-                else self._tool_result_detail(label, response)
+                else self._tool_result_detail(label, response, thread=thread, agent_id=agent_id)
             )
         else:
             tool_input = _hook_field(hook_input, "tool_input", {})
             event_name = "skill_call" if skill_name else event
             detail = (
-                f"{label}: {tool_input!r}"
+                f"{label}{thread}: {tool_input!r}"
                 if skill_name
-                else self._tool_call_detail(label, tool_input)
+                else self._tool_call_detail(label, tool_input, thread=thread, agent_id=agent_id)
             )
         self._log(event_name, _truncate(detail))
 
-    def _tool_call_detail(self, label: str, tool_input: Any) -> str:
-        path = self._archive_evidence("tool_call", _json_or_repr(tool_input), extension="json")
+    def _tool_call_detail(
+        self, label: str, tool_input: Any, *, thread: str = "", agent_id: str | None = None
+    ) -> str:
+        path = self._archive_evidence(
+            "tool_call", _json_or_repr(_with_agent_id(tool_input, agent_id)), extension="json"
+        )
         if path is None:
-            return f"{label}: {tool_input!r}"
-        return f"{label} -> {path}"
+            return f"{label}{thread}: {tool_input!r}"
+        return f"{label}{thread} -> {path}"
 
-    def _tool_result_detail(self, label: str, response: Any) -> str:
-        path = self._archive_evidence("tool_result", _json_or_repr(response), extension="json")
+    def _tool_result_detail(
+        self, label: str, response: Any, *, thread: str = "", agent_id: str | None = None
+    ) -> str:
+        path = self._archive_evidence(
+            "tool_result", _json_or_repr(_with_agent_id(response, agent_id)), extension="json"
+        )
         if path is None:
-            return f"{label}: {response!r}"
+            return f"{label}{thread}: {response!r}"
         outcome = _outcome_hint(response)
-        return f"{label} -> {path}" + (f" ({outcome})" if outcome else "")
+        return f"{label}{thread} -> {path}" + (f" ({outcome})" if outcome else "")
 
     def _model_response_detail(self, text: str) -> str:
         path = self._archive_evidence("model_response", text, extension="txt")
@@ -1046,6 +1199,16 @@ def _deny(reason: str) -> dict[str, Any]:
     }
 
 
+def _cost_deny(restriction: str) -> dict[str, Any]:
+    """Deny with the shared cost-guard wording for the given restriction."""
+
+    return _deny(
+        "Cost soft threshold reached. "
+        f"{restriction} "
+        "You must invoke the `handoff` skill now to preserve your progress."
+    )
+
+
 def _meta_environment(api_key: str, model: str) -> dict[str, str]:
     return {
         "ANTHROPIC_BASE_URL": _META_BASE_URL,
@@ -1077,6 +1240,49 @@ def _hook_field(hook_input: object, name: str, default: Any = None) -> Any:
     if isinstance(hook_input, Mapping):
         return hook_input.get(name, default)
     return getattr(hook_input, name, default)
+
+
+def _hook_agent_id(hook_input: object) -> str | None:
+    """The subagent id of a hook invocation, or None on the main thread."""
+
+    agent_id = _hook_field(hook_input, "agent_id")
+    return agent_id if isinstance(agent_id, str) and agent_id else None
+
+
+def _is_main_thread(hook_input: object) -> bool:
+    """Whether a hook invocation came from the main thread (no subagent id)."""
+
+    return _hook_agent_id(hook_input) is None
+
+
+def _thread_label(hook_input: object) -> str:
+    """Short calling-thread suffix so tool logs show main vs subagent work."""
+
+    agent_id = _hook_agent_id(hook_input)
+    if agent_id is not None:
+        return f" [subagent:{agent_id}]"
+    return " [main]"
+
+
+def _is_subagent_launch(hook_input: object) -> bool:
+    """Whether a Task-shaped tool call spawns a subagent rather than polling one."""
+
+    tool_input = _hook_field(hook_input, "tool_input", {})
+    if not isinstance(tool_input, Mapping):
+        return True
+    return any(key in tool_input for key in ("prompt", "description", "subagent_type"))
+
+
+def _with_agent_id(payload: Any, agent_id: str | None) -> Any:
+    """Envelope an archived tool payload with its calling thread.
+
+    ``agent_id`` is None on the main thread, so the evidence files show
+    whether each tool call/result came from the main thread or a subagent.
+    """
+
+    if isinstance(payload, Mapping):
+        return {"agent_id": agent_id, **payload}
+    return {"agent_id": agent_id, "payload": payload}
 
 
 def _is_publication_command(command: str) -> bool:
@@ -1122,7 +1328,21 @@ def _is_prohibited_invocation(tokens: list[str]) -> bool:
     return False
 
 
+# Read-only stdin-to-stdout filters: safe to append to handoff git commands
+# (e.g. `git log | tail -3`) because they cannot write files, run commands,
+# or reach the network. Anything else in a pipeline (test runners, curl,
+# file removal, …) still fails the handoff allowlist.
+_READONLY_OUTPUT_FILTERS = frozenset(
+    {"tail", "head", "wc", "grep", "sort", "uniq", "cut", "tr"}
+)
+# Shell stderr duplication (`2>&1`) is stripped before segmentation: shlex
+# would otherwise split the bare `&` into its own pipeline segment and the
+# leftover `1` would read as a non-allowlisted executable.
+_COST_OUTPUT_REDIRECT = re.compile(r"\d*>&\d+")
+
+
 def _is_handoff_command(command: str) -> bool:
+    command = _COST_OUTPUT_REDIRECT.sub("", command)
     for segment in _shell_segments(command):
         if not segment:
             continue
@@ -1141,6 +1361,8 @@ def _is_handoff_command(command: str) -> bool:
                 continue
             return False
         if executable in ("date", "mkdir", "echo", "cat", "pwd", "ls", "test", "true"):
+            continue
+        if executable in _READONLY_OUTPUT_FILTERS:
             continue
         return False
     return True
