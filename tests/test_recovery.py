@@ -222,6 +222,54 @@ def test_retained_checkpoint_blocks_new_claims_until_recovery(tmp_path: Path) ->
     assert tracker.claimed == [99]
 
 
+def test_resume_stays_rejected_while_a_recovery_command_runs(tmp_path: Path) -> None:
+    from simple_coding_agent.control import ResumeBlockedError
+
+    checkpoint = start_checkpoint(tmp_path, AttemptPhase.PUSHING)
+    assert checkpoint is not None
+    entered = threading.Event()
+    proceed = threading.Event()
+    outcomes: list[object] = []
+
+    class BlockingPublisher(FakePublisher):
+        def publish(self, request: object):
+            self.requests.append(request)
+            entered.set()
+            assert proceed.wait(timeout=30)
+            return type(
+                "Published",
+                (),
+                {
+                    "outcome": AttemptOutcome.INFRASTRUCTURE_ERROR,
+                    "branch_url": None,
+                    "comment_posted": True,
+                },
+            )()
+
+    lifecycle, _, _, _, store = make_lifecycle(tmp_path, publisher=BlockingPublisher())
+
+    def run_retry() -> None:
+        try:
+            outcomes.append(lifecycle.submit_recovery_retry("req-retry", checkpoint.started_at))
+        except Exception as error:  # pragma: no cover - surfaced below
+            outcomes.append(error)
+
+    worker = threading.Thread(target=run_retry)
+    worker.start()
+    assert entered.wait(timeout=30)
+    try:
+        # The retained checkpoint is owned by the running recovery command:
+        # resume must stay rejected instead of slipping through the gap.
+        with pytest.raises(ResumeBlockedError, match=checkpoint.started_at):
+            lifecycle.submit_resume("req-resume-race")
+    finally:
+        proceed.set()
+        worker.join(timeout=30)
+    assert store.get_command("req-resume-race") is None
+    assert len(outcomes) == 1 and not isinstance(outcomes[0], Exception)
+    assert outcomes[0].acknowledgement is CommandAcknowledgement.COMPLETED
+
+
 def test_resume_cannot_bypass_the_recovery_hold(tmp_path: Path) -> None:
     checkpoint = start_checkpoint(tmp_path)
     assert checkpoint is not None

@@ -222,6 +222,12 @@ an operator clears it:
 Both commands print a durable request ID and accept `--request-id` for an
 identical retry after an ambiguous connection loss, like `stop`.
 
+A related hold covers unexplained dirty or untracked work with no attempt
+identity behind it. It also blocks intake and `resume`, and `status` reports
+it with the repair instruction — but no `recovery` subcommand can clear it:
+inspect the working tree and repair or remove the unexplained changes
+manually.
+
 ## Persisted error-guard recovery
 
 The agent tracks consecutive `infrastructure_error` outcomes in

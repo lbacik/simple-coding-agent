@@ -623,6 +623,11 @@ class AgentLifecycle:
         # startup reconciliation). A checkpoint without in-progress work is a
         # retained hold: resume must be rejected until recovery finishes it.
         self._attempt_processing = False
+        # True while a ``recovery retry`` or ``recovery release`` command is
+        # executing (it unlocks during execution so status stays live). The
+        # retained checkpoint is still a hold then: resume must stay rejected
+        # until the command finishes, even though _attempt_processing is set.
+        self._recovery_executing = False
 
     @property
     def active_issue_number(self) -> int | None:
@@ -794,15 +799,18 @@ class AgentLifecycle:
                 # once instead of recording twice.
                 checkpoint = self._validated_recovery_checkpoint_locked(parsed)
                 self._attempt_processing = True
+                self._recovery_executing = True
             else:
                 checkpoint = self._validated_recovery_checkpoint_locked(parsed)
                 record = store.submit_recovery_retry(request_id, parsed)
                 self._attempt_processing = True
+                self._recovery_executing = True
         try:
             success, detail = self._retry_retained_attempt(checkpoint)
         finally:
             with self._control_lock:
                 self._attempt_processing = False
+                self._recovery_executing = False
         with self._control_lock:
             if success:
                 completed = store.complete_recovery_command(request_id, detail)
@@ -852,17 +860,20 @@ class AgentLifecycle:
                     return record
                 checkpoint = self._validated_recovery_checkpoint_locked(parsed_attempt)
                 self._attempt_processing = True
+                self._recovery_executing = True
             else:
                 checkpoint = self._validated_recovery_checkpoint_locked(parsed_attempt)
                 record = store.submit_recovery_release(
                     request_id, parsed_attempt, parsed_saved
                 )
                 self._attempt_processing = True
+                self._recovery_executing = True
         try:
             success, detail = self._release_retained_attempt(checkpoint, parsed_saved)
         finally:
             with self._control_lock:
                 self._attempt_processing = False
+                self._recovery_executing = False
         with self._control_lock:
             if success:
                 completed = store.complete_recovery_command(request_id, detail)
@@ -973,6 +984,22 @@ class AgentLifecycle:
                 reason=(
                     "attempt finalization is unresolved; the branch,"
                     " checkpoint, and working tree are preserved for recovery"
+                ),
+            )
+        if checkpoint is not None and self._recovery_executing:
+            # A recovery command owns the retained attempt right now (it
+            # unlocks during execution so status stays live): resume stays
+            # rejected until the command finishes instead of slipping
+            # through the in-progress gap.
+            return RecoveryHold(
+                issue_number=checkpoint.issue_number,
+                attempt_id=checkpoint.started_at,
+                branch=checkpoint.branch,
+                phase=checkpoint.phase.value,
+                reason=(
+                    "a recovery command is running for the retained attempt;"
+                    " the branch, checkpoint, and working tree are preserved"
+                    " until it finishes"
                 ),
             )
         if not self._attempt_processing and self._workspace_is_dirty():
@@ -1140,7 +1167,9 @@ class AgentLifecycle:
             self._workspace.cleanup(
                 base_branch=profile.base_branch,
                 prepared=prepared,
-                retain_branch=bool(retain_branch) or not comment_posted,
+                # comment_posted is True here (the unconfirmed path returned
+                # above), so only genuinely unpublished work retains.
+                retain_branch=bool(retain_branch),
             )
         except Exception as error:
             return False, (
