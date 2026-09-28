@@ -465,12 +465,18 @@ class ModelAttemptRunner:
             ModelExecutionStatus.MODEL_LIMIT_REACHED,
             ModelExecutionStatus.OPERATOR_HANDOFF_EXPIRED,
             ModelExecutionStatus.SUCCEEDED,
+            ModelExecutionStatus.INFRASTRUCTURE_ERROR,
         ):
             # Always preserve dirty/untracked work as a commit rather than
             # letting it get silently discarded. This also covers a model
             # that reports success but stops before its own final commit:
             # without this, commit_count and the final check would be
             # evaluated against work that never makes it into the push.
+            # It also covers an infrastructure error (e.g. the SDK stream
+            # ending without a terminal message): the model's edits are
+            # finished work that must stay committed on the attempt branch,
+            # otherwise cleanup's checkout of the base branch would carry
+            # the uncommitted changes onto the base branch.
             commit_fn = getattr(self._workspace, "commit_dirty_work", None)
             if callable(commit_fn):
                 message = (

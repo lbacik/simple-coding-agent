@@ -760,3 +760,58 @@ def profile() -> RepositoryProfile:
     return RepositoryProfile(
         setup=(), check=("pytest",), base_branch="main", timeout=60, setup_timeout=60, env={}
     )
+
+
+class PreservingWorkspace(FakeWorkspace):
+    """A workspace double that records ``commit_dirty_work`` calls."""
+
+    def __init__(self, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self.preserved: list[str] = []
+
+    def commit_dirty_work(self, message: str) -> bool:
+        self.preserved.append(message)
+        return True
+
+
+def test_infrastructure_error_preserves_dirty_work(tmp_path: Path) -> None:
+    """An SDK stream that dies without a terminal message still preserves edits.
+
+    Regression test: ``INFRASTRUCTURE_ERROR`` used to skip the
+    ``commit_dirty_work`` safety net, so uncommitted work rode along when
+    ``cleanup`` checked out the base branch and wedged the next poll cycle
+    with ``working_tree_dirty``.
+    """
+
+    executor = FakeModelExecutor(status=ModelExecutionStatus.INFRASTRUCTURE_ERROR)
+    workspace = PreservingWorkspace()
+    runner = build_runner(tmp_path, model_executor=executor, workspace=workspace)
+
+    runner(
+        claim(issue_number=24, issue_body="Fix the parser."), profile(), FakePrepared()
+    )
+
+    assert workspace.preserved == ["Preserve uncommitted work before handoff"]
+
+
+def test_dirty_work_is_preserved_for_every_terminal_model_status(tmp_path: Path) -> None:
+    """The safety net covers the whole ``ModelExecutionStatus`` enum.
+
+    Guards against a future status being added to the enum without joining
+    the ``commit_dirty_work`` guard in ``ModelAttemptRunner``.
+    """
+
+    for status in ModelExecutionStatus:
+        state_dir = tmp_path / status.value
+        state_dir.mkdir(exist_ok=True)
+        executor = FakeModelExecutor(status=status)
+        workspace = PreservingWorkspace()
+        runner = build_runner(state_dir, model_executor=executor, workspace=workspace)
+
+        runner(
+            claim(issue_number=24, issue_body="Fix the parser."),
+            profile(),
+            FakePrepared(),
+        )
+
+        assert workspace.preserved, f"commit_dirty_work not called for {status}"
