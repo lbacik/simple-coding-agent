@@ -41,6 +41,8 @@ class ControlSurface(Protocol):
         self, request_id: str, attempt_id: object, saved_at: object
     ) -> object: ...
 
+    def submit_errors_reset(self, request_id: str) -> object: ...
+
     def get_command(self, request_id: str) -> object | None: ...
 
     def control_status(self, repository: str | None = ...) -> dict: ...
@@ -198,6 +200,8 @@ class ControlServer:
             self._reply_recovery_retry(connection, request)
         elif operation == "recovery_release":
             self._reply_recovery_release(connection, request)
+        elif operation == "errors_reset":
+            self._reply_errors_reset(connection, request)
         elif operation == "status":
             self._reply_status(connection)
         elif operation == "command":
@@ -313,6 +317,17 @@ class ControlServer:
                 request_id, attempt_id, saved_at
             ),
             rejected=(RequestIdError, PayloadMismatchError, RecoveryRejectedError),
+            repository=self._repository(),
+        )
+
+    def _reply_errors_reset(self, connection: socket.socket, request: dict) -> None:
+        from simple_coding_agent.control import PayloadMismatchError, RequestIdError
+
+        _reply_mutating(
+            connection,
+            request,
+            self._control.submit_errors_reset,
+            rejected=(RequestIdError, PayloadMismatchError),
             repository=self._repository(),
         )
 

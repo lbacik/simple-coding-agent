@@ -101,6 +101,14 @@ def run_recovery_release(
     )
 
 
+def run_errors_reset(socket_path: Path, request_id: str) -> dict:
+    """Submit ``errors reset`` once; never present a failure as accepted."""
+
+    return send_request(
+        socket_path, {"op": "errors_reset", "request_id": request_id}
+    )
+
+
 def run_status(socket_path: Path) -> dict:
     """Read one consistent live snapshot; raise when the process is down."""
 
@@ -272,6 +280,20 @@ def format_status(status: dict) -> str:
             f" model {handoff.get('model_deadline_at')}"
             f" publication {handoff.get('publication_deadline_at')}"
         )
+    errors = status.get("consecutive_errors")
+    if errors is None:
+        lines.append("consecutive errors: none")
+    elif errors.get("error"):
+        lines.append(f"consecutive errors: unavailable ({errors.get('error')})")
+    else:
+        count = errors.get("count")
+        maximum = errors.get("max_consecutive_errors")
+        last_attempt = errors.get("last_attempt_id") or "none"
+        last_success = errors.get("last_success_at") or "none"
+        lines.append(
+            f"consecutive errors: {count} / {maximum}"
+            f" (last attempt {last_attempt}; last success {last_success})"
+        )
     commands = status.get("commands") or {}
     if commands:
         lines.append("recent_commands:")
@@ -397,6 +419,25 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Retry a previously generated request ID with the identical payload.",
     )
+
+    errors_parser = subparsers.add_parser(
+        "errors",
+        aliases=["consecutive-errors"],
+        help="Inspect or reset the consecutive-error guard.",
+    )
+    errors_subparsers = errors_parser.add_subparsers(
+        dest="errors_command", required=True
+    )
+    errors_reset_parser = errors_subparsers.add_parser(
+        "reset",
+        help="Reset the consecutive-error counter to 0 through the live process.",
+    )
+    errors_reset_parser.add_argument(
+        "--request-id",
+        dest="request_id",
+        default=None,
+        help="Retry a previously generated request ID with the identical payload.",
+    )
     return parser
 
 
@@ -491,6 +532,14 @@ def main(argv: list[str] | None = None) -> int:
                 f"recovery release {attempt_id}",
                 request_id,
                 lambda path, rid: run_recovery_release(path, rid, attempt_id, saved_at),
+            )
+        if args.command in ("errors", "consecutive-errors") and args.errors_command == "reset":
+            request_id = args.request_id or generate_request_id()
+            return submit_mutating(
+                socket_path,
+                "errors reset",
+                request_id,
+                run_errors_reset,
             )
     except ControlUnavailableError as error:
         print(f"Cannot connect to the agent process: {error}", file=sys.stderr)

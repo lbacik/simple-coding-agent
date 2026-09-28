@@ -142,6 +142,7 @@ _NEXT_ISSUE_KIND = "next_issue"
 _HANDOFF_KIND = "handoff"
 _RECOVERY_RETRY_KIND = "recovery_retry"
 _RECOVERY_RELEASE_KIND = "recovery_release"
+_ERRORS_RESET_KIND = "errors_reset"
 # Stop-plan kinds a newer ``resume`` (or a newer stop plan) replaces. Later
 # commands extend this tuple without changing the replacement rules.
 # ``next issue`` is intentionally absent: it neither replaces a stop plan
@@ -1215,6 +1216,55 @@ class ControlStore:
             except sqlite3.Error as error:
                 raise ControlStoreError("Control command could not be committed") from error
 
+    def submit_errors_reset(
+        self, request_id: str, *, previous_count: int | None = None
+    ) -> CommandRecord:
+        """Durably record a consecutive-errors reset to 0.
+
+        The counter itself lives in ``consecutive_errors.json`` and is
+        cleared by the lifecycle; this method only commits the durable
+        acknowledgement so ``agentctl command <id>`` and ``status`` report
+        it. The reset never changes intake and never touches a stop plan,
+        so it applies immediately even with an active attempt. Retrying
+        the same request ID returns the stored record without recording
+        twice; reuse with a different command kind or payload is rejected.
+        """
+
+        _check_request_id(request_id)
+        payload: dict = {}
+        with self.lock:
+            try:
+                with self._connect() as connection:
+                    connection.execute("BEGIN IMMEDIATE")
+                    existing = self._find_locked(connection, request_id)
+                    if existing is not None:
+                        self._ensure_payload_identical(
+                            connection, existing, _ERRORS_RESET_KIND, payload
+                        )
+                        connection.execute("ROLLBACK")
+                        return existing
+                    if previous_count is None:
+                        detail = "consecutive errors reset to 0"
+                    else:
+                        detail = (
+                            "consecutive errors reset"
+                            f" from {previous_count} to 0"
+                        )
+                    record = self._insert_locked(
+                        connection,
+                        request_id,
+                        _ERRORS_RESET_KIND,
+                        payload,
+                        CommandAcknowledgement.COMPLETED,
+                        detail,
+                    )
+                    connection.execute("COMMIT")
+                    return record
+            except (PayloadMismatchError, RequestIdError):
+                raise
+            except sqlite3.Error as error:
+                raise ControlStoreError("Control command could not be committed") from error
+
     def submit_command(self, kind: str, request_id: str, payload: dict) -> CommandRecord:
         """Generic command entry used to detect request-ID reuse.
 
@@ -2011,6 +2061,7 @@ def build_status(
     stop_plan: dict | None = None,
     recovery: dict | None = None,
     handoff: dict | None = None,
+    consecutive_errors: dict | None = None,
 ) -> dict:
     """Build one consistent live status snapshot.
 
@@ -2026,6 +2077,10 @@ def build_status(
     operator handoff (request ID, acceptance time, skill-begun flag, phase,
     acknowledgement, and the original model/publication deadlines recomputed
     from acceptance) or ``None`` when no handoff owns the attempt.
+    ``consecutive_errors`` carries the infrastructure-error guard (``count``,
+    ``max_consecutive_errors``, ``last_attempt_id``, ``last_success_at``,
+    and ``error`` naming an unreadable store) or ``None`` when the guard
+    is not configured.
     """
 
     pending = get_command(pending_command_id) if pending_command_id else None
@@ -2048,5 +2103,6 @@ def build_status(
         "stop_plan": dict(stop_plan) if stop_plan is not None else None,
         "recovery": dict(recovery) if recovery is not None else None,
         "handoff": dict(handoff) if handoff is not None else None,
+        "consecutive_errors": dict(consecutive_errors) if consecutive_errors is not None else None,
         "commands": {record.request_id: command_to_json(record) for record in recent_commands()},
     }
