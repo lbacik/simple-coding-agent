@@ -1376,4 +1376,40 @@ def test_archived_tool_evidence_carries_the_calling_agent_id(tmp_path: Path) -> 
     assert results and results[0]["agent_id"] == "sub-1"
 
 
+def test_quiet_stream_longer_than_operator_wait_still_reaches_terminal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A gap between SDK messages longer than the operator wait must not end the run.
+
+    Regression test: ``asyncio.timeout`` around ``__anext__()`` cancelled a
+    real async generator, so the next ``__anext__()`` raised
+    ``StopAsyncIteration`` and the run ended with ``infrastructure_error``.
+    """
+
+    import simple_coding_agent.model_execution as model_execution_module
+
+    monkeypatch.setattr(
+        model_execution_module, "_OPERATOR_HANDOFF_DELIVERY_WINDOW_SECONDS", 0.05
+    )
+
+    class SlowClient(FakeClient):
+        async def receive_response(self):
+            await asyncio.sleep(0.3)
+            yield result()
+
+    executor = ModelExecutor(
+        runtime_config(tmp_path),
+        client_factory=lambda options: SlowClient(options, []),
+    )
+    executor.set_operator_handoff_provider(lambda: None)
+
+    execution = asyncio.run(
+        executor.execute(issue_body="Fix it.", working_directory=tmp_path)
+    )
+
+    assert execution.status is ModelExecutionStatus.SUCCEEDED
+    assert execution.status is not ModelExecutionStatus.INFRASTRUCTURE_ERROR
+    assert execution.stop_reason == "end_turn"
+
+
 

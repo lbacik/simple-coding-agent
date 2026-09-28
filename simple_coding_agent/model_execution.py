@@ -755,46 +755,66 @@ class ModelExecutor:
     ) -> tuple[ResultMessage | None, tuple[str, ...]]:
         observed_models: list[str] = []
         stream = client.receive_response().__aiter__()
-        while True:
-            action = self._operator_due_action()
-            if action == "fallback":
-                outcome = await self._run_operator_fallback(client, observed_models)
-                if outcome is not None:
-                    return outcome
-                continue
-            if action == "expire":
-                await client.interrupt()
-                await self._drain(client)
-                self._operator_deadline_expired = True
-                self._log(
-                    "operator_handoff_model_deadline_expired",
-                    f"request={self._operator_handoff.request_id if self._operator_handoff else None}; "
-                    f"deadline_seconds={_OPERATOR_HANDOFF_MODEL_DEADLINE_SECONDS}",
-                )
-                return None, tuple(observed_models)
-            wait = self._operator_stream_wait()
-            try:
+        # One pending ``__anext__()`` shared across loop iterations: waiting
+        # for it with ``asyncio.wait`` (instead of ``asyncio.timeout``) lets
+        # operator boundaries pass without cancelling the generator, which
+        # would close it and end the stream with ``StopAsyncIteration``.
+        pending: asyncio.Task | None = None
+        try:
+            while True:
+                action = self._operator_due_action()
+                if action == "fallback":
+                    await _cancel_stream_wait(pending)
+                    pending = None
+                    outcome = await self._run_operator_fallback(client, observed_models)
+                    if outcome is not None:
+                        return outcome
+                    continue
+                if action == "expire":
+                    await _cancel_stream_wait(pending)
+                    pending = None
+                    await client.interrupt()
+                    await self._drain(client)
+                    self._operator_deadline_expired = True
+                    self._log(
+                        "operator_handoff_model_deadline_expired",
+                        f"request={self._operator_handoff.request_id if self._operator_handoff else None}; "
+                        f"deadline_seconds={_OPERATOR_HANDOFF_MODEL_DEADLINE_SECONDS}",
+                    )
+                    return None, tuple(observed_models)
+                wait = self._operator_stream_wait()
+                if pending is None:
+                    pending = asyncio.ensure_future(stream.__anext__())
                 if wait is None:
-                    message = await stream.__anext__()
+                    try:
+                        message = await pending
+                    except StopAsyncIteration:
+                        return None, tuple(observed_models)
+                    pending = None
                 else:
-                    async with asyncio.timeout(wait):
-                        message = await stream.__anext__()
-            except StopAsyncIteration:
-                return None, tuple(observed_models)
-            except TimeoutError:
-                # Awaited longer than the next operator boundary without a
-                # message; loop back so the due action runs above.
-                continue
-            if isinstance(message, ResultMessage) or _looks_like_result(message):
-                return message, tuple(observed_models)
-            if isinstance(message, AssistantMessage):
-                for block in message.content:
-                    if isinstance(block, TextBlock) and block.text.strip():
-                        self._log("model_response", self._model_response_detail(block.text))
-                self._observe_cost(message.usage)
-            model = getattr(message, "model", None)
-            if isinstance(model, str):
-                observed_models.append(model)
+                    done, _ = await asyncio.wait({pending}, timeout=wait)
+                    if not done:
+                        # Operator boundary reached; the generator stays alive.
+                        continue
+                    task, pending = pending, None
+                    try:
+                        message = task.result()
+                    except StopAsyncIteration:
+                        return None, tuple(observed_models)
+                if isinstance(message, ResultMessage) or _looks_like_result(message):
+                    return message, tuple(observed_models)
+                if isinstance(message, AssistantMessage):
+                    for block in message.content:
+                        if isinstance(block, TextBlock) and block.text.strip():
+                            self._log("model_response", self._model_response_detail(block.text))
+                    self._observe_cost(message.usage)
+                model = getattr(message, "model", None)
+                if isinstance(model, str):
+                    observed_models.append(model)
+        finally:
+            # The outer model-timeout/follow-up timeout may cancel this method
+            # while a ``__anext__()`` is still pending; never leave it dangling.
+            await _cancel_stream_wait(pending)
 
     def _observe_cost(self, usage: Any) -> None:
         """Latch a one-time soft-threshold crossing from estimated cumulative cost."""
@@ -1220,6 +1240,29 @@ def _meta_environment(api_key: str, model: str) -> dict[str, str]:
         "CLAUDE_CODE_SUBAGENT_MODEL": model,
         "CLAUDE_STREAM_IDLE_TIMEOUT_MS": "60000",
     }
+
+
+async def _cancel_stream_wait(pending: asyncio.Task | None) -> None:
+    """Cancel a pending stream ``__anext__()`` left over by an abandoned wait.
+
+    Used only when the stream itself is abandoned (operator fallback/expire
+    switches to a fresh stream, or an outer timeout cancels collection), so
+    closing the generator here is intended. Never used for an operator wait
+    boundary on a live stream: that path keeps ``pending`` alive across loop
+    iterations instead.
+    """
+
+    if pending is None:
+        return
+    pending.cancel()
+    try:
+        await pending
+    except asyncio.CancelledError:
+        pass
+    except StopAsyncIteration:
+        pass
+    except Exception:
+        pass
 
 
 def _looks_like_result(message: object) -> bool:
