@@ -64,6 +64,24 @@ class ConsecutiveErrorStore:
         self._write(updated)
         return updated.count
 
+    def reset(self) -> ConsecutiveErrorState:
+        """Reset the count to 0 and return the previous state.
+
+        ``last_success_at`` (and ``last_attempt_id``) are preserved: no
+        success happened, only an operator clear. An unreadable or malformed
+        store is replaced with a clean zero state and reported as a zeroed
+        previous state, so the reset itself never fails on old damage.
+        """
+
+        try:
+            previous = self.read()
+        except RuntimeError:
+            previous = ConsecutiveErrorState(0, None, None)
+        self._write(
+            ConsecutiveErrorState(0, previous.last_success_at, previous.last_attempt_id)
+        )
+        return previous
+
     def _write(self, state: ConsecutiveErrorState) -> None:
         self._path.parent.mkdir(parents=True, exist_ok=True)
         temporary: Path | None = None

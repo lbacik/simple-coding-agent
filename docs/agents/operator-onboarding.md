@@ -252,13 +252,30 @@ The agent tracks consecutive `infrastructure_error` outcomes in
 `$DATA_DIR/state/consecutive_errors.json`.  At `MAX_CONSECUTIVE_ERRORS`
 (default 3) the process exits with status 1.
 
+`agentctl status` shows the guard as a `consecutive errors` line with the
+current count, the limit, and the last attempt and success timestamps. When
+the store cannot be read, status reports the counter as unavailable instead
+of failing the whole snapshot.
+
 A restart alone does **not** reset the guard.  To recover:
 1. Diagnose and fix the underlying infrastructure problem (credentials,
    network, disk, or broken provenance).
-2. Either remove `$DATA_DIR/state/consecutive_errors.json` to reset the
-   counter, or allow the next successful outcome to reset it automatically.
-3. Restart the agent.
+2. Reset the counter through the live process (never by editing the state
+   file, which would race the agent):
+
+   ```shell
+   /usr/local/bin/agentctl errors reset
+   ```
+
+   The command prints a durable request ID, accepts `--request-id` for an
+   identical retry after an ambiguous connection loss, is recorded so
+   `agentctl command <id>` reports it, and logs a `consecutive_errors_reset`
+   event with the previous count. It applies immediately even with an
+   active attempt. (`consecutive-errors reset` is an accepted alias.)
+   A non-infrastructure outcome also resets the counter automatically.
+3. Restart the agent if it already exited.
 
 An operator's auto-restart policy (e.g. `restart: unless-stopped` in Compose)
 cannot silently defeat this guard because the counter is persisted across
-restarts.
+restarts: with a restart policy the restarted process is reachable, so run
+the reset before its next attempt ends.

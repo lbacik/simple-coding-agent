@@ -2065,6 +2065,84 @@ class AgentLifecycle:
         with self._control_lock:
             return self._control_store.get_command(request_id)
 
+    def submit_errors_reset(self, request_id: str) -> CommandRecord:
+        """Reset the consecutive-error guard to 0 through the live process.
+
+        The counter is cleared in the process (never from outside it, so
+        the reset cannot race ``_record_terminal_outcome``) and the reset
+        is durably recorded so ``agentctl command <id>`` reports it. The
+        file write precedes the command commit under the same lock, so a
+        crash between them leaves no record and a retry safely re-applies
+        both; a retry arriving after the commit returns the stored
+        acknowledgement without touching the counter again. The reset
+        applies immediately even with an active attempt: it only changes
+        the counter the next terminal outcome is compared against.
+        """
+
+        if self._control_store is None:
+            raise ControlStoreError("Operator control is not configured")
+        with self._control_lock:
+            store = self._control_store
+            try:
+                existing = store.get_command(request_id)
+            except ControlStoreError:
+                raise
+            except Exception as error:
+                raise ControlStoreError("Control command could not be read") from error
+            if existing is not None:
+                return store.submit_errors_reset(request_id)
+            previous_count = self._consecutive_error_count_or_none()
+            self._reset_consecutive_errors()
+            record = store.submit_errors_reset(
+                request_id, previous_count=previous_count
+            )
+            self._event_log(
+                "consecutive_errors_reset",
+                f"request={request_id}; previous_count={previous_count}; count=0",
+                level="INFO",
+            )
+            return record
+
+    def _consecutive_error_count_or_none(self) -> int | None:
+        """Return the current guard count, or ``None`` when unreadable."""
+
+        if self._error_store is None:
+            return None
+        try:
+            return self._error_store.read().count
+        except (RuntimeError, OSError):
+            return None
+
+    def _reset_consecutive_errors(self) -> None:
+        """Clear the guard counter in-process; no-op when unconfigured."""
+
+        if self._error_store is None:
+            return
+        self._error_store.reset()
+
+    def _consecutive_errors_snapshot_locked(self) -> dict | None:
+        """Build the status ``consecutive_errors`` section (caller holds the lock)."""
+
+        if self._error_store is None:
+            return None
+        try:
+            state = self._error_store.read()
+        except (RuntimeError, OSError) as error:
+            return {
+                "count": None,
+                "max_consecutive_errors": self._max_consecutive_errors,
+                "last_attempt_id": None,
+                "last_success_at": None,
+                "error": str(error),
+            }
+        return {
+            "count": state.count,
+            "max_consecutive_errors": self._max_consecutive_errors,
+            "last_attempt_id": state.last_attempt_id,
+            "last_success_at": state.last_success_at,
+            "error": None,
+        }
+
     def control_status(self, repository: str | None = None) -> dict:
         """Return one consistent live snapshot for ``status`` and the socket."""
 
@@ -2095,6 +2173,7 @@ class AgentLifecycle:
                 stop_plan=store.stop_plan_snapshot(),
                 recovery=self._recovery_snapshot_locked(checkpoint),
                 handoff=store.handoff_snapshot(),
+                consecutive_errors=self._consecutive_errors_snapshot_locked(),
             )
 
     def run_once(self) -> LifecycleResult:
@@ -3416,7 +3495,10 @@ class AgentLifecycle:
 
         if self._error_store is None:
             return
-        count = self._error_store.record(outcome, attempt_id)
+        # Share the control lock with the operator reset so a reset racing
+        # a terminal outcome cannot lose its write between read and write.
+        with self._control_lock:
+            count = self._error_store.record(outcome, attempt_id)
         if count >= self._max_consecutive_errors:
             self._event_log("consecutive_error_limit_reached", level="ERROR", issue_number=issue_number)
             raise SystemExit(1)
