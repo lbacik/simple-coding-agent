@@ -35,3 +35,11 @@ _Avoid_: Status, result code, exit status
 **Handoff note**:
 The durable record of a `handoff` outcome: a committed file at a fixed per-issue path (`.agent/handoff/<issue-number>.md`) describing remaining work, plus a verbatim copy posted as an issue comment. The comment copy is what a continuation's starting prompt is enriched with; the file itself is only pointed at, never digested, since it is already reachable on the resumed branch.
 _Avoid_: Progress note, status update, summary
+
+**Attempt workspace**:
+The working tree in which one implementation attempt makes its changes, prepared from the verified base and holding the attempt's branch. It belongs to a single attempt at a time; after the attempt it returns to the base without carrying any of the attempt's changes with it.
+_Avoid_: Repo, checkout, sandbox
+
+**Sealing**:
+Turning every uncommitted change in the attempt workspace into a commit attributed to that attempt (issue, attempt ID, and the reason the model stopped). An attempt is sealed after every model execution, whatever its status, so no work the model wrote is ever lost or leaks onto the base. A workspace mid-way through an unresolved rebase or merge is never sealed: its conflicts are aborted instead.
+_Avoid_: Preserving dirty work, safety-net commit, checkpoint (the attempt checkpoint is a different thing)
