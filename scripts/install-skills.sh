@@ -10,7 +10,7 @@
 # by copying it into the same HOME layout the upstream skills use.
 #
 # Pinned versions:
-#   agent-installer : 0.6.0
+#   agent-installer : 0.7.2
 #   source repo     : https://github.com/mattpocock/skills
 #   source commit   : c55ee46073ed923f86ce59a5eb3b6d895095d1b7
 #   skills          : implement, tdd, code-review, codebase-design
@@ -18,7 +18,7 @@
 
 set -euo pipefail
 
-INSTALLER_VERSION="0.6.0"
+INSTALLER_VERSION="0.7.2"
 SOURCE_REPO="https://github.com/mattpocock/skills"
 SKILLS_COMMIT="c55ee46073ed923f86ce59a5eb3b6d895095d1b7"
 SKILLS=(implement tdd code-review codebase-design)
@@ -52,6 +52,20 @@ ONLY_FLAGS=()
 for skill in "${SKILLS[@]}"; do
     ONLY_FLAGS+=(--only "skill:${skill}")
 done
+
+# ---------------------------------------------------------------------------
+# Declare ~/.claude/skills as an exposure target
+# ---------------------------------------------------------------------------
+# Since 0.7, agent-installer installs only into the base store
+# (~/.agents/skills) and links a skill into ~/.claude/skills only when its
+# config declares that directory as an exposure target.
+mkdir -p "${HOME}/.agents/agent-installer"
+cat > "${HOME}/.agents/agent-installer/config.yaml" <<'YAML'
+version: 1
+targets:
+  claude:
+    skills: ~/.claude/skills
+YAML
 
 echo "[install-skills] Installing skills from ${SOURCE_REPO}@${SKILLS_COMMIT} ..."
 agent-installer install \

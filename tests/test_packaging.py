@@ -112,6 +112,18 @@ def test_dockerfile_entrypoint_runs_the_agent() -> None:
     )
 
 
+def test_dockerfile_preinstalls_the_pinned_agent_installer_as_root() -> None:
+    content = _dockerfile()
+    install_at = content.find("npm install --global agent-installer@0.7.2")
+    assert install_at != -1, (
+        "Dockerfile must install agent-installer@0.7.2 globally, since the agent user "
+        "cannot write the global npm prefix"
+    )
+    assert install_at < content.find("USER agent"), (
+        "Dockerfile must install agent-installer before switching to the agent user"
+    )
+
+
 def test_dockerfile_copies_the_project_owned_skills_directory() -> None:
     content = _dockerfile()
     assert "COPY skills/" in content, (
@@ -194,8 +206,23 @@ def test_install_skills_is_executable() -> None:
 
 def test_install_skills_pins_agent_installer_version() -> None:
     content = _script()
-    assert "agent-installer@0.6.0" in content or 'INSTALLER_VERSION="0.6.0"' in content, (
-        "install-skills.sh must pin agent-installer to 0.6.0"
+    assert 'INSTALLER_VERSION="0.7.2"' in content, (
+        "install-skills.sh must pin agent-installer to 0.7.2"
+    )
+
+
+def test_install_skills_declares_the_claude_exposure_target_before_installing() -> None:
+    content = _script()
+    config_at = content.find(".agents/agent-installer/config.yaml")
+    install_at = content.find("\nagent-installer install ")
+    assert config_at != -1, (
+        "install-skills.sh must write the agent-installer exposure config"
+    )
+    assert config_at < install_at, (
+        "install-skills.sh must write the exposure config before installing skills"
+    )
+    assert "skills: ~/.claude/skills" in content, (
+        "install-skills.sh must expose skills into ~/.claude/skills"
     )
 
 
