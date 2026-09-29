@@ -46,26 +46,33 @@ if [[ "${INSTALLED_VERSION}" != "${INSTALLER_VERSION}" ]]; then
 fi
 
 # ---------------------------------------------------------------------------
+# Declare ~/.claude/skills as an exposure target
+# ---------------------------------------------------------------------------
+# Since 0.7, agent-installer installs only into the base store
+# (~/.agents/skills) and links a skill into ~/.claude/skills only when its
+# config declares that directory as an exposure target. An existing config
+# is kept so a local run does not discard a developer's own targets; the
+# symlink verification below catches one that lacks the claude target.
+INSTALLER_CONFIG="${HOME}/.agents/agent-installer/config.yaml"
+if [[ -f "${INSTALLER_CONFIG}" ]]; then
+    echo "[install-skills] Keeping existing ${INSTALLER_CONFIG}; it must expose skills to ~/.claude/skills."
+else
+    mkdir -p "$(dirname "${INSTALLER_CONFIG}")"
+    cat > "${INSTALLER_CONFIG}" <<'YAML'
+version: 1
+targets:
+  claude:
+    skills: ~/.claude/skills
+YAML
+fi
+
+# ---------------------------------------------------------------------------
 # Install each required skill from the pinned commit
 # ---------------------------------------------------------------------------
 ONLY_FLAGS=()
 for skill in "${SKILLS[@]}"; do
     ONLY_FLAGS+=(--only "skill:${skill}")
 done
-
-# ---------------------------------------------------------------------------
-# Declare ~/.claude/skills as an exposure target
-# ---------------------------------------------------------------------------
-# Since 0.7, agent-installer installs only into the base store
-# (~/.agents/skills) and links a skill into ~/.claude/skills only when its
-# config declares that directory as an exposure target.
-mkdir -p "${HOME}/.agents/agent-installer"
-cat > "${HOME}/.agents/agent-installer/config.yaml" <<'YAML'
-version: 1
-targets:
-  claude:
-    skills: ~/.claude/skills
-YAML
 
 echo "[install-skills] Installing skills from ${SOURCE_REPO}@${SKILLS_COMMIT} ..."
 agent-installer install \

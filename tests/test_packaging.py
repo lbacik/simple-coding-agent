@@ -114,10 +114,11 @@ def test_dockerfile_entrypoint_runs_the_agent() -> None:
 
 def test_dockerfile_preinstalls_the_pinned_agent_installer_as_root() -> None:
     content = _dockerfile()
-    install_at = content.find("npm install --global agent-installer@0.7.2")
+    version = _installer_version()
+    install_at = content.find(f"npm install --global agent-installer@{version}")
     assert install_at != -1, (
-        "Dockerfile must install agent-installer@0.7.2 globally, since the agent user "
-        "cannot write the global npm prefix"
+        f"Dockerfile must install agent-installer@{version} (the install-skills.sh pin) "
+        "globally, since the agent user cannot write the global npm prefix"
     )
     assert install_at < content.find("USER agent"), (
         "Dockerfile must install agent-installer before switching to the agent user"
@@ -211,6 +212,12 @@ def test_install_skills_pins_agent_installer_version() -> None:
     )
 
 
+def _installer_version() -> str:
+    match = re.search(r'^INSTALLER_VERSION="([^"]+)"$', _script(), re.MULTILINE)
+    assert match, "install-skills.sh must define INSTALLER_VERSION"
+    return match.group(1)
+
+
 def test_install_skills_declares_the_claude_exposure_target_before_installing() -> None:
     content = _script()
     config_at = content.find(".agents/agent-installer/config.yaml")
@@ -218,6 +225,7 @@ def test_install_skills_declares_the_claude_exposure_target_before_installing() 
     assert config_at != -1, (
         "install-skills.sh must write the agent-installer exposure config"
     )
+    assert install_at != -1, "install-skills.sh must run 'agent-installer install'"
     assert config_at < install_at, (
         "install-skills.sh must write the exposure config before installing skills"
     )
