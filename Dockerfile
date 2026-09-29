@@ -63,6 +63,11 @@ RUN test -x /usr/local/bin/agentctl
 COPY package.json ./
 RUN npm install --global @anthropic-ai/claude-code@2.1.276
 
+# Pinned skill installer (installed globally as root: the agent user cannot
+# write the global npm prefix). install-skills.sh rejects any other version,
+# so keep this in step with its INSTALLER_VERSION.
+RUN npm install --global agent-installer@0.7.2
+
 # ---------------------------------------------------------------------------
 # Skill bundle (run as agent user so paths land in /home/agent)
 # ---------------------------------------------------------------------------

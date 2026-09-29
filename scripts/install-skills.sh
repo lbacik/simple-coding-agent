@@ -10,7 +10,7 @@
 # by copying it into the same HOME layout the upstream skills use.
 #
 # Pinned versions:
-#   agent-installer : 0.6.0
+#   agent-installer : 0.7.2
 #   source repo     : https://github.com/mattpocock/skills
 #   source commit   : c55ee46073ed923f86ce59a5eb3b6d895095d1b7
 #   skills          : implement, tdd, code-review, codebase-design
@@ -18,7 +18,7 @@
 
 set -euo pipefail
 
-INSTALLER_VERSION="0.6.0"
+INSTALLER_VERSION="0.7.2"
 SOURCE_REPO="https://github.com/mattpocock/skills"
 SKILLS_COMMIT="c55ee46073ed923f86ce59a5eb3b6d895095d1b7"
 SKILLS=(implement tdd code-review codebase-design)
@@ -43,6 +43,27 @@ INSTALLED_VERSION="$(agent-installer --version 2>/dev/null | awk '{print $NF}' |
 if [[ "${INSTALLED_VERSION}" != "${INSTALLER_VERSION}" ]]; then
     echo "[install-skills] ERROR: agent-installer ${INSTALLED_VERSION} is installed but ${INSTALLER_VERSION} is required." >&2
     exit 1
+fi
+
+# ---------------------------------------------------------------------------
+# Declare ~/.claude/skills as an exposure target
+# ---------------------------------------------------------------------------
+# Since 0.7, agent-installer installs only into the base store
+# (~/.agents/skills) and links a skill into ~/.claude/skills only when its
+# config declares that directory as an exposure target. An existing config
+# is kept so a local run does not discard a developer's own targets; the
+# symlink verification below catches one that lacks the claude target.
+INSTALLER_CONFIG="${HOME}/.agents/agent-installer/config.yaml"
+if [[ -f "${INSTALLER_CONFIG}" ]]; then
+    echo "[install-skills] Keeping existing ${INSTALLER_CONFIG}; it must expose skills to ~/.claude/skills."
+else
+    mkdir -p "$(dirname "${INSTALLER_CONFIG}")"
+    cat > "${INSTALLER_CONFIG}" <<'YAML'
+version: 1
+targets:
+  claude:
+    skills: ~/.claude/skills
+YAML
 fi
 
 # ---------------------------------------------------------------------------
