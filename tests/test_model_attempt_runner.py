@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import tempfile
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -9,6 +10,7 @@ from types import SimpleNamespace
 import pytest
 
 from simple_coding_agent.attempt_state import AttemptPhase, AttemptStateStore
+from simple_coding_agent.attempt_workspace import ConflictState
 from simple_coding_agent.completion import (
     AttemptOutcome,
     CompletionDecision,
@@ -16,9 +18,10 @@ from simple_coding_agent.completion import (
 )
 from simple_coding_agent.config import RepositoryProfile
 from simple_coding_agent.github_tracker import Assignment, Claim, TrackerIssue
-from simple_coding_agent.git_workspace import RebaseConflictError
+from simple_coding_agent.git_workspace import PreparedAttempt, RebaseConflictError
 from simple_coding_agent.lifecycle import ModelAttemptRunner
 from simple_coding_agent.model_execution import ModelExecution, ModelExecutionStatus
+from tests.fakes import InMemoryWorkspace
 
 
 def test_prompt_appends_trusted_comments_in_order(tmp_path: Path) -> None:
@@ -320,10 +323,11 @@ def test_unresolved_conflicts_after_the_model_abort_restore_and_raise(
 def test_fallback_falls_back_to_the_prepare_snapshot_for_the_file_list(
     tmp_path: Path,
 ) -> None:
-    """Workspaces without live conflict probes still report the file list."""
+    """A conflict state without live file names still reports the file list."""
 
     executor = FakeModelExecutor(status=ModelExecutionStatus.SUCCEEDED)
-    workspace = MinimalConflictingWorkspace()
+    workspace = FakeWorkspace(commits=("Retained work",))
+    workspace.leave_conflict(files=())
     events: list[tuple[str, str, str]] = []
     runner = build_runner(
         tmp_path,
@@ -345,19 +349,24 @@ def test_fallback_falls_back_to_the_prepare_snapshot_for_the_file_list(
     assert workspace.abort_calls == [prepared]
 
 
-def test_unreadable_verification_state_falls_back_without_running_setup(
+def test_unreadable_verification_state_fails_safe_without_running_setup(
     tmp_path: Path,
 ) -> None:
-    """A verification probe failure must fail safe, never fail open.
+    """A verification problem with no live file names still aborts and restores.
 
-    When the post-model conflict verification cannot be read, the attempt
-    aborts the rebase, restores the branch, and reports a rebase conflict
-    instead of running setup against an unverified tree.
+    The fail-safe rule lives in the adapter's ``conflict_state``: an
+    unverifiable tree reports ``in_progress`` with a verification problem,
+    so the runner aborts the rebase and restores the branch instead of
+    running setup against an unverified tree.
     """
 
     calls: list[str] = []
     executor = FakeModelExecutor(status=ModelExecutionStatus.SUCCEEDED, calls=calls)
-    workspace = ExplodingVerificationWorkspace()
+    workspace = FakeWorkspace(commits=("Retained work",))
+    workspace.leave_conflict(
+        files=(),
+        problems=("Conflict-resolution verification failed; treating the tree as conflicted.",),
+    )
     verifier = FakeVerifier(calls=calls)
     events: list[tuple[str, str, str]] = []
     runner = build_runner(
@@ -621,8 +630,14 @@ class FakeEvaluator:
         return CompletionDecision(AttemptOutcome.INCOMPLETE, False, PublicationPath.NONE, ("stub",))
 
 
-class FakeWorkspace:
-    working_directory = Path("/repository")
+class FakeWorkspace(InMemoryWorkspace):
+    """The shared in-memory workspace with the old conflict-timing knobs.
+
+    ``commits`` seeds retained-branch subjects, ``conflicts`` simulates a
+    retained-branch rebase left unresolved, and ``note_model_finished``
+    (wired as ``executor.after_execute``) simulates the model resolving it
+    during its turn when ``resolve_after_model`` holds.
+    """
 
     def __init__(
         self,
@@ -631,11 +646,13 @@ class FakeWorkspace:
         conflicts: bool = False,
         resolve_after_model: bool = True,
     ) -> None:
-        self._commits = commits
+        self._tmpdir = tempfile.TemporaryDirectory(prefix="fake-workspace-")
+        super().__init__(Path(self._tmpdir.name) / "repo", issue_number=24)
+        for subject in commits:
+            self.model_commit(subject, files=(subject,))
         self._conflicts = conflicts
         self._resolve_after_model = resolve_after_model
         self._model_finished = False
-        self.abort_calls: list[object] = []
 
     def note_model_finished(self) -> None:
         """Simulate the model's turn ending so resolution can take effect."""
@@ -645,92 +662,36 @@ class FakeWorkspace:
     def _resolved(self) -> bool:
         return self._model_finished and self._resolve_after_model
 
-    def commits_added(self, prepared: object) -> tuple[str, ...]:
-        return self._commits
-
-    def has_unresolved_conflicts(self) -> bool:
-        return self._conflicts and not self._resolved()
-
-    def conflicted_files(self) -> tuple[str, ...]:
-        if self.has_unresolved_conflicts():
-            return ("SubscriptionController.php",)
-        return ()
-
-    def rebase_resolution_problems(self) -> tuple[str, ...]:
-        if self.has_unresolved_conflicts():
-            return (
-                "A rebase or merge is still in progress."
-                " Conflicting files: SubscriptionController.php.",
+    def conflict_state(self) -> ConflictState:
+        if self._conflicts and not self._resolved():
+            return ConflictState(
+                in_progress=True,
+                conflicted_files=("SubscriptionController.php",),
+                resolution_problems=(
+                    "A rebase or merge is still in progress."
+                    " Conflicting files: SubscriptionController.php.",
+                ),
             )
-        return ()
-
-    def abort_unresolved_rebase(self, prepared: object) -> None:
-        self.abort_calls.append(prepared)
+        return super().conflict_state()
 
 
-class MinimalConflictingWorkspace:
-    """A workspace with conflicts but without the newer conflict probes.
+def FakePrepared(
+    *,
+    branch: str = "agent/issue-24",
+    base_revision: str = "base-revision-0",
+    restored_from_remote: bool = True,
+    rebase_conflicts: tuple[str, ...] = (),
+    pre_rebase_revision: str | None = None,
+) -> PreparedAttempt:
+    """Build a real ``PreparedAttempt`` with test-friendly defaults."""
 
-    Pins the runner's fallback chain: the file list comes from the prepared
-    attempt snapshot when live probes are unavailable.
-    """
-
-    working_directory = Path("/repository")
-
-    def __init__(self) -> None:
-        self.abort_calls: list[object] = []
-
-    def commits_added(self, prepared: object) -> tuple[str, ...]:
-        return ("Retained work",)
-
-    def has_unresolved_conflicts(self) -> bool:
-        return True
-
-    def abort_unresolved_rebase(self, prepared: object) -> None:
-        self.abort_calls.append(prepared)
-
-
-class ExplodingVerificationWorkspace:
-    """A workspace whose post-model verification probe is unreadable.
-
-    Pins the fail-safe rule: an unverifiable tree falls back to
-    abort-and-restore instead of running setup.
-    """
-
-    working_directory = Path("/repository")
-
-    def __init__(self) -> None:
-        self.abort_calls: list[object] = []
-
-    def commits_added(self, prepared: object) -> tuple[str, ...]:
-        return ("Retained work",)
-
-    def has_unresolved_conflicts(self) -> bool:
-        return True
-
-    def conflicted_files(self) -> tuple[str, ...]:
-        raise OSError("cannot read worktree state")
-
-    def rebase_resolution_problems(self) -> tuple[str, ...]:
-        raise OSError("cannot read worktree state")
-
-    def abort_unresolved_rebase(self, prepared: object) -> None:
-        self.abort_calls.append(prepared)
-
-
-class FakePrepared:
-    def __init__(
-        self,
-        *,
-        branch: str = "agent/issue-24",
-        restored_from_remote: bool = True,
-        rebase_conflicts: tuple[str, ...] = (),
-        pre_rebase_revision: str | None = None,
-    ) -> None:
-        self.branch = branch
-        self.restored_from_remote = restored_from_remote
-        self.rebase_conflicts = rebase_conflicts
-        self.pre_rebase_revision = pre_rebase_revision
+    return PreparedAttempt(
+        branch=branch,
+        base_revision=base_revision,
+        restored_from_remote=restored_from_remote,
+        rebase_conflicts=rebase_conflicts,
+        pre_rebase_revision=pre_rebase_revision,
+    )
 
 
 def claim(
@@ -762,56 +723,150 @@ def profile() -> RepositoryProfile:
     )
 
 
-class PreservingWorkspace(FakeWorkspace):
-    """A workspace double that records ``commit_dirty_work`` calls."""
-
-    def __init__(self, **kwargs) -> None:
-        super().__init__(**kwargs)
-        self.preserved: list[str] = []
-
-    def commit_dirty_work(self, message: str) -> bool:
-        self.preserved.append(message)
-        return True
-
-
-def test_infrastructure_error_preserves_dirty_work(tmp_path: Path) -> None:
+def test_infrastructure_error_seals_dirty_work(tmp_path: Path) -> None:
     """An SDK stream that dies without a terminal message still preserves edits.
 
-    Regression test: ``INFRASTRUCTURE_ERROR`` used to skip the
-    ``commit_dirty_work`` safety net, so uncommitted work rode along when
-    ``cleanup`` checked out the base branch and wedged the next poll cycle
-    with ``working_tree_dirty``.
+    Regression test: ``INFRASTRUCTURE_ERROR`` used to skip the preservation
+    path, so uncommitted work rode along when ``cleanup`` checked out the
+    base branch and wedged the next poll cycle with ``working_tree_dirty``.
+    The runner now seals unconditionally, so the work lands in a
+    provenance-carrying seal commit on the attempt branch.
     """
 
     executor = FakeModelExecutor(status=ModelExecutionStatus.INFRASTRUCTURE_ERROR)
-    workspace = PreservingWorkspace()
+    workspace = FakeWorkspace()
+    workspace.make_dirty("work.txt", "model edits")
     runner = build_runner(tmp_path, model_executor=executor, workspace=workspace)
+    prepared = FakePrepared()
 
     runner(
-        claim(issue_number=24, issue_body="Fix the parser."), profile(), FakePrepared()
+        claim(issue_number=24, issue_body="Fix the parser."), profile(), prepared
     )
 
-    assert workspace.preserved == ["Preserve uncommitted work before handoff"]
+    assert workspace.is_clean()
+    commits = workspace.commits_added(prepared)
+    assert [commit.subject for commit in commits] == [
+        "Seal attempt work for #24 (infrastructure_error)"
+    ]
 
 
-def test_dirty_work_is_preserved_for_every_terminal_model_status(tmp_path: Path) -> None:
-    """The safety net covers the whole ``ModelExecutionStatus`` enum.
+def test_dirty_work_is_sealed_for_every_model_status(tmp_path: Path) -> None:
+    """Sealing covers the whole ``ModelExecutionStatus`` enum.
 
-    Guards against a future status being added to the enum without joining
-    the ``commit_dirty_work`` guard in ``ModelAttemptRunner``.
+    Guards against a future status being added to the enum without being
+    sealed by ``ModelAttemptRunner``: the new member is picked up
+    automatically because the test iterates the enum.
     """
 
     for status in ModelExecutionStatus:
         state_dir = tmp_path / status.value
         state_dir.mkdir(exist_ok=True)
         executor = FakeModelExecutor(status=status)
-        workspace = PreservingWorkspace()
+        workspace = FakeWorkspace()
+        workspace.make_dirty("work.txt", "model edits")
         runner = build_runner(state_dir, model_executor=executor, workspace=workspace)
+        prepared = FakePrepared()
 
         runner(
             claim(issue_number=24, issue_body="Fix the parser."),
             profile(),
-            FakePrepared(),
+            prepared,
         )
 
-        assert workspace.preserved, f"commit_dirty_work not called for {status}"
+        assert workspace.is_clean(), f"dirty work left behind for {status}"
+        assert len(workspace.seal_calls) == 1, f"seal not called for {status}"
+        assert workspace.seal_calls[0][2] is status
+        subjects = [commit.subject for commit in workspace.commits_added(prepared)]
+        assert f"Seal attempt work for #24 ({status.value})" in subjects, (
+            f"no seal commit for {status}"
+        )
+
+
+def test_model_execution_failure_still_seals_dirty_work(tmp_path: Path) -> None:
+    """When execution itself raises, the runner seals before propagating.
+
+    The attempt finalizes as an infrastructure error with the model's work
+    preserved on the branch instead of left dirty in the tree.
+    """
+
+    class ExplodingExecutor(FakeModelExecutor):
+        async def execute(self, **kwargs: object) -> ModelExecution:
+            raise RuntimeError("SDK stream died")
+
+    workspace = FakeWorkspace()
+    workspace.make_dirty("work.txt", "model edits")
+    runner = build_runner(
+        tmp_path, model_executor=ExplodingExecutor(), workspace=workspace
+    )
+    prepared = FakePrepared()
+
+    with pytest.raises(RuntimeError, match="SDK stream died"):
+        runner(
+            claim(issue_number=24, issue_body="Fix the parser."), profile(), prepared
+        )
+
+    assert workspace.is_clean()
+    assert [commit.subject for commit in workspace.commits_added(prepared)] == [
+        "Seal attempt work for #24 (infrastructure_error)"
+    ]
+
+
+def test_model_limit_path_seals_work_then_commits_note_only(tmp_path: Path) -> None:
+    """On model limit the seal commit lands first and the note commit second.
+
+    The model's dirty work is sealed with provenance, then the emergency
+    handoff note is committed on top touching only the note file — the note
+    commit must not sweep up unrelated work.
+    """
+
+    executor = FakeModelExecutor(status=ModelExecutionStatus.MODEL_LIMIT_REACHED)
+    workspace = FakeWorkspace()
+    workspace.make_dirty("work.txt", "model edits")
+    runner = build_runner(tmp_path, model_executor=executor, workspace=workspace)
+    prepared = FakePrepared()
+
+    runner(
+        claim(issue_number=24, issue_body="Fix the parser."), profile(), prepared
+    )
+
+    assert workspace.is_clean()
+    assert len(workspace.seal_calls) == 1
+    assert len(workspace.note_calls) == 1
+    commits = workspace.commits_added(prepared)
+    assert [commit.subject for commit in commits] == [
+        "Handoff note: issue #24",
+        "Seal attempt work for #24 (model_limit_reached)",
+    ]
+    note_commit = workspace.handoff_note_commit(prepared, 24, attempt_id="unused")
+    assert note_commit is not None
+    assert note_commit.revision == commits[0].revision
+    assert workspace.commit_files()[0] == frozenset({".agent/handoff/24.md"})
+
+
+def test_model_limit_on_a_continuation_ignores_an_earlier_rounds_note(
+    tmp_path: Path,
+) -> None:
+    """A note left by an earlier round must not stand in for this attempt's.
+
+    The continued branch already carries a committed note; on model limit
+    the runner still writes a fresh emergency note on top of the sealed work.
+    """
+
+    executor = FakeModelExecutor(status=ModelExecutionStatus.MODEL_LIMIT_REACHED)
+    workspace = FakeWorkspace()
+    workspace.prior_round_commit("Handoff note: issue #24", (".agent/handoff/24.md",))
+    workspace.make_dirty("work.txt", "model edits")
+    runner = build_runner(tmp_path, model_executor=executor, workspace=workspace)
+    prepared = FakePrepared()
+
+    runner(
+        claim(issue_number=24, issue_body="Fix the parser."), profile(), prepared
+    )
+
+    assert len(workspace.note_calls) == 1
+    subjects = [commit.subject for commit in workspace.commits_added(prepared)]
+    assert subjects == [
+        "Handoff note: issue #24",
+        "Seal attempt work for #24 (model_limit_reached)",
+        "Handoff note: issue #24",
+    ]

@@ -13,7 +13,7 @@ import re
 import signal
 import threading
 import time
-from typing import Protocol
+from typing import NoReturn, Protocol
 
 from simple_coding_agent.attempt_state import (
     AttemptCheckpoint,
@@ -21,6 +21,7 @@ from simple_coding_agent.attempt_state import (
     AttemptStateError,
     AttemptStateStore,
 )
+from simple_coding_agent.attempt_workspace import AttemptWorkspace, ConflictState
 from simple_coding_agent.control import (
     ActiveAttemptInfo,
     CommandAcknowledgement,
@@ -48,10 +49,13 @@ from simple_coding_agent.completion import (
 from simple_coding_agent.config import RepositoryProfile
 from simple_coding_agent.finalization import AttemptCompletionStore, CompletionStoreError
 from simple_coding_agent.git_workspace import (
+    AttemptCommit,
     DirtyWorkspaceError,
     GitWorkspaceError,
     GitWorkspaceRecoveryError,
+    PreparedAttempt,
     RebaseConflictError,
+    handoff_note_relpath,
 )
 from simple_coding_agent.github_tracker import (
     ROUND_FINISHED,
@@ -243,20 +247,6 @@ class AttemptTracker(Protocol):
     def release_handoff(self, issue_number: int, assignee_id: str) -> None: ...
 
 
-class Workspace(Protocol):
-    """Workspace operations needed by the orchestration seam."""
-
-    working_directory: Path
-
-    def prepare_for_profile_read(self, *, base_branch: str = "main"): ...
-
-    def prepare_attempt(self, *, base_branch: str, issue_number: int): ...
-
-    def cleanup(self, *, base_branch: str, prepared: object, retain_branch: bool) -> None: ...
-
-    def commit_dirty_work(self, message: str) -> bool: ...
-
-
 class Publisher(Protocol):
     """Publication boundary, including the result-comment operation."""
 
@@ -270,7 +260,7 @@ class ModelAttemptRunner:
         self,
         *,
         attempt_state: AttemptStateStore,
-        workspace: object,
+        workspace: AttemptWorkspace,
         verifier: VerificationRunner,
         evaluator: CompletionEvaluator,
         model_executor: ModelExecutor,
@@ -303,13 +293,13 @@ class ModelAttemptRunner:
 
         self._operator_handoff = control
 
-    def __call__(self, claim: Claim, profile: RepositoryProfile, prepared: object) -> AttemptEvidence:
+    def __call__(self, claim: Claim, profile: RepositoryProfile, prepared: PreparedAttempt) -> AttemptEvidence:
         """Run the local evidence gates in their mandated phase order."""
 
-        if not getattr(prepared, "restored_from_remote", False) and _continuation_expected(
+        if not prepared.restored_from_remote and _continuation_expected(
             claim.issue, self._issue_comments
         ):
-            branch = getattr(prepared, "branch", f"agent/issue-{claim.issue.number}")
+            branch = prepared.branch
             details = (
                 f"Expected continuation branch `{branch}` was not found on origin, so it "
                 "could not be restored. A human should inspect this issue and decide next steps."
@@ -321,25 +311,23 @@ class ModelAttemptRunner:
             return _attempt_evidence(decision, profile, None, 0, "not run", details)
 
         checkpoint = self._attempt_state.read()
+        attempt_id = _attempt_id(checkpoint)
         archive = (
             self._attempt_archive_factory(claim.issue.number, checkpoint.started_at)
             if checkpoint is not None and self._attempt_archive_factory is not None
             else None
         )
-        initial_commits = (
-            getattr(self._workspace, "commits_added")(prepared)
-            if hasattr(self._workspace, "commits_added")
-            else ()
-        )
+        initial_commits = self._workspace.commits_added(prepared)
         continuation = bool(initial_commits)
         # A retained branch rebased onto its base can be left with conflict
         # markers for the model to resolve. Setup commands parse every source
         # file, so they must never run against that half-rebased tree; they
         # are deferred until after the model resolves the conflicts.
-        setup_deferred = _has_unresolved_conflicts(self._workspace)
+        pre_state = self._workspace.conflict_state()
+        setup_deferred = pre_state.in_progress
         preparation: PreparationEvidence | None = None
         if setup_deferred:
-            resolution_files = _conflict_resolution_files(self._workspace, prepared)
+            resolution_files = _remaining_conflicts(pre_state, prepared)
             self._event_log(
                 "rebase_resolution_started",
                 "The model resolves the rebase conflicts first, before setup runs."
@@ -394,23 +382,45 @@ class ModelAttemptRunner:
             issue_number=claim.issue.number,
         )
         self._wire_operator_handoff()
-        execution = asyncio.run(
-            self._model_executor.execute(
-                issue_body=prompt_body,
-                working_directory=getattr(self._workspace, "working_directory"),
-                issue_number=claim.issue.number,
-                archive=archive,
+        try:
+            execution = asyncio.run(
+                self._model_executor.execute(
+                    issue_body=prompt_body,
+                    working_directory=self._workspace.working_directory,
+                    issue_number=claim.issue.number,
+                    archive=archive,
+                )
             )
-        )
-        if archive is not None:
-            archive.write_attempt(
-                {
-                    "model_usage": execution.model_usage,
-                    "skill_events": [event.__dict__ for event in execution.skill_events],
-                    "model_stop_reason": execution.stop_reason,
-                }
-            )
-        served_operator_request, late_operator_snapshot = self._read_operator_request()
+            if archive is not None:
+                archive.write_attempt(
+                    {
+                        "model_usage": execution.model_usage,
+                        "skill_events": [event.__dict__ for event in execution.skill_events],
+                        "model_stop_reason": execution.stop_reason,
+                    }
+                )
+            served_operator_request, late_operator_snapshot = self._read_operator_request()
+        except BaseException:
+            # Model execution, or recording its result, failed: still seal
+            # whatever the model left behind, then propagate so the attempt
+            # finalizes as an infrastructure error with the work sealed on
+            # the branch. A seal failure is only logged here. It refuses on
+            # an unresolved rebase, which cleanup then aborts; any other
+            # dirty tree makes cleanup hold the workspace for the operator.
+            try:
+                self._workspace.seal(
+                    issue_number=claim.issue.number,
+                    attempt_id=attempt_id,
+                    status=ModelExecutionStatus.INFRASTRUCTURE_ERROR,
+                )
+            except Exception as seal_error:
+                self._event_log(
+                    "seal_attempt_work_failed",
+                    _exception_detail(seal_error),
+                    level="ERROR",
+                    issue_number=claim.issue.number,
+                )
+            raise
         if setup_deferred:
             # The model had its chance to resolve the conflicts left in
             # place by preparation. Setup must never run against a
@@ -420,25 +430,23 @@ class ModelAttemptRunner:
             # back to the pre-rebase branch state and the attempt reports
             # a rebase_conflict infrastructure error, exactly as if the
             # rebase had been aborted up front.
-            problems = _resolution_problems(self._workspace)
-            if problems:
-                remaining = _conflict_resolution_files(self._workspace, prepared)
-                branch = getattr(prepared, "branch", f"agent/issue-{claim.issue.number}")
-                abort = getattr(self._workspace, "abort_unresolved_rebase", None)
-                if callable(abort):
-                    try:
-                        abort(prepared)
-                    except GitWorkspaceError:
-                        self._event_log(
-                            "rebase_resolution_failed",
-                            f"{' '.join(problems)} The branch could not be restored.",
-                            level="ERROR",
-                            issue_number=claim.issue.number,
-                        )
-                        raise
+            post_state = self._workspace.conflict_state()
+            if post_state.resolution_problems:
+                remaining = _remaining_conflicts(post_state, prepared)
+                branch = prepared.branch
+                try:
+                    self._workspace.abort_unresolved_rebase(prepared)
+                except GitWorkspaceError:
+                    self._event_log(
+                        "rebase_resolution_failed",
+                        f"{' '.join(post_state.resolution_problems)} The branch could not be restored.",
+                        level="ERROR",
+                        issue_number=claim.issue.number,
+                    )
+                    raise
                 self._event_log(
                     "rebase_resolution_failed",
-                    f"{' '.join(problems)}"
+                    f"{' '.join(post_state.resolution_problems)}"
                     " The rebase was aborted and the branch restored to its"
                     " pre-rebase state.",
                     level="ERROR",
@@ -460,40 +468,27 @@ class ModelAttemptRunner:
                 level="INFO",
                 issue_number=claim.issue.number,
             )
-        if execution.status in (
-            ModelExecutionStatus.HANDOFF_REQUESTED,
-            ModelExecutionStatus.MODEL_LIMIT_REACHED,
-            ModelExecutionStatus.OPERATOR_HANDOFF_EXPIRED,
-            ModelExecutionStatus.SUCCEEDED,
-            ModelExecutionStatus.INFRASTRUCTURE_ERROR,
-        ):
-            # Always preserve dirty/untracked work as a commit rather than
-            # letting it get silently discarded. This also covers a model
-            # that reports success but stops before its own final commit:
-            # without this, commit_count and the final check would be
-            # evaluated against work that never makes it into the push.
-            # It also covers an infrastructure error (e.g. the SDK stream
-            # ending without a terminal message): the model's edits are
-            # finished work that must stay committed on the attempt branch,
-            # otherwise cleanup's checkout of the base branch would carry
-            # the uncommitted changes onto the base branch.
-            commit_fn = getattr(self._workspace, "commit_dirty_work", None)
-            if callable(commit_fn):
-                message = (
-                    "Preserve uncommitted work before handoff"
-                    if execution.status is not ModelExecutionStatus.SUCCEEDED
-                    else "Preserve uncommitted work left after model completion"
-                )
-                try:
-                    commit_fn(message)
-                except GitWorkspaceError as error:
-                    decision = CompletionDecision(
-                        outcome=AttemptOutcome.INFRASTRUCTURE_ERROR,
-                        publication_eligible=False,
-                        publication_path=PublicationPath.NONE,
-                        reasons=(f"Failed to preserve dirty work after model completion: {error}",),
-                    )
-                    return _attempt_evidence(decision, profile, None, 0, "not run", str(error))
+        # Seal the attempt's work unconditionally: every normal exit from
+        # model execution leaves dirty and untracked changes in one commit
+        # attributed to this attempt, whatever the execution status. A new
+        # ``ModelExecutionStatus`` therefore cannot silently drop work the
+        # way the old enumerated status tuple did. The unresolved-conflict
+        # path above aborts and restores instead of committing conflict
+        # markers; the exception path seals before propagating.
+        try:
+            self._workspace.seal(
+                issue_number=claim.issue.number,
+                attempt_id=attempt_id,
+                status=execution.status,
+            )
+        except GitWorkspaceError as error:
+            decision = CompletionDecision(
+                outcome=AttemptOutcome.INFRASTRUCTURE_ERROR,
+                publication_eligible=False,
+                publication_path=PublicationPath.NONE,
+                reasons=(f"Failed to seal attempt work after model execution: {error}",),
+            )
+            return _attempt_evidence(decision, profile, None, 0, "not run", str(error))
         if setup_deferred:
             # Setup was skipped before the model so it would not parse a
             # half-rebased tree; run it now that the model had its chance to
@@ -505,30 +500,25 @@ class ModelAttemptRunner:
             if isinstance(early, AttemptEvidence):
                 return early
             preparation = early
-        commits = getattr(self._workspace, "commits_added")(prepared)
+        commits = self._workspace.commits_added(prepared)
         if execution.status is ModelExecutionStatus.MODEL_LIMIT_REACHED:
             # Emergency handoff: synthesize and commit a handoff note so
             # progress is preserved for human review with round-finished.
-            if not commits or not _is_handoff_note_commit(commits[0]):
+            # The model's work is already sealed above; the note commit
+            # stages only the note file on top of it.
+            note_commit = self._workspace.handoff_note_commit(
+                prepared, claim.issue.number, attempt_id=attempt_id
+            )
+            if note_commit is None:
                 note_content = _build_emergency_handoff_note(
                     issue_number=claim.issue.number,
-                    started_at=checkpoint.started_at,
+                    started_at=attempt_id,
                     reason=_classify_handoff_reason(execution),
-                    last_work_commit=getattr(commits[0], "revision", str(commits[0])) if commits else getattr(prepared, "base_revision", "0" * 40),
+                    last_work_commit=commits[0].revision if commits else prepared.base_revision,
                     explanation=execution.explanation,
                 )
-                working_dir = getattr(self._workspace, "working_directory", None)
-                if working_dir is not None:
-                    try:
-                        note_path = working_dir / ".agent" / "handoff" / f"{claim.issue.number}.md"
-                        note_path.parent.mkdir(parents=True, exist_ok=True)
-                        note_path.write_text(note_content)
-                    except OSError:
-                        pass
-                commit_fn = getattr(self._workspace, "commit_dirty_work", None)
-                if callable(commit_fn):
-                    commit_fn(f"Handoff note: issue #{claim.issue.number}")
-                commits = getattr(self._workspace, "commits_added")(prepared)
+                self._workspace.commit_handoff_note(claim.issue.number, note_content)
+                commits = self._workspace.commits_added(prepared)
             execution = replace(execution, status=ModelExecutionStatus.HANDOFF_REQUESTED)
         commit_count = len(commits)
         review_count = sum(
@@ -551,7 +541,7 @@ class ModelAttemptRunner:
                 )
                 if archive is not None:
                     archive.write_attempt({"final_check_started": _utc_timestamp()})
-                final_check = self._verifier.final_check(profile, getattr(self._workspace, "working_directory"))
+                final_check = self._verifier.final_check(profile, self._workspace.working_directory)
                 if archive is not None:
                     archive.write_attempt({"final_check_finished": _utc_timestamp()})
             except VerificationOrderError:
@@ -597,10 +587,13 @@ class ModelAttemptRunner:
         handoff_rejection_reason: str | None = None
         if decision.outcome is AttemptOutcome.HANDOFF:
             validation = _validate_handoff_note(
+                self._workspace.handoff_note_commit(
+                    prepared, claim.issue.number, attempt_id=attempt_id
+                ),
                 commits,
                 claim.issue.number,
-                getattr(self._workspace, "working_directory"),
-                getattr(prepared, "base_revision"),
+                self._workspace.working_directory,
+                prepared.base_revision,
             )
             if not validation.valid:
                 # A committed-but-untrustworthy note is ordinary evidence,
@@ -627,10 +620,13 @@ class ModelAttemptRunner:
         note_commit_sha = None
         if decision.outcome is AttemptOutcome.HANDOFF:
             details = _read_handoff_note(
-                getattr(self._workspace, "working_directory"), claim.issue.number
+                self._workspace.working_directory, claim.issue.number
             )
-            if commits and _is_handoff_note_commit(commits[0]):
-                note_commit_sha = commits[0].revision
+            note_commit = self._workspace.handoff_note_commit(
+                prepared, claim.issue.number, attempt_id=attempt_id
+            )
+            if note_commit is not None:
+                note_commit_sha = note_commit.revision
         elif handoff_rejection_reason is not None:
             details = handoff_rejection_reason
         return _attempt_evidence(
@@ -769,7 +765,7 @@ class ModelAttemptRunner:
 
         try:
             text = _read_handoff_note(
-                getattr(self._workspace, "working_directory"), issue_number
+                self._workspace.working_directory, issue_number
             )
         except Exception:
             return None
@@ -795,13 +791,13 @@ class ModelAttemptRunner:
         try:
             preparation = self._verifier.prepare(
                 profile,
-                getattr(self._workspace, "working_directory"),
+                self._workspace.working_directory,
                 continuation=continuation,
             )
         except TypeError:
             preparation = self._verifier.prepare(
                 profile,
-                getattr(self._workspace, "working_directory"),
+                self._workspace.working_directory,
             )
         _archive_commands(archive, "setup", preparation.setup)
         if not preparation.setup.succeeded:
@@ -881,7 +877,7 @@ class AgentLifecycle:
         *,
         tracker: AttemptTracker,
         attempt_state: AttemptStateStore,
-        workspace: Workspace,
+        workspace: AttemptWorkspace,
         profile_loader: Callable[[Path], RepositoryProfile],
         publisher: Publisher,
         attempt_runner: Callable[[Claim, RepositoryProfile, object], AttemptEvidence] | None = None,
@@ -1352,16 +1348,12 @@ class AgentLifecycle:
     def _workspace_is_dirty(self) -> bool:
         """Whether the tree holds work outside any active attempt.
 
-        Mirrors the pre-claim dirt guard in ``run_once``: only workspaces
-        exposing ``is_clean`` are inspected. An unreadable tree fails closed
-        as a hold so resume never bypasses it.
+        Mirrors the pre-claim dirt guard in ``run_once``. An unreadable
+        tree fails closed as a hold so resume never bypasses it.
         """
 
-        probe = getattr(self._workspace, "is_clean", None)
-        if not callable(probe):
-            return False
         try:
-            return not probe()
+            return not self._workspace.is_clean()
         except Exception:
             return True
 
@@ -1423,7 +1415,7 @@ class AgentLifecycle:
                 f" the workspace cannot be safely prepared"
                 f" ({_exception_detail(error)}); the hold remains. {hold_suffix}"
             )
-        if _has_unresolved_conflicts(self._workspace):
+        if self._workspace.conflict_state().in_progress:
             return False, (
                 f"recovery retry for attempt {attempt_id} not fulfilled:"
                 " the worktree holds unresolved merge conflicts that the"
@@ -1445,7 +1437,7 @@ class AgentLifecycle:
                 PublicationRequest(
                     issue_number=claim.issue.number,
                     issue_title=claim.issue.title,
-                    branch=getattr(prepared, "branch", checkpoint.branch),
+                    branch=prepared.branch,
                     started_at=attempt_id,
                     decision=decision,
                     check_command="not rerun during recovery retry",
@@ -1500,6 +1492,19 @@ class AgentLifecycle:
                 # above), so only genuinely unpublished work retains.
                 retain_branch=bool(retain_branch),
             )
+        except DirtyWorkspaceError as error:
+            # Cleanup refused to leave the attempt branch while the tree is
+            # dirty: the hold remains with everything preserved for
+            # operator inspection. Unlike the attempt paths this does not
+            # exit the process: recovery retry is an operator command, and
+            # the failed result below already keeps the hold in place.
+            self._emit_workspace_hold(claim.issue.number, error)
+            return False, (
+                f"recovery retry for attempt {attempt_id} not fulfilled:"
+                f" local cleanup failed ({_exception_detail(error)});"
+                " the hold remains."
+                f" {hold_suffix}"
+            )
         except Exception as error:
             return False, (
                 f"recovery retry for attempt {attempt_id} not fulfilled:"
@@ -1512,7 +1517,7 @@ class AgentLifecycle:
             self._commit_finalization(
                 checkpoint,
                 claim.issue.number,
-                getattr(prepared, "branch", checkpoint.branch),
+                prepared.branch,
                 outcome,
                 archive,
             )
@@ -1597,7 +1602,7 @@ class AgentLifecycle:
         actual_outcome, failure_reason = self._infer_release_outcome(
             checkpoint, claim, prepared
         )
-        branch = getattr(prepared, "branch", checkpoint.branch)
+        branch = prepared.branch
         marker = attempt_marker(attempt_id)
         comment_body = release_comment_body(
             issue_number=issue_number,
@@ -1677,15 +1682,12 @@ class AgentLifecycle:
         )
 
     def _infer_retry_decision(
-        self, checkpoint: AttemptCheckpoint, claim: Claim, prepared: object
+        self, checkpoint: AttemptCheckpoint, claim: Claim, prepared: PreparedAttempt
     ) -> tuple[CompletionDecision, str, str | None, bool]:
         """Infer the safe republication decision without invoking the model."""
 
         archive = self._archive_for(claim.issue.number, checkpoint.started_at)
-        commits_added = getattr(self._workspace, "commits_added", None)
-        commits = (
-            tuple(commits_added(prepared)) if callable(commits_added) else ()
-        )
+        commits = self._workspace.commits_added(prepared)
         has_commits = bool(commits)
         if checkpoint.phase is AttemptPhase.MODEL_RUNNING:
             if commits:
@@ -1716,13 +1718,16 @@ class AgentLifecycle:
                 )
             return (decision, decision.reasons[0], None, has_commits)
         if checkpoint.phase in (AttemptPhase.PUSHING, AttemptPhase.PUBLISHING):
-            if _is_handoff_recovery(commits):
-                base_revision = getattr(prepared, "base_revision", "")
+            note_commit = self._workspace.handoff_note_commit(
+                prepared, claim.issue.number, attempt_id=checkpoint.started_at
+            )
+            if note_commit is not None:
                 validation = _validate_handoff_note(
+                    note_commit,
                     commits,
                     claim.issue.number,
                     self._workspace.working_directory,
-                    base_revision if isinstance(base_revision, str) else "",
+                    prepared.base_revision,
                 )
                 if validation.valid:
                     decision = CompletionDecision(
@@ -1737,7 +1742,7 @@ class AgentLifecycle:
                     details = _read_handoff_note(
                         self._workspace.working_directory, claim.issue.number
                     )
-                    return (decision, details, commits[0].revision, has_commits)
+                    return (decision, details, note_commit.revision, has_commits)
                 # An invalid recovered note is ordinary incomplete work, not
                 # an infrastructure failure: the preserved commits still
                 # publish on the partial path with the validation reason.
@@ -1761,25 +1766,28 @@ class AgentLifecycle:
         return (decision, decision.reasons[0], None, has_commits)
 
     def _infer_release_outcome(
-        self, checkpoint: AttemptCheckpoint, claim: Claim, prepared: object
+        self, checkpoint: AttemptCheckpoint, claim: Claim, prepared: PreparedAttempt
     ) -> tuple[AttemptOutcome, str]:
         """Infer the actual outcome recorded by ``recovery release``."""
 
-        commits_added = getattr(self._workspace, "commits_added", None)
         try:
-            commits = (
-                tuple(commits_added(prepared)) if callable(commits_added) else ()
-            )
+            commits = self._workspace.commits_added(prepared)
         except Exception:
             commits = ()
-        if _is_handoff_recovery(commits):
-            base_revision = getattr(prepared, "base_revision", "")
+        try:
+            note_commit = self._workspace.handoff_note_commit(
+                prepared, claim.issue.number, attempt_id=checkpoint.started_at
+            )
+        except Exception:
+            note_commit = None
+        if note_commit is not None:
             try:
                 validation = _validate_handoff_note(
+                    note_commit,
                     commits,
                     claim.issue.number,
                     self._workspace.working_directory,
-                    base_revision if isinstance(base_revision, str) else "",
+                    prepared.base_revision,
                 )
             except Exception:
                 validation = None
@@ -1946,9 +1954,7 @@ class AgentLifecycle:
                 "phase": None,
                 "outcome": None,
                 "branch": None,
-                "workspace": str(
-                    getattr(self._workspace, "working_directory", "")
-                ),
+                "workspace": str(self._workspace.working_directory),
                 "checkpoint": False,
                 "publication": {
                     "phase": None,
@@ -1993,7 +1999,7 @@ class AgentLifecycle:
             "phase": checkpoint.phase.value,
             "outcome": outcome,
             "branch": checkpoint.branch,
-            "workspace": str(getattr(self._workspace, "working_directory", "")),
+            "workspace": str(self._workspace.working_directory),
             "checkpoint": True,
             "publication": publication,
             "hold_reason": describe_hold(
@@ -2189,7 +2195,11 @@ class AgentLifecycle:
             if recovered is not None:
                 return LifecycleResult(LifecycleStatus.ATTEMPTED, recovered)
 
-        if hasattr(self._workspace, "is_clean") and not self._workspace.is_clean():
+        try:
+            tree_clean = self._workspace.is_clean()
+        except Exception:
+            tree_clean = False
+        if not tree_clean:
             self._event_log(
                 "working_tree_dirty",
                 "Repository working tree contains uncommitted or untracked changes before claim; human cleanup is required.",
@@ -2211,7 +2221,7 @@ class AgentLifecycle:
         self._active_issue_number = claim.issue.number
         assert checkpoint is not None  # _gated_claim starts it atomically with the claim
         archive = self._archive_for(claim.issue.number, checkpoint.started_at)
-        prepared: object | None = None
+        prepared: PreparedAttempt | None = None
         profile: RepositoryProfile | None = None
         outcome = AttemptOutcome.INFRASTRUCTURE_ERROR
         retain_branch = False
@@ -2240,9 +2250,9 @@ class AgentLifecycle:
             prepared = self._workspace.prepare_attempt(
                 base_branch=profile.base_branch, issue_number=claim.issue.number
             )
-            rebase_conflicts = tuple(getattr(prepared, "rebase_conflicts", None) or ())
+            rebase_conflicts = tuple(prepared.rebase_conflicts or ())
             prepared_detail = (
-                f"branch={getattr(prepared, 'branch', None)}; base_branch={profile.base_branch}"
+                f"branch={prepared.branch}; base_branch={profile.base_branch}"
             )
             if rebase_conflicts:
                 prepared_detail += f"; rebase_conflicts={', '.join(rebase_conflicts)}"
@@ -2275,7 +2285,7 @@ class AgentLifecycle:
                     PublicationRequest(
                         issue_number=claim.issue.number,
                         issue_title=claim.issue.title,
-                        branch=getattr(prepared, "branch"),
+                        branch=prepared.branch,
                         started_at=checkpoint.started_at,
                         decision=evidence.decision,
                         check_command=evidence.check_command,
@@ -2396,6 +2406,12 @@ class AgentLifecycle:
                             retain_branch=retain_branch or not comment_posted,
                         )
                         cleanup_ok = True
+                except DirtyWorkspaceError as error:
+                    # Cleanup refused to leave the attempt branch while the
+                    # tree is dirty: hold intake with everything preserved
+                    # for operator inspection instead of carrying uncommitted
+                    # work onto the base or claiming further issues.
+                    self._hold_dirty_workspace(claim.issue.number, error)
                 finally:
                     if comment_posted and released and cleanup_ok and not hold:
                         # Publication already confirmed (comment posted) before
@@ -2411,9 +2427,8 @@ class AgentLifecycle:
                         )
                     if comment_posted and released and cleanup_ok and not hold:
                         self._commit_finalization(
-                            checkpoint, claim.issue.number, getattr(
-                                prepared, "branch", f"agent/issue-{claim.issue.number}"
-                            ) if prepared is not None else f"agent/issue-{claim.issue.number}",
+                            checkpoint, claim.issue.number, prepared.branch
+                            if prepared is not None else f"agent/issue-{claim.issue.number}",
                             outcome, archive,
                         )
                         self._resolve_pending_handoff(
@@ -2698,7 +2713,7 @@ class AgentLifecycle:
         *,
         issue_number: int,
         outcome: AttemptOutcome,
-        prepared: object | None,
+        prepared: PreparedAttempt | None,
         publication_started_at: datetime | None = None,
         check_allowance: bool = True,
     ) -> str | None:
@@ -2775,7 +2790,7 @@ class AgentLifecycle:
         issue_number: int,
         attempt_id: str,
         outcome: AttemptOutcome,
-        prepared: object | None,
+        prepared: PreparedAttempt | None,
         publication_started_at: datetime | None = None,
         check_allowance: bool = True,
     ) -> bool:
@@ -2847,7 +2862,7 @@ class AgentLifecycle:
         *,
         issue_number: int,
         outcome: AttemptOutcome,
-        prepared: object | None,
+        prepared: PreparedAttempt | None,
         attempt_id: str | None = None,
         publication_started_at: datetime | None = None,
         check_allowance: bool = True,
@@ -2930,7 +2945,7 @@ class AgentLifecycle:
         return False
 
     def _check_operator_note(
-        self, issue_number: int, prepared: object | None
+        self, issue_number: int, prepared: PreparedAttempt | None
     ) -> tuple[bool, str]:
         """Whether the branch carries a valid ``operator_request`` note.
 
@@ -2942,16 +2957,20 @@ class AgentLifecycle:
         if prepared is None:
             return True, "not rechecked after a crash replay"
         try:
-            commits = getattr(self._workspace, "commits_added")(prepared)
-            working_directory = getattr(self._workspace, "working_directory")
+            commits = self._workspace.commits_added(prepared)
+            working_directory = self._workspace.working_directory
+            attempt_id = _attempt_id(self._attempt_state.read())
         except Exception as error:
             return False, f"the branch state could not be read ({_exception_detail(error)})"
         try:
             validation = _validate_handoff_note(
+                self._workspace.handoff_note_commit(
+                    prepared, issue_number, attempt_id=attempt_id
+                ),
                 commits,
                 issue_number,
                 working_directory,
-                getattr(prepared, "base_revision", ""),
+                prepared.base_revision,
             )
         except Exception as error:
             return False, f"the handoff note could not be validated ({_exception_detail(error)})"
@@ -3040,6 +3059,31 @@ class AgentLifecycle:
             self._tracker.release_attempt(
                 claim.issue.number, "ready-for-agent", claim.assignment.assignee_id
             )
+
+    def _hold_dirty_workspace(self, issue_number: int, error: DirtyWorkspaceError) -> NoReturn:
+        """Hold intake with a dirty tree preserved on the attempt branch.
+
+        Cleanup refused to switch to the base branch while the tree is
+        dirty, so the workspace stays on the attempt branch: emit the hold
+        event and pause the agent loop for the operator instead of
+        finalizing or claiming further issues. The branch, checkpoint, and
+        entire working tree are preserved for inspection.
+        """
+
+        self._emit_workspace_hold(issue_number, error)
+        raise SystemExit(1) from error
+
+    def _emit_workspace_hold(self, issue_number: int, error: DirtyWorkspaceError) -> None:
+        """Record that intake is held on a dirty attempt workspace."""
+
+        self._event_log(
+            "workspace_hold",
+            f"{_exception_detail(error)} The branch, checkpoint, and working tree "
+            "are preserved for inspection; issue intake is held until the "
+            "workspace is repaired by an operator.",
+            level="WARNING",
+            issue_number=issue_number,
+        )
 
     def _commit_finalization(
         self,
@@ -3163,7 +3207,7 @@ class AgentLifecycle:
                 self._control_store.enter_stopping_for_final_claim()
         archive = self._archive_for(claim.issue.number, checkpoint.started_at)
 
-        prepared: object | None = None
+        prepared: PreparedAttempt | None = None
         profile: RepositoryProfile | None = None
         outcome = AttemptOutcome.INFRASTRUCTURE_ERROR
         comment_posted = True
@@ -3177,7 +3221,7 @@ class AgentLifecycle:
                 base_branch=profile.base_branch, issue_number=claim.issue.number
             )
             if checkpoint.phase is AttemptPhase.MODEL_RUNNING:
-                commits = getattr(self._workspace, "commits_added")(prepared)
+                commits = self._workspace.commits_added(prepared)
                 has_commits = bool(commits)
                 if commits:
                     if _final_check_was_interrupted(archive):
@@ -3210,10 +3254,14 @@ class AgentLifecycle:
                 else:
                     decision = _infrastructure_decision("Model execution was interrupted without commits.")
             elif checkpoint.phase in (AttemptPhase.PUSHING, AttemptPhase.PUBLISHING):
-                recovered_commits = getattr(self._workspace, "commits_added")(prepared)
+                recovered_commits = self._workspace.commits_added(prepared)
                 has_commits = bool(recovered_commits)
-                if _is_handoff_recovery(recovered_commits):
+                recovered_note_commit = self._workspace.handoff_note_commit(
+                    prepared, claim.issue.number, attempt_id=checkpoint.started_at
+                )
+                if recovered_note_commit is not None:
                     validation = _validate_handoff_note(
+                        recovered_note_commit,
                         recovered_commits,
                         claim.issue.number,
                         self._workspace.working_directory,
@@ -3244,13 +3292,17 @@ class AgentLifecycle:
             note_commit_sha = None
             if decision.outcome is AttemptOutcome.HANDOFF:
                 details = _read_handoff_note(self._workspace.working_directory, claim.issue.number)
-                note_commit_sha = recovered_commits[0].revision
+                note_commit = self._workspace.handoff_note_commit(
+                    prepared, claim.issue.number, attempt_id=checkpoint.started_at
+                )
+                if note_commit is not None:
+                    note_commit_sha = note_commit.revision
             publication_started_at = self._clock()
             published = self._publish_bounded(
                 PublicationRequest(
                     issue_number=claim.issue.number,
                     issue_title=claim.issue.title,
-                    branch=getattr(prepared, "branch", checkpoint.branch),
+                    branch=prepared.branch,
                     started_at=checkpoint.started_at,
                     decision=decision,
                     check_command="not rerun during startup recovery",
@@ -3369,6 +3421,12 @@ class AgentLifecycle:
                             retain_branch=retain_branch or not comment_posted,
                         )
                         cleanup_ok = True
+                except DirtyWorkspaceError as error:
+                    # Cleanup refused to leave the attempt branch while the
+                    # tree is dirty: hold intake with everything preserved
+                    # for operator inspection instead of carrying uncommitted
+                    # work onto the base or claiming further issues.
+                    self._hold_dirty_workspace(claim.issue.number, error)
                 finally:
                     if comment_posted and released and cleanup_ok and not hold:
                         # Publication already confirmed (comment posted) before
@@ -3384,9 +3442,8 @@ class AgentLifecycle:
                         )
                     if comment_posted and released and cleanup_ok and not hold:
                         self._commit_finalization(
-                            checkpoint, claim.issue.number, getattr(
-                                prepared, "branch", checkpoint.branch
-                            ) if prepared is not None else checkpoint.branch,
+                            checkpoint, claim.issue.number, prepared.branch
+                            if prepared is not None else checkpoint.branch,
                             outcome, archive,
                         )
                         self._resolve_pending_handoff(
@@ -3424,13 +3481,13 @@ class AgentLifecycle:
         self,
         claim: Claim,
         started_at: str,
-        prepared: object | None,
+        prepared: PreparedAttempt | None,
         profile: RepositoryProfile | None,
         outcome: AttemptOutcome,
         details: str = "Repository profile could not be loaded or the attempt could not start.",
         timeout: float | None = None,
     ):
-        branch = getattr(prepared, "branch", f"agent/issue-{claim.issue.number}")
+        branch = prepared.branch if prepared is not None else f"agent/issue-{claim.issue.number}"
         base_branch = profile.base_branch if profile is not None else "main"
         request = PublicationRequest(
             issue_number=claim.issue.number,
@@ -3453,7 +3510,7 @@ class AgentLifecycle:
         self,
         claim: Claim,
         started_at: str,
-        prepared: object | None,
+        prepared: PreparedAttempt | None,
         profile: RepositoryProfile | None,
         error: RebaseConflictError,
         timeout: float | None = None,
@@ -3549,52 +3606,6 @@ def _final_check_was_interrupted(archive: AttemptArchive | None) -> bool:
     return bool(record.get("final_check_started")) and not record.get("final_check_finished")
 
 
-def _has_unresolved_conflicts(workspace: object) -> bool:
-    """Whether the workspace holds a rebase/merge the model must resolve first."""
-
-    probe = getattr(workspace, "has_unresolved_conflicts", None)
-    if not callable(probe):
-        return False
-    try:
-        return bool(probe())
-    except Exception:
-        # An unreadable worktree is not a clean one: fail safe so setup
-        # never runs against a tree whose state could not be verified.
-        return True
-
-
-def _conflict_resolution_files(workspace: object, prepared: object) -> tuple[str, ...]:
-    """The files the model must resolve, from live probes or the prepare snapshot."""
-
-    probe = getattr(workspace, "conflicted_files", None)
-    if callable(probe):
-        try:
-            files = tuple(str(path) for path in probe() if str(path).strip())
-        except Exception:
-            files = ()
-        if files:
-            return files
-    snapshot = getattr(prepared, "rebase_conflicts", None) or ()
-    return tuple(str(path) for path in snapshot if str(path).strip())
-
-
-def _resolution_problems(workspace: object) -> tuple[str, ...]:
-    """Deterministic post-model verification that a left-in-place rebase resolved."""
-
-    problems: list[str] = []
-    probe = getattr(workspace, "rebase_resolution_problems", None)
-    if callable(probe):
-        try:
-            problems.extend(str(problem) for problem in probe())
-        except Exception as error:
-            # Verification itself failed: fall back to abort-and-restore
-            # rather than running setup against an unverified tree.
-            problems.append(f"Conflict-resolution verification failed: {error}.")
-    if _has_unresolved_conflicts(workspace) and not problems:
-        problems.append("A rebase or merge is still in progress or paths remain unmerged.")
-    return tuple(problems)
-
-
 def _format_conflicted_files(files: tuple[str, ...]) -> str:
     """Render the conflicted file list for event details, or "" when unknown."""
 
@@ -3605,6 +3616,28 @@ def _format_conflicted_files(files: tuple[str, ...]) -> str:
 
 def _utc_timestamp() -> str:
     return datetime.now(UTC).isoformat().replace("+00:00", "Z")
+
+
+def _remaining_conflicts(state: ConflictState, prepared: PreparedAttempt) -> tuple[str, ...]:
+    """Conflicted files from the tree, or those preparation reported."""
+
+    return state.conflicted_files or tuple(
+        str(path) for path in (prepared.rebase_conflicts or ()) if str(path).strip()
+    )
+
+
+def _attempt_id(checkpoint: AttemptCheckpoint | None) -> str:
+    """The stable attempt ID carried in seal trailers and handoff notes.
+
+    This is the checkpoint's ``started_at``. The lifecycle always starts
+    the checkpoint before the runner executes; a missing checkpoint falls
+    back to a placeholder so sealing still preserves the work instead of
+    failing the attempt.
+    """
+
+    if checkpoint is None:
+        return "unknown"
+    return checkpoint.started_at
 
 
 def _attempt_evidence(
@@ -3662,7 +3695,7 @@ def _read_handoff_note(working_directory: Path, issue_number: int) -> str:
     in the SDK session this function has no control over.
     """
 
-    note_path = working_directory / ".agent" / "handoff" / f"{issue_number}.md"
+    note_path = working_directory / handoff_note_relpath(issue_number)
     try:
         return note_path.read_text()
     except OSError:
@@ -3688,8 +3721,6 @@ def _build_starting_prompt(
         )
     return "\n\n".join(parts)
 
-
-_HANDOFF_NOTE_SUBJECT_PREFIX = "Handoff note:"
 
 _HANDOFF_RESULT_MARKERS = (
     "Agent Attempt Result: incomplete",
@@ -3733,26 +3764,6 @@ def _continuation_expected(
             continue
         return True
     return False
-
-
-def _is_handoff_note_commit(commit: object) -> bool:
-    """Whether a commit is the handoff note commit, by its fixed subject prefix."""
-
-    return getattr(commit, "subject", "").startswith(_HANDOFF_NOTE_SUBJECT_PREFIX)
-
-
-def _is_handoff_recovery(commits: Sequence[object]) -> bool:
-    """Whether the most recent commit on the branch is a handoff note commit.
-
-    Only the most recent commit is checked: the note is the required final
-    commit of a handoff attempt, so its presence there (rather than anywhere
-    in history) is what distinguishes a recovered handoff from a recovered
-    ordinary complete attempt.
-    """
-
-    if not commits:
-        return False
-    return _is_handoff_note_commit(commits[0])
 
 
 _ALLOWED_HANDOFF_REASONS = frozenset(
@@ -3805,31 +3816,33 @@ class _HandoffNoteValidation:
 
 
 def _validate_handoff_note(
-    commits: Sequence[object],
+    note_commit: AttemptCommit | None,
+    commits: Sequence[AttemptCommit],
     issue_number: int,
     working_directory: Path,
     base_revision: str,
 ) -> _HandoffNoteValidation:
     """Confirm a handoff has a trustworthy, committed note before it may publish.
 
-    Recognizing a commit by its subject prefix only proves a commit with that
-    subject exists; it does not prove the note file was actually written,
-    belongs to this issue and attempt, or reflects the work actually
-    preserved. All of that is checked here, since a continuation trusts the
-    note and a human trusts the ``round-finished`` label that only a valid
-    handoff may add.
+    The note is located by path (the newest attempt commit touching the
+    issue's handoff note file), not by position: a seal commit landing on
+    top of a model-committed note does not hide it. Recognizing the note
+    commit only proves a commit touched that path; it does not prove the
+    note file was actually written, belongs to this issue and attempt, or
+    reflects the work actually preserved. All of that is checked here,
+    since a continuation trusts the note and a human trusts the
+    ``round-finished`` label that only a valid handoff may add.
     """
 
-    if not commits or not _is_handoff_note_commit(commits[0]):
+    if note_commit is None:
         return _HandoffNoteValidation(
             False,
-            "Handoff was requested, but no committed handoff note is the final "
-            "commit on the branch.",
+            "Handoff was requested, but no handoff note commit is on the branch.",
         )
-    # The note commit being the newest commit (just checked above) means the
-    # checked-out working tree is clean and matches that commit's tree, so
-    # reading the file here reads the committed blob, not uncommitted state.
-    note_path = working_directory / ".agent" / "handoff" / f"{issue_number}.md"
+    # The seal commit (when the model left dirty work after committing its
+    # own note) only adds other files, so reading the note file from the
+    # checked-out working tree reads the committed note content.
+    note_path = working_directory / handoff_note_relpath(issue_number)
     try:
         text = note_path.read_text()
     except OSError:
@@ -3857,7 +3870,17 @@ def _validate_handoff_note(
             False, "Handoff note is missing a valid `reason` field."
         )
     last_work_commit = fields.get("last_work_commit", "")
-    expected_last_work_commit = commits[1].revision if len(commits) > 1 else base_revision
+    # The note describes the work preserved beneath it: the attempt commit
+    # directly under the note in newest-first order, or the base revision
+    # when the note is the oldest attempt commit.
+    note_index = next(
+        (index for index, commit in enumerate(commits) if commit.revision == note_commit.revision),
+        None,
+    )
+    if note_index is not None and note_index + 1 < len(commits):
+        expected_last_work_commit = commits[note_index + 1].revision
+    else:
+        expected_last_work_commit = base_revision
     if (
         len(last_work_commit) < 7
         or not expected_last_work_commit.startswith(last_work_commit)
