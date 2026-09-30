@@ -18,6 +18,8 @@ from pathlib import Path
 
 import pytest
 
+from tests.fakes import FakePublisher, FakeTracker, InMemoryWorkspace
+
 
 @pytest.fixture
 def tmp_path() -> Iterator[Path]:
@@ -26,3 +28,24 @@ def tmp_path() -> Iterator[Path]:
         yield path
     finally:
         shutil.rmtree(path, ignore_errors=True)
+
+
+@pytest.fixture
+def workspace(tmp_path: Path) -> InMemoryWorkspace:
+    """A fresh shared workspace double rooted under the test's temp dir."""
+
+    return InMemoryWorkspace(tmp_path / "repo")
+
+
+@pytest.fixture
+def tracker() -> FakeTracker:
+    """A fresh shared tracker double with no seeded issues."""
+
+    return FakeTracker()
+
+
+@pytest.fixture
+def publisher() -> FakePublisher:
+    """A fresh shared publisher double with default publication behaviour."""
+
+    return FakePublisher()
