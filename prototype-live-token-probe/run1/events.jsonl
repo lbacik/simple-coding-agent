@@ -1,0 +1,52 @@
+{"t": 1.112, "kind": "system", "subtype": "init"}
+{"t": 1.116, "kind": "system", "subtype": "status"}
+{"t": 8.001, "kind": "message_start", "id": "msg_6abd4796c37a43f51b284d14", "usage": {"input_tokens": 0, "output_tokens": 0}, "parent": null}
+{"t": 18.155, "kind": "assistant", "id": "msg_6abd4796c37a43f51b284d14", "stop_reason": null, "usage": {"input_tokens": 0, "output_tokens": 0}, "parent": null, "tool_uses": []}
+{"t": 18.156, "kind": "assistant", "id": "msg_6abd4796c37a43f51b284d14", "stop_reason": null, "usage": {"input_tokens": 0, "output_tokens": 0}, "parent": null, "tool_uses": []}
+{"t": 18.159, "kind": "assistant", "id": "msg_6abd4796c37a43f51b284d14", "stop_reason": null, "usage": {"input_tokens": 0, "output_tokens": 0}, "parent": null, "tool_uses": ["Read"]}
+{"t": 18.166, "kind": "message_delta", "usage": {"cache_creation_input_tokens": 0, "cache_read_input_tokens": 0, "input_tokens": 16461, "output_tokens": 354, "output_tokens_details": {"thinking_tokens": 245}}, "stop_reason": "tool_use", "parent": null}
+{"t": 21.367, "kind": "post_tool_use", "tool_name": "Read", "tool_use_id": "call_01a0f35fc4fc7380a86df086ff6bd05a", "agent_id": null, "transcript": {"found": false, "assistant_entries_on_disk": 0}, "context_usage": {"apiUsage": {"input_tokens": 16461, "output_tokens": 354, "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0}, "totalTokens": 16461}}
+{"t": 21.373, "kind": "user", "parent": null}
+{"t": 21.377, "kind": "system", "subtype": "status"}
+{"t": 23.581, "kind": "message_start", "id": "msg_6abd47a5aa8157c264344a34", "usage": {"input_tokens": 0, "output_tokens": 0}, "parent": null}
+{"t": 25.589, "kind": "assistant", "id": "msg_6abd47a5aa8157c264344a34", "stop_reason": null, "usage": {"input_tokens": 0, "output_tokens": 0}, "parent": null, "tool_uses": []}
+{"t": 25.59, "kind": "assistant", "id": "msg_6abd47a5aa8157c264344a34", "stop_reason": null, "usage": {"input_tokens": 0, "output_tokens": 0}, "parent": null, "tool_uses": []}
+{"t": 25.602, "kind": "assistant", "id": "msg_6abd47a5aa8157c264344a34", "stop_reason": null, "usage": {"input_tokens": 0, "output_tokens": 0}, "parent": null, "tool_uses": ["Bash"]}
+{"t": 25.617, "kind": "message_delta", "usage": {"cache_creation_input_tokens": 0, "cache_read_input_tokens": 0, "input_tokens": 16877, "output_tokens": 146, "output_tokens_details": {"thinking_tokens": 55}}, "stop_reason": "tool_use", "parent": null}
+{"t": 29.297, "kind": "post_tool_use", "tool_name": "Bash", "tool_use_id": "call_01a0f35fe56a74a4ac69023f614d8d9c", "agent_id": null, "transcript": {"found": false, "assistant_entries_on_disk": 3}, "context_usage": {"apiUsage": {"input_tokens": 16877, "output_tokens": 146, "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0}, "totalTokens": 16877}}
+{"t": 29.302, "kind": "user", "parent": null}
+{"t": 29.307, "kind": "system", "subtype": "status"}
+{"t": 31.355, "kind": "message_start", "id": "msg_6abd47ad342999eea2864788", "usage": {"input_tokens": 0, "output_tokens": 0}, "parent": null}
+{"t": 33.717, "kind": "assistant", "id": "msg_6abd47ad342999eea2864788", "stop_reason": null, "usage": {"input_tokens": 0, "output_tokens": 0}, "parent": null, "tool_uses": []}
+{"t": 33.718, "kind": "assistant", "id": "msg_6abd47ad342999eea2864788", "stop_reason": null, "usage": {"input_tokens": 0, "output_tokens": 0}, "parent": null, "tool_uses": []}
+{"t": 33.719, "kind": "assistant", "id": "msg_6abd47ad342999eea2864788", "stop_reason": null, "usage": {"input_tokens": 0, "output_tokens": 0}, "parent": null, "tool_uses": ["Agent"]}
+{"t": 33.726, "kind": "system", "subtype": "background_tasks_changed"}
+{"t": 33.727, "kind": "task_started", "usage": null, "task_id": "aa54c097094c99015"}
+{"t": 33.731, "kind": "message_delta", "usage": {"cache_creation_input_tokens": 0, "cache_read_input_tokens": 0, "input_tokens": 17087, "output_tokens": 170, "output_tokens_details": {"thinking_tokens": 50}}, "stop_reason": "tool_use", "parent": null}
+{"t": 37.029, "kind": "post_tool_use", "tool_name": "Agent", "tool_use_id": "call_01a0f360033075519e0ce545fdbd6cb6", "agent_id": null, "transcript": {"found": false, "assistant_entries_on_disk": 6}, "context_usage": {"apiUsage": {"input_tokens": 17087, "output_tokens": 170, "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0}, "totalTokens": 17087}}
+{"t": 37.031, "kind": "user", "parent": null}
+{"t": 37.034, "kind": "system", "subtype": "status"}
+{"t": 38.309, "kind": "assistant", "id": "msg_6abd47b12c3b90b86d734d4a", "stop_reason": null, "usage": {"input_tokens": 0, "output_tokens": 0}, "parent": "call_01a0f360033075519e0ce545fdbd6cb6", "tool_uses": []}
+{"t": 38.31, "kind": "assistant", "id": "msg_6abd47b12c3b90b86d734d4a", "stop_reason": null, "usage": {"input_tokens": 0, "output_tokens": 0}, "parent": "call_01a0f360033075519e0ce545fdbd6cb6", "tool_uses": []}
+{"t": 38.313, "kind": "assistant", "id": "msg_6abd47b12c3b90b86d734d4a", "stop_reason": null, "usage": {"input_tokens": 0, "output_tokens": 0}, "parent": "call_01a0f360033075519e0ce545fdbd6cb6", "tool_uses": ["Read"]}
+{"t": 38.315, "kind": "task_progress", "usage": {"total_tokens": 28, "tool_uses": 1, "duration_ms": 4594}, "task_id": "aa54c097094c99015"}
+{"t": 41.292, "kind": "post_tool_use", "tool_name": "Read", "tool_use_id": "call_01a0f36015d177e0b6e9b692fd78010a", "agent_id": "aa54c097094c99015", "context_usage": {"apiUsage": {"input_tokens": 17087, "output_tokens": 170, "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0}, "totalTokens": 17087}}
+{"t": 41.298, "kind": "user", "parent": "call_01a0f360033075519e0ce545fdbd6cb6"}
+{"t": 41.407, "kind": "message_start", "id": "msg_6abd47b7c3a0babd2518489a", "usage": {"input_tokens": 0, "output_tokens": 0}, "parent": null}
+{"t": 49.832, "kind": "assistant", "id": "msg_6abd47b83109526c0efe46e2", "stop_reason": null, "usage": {"input_tokens": 0, "output_tokens": 0}, "parent": "call_01a0f360033075519e0ce545fdbd6cb6", "tool_uses": []}
+{"t": 49.833, "kind": "assistant", "id": "msg_6abd47b83109526c0efe46e2", "stop_reason": null, "usage": {"input_tokens": 0, "output_tokens": 0}, "parent": "call_01a0f360033075519e0ce545fdbd6cb6", "tool_uses": []}
+{"t": 49.913, "kind": "system", "subtype": "background_tasks_changed"}
+{"t": 49.913, "kind": "system", "subtype": "task_updated"}
+{"t": 49.914, "kind": "task_notification", "usage": {"total_tokens": 2084, "tool_uses": 1, "duration_ms": 16190}, "task_id": "aa54c097094c99015"}
+{"t": 76.062, "kind": "assistant", "id": "msg_6abd47b7c3a0babd2518489a", "stop_reason": null, "usage": {"input_tokens": 0, "output_tokens": 0}, "parent": null, "tool_uses": []}
+{"t": 76.063, "kind": "assistant", "id": "msg_6abd47b7c3a0babd2518489a", "stop_reason": null, "usage": {"input_tokens": 0, "output_tokens": 0}, "parent": null, "tool_uses": []}
+{"t": 76.065, "kind": "assistant", "id": "msg_6abd47b7c3a0babd2518489a", "stop_reason": null, "usage": {"input_tokens": 0, "output_tokens": 0}, "parent": null, "tool_uses": ["TaskOutput"]}
+{"t": 76.07, "kind": "message_delta", "usage": {"cache_creation_input_tokens": 0, "cache_read_input_tokens": 0, "input_tokens": 17602, "output_tokens": 1254, "output_tokens_details": {"thinking_tokens": 1108}}, "stop_reason": "tool_use", "parent": null}
+{"t": 78.753, "kind": "post_tool_use", "tool_name": "TaskOutput", "tool_use_id": "call_01a0f360a9357172a4ecbb0a5dc94693", "agent_id": null, "transcript": {"found": false, "assistant_entries_on_disk": 9}, "context_usage": {"apiUsage": {"input_tokens": 17602, "output_tokens": 1254, "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0}, "totalTokens": 17602}}
+{"t": 78.757, "kind": "user", "parent": null}
+{"t": 78.764, "kind": "system", "subtype": "status"}
+{"t": 83.979, "kind": "message_start", "id": "msg_6abd47e2a4e42217a80443fb", "usage": {"input_tokens": 0, "output_tokens": 0}, "parent": null}
+{"t": 89.952, "kind": "assistant", "id": "msg_6abd47e2a4e42217a80443fb", "stop_reason": null, "usage": {"input_tokens": 0, "output_tokens": 0}, "parent": null, "tool_uses": []}
+{"t": 89.964, "kind": "assistant", "id": "msg_6abd47e2a4e42217a80443fb", "stop_reason": null, "usage": {"input_tokens": 0, "output_tokens": 0}, "parent": null, "tool_uses": []}
+{"t": 89.968, "kind": "message_delta", "usage": {"cache_creation_input_tokens": 0, "cache_read_input_tokens": 0, "input_tokens": 19374, "output_tokens": 248, "output_tokens_details": {"thinking_tokens": 198}}, "stop_reason": "end_turn", "parent": null}
+{"t": 90.005, "kind": "result", "subtype": "success", "duration_ms": 88913, "duration_api_ms": 89105, "is_error": false, "num_turns": 5, "session_id": "904c9411-79b4-4fee-9aef-98dfc100eead", "stop_reason": "end_turn", "total_cost_usd": 0.52154, "usage": {"input_tokens": 87401, "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0, "output_tokens": 2172, "output_tokens_details": {"thinking_tokens": 1656}, "server_tool_use": {"web_search_requests": 0, "web_fetch_requests": 0}, "service_tier": "standard", "cache_creation": {"ephemeral_1h_input_tokens": 0, "ephemeral_5m_input_tokens": 0}, "inference_geo": "", "iterations": [], "speed": "standard"}, "result": "Notes mentions two files, data.txt has 5 lines, and 3 start with a.", "structured_output": null, "model_usage": {"muse-spark-1.3-contributor": {"inputTokens": 90528, "outputTokens": 2756, "cacheReadInputTokens": 0, "cacheCreationInputTokens": 0, "webSearchRequests": 0, "costUSD": 0.52154, "contextWindow": 200000, "maxOutputTokens": 32000, "thinkingTokens": 2049, "canonicalModel": "muse-spark-1.3-contributor", "provider": "firstParty", "costBasis": "unknown"}}, "permission_denials": [], "deferred_tool_use": null, "errors": null, "api_error_status": null, "uuid": "ef214b95-7af1-4cb7-b980-76abb249d9ba", "terminal_reason": "completed", "origin": null}
