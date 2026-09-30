@@ -43,3 +43,15 @@ _Avoid_: Repo, checkout, sandbox
 **Sealing**:
 Turning every uncommitted change in the attempt workspace into a commit attributed to that attempt (issue, attempt ID, and the reason the model stopped). An attempt is sealed after every model execution, whatever its status, so no work the model wrote is ever lost or leaks onto the base. A workspace mid-way through an unresolved rebase or merge is never sealed: its conflicts are aborted instead.
 _Avoid_: Preserving dirty work, safety-net commit, checkpoint (the attempt checkpoint is a different thing)
+
+**Token budget**:
+The limit on the total tokens one implementation attempt may process and generate, counting every token category unweighted and including the tokens spent by its subagents. It measures the amount of work in the attempt, not its price; a USD limit exists only as a looser backstop.
+_Avoid_: Cost budget, spend limit
+
+**Soft threshold**:
+The point in the token budget past which the model must end the attempt with a handoff, leaving the rest of the budget for writing the Handoff note.
+_Avoid_: Cost threshold, warning limit
+
+**Hard ceiling**:
+The point at which the attempt is stopped regardless of the model, whether or not it has handed off.
+_Avoid_: Budget cap, kill limit
