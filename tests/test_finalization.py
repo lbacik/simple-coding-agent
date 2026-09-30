@@ -10,10 +10,11 @@ import pytest
 from simple_coding_agent.attempt_state import AttemptPhase, AttemptStateStore
 from simple_coding_agent.completion import AttemptOutcome, CompletionDecision, PublicationPath
 from simple_coding_agent.finalization import AttemptCompletionStore
-from simple_coding_agent.git_workspace import DirtyWorkspaceError
+from simple_coding_agent.git_workspace import DirtyWorkspaceError, PreparedAttempt
 from simple_coding_agent.github_tracker import Assignment, Claim, TrackerIssue
 from simple_coding_agent.lifecycle import AgentLifecycle, LifecycleStatus
 from simple_coding_agent.operating import ConsecutiveErrorStore
+from tests.fakes import FakePublisher, FakeTracker, InMemoryWorkspace
 
 
 def test_completion_store_records_each_attempt_once(tmp_path: Path) -> None:
@@ -51,12 +52,12 @@ def test_completion_store_rejects_malformed_record(tmp_path: Path) -> None:
         AttemptCompletionStore(tmp_path).is_finalized("attempt-a")
 
 
-def test_finalized_attempt_is_recorded_once_before_a_new_claim(tmp_path: Path) -> None:
+def test_finalized_attempt_is_recorded_once_before_a_new_claim(
+    tmp_path: Path, workspace: InMemoryWorkspace, publisher: FakePublisher
+) -> None:
     """A fully finalized attempt lands in the ledger exactly once with its accounting."""
     claim = Claim(_issue(24), Assignment("issue-24", "agent-id"))
-    tracker = _FakeTracker(claim)
-    workspace = _FakeWorkspace()
-    publisher = _FakePublisher()
+    tracker = FakeTracker(next_claim=claim)
     completions = AttemptCompletionStore(tmp_path)
     errors = ConsecutiveErrorStore(tmp_path)
     lifecycle = AgentLifecycle(
@@ -82,7 +83,9 @@ def test_finalized_attempt_is_recorded_once_before_a_new_claim(tmp_path: Path) -
     assert errors.read().last_attempt_id == attempt_id
 
 
-def test_crash_between_finalization_and_checkpoint_removal_does_not_republish(tmp_path: Path) -> None:
+def test_crash_between_finalization_and_checkpoint_removal_does_not_republish(
+    tmp_path: Path, workspace: InMemoryWorkspace, publisher: FakePublisher
+) -> None:
     """Ledger present + checkpoint present means: only remove the checkpoint."""
     state = _state_at(tmp_path, AttemptPhase.PUBLISHING)
     checkpoint = state.read()
@@ -91,12 +94,12 @@ def test_crash_between_finalization_and_checkpoint_removal_does_not_republish(tm
     completions.record(
         attempt_id=checkpoint.started_at, issue_number=24, branch="agent/issue-24", outcome=AttemptOutcome.COMPLETE
     )
-    tracker = _FakeTracker(None)
-    publisher = _FakePublisher()
+    workspace.model_commit("completed", files=("completed",))
+    tracker = FakeTracker({24: _issue(24)})
     lifecycle = AgentLifecycle(
         tracker=tracker,
         attempt_state=state,
-        workspace=_FakeWorkspace(commits=("completed",)),
+        workspace=workspace,
         profile_loader=lambda _: _profile(),
         publisher=publisher,
         completion_store=completions,
@@ -112,18 +115,21 @@ def test_crash_between_finalization_and_checkpoint_removal_does_not_republish(tm
     assert len(completions.read_all()) == 1
 
 
-def test_release_failure_holds_the_attempt_without_accounting(tmp_path: Path) -> None:
+def test_release_failure_holds_the_attempt_without_accounting(
+    tmp_path: Path, workspace: InMemoryWorkspace, publisher: FakePublisher
+) -> None:
     state = _state_at(tmp_path, AttemptPhase.PUSHING)
     checkpoint = state.read()
     assert checkpoint is not None
     completions = AttemptCompletionStore(tmp_path)
     errors = ConsecutiveErrorStore(tmp_path)
+    workspace.model_commit("completed", files=("completed",))
     lifecycle = AgentLifecycle(
-        tracker=_FailingReleaseTracker(None),
+        tracker=FailingReleaseTracker({24: _issue(24)}),
         attempt_state=state,
-        workspace=_FakeWorkspace(commits=("completed",)),
+        workspace=workspace,
         profile_loader=lambda _: _profile(),
-        publisher=_FakePublisher(),
+        publisher=publisher,
         error_store=errors,
         completion_store=completions,
     )
@@ -136,17 +142,19 @@ def test_release_failure_holds_the_attempt_without_accounting(tmp_path: Path) ->
     assert errors.read().last_attempt_id is None
 
 
-def test_comment_failure_holds_without_ledger_then_recovers_once(tmp_path: Path) -> None:
+def test_comment_failure_holds_without_ledger_then_recovers_once(
+    tmp_path: Path, workspace: InMemoryWorkspace, publisher: FakePublisher
+) -> None:
     state = _state_at(tmp_path, AttemptPhase.PUSHING)
     completions = AttemptCompletionStore(tmp_path)
     errors = ConsecutiveErrorStore(tmp_path)
-    workspace = _FakeWorkspace(commits=("completed",))
+    workspace.model_commit("completed", files=("completed",))
     first = AgentLifecycle(
-        tracker=_FakeTracker(None),
+        tracker=FakeTracker({24: _issue(24)}),
         attempt_state=state,
         workspace=workspace,
         profile_loader=lambda _: _profile(),
-        publisher=_CommentFailingPublisher(),
+        publisher=FakePublisher(comment_posted=False),
         error_store=errors,
         completion_store=completions,
         sleeper=lambda seconds: None,
@@ -158,13 +166,13 @@ def test_comment_failure_holds_without_ledger_then_recovers_once(tmp_path: Path)
     assert completions.read_all() == {}
     assert errors.read().last_attempt_id is None
 
-    tracker = _FakeTracker(None)
+    tracker = FakeTracker({24: _issue(24)})
     second = AgentLifecycle(
         tracker=tracker,
         attempt_state=state,
         workspace=workspace,
         profile_loader=lambda _: _profile(),
-        publisher=_FakePublisher(),
+        publisher=publisher,
         error_store=errors,
         completion_store=completions,
         sleeper=lambda seconds: None,
@@ -178,16 +186,19 @@ def test_comment_failure_holds_without_ledger_then_recovers_once(tmp_path: Path)
     assert errors.read().last_attempt_id is not None
 
 
-def test_dirty_worktree_during_startup_holds_without_publishing(tmp_path: Path) -> None:
+def test_dirty_worktree_during_startup_holds_without_publishing(
+    tmp_path: Path, publisher: FakePublisher
+) -> None:
     """Unexplained dirty work keeps the checkpoint, branch, and tree for inspection."""
     state = _state_at(tmp_path, AttemptPhase.MODEL_RUNNING)
     completions = AttemptCompletionStore(tmp_path)
-    publisher = _FakePublisher()
-    tracker = _FakeTracker(None)
+    tracker = FakeTracker({24: _issue(24)})
+    workspace = DirtyStartupWorkspace(tmp_path / "repo")
+    workspace.make_dirty("work.txt", "uncommitted work")
     lifecycle = AgentLifecycle(
         tracker=tracker,
         attempt_state=state,
-        workspace=_DirtyWorkspace(),
+        workspace=workspace,
         profile_loader=lambda _: _profile(),
         publisher=publisher,
         completion_store=completions,
@@ -206,13 +217,13 @@ def test_malformed_checkpoint_holds_intake_without_claiming(tmp_path: Path) -> N
     path = tmp_path / "state" / "attempt.json"
     path.parent.mkdir(parents=True)
     path.write_text("{not JSON")
-    tracker = _FakeTracker(Claim(_issue(25), Assignment("issue-25", "agent-id")))
+    tracker = FakeTracker(next_claim=Claim(_issue(25), Assignment("issue-25", "agent-id")))
     lifecycle = AgentLifecycle(
         tracker=tracker,
         attempt_state=AttemptStateStore(tmp_path),
-        workspace=_FakeWorkspace(),
+        workspace=workspace,
         profile_loader=lambda _: _profile(),
-        publisher=_FakePublisher(),
+        publisher=publisher,
         completion_store=AttemptCompletionStore(tmp_path),
     )
 
@@ -222,14 +233,17 @@ def test_malformed_checkpoint_holds_intake_without_claiming(tmp_path: Path) -> N
     assert tracker.claimed == []
 
 
-def test_dirty_tree_without_checkpoint_holds_intake(tmp_path: Path) -> None:
-    tracker = _FakeTracker(Claim(_issue(25), Assignment("issue-25", "agent-id")))
+def test_dirty_tree_without_checkpoint_holds_intake(
+    tmp_path: Path, workspace: InMemoryWorkspace, publisher: FakePublisher
+) -> None:
+    workspace.make_dirty("work.txt", "uncommitted work")
+    tracker = FakeTracker(next_claim=Claim(_issue(25), Assignment("issue-25", "agent-id")))
     lifecycle = AgentLifecycle(
         tracker=tracker,
         attempt_state=AttemptStateStore(tmp_path),
-        workspace=_DirtyWorkspace(),
+        workspace=workspace,
         profile_loader=lambda _: _profile(),
-        publisher=_FakePublisher(),
+        publisher=publisher,
         completion_store=AttemptCompletionStore(tmp_path),
     )
 
@@ -388,7 +402,7 @@ def test_malformed_completion_ledger_holds_intake_without_claiming(tmp_path: Pat
     assert AttemptStateStore(tmp_path).read() is not None
 
 
-# --- Fakes ---
+# --- Failure-injection doubles (single-method subclasses of shared doubles) ---
 
 
 def _evidence_runner(outcome: AttemptOutcome):
@@ -404,29 +418,7 @@ def _evidence_runner(outcome: AttemptOutcome):
     return run
 
 
-class _FakeTracker:
-    def __init__(self, next_claim: Claim | None) -> None:
-        self.next_claim = next_claim
-        self.cleanup: list[tuple[int, str, str]] = []
-        self.claimed: list[int] = []
-
-    def claim_next(self) -> Claim | None:
-        claim, self.next_claim = self.next_claim, None
-        if claim is not None:
-            self.claimed.append(claim.issue.number)
-        return claim
-
-    def recover_claim(self, issue_number: int) -> Claim | None:
-        return Claim(_issue(issue_number), Assignment(f"issue-{issue_number}", "agent-id"))
-
-    def release_attempt(self, issue_number: int, label: str, assignee_id: str) -> None:
-        self.cleanup.append((issue_number, label, assignee_id))
-
-    def release_handoff(self, issue_number: int, assignee_id: str) -> None:
-        self.cleanup.append((issue_number, "round-finished", assignee_id))
-
-
-class _FailingReleaseTracker(_FakeTracker):
+class FailingReleaseTracker(FakeTracker):
     def release_attempt(self, issue_number: int, label: str, assignee_id: str) -> None:
         raise OSError("GitHub unavailable")
 
@@ -434,73 +426,21 @@ class _FailingReleaseTracker(_FakeTracker):
         raise OSError("GitHub unavailable")
 
 
-class _FakeWorkspace:
-    working_directory = Path("/repository")
-
-    def __init__(self, *, commits: tuple[str, ...] = ()) -> None:
-        self.cleanup_calls: list[tuple[str, bool]] = []
-        self._commits = commits
-
-    def is_clean(self) -> bool:
-        return True
-
-    def prepare_for_profile_read(self, *, base_branch: str = "main") -> None:
-        return None
-
-    def prepare_attempt(self, *, base_branch: str, issue_number: int):
-        return type("Prepared", (), {"branch": f"agent/issue-{issue_number}"})()
-
-    def cleanup(self, *, base_branch: str, prepared: object, retain_branch: bool) -> None:
-        self.cleanup_calls.append((base_branch, retain_branch))
-
-    def commits_added(self, prepared: object) -> tuple[str, ...]:
-        return self._commits
-
-
-class _DirtyWorkspace(_FakeWorkspace):
-    def is_clean(self) -> bool:
-        return False
-
-    def prepare_for_profile_read(self, *, base_branch: str = "main") -> None:
-        raise DirtyWorkspaceError("Repository working tree contains uncommitted changes")
-
-    def prepare_attempt(self, *, base_branch: str, issue_number: int):
+class DirtyStartupWorkspace(InMemoryWorkspace):
+    def prepare_for_profile_read(self, *, base_branch: str = "main") -> str:
         raise DirtyWorkspaceError("Repository working tree contains uncommitted changes")
 
 
-class _CleanupFailingWorkspace(_FakeWorkspace):
-    def cleanup(self, *, base_branch: str, prepared: object, retain_branch: bool) -> None:
-        raise OSError("cleanup unavailable")
-
-
-class _PrepareDirtyWorkspace(_FakeWorkspace):
+class PrepareDirtyWorkspace(InMemoryWorkspace):
     """Clean at the pre-claim check, dirty once preparation touches the tree."""
 
-    def prepare_for_profile_read(self, *, base_branch: str = "main") -> None:
-        raise DirtyWorkspaceError("Repository working tree contains uncommitted changes")
-
-    def prepare_attempt(self, *, base_branch: str, issue_number: int):
+    def prepare_attempt(self, *, base_branch: str, issue_number: int) -> PreparedAttempt:
         raise DirtyWorkspaceError("Repository working tree contains uncommitted changes")
 
 
-class _FakePublisher:
-    def __init__(self) -> None:
-        self.outcomes: list[AttemptOutcome | None] = []
-        self.requests: list[object] = []
-
-    def publish(self, request: object):
-        self.requests.append(request)
-        self.outcomes.append(request.decision.outcome)
-        outcome = request.decision.outcome or AttemptOutcome.COMPLETE
-        branch_url = None if outcome is AttemptOutcome.INFRASTRUCTURE_ERROR else "https://example.test/tree/x"
-        return type("Published", (), {"outcome": outcome, "branch_url": branch_url, "comment_posted": True})()
-
-
-class _CommentFailingPublisher(_FakePublisher):
-    def publish(self, request: object):
-        self.requests.append(request)
-        self.outcomes.append(request.decision.outcome)
-        return type("Published", (), {"outcome": request.decision.outcome, "comment_posted": False})()
+class CleanupFailingWorkspace(InMemoryWorkspace):
+    def cleanup(self, *, base_branch: str, prepared: PreparedAttempt, retain_branch: bool) -> None:
+        raise OSError("cleanup unavailable")
 
 
 def _profile(base_branch: str = "main"):
