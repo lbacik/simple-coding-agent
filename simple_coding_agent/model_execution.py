@@ -220,12 +220,17 @@ class ModelExecutor:
     """Run the approved upstream skills and retain terminal stream evidence.
 
     Cost soft-threshold policy: once the estimated cost crosses the soft
-    threshold, only the main thread is steered toward the ``handoff`` skill.
-    In-flight subagent tools stay allowed (denying them would only degrade
-    already-paid-for work while still burning budget) and never receive the
-    handoff instruction; new subagent launches from the main thread are
-    denied. A ``handoff`` skill invocation counts only when observed in the
-    main thread (``agent_id is None``).
+    threshold, every running subagent (including background ones) is
+    stopped: subsequent subagent tool calls are denied and the cancelled
+    ids are recorded in a ``cost_soft_threshold_subagents_stopped`` event.
+    Only the main thread is steered toward the ``handoff`` skill after the
+    crossing; new subagent launches from the main thread are denied. The
+    handoff instruction is delivered on the next tool boundary once no
+    subagent is left running, without waiting for a main-thread boundary.
+    A ``handoff`` skill invocation counts only when observed in the main
+    thread (``agent_id is None``). Partial subagent output already written
+    to the working tree is left as is for the normal dirty-work
+    preservation.
     """
 
     def __init__(
@@ -251,7 +256,8 @@ class ModelExecutor:
         self._started_at = self._clock()
         self._soft_threshold_crossed = False
         self._handoff_context_delivered = False
-        self._cost_subagent_notice_logged = False
+        self._running_subagents: set[str] = set()
+        self._stopped_subagent_ids: list[str] = []
         self._usage_shape_logged = False
         self._cost_estimator_observed_on_assistant = False
         self._operator_handoff_provider: OperatorHandoffProvider | None = None
@@ -437,24 +443,35 @@ class ModelExecutor:
     def _log(self, event: str, detail: str = "") -> None:
         self._event_log(event, detail, issue_number=self._issue_number)
 
-    def _note_cost_subagent_activity(self, hook_input: Any) -> None:
-        """Record the chosen post-crossing subagent behaviour once.
+    def _track_subagent_seen(self, hook_input: Any) -> None:
+        """Remember a subagent id seen before the soft-threshold crossing.
 
-        In-flight subagent tools stay allowed and the handoff instruction is
-        withheld from subagents; this single event makes that visible in the
-        main thread's log instead of leaving degraded subagent results
-        unexplained.
+        Only pre-crossing ids count as running: after the crossing every
+        subagent is stopped, so later ids are recorded as stopped instead
+        of re-populating the running set.
         """
 
-        if self._cost_subagent_notice_logged:
+        agent_id = _hook_agent_id(hook_input)
+        if agent_id is None:
             return
-        self._cost_subagent_notice_logged = True
+        if agent_id in self._stopped_subagent_ids:
+            return
+        self._running_subagents.add(agent_id)
+
+    def _stop_running_subagents(self) -> None:
+        """Cancel every running subagent and record the cancelled ids."""
+
+        stopped = sorted(self._running_subagents)
+        for agent_id in stopped:
+            if agent_id not in self._stopped_subagent_ids:
+                self._stopped_subagent_ids.append(agent_id)
+        self._running_subagents.clear()
+        ids_detail = ",".join(stopped)
         self._log(
-            "cost_soft_threshold_subagent_deferred",
-            f"agent_id={_hook_field(hook_input, 'agent_id')}; in-flight subagent"
-            " tools stay allowed after the cost crossing and the handoff"
-            " instruction is withheld until the next main-thread tool boundary;"
-            " new subagent launches are denied.",
+            "cost_soft_threshold_subagents_stopped",
+            f"stopped_agent_ids={ids_detail}; count={len(stopped)}; "
+            "in-flight subagent tools are denied after the cost crossing "
+            "and only handoff-related main-thread commands stay allowed.",
         )
 
     def _archive_evidence(self, kind: str, content: str, *, extension: str) -> str | None:
@@ -493,7 +510,8 @@ class ModelExecutor:
         )
         self._soft_threshold_crossed = False
         self._handoff_context_delivered = False
-        self._cost_subagent_notice_logged = False
+        self._running_subagents = set()
+        self._stopped_subagent_ids = []
         self._usage_shape_logged = False
         self._cost_estimator_observed_on_assistant = False
         self._operator_handoff = None
@@ -853,6 +871,7 @@ class ModelExecutor:
                 f"estimated_cost_usd={self._cost_estimator.estimated_cost_usd:.4f}; "
                 f"soft_threshold_usd={soft_threshold:.4f}",
             )
+            self._stop_running_subagents()
 
     async def _drain(self, client: SDKClient) -> None:
         """Consume buffered messages after interrupting before client teardown."""
@@ -1021,9 +1040,14 @@ class ModelExecutor:
             self._review_count += 1
             if self._review_count > 3:
                 return _deny("At most two code-review repair cycles are allowed.")
+        if not self._soft_threshold_crossed:
+            self._track_subagent_seen(hook_input)
         if self._soft_threshold_crossed and not self._main_thread_handoff_invoked():
             if not _is_main_thread(hook_input):
-                self._note_cost_subagent_activity(hook_input)
+                agent_id = _hook_agent_id(hook_input)
+                if agent_id is not None and agent_id not in self._stopped_subagent_ids:
+                    self._stopped_subagent_ids.append(agent_id)
+                return _cost_deny("Subagent work is stopped after the cost soft threshold.")
             else:
                 tool_name = _hook_field(hook_input, "tool_name")
                 if tool_name == "Skill" and _skill_name(hook_input) == "handoff":
@@ -1074,6 +1098,8 @@ class ModelExecutor:
             "tool_result", hook_input, response=_hook_field(hook_input, "tool_response")
         )
         await self._record_skill_event("PostToolUse", hook_input, tool_use_id, context)
+        if not self._soft_threshold_crossed:
+            self._track_subagent_seen(hook_input)
         if not self._cost_estimator.has_positive_usage:
             per_turn_cost = self._config.max_budget_usd / max(self._config.max_turns, 1)
             self._cost_estimator.observe_turn(per_turn_cost)
@@ -1081,16 +1107,21 @@ class ModelExecutor:
         self._poll_operator_handoff()
         contexts: list[str] = []
         if self._soft_threshold_crossed and not self._handoff_context_delivered:
-            if _is_main_thread(hook_input):
+            if _is_main_thread(hook_input) or not self._running_subagents:
+                # Once no subagent is left running the handoff instruction is
+                # delivered on the very next tool boundary (whatever thread
+                # it arrives on) instead of waiting for a main-thread
+                # boundary; stopping the subagents at the crossing is what
+                # frees the remaining budget for the handoff.
                 self._handoff_context_delivered = True
                 self._log("cost_soft_threshold_handoff_context_injected")
                 contexts.append(_COST_HANDOFF_INSTRUCTION)
             else:
-                # A subagent cannot perform the handoff and its transcript does
-                # not flow back to the main thread, so the instruction is
-                # withheld here and delivery stays latched off until a
-                # main-thread boundary arrives.
-                self._note_cost_subagent_activity(hook_input)
+                # Subagents are still recorded as running (for example the
+                # crossing flag was set without going through the stop
+                # path): a subagent cannot perform the handoff, so the
+                # instruction stays withheld until they are stopped.
+                pass
         if self._operator_handoff is not None and not self._operator_context_delivered:
             self._operator_context_delivered = True
             self._report_operator("delivered")
