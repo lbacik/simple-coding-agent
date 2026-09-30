@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import tempfile
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -10,7 +9,6 @@ from types import SimpleNamespace
 import pytest
 
 from simple_coding_agent.attempt_state import AttemptPhase, AttemptStateStore
-from simple_coding_agent.attempt_workspace import ConflictState
 from simple_coding_agent.completion import (
     AttemptOutcome,
     CompletionDecision,
@@ -22,6 +20,15 @@ from simple_coding_agent.git_workspace import PreparedAttempt, RebaseConflictErr
 from simple_coding_agent.lifecycle import ModelAttemptRunner
 from simple_coding_agent.model_execution import ModelExecution, ModelExecutionStatus
 from tests.fakes import InMemoryWorkspace
+
+
+def seeded_workspace(root: Path, *subjects: str) -> InMemoryWorkspace:
+    """Build the shared workspace double with retained-branch model commits."""
+
+    workspace = InMemoryWorkspace(root)
+    for subject in subjects:
+        workspace.model_commit(subject, files=(subject,))
+    return workspace
 
 
 def test_prompt_appends_trusted_comments_in_order(tmp_path: Path) -> None:
@@ -49,7 +56,7 @@ def test_prompt_degrades_to_the_bare_issue_body_with_no_comments_or_continuation
 
 def test_continuation_adds_only_a_pointer_to_the_handoff_note(tmp_path: Path) -> None:
     executor = FakeModelExecutor()
-    workspace = FakeWorkspace(commits=("Previous attempt work",))
+    workspace = seeded_workspace(tmp_path / "repo", "Previous attempt work")
     runner = build_runner(tmp_path, model_executor=executor, workspace=workspace, issue_number=24)
 
     runner(claim(issue_number=24, issue_body="Fix the parser."), profile(), FakePrepared())
@@ -219,7 +226,8 @@ def test_defers_setup_until_after_the_model_resolves_conflicts(tmp_path: Path) -
 
     calls: list[str] = []
     executor = FakeModelExecutor(status=ModelExecutionStatus.SUCCEEDED, calls=calls)
-    workspace = FakeWorkspace(commits=("Retained work",), conflicts=True)
+    workspace = seeded_workspace(tmp_path / "repo", "Retained work")
+    workspace.leave_conflict(files=("SubscriptionController.php",))
     executor.after_execute = workspace.note_model_finished
     verifier = FakeVerifier(calls=calls)
     events: list[tuple[str, str]] = []
@@ -247,7 +255,8 @@ def test_successful_conflict_resolution_logs_started_and_succeeded_with_files(
     """The attempt record shows the model resolved a rebase conflict."""
 
     executor = FakeModelExecutor(status=ModelExecutionStatus.SUCCEEDED)
-    workspace = FakeWorkspace(commits=("Retained work",), conflicts=True)
+    workspace = seeded_workspace(tmp_path / "repo", "Retained work")
+    workspace.leave_conflict(files=("SubscriptionController.php",))
     executor.after_execute = workspace.note_model_finished
     events: list[tuple[str, str, str]] = []
     runner = build_runner(
@@ -284,9 +293,9 @@ def test_unresolved_conflicts_after_the_model_abort_restore_and_raise(
 
     calls: list[str] = []
     executor = FakeModelExecutor(status=ModelExecutionStatus.SUCCEEDED, calls=calls)
-    workspace = FakeWorkspace(
-        commits=("Retained work",), conflicts=True, resolve_after_model=False
-    )
+    workspace = InMemoryWorkspace(tmp_path / "repo", resolve_after_model=False)
+    workspace.model_commit("Retained work", files=("Retained work",))
+    workspace.leave_conflict(files=("SubscriptionController.php",))
     executor.after_execute = workspace.note_model_finished
     verifier = FakeVerifier(calls=calls)
     events: list[tuple[str, str, str]] = []
@@ -326,7 +335,7 @@ def test_fallback_falls_back_to_the_prepare_snapshot_for_the_file_list(
     """A conflict state without live file names still reports the file list."""
 
     executor = FakeModelExecutor(status=ModelExecutionStatus.SUCCEEDED)
-    workspace = FakeWorkspace(commits=("Retained work",))
+    workspace = seeded_workspace(tmp_path / "repo", "Retained work")
     workspace.leave_conflict(files=())
     events: list[tuple[str, str, str]] = []
     runner = build_runner(
@@ -362,7 +371,7 @@ def test_unreadable_verification_state_fails_safe_without_running_setup(
 
     calls: list[str] = []
     executor = FakeModelExecutor(status=ModelExecutionStatus.SUCCEEDED, calls=calls)
-    workspace = FakeWorkspace(commits=("Retained work",))
+    workspace = seeded_workspace(tmp_path / "repo", "Retained work")
     workspace.leave_conflict(
         files=(),
         problems=("Conflict-resolution verification failed; treating the tree as conflicted.",),
@@ -392,7 +401,8 @@ def test_unreadable_verification_state_fails_safe_without_running_setup(
 def test_deferred_setup_failure_still_reports_without_a_final_check(tmp_path: Path) -> None:
     calls: list[str] = []
     executor = FakeModelExecutor(status=ModelExecutionStatus.SUCCEEDED, calls=calls)
-    workspace = FakeWorkspace(commits=("Retained work",), conflicts=True)
+    workspace = seeded_workspace(tmp_path / "repo", "Retained work")
+    workspace.leave_conflict(files=("SubscriptionController.php",))
     executor.after_execute = workspace.note_model_finished
     verifier = FakeVerifier(calls=calls, setup_succeeded=False)
     events: list[str] = []
@@ -416,7 +426,7 @@ def test_deferred_setup_failure_still_reports_without_a_final_check(tmp_path: Pa
 
 def test_logs_final_check_start_and_success(tmp_path: Path) -> None:
     executor = FakeModelExecutor(status=ModelExecutionStatus.SUCCEEDED)
-    workspace = FakeWorkspace(commits=("Implemented",))
+    workspace = seeded_workspace(tmp_path / "repo", "Implemented")
     events: list[str] = []
     runner = build_runner(
         tmp_path,
@@ -432,7 +442,7 @@ def test_logs_final_check_start_and_success(tmp_path: Path) -> None:
 
 def test_writes_final_check_markers_to_the_archive(tmp_path: Path) -> None:
     executor = FakeModelExecutor(status=ModelExecutionStatus.SUCCEEDED)
-    workspace = FakeWorkspace(commits=("Implemented",))
+    workspace = seeded_workspace(tmp_path / "repo", "Implemented")
     archive = FakeArchive()
     runner = build_runner(tmp_path, model_executor=executor, workspace=workspace)
     runner._attempt_archive_factory = lambda issue_number, started_at: archive
@@ -447,7 +457,7 @@ def build_runner(
     tmp_path: Path,
     *,
     model_executor: "FakeModelExecutor",
-    workspace: "FakeWorkspace | None" = None,
+    workspace: "InMemoryWorkspace | None" = None,
     verifier: "FakeVerifier | None" = None,
     issue_comments=lambda issue: (),
     issue_number: int = 24,
@@ -459,7 +469,7 @@ def build_runner(
     kwargs = {} if event_log is None else {"event_log": event_log}
     return ModelAttemptRunner(
         attempt_state=attempt_state,
-        workspace=workspace or FakeWorkspace(),
+        workspace=workspace or InMemoryWorkspace(tmp_path / "repo"),
         verifier=verifier or FakeVerifier(),
         evaluator=FakeEvaluator(),
         model_executor=model_executor,
@@ -499,7 +509,7 @@ def test_logs_setup_baseline_and_model_dispatch_stages(tmp_path: Path) -> None:
 def test_baseline_failure_tolerated_on_continuation_and_logs_warning(tmp_path: Path) -> None:
     executor = FakeModelExecutor()
     events: list[tuple[str, str, int | None]] = []
-    workspace = FakeWorkspace(commits=("Previous work",))
+    workspace = seeded_workspace(tmp_path / "repo", "Previous work")
     verifier = FakeVerifier(baseline_succeeded=False)
     runner = build_runner(
         tmp_path,
@@ -522,10 +532,11 @@ def test_baseline_failure_tolerated_on_continuation_and_logs_warning(tmp_path: P
     assert executor.captured_prompt is not None
 
 
-def test_baseline_failure_aborts_on_fresh_attempt_and_logs_error(tmp_path: Path) -> None:
+def test_baseline_failure_aborts_on_fresh_attempt_and_logs_error(
+    tmp_path: Path, workspace: InMemoryWorkspace
+) -> None:
     executor = FakeModelExecutor()
     events: list[tuple[str, str, int | None]] = []
-    workspace = FakeWorkspace(commits=())
     verifier = FakeVerifier(baseline_succeeded=False)
     runner = build_runner(
         tmp_path,
@@ -630,51 +641,6 @@ class FakeEvaluator:
         return CompletionDecision(AttemptOutcome.INCOMPLETE, False, PublicationPath.NONE, ("stub",))
 
 
-class FakeWorkspace(InMemoryWorkspace):
-    """The shared in-memory workspace with the old conflict-timing knobs.
-
-    ``commits`` seeds retained-branch subjects, ``conflicts`` simulates a
-    retained-branch rebase left unresolved, and ``note_model_finished``
-    (wired as ``executor.after_execute``) simulates the model resolving it
-    during its turn when ``resolve_after_model`` holds.
-    """
-
-    def __init__(
-        self,
-        *,
-        commits: tuple[str, ...] = (),
-        conflicts: bool = False,
-        resolve_after_model: bool = True,
-    ) -> None:
-        self._tmpdir = tempfile.TemporaryDirectory(prefix="fake-workspace-")
-        super().__init__(Path(self._tmpdir.name) / "repo", issue_number=24)
-        for subject in commits:
-            self.model_commit(subject, files=(subject,))
-        self._conflicts = conflicts
-        self._resolve_after_model = resolve_after_model
-        self._model_finished = False
-
-    def note_model_finished(self) -> None:
-        """Simulate the model's turn ending so resolution can take effect."""
-
-        self._model_finished = True
-
-    def _resolved(self) -> bool:
-        return self._model_finished and self._resolve_after_model
-
-    def conflict_state(self) -> ConflictState:
-        if self._conflicts and not self._resolved():
-            return ConflictState(
-                in_progress=True,
-                conflicted_files=("SubscriptionController.php",),
-                resolution_problems=(
-                    "A rebase or merge is still in progress."
-                    " Conflicting files: SubscriptionController.php.",
-                ),
-            )
-        return super().conflict_state()
-
-
 def FakePrepared(
     *,
     branch: str = "agent/issue-24",
@@ -723,7 +689,9 @@ def profile() -> RepositoryProfile:
     )
 
 
-def test_infrastructure_error_seals_dirty_work(tmp_path: Path) -> None:
+def test_infrastructure_error_seals_dirty_work(
+    tmp_path: Path, workspace: InMemoryWorkspace
+) -> None:
     """An SDK stream that dies without a terminal message still preserves edits.
 
     Regression test: ``INFRASTRUCTURE_ERROR`` used to skip the preservation
@@ -734,7 +702,6 @@ def test_infrastructure_error_seals_dirty_work(tmp_path: Path) -> None:
     """
 
     executor = FakeModelExecutor(status=ModelExecutionStatus.INFRASTRUCTURE_ERROR)
-    workspace = FakeWorkspace()
     workspace.make_dirty("work.txt", "model edits")
     runner = build_runner(tmp_path, model_executor=executor, workspace=workspace)
     prepared = FakePrepared()
@@ -762,7 +729,7 @@ def test_dirty_work_is_sealed_for_every_model_status(tmp_path: Path) -> None:
         state_dir = tmp_path / status.value
         state_dir.mkdir(exist_ok=True)
         executor = FakeModelExecutor(status=status)
-        workspace = FakeWorkspace()
+        workspace = InMemoryWorkspace(state_dir / "repo")
         workspace.make_dirty("work.txt", "model edits")
         runner = build_runner(state_dir, model_executor=executor, workspace=workspace)
         prepared = FakePrepared()
@@ -782,7 +749,9 @@ def test_dirty_work_is_sealed_for_every_model_status(tmp_path: Path) -> None:
         )
 
 
-def test_model_execution_failure_still_seals_dirty_work(tmp_path: Path) -> None:
+def test_model_execution_failure_still_seals_dirty_work(
+    tmp_path: Path, workspace: InMemoryWorkspace
+) -> None:
     """When execution itself raises, the runner seals before propagating.
 
     The attempt finalizes as an infrastructure error with the model's work
@@ -793,7 +762,6 @@ def test_model_execution_failure_still_seals_dirty_work(tmp_path: Path) -> None:
         async def execute(self, **kwargs: object) -> ModelExecution:
             raise RuntimeError("SDK stream died")
 
-    workspace = FakeWorkspace()
     workspace.make_dirty("work.txt", "model edits")
     runner = build_runner(
         tmp_path, model_executor=ExplodingExecutor(), workspace=workspace
@@ -811,7 +779,9 @@ def test_model_execution_failure_still_seals_dirty_work(tmp_path: Path) -> None:
     ]
 
 
-def test_model_limit_path_seals_work_then_commits_note_only(tmp_path: Path) -> None:
+def test_model_limit_path_seals_work_then_commits_note_only(
+    tmp_path: Path, workspace: InMemoryWorkspace
+) -> None:
     """On model limit the seal commit lands first and the note commit second.
 
     The model's dirty work is sealed with provenance, then the emergency
@@ -820,7 +790,6 @@ def test_model_limit_path_seals_work_then_commits_note_only(tmp_path: Path) -> N
     """
 
     executor = FakeModelExecutor(status=ModelExecutionStatus.MODEL_LIMIT_REACHED)
-    workspace = FakeWorkspace()
     workspace.make_dirty("work.txt", "model edits")
     runner = build_runner(tmp_path, model_executor=executor, workspace=workspace)
     prepared = FakePrepared()
@@ -845,6 +814,7 @@ def test_model_limit_path_seals_work_then_commits_note_only(tmp_path: Path) -> N
 
 def test_model_limit_on_a_continuation_ignores_an_earlier_rounds_note(
     tmp_path: Path,
+    workspace: InMemoryWorkspace,
 ) -> None:
     """A note left by an earlier round must not stand in for this attempt's.
 
@@ -853,7 +823,6 @@ def test_model_limit_on_a_continuation_ignores_an_earlier_rounds_note(
     """
 
     executor = FakeModelExecutor(status=ModelExecutionStatus.MODEL_LIMIT_REACHED)
-    workspace = FakeWorkspace()
     workspace.prior_round_commit("Handoff note: issue #24", (".agent/handoff/24.md",))
     workspace.make_dirty("work.txt", "model edits")
     runner = build_runner(tmp_path, model_executor=executor, workspace=workspace)
