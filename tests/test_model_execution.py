@@ -1025,7 +1025,7 @@ def test_positive_token_usage_logs_limits_checked_progress(tmp_path: Path) -> No
 # --- Cost soft-threshold handoff guarantee (issue #85) -----------------------
 
 
-def test_cost_instruction_is_withheld_from_subagents_until_the_main_thread(
+def test_cost_instruction_is_withheld_while_subagents_still_running(
     tmp_path: Path,
 ) -> None:
     captured: list[FakeClient] = []
@@ -1042,9 +1042,26 @@ def test_cost_instruction_is_withheld_from_subagents_until_the_main_thread(
         event_log=lambda event, detail="", issue_number=None: events.append((event, detail)),
     )
     asyncio.run(executor.execute(issue_body="Fix it.", working_directory=tmp_path))
-    executor._soft_threshold_crossed = True
+    pre_hook = captured[0].options.hooks["PreToolUse"][0].hooks[0]
     post_hook = captured[0].options.hooks["PostToolUse"][0].hooks[0]
 
+    # A subagent tool call before the crossing registers it as running.
+    assert (
+        asyncio.run(
+            pre_hook(
+                {"tool_name": "Read", "tool_input": {"file_path": "src/a.py"}, "agent_id": "sub-1"},
+                None,
+                {},
+            )
+        )
+        == {}
+    )
+    assert executor._running_subagents == {"sub-1"}
+
+    # Crossing flag set without going through the stop path (as in a
+    # hand-rolled state): the handoff instruction stays withheld while a
+    # subagent is still recorded as running.
+    executor._soft_threshold_crossed = True
     subagent_reply = asyncio.run(
         post_hook(
             {
@@ -1061,21 +1078,131 @@ def test_cost_instruction_is_withheld_from_subagents_until_the_main_thread(
     assert subagent_reply == {}
     assert executor._handoff_context_delivered is False
 
-    main_reply = asyncio.run(
+    # Once the running subagents are stopped, the very next boundary --
+    # even a subagent one -- delivers the handoff instruction instead of
+    # waiting for a main-thread boundary.
+    executor._stop_running_subagents()
+    stopped_reply = asyncio.run(
         post_hook(
-            {"tool_name": "Bash", "tool_input": {"command": "pytest"}, "tool_response": "ok"},
+            {
+                "tool_name": "Read",
+                "tool_input": {"file_path": "src/a.py"},
+                "tool_response": "ok",
+                "agent_id": "sub-1",
+            },
             None,
             {},
         )
     )
 
-    assert "handoff" in main_reply["hookSpecificOutput"]["additionalContext"]
+    assert "handoff" in stopped_reply["hookSpecificOutput"]["additionalContext"]
     assert executor._handoff_context_delivered is True
-    assert any(name == "cost_soft_threshold_subagent_deferred" for name, _ in events)
+    assert any(name == "cost_soft_threshold_subagents_stopped" for name, _ in events)
     assert any(name == "cost_soft_threshold_handoff_context_injected" for name, _ in events)
 
 
-def test_cost_guard_leaves_in_flight_subagents_alone_but_denies_new_launches(
+def test_cost_crossing_stops_running_subagent_and_denies_later_subagent_calls(
+    tmp_path: Path,
+) -> None:
+    captured: list[FakeClient] = []
+
+    def client_factory(options: object) -> FakeClient:
+        client = FakeClient(options, [result()])
+        captured.append(client)
+        return client
+
+    events: list[tuple[str, str]] = []
+    executor = ModelExecutor(
+        runtime_config(tmp_path),
+        client_factory=client_factory,
+        event_log=lambda event, detail="", issue_number=None: events.append((event, detail)),
+    )
+    asyncio.run(executor.execute(issue_body="Fix it.", working_directory=tmp_path))
+    pre_hook = captured[0].options.hooks["PreToolUse"][0].hooks[0]
+
+    # In-flight subagent work registers before the crossing.
+    assert (
+        asyncio.run(
+            pre_hook(
+                {"tool_name": "Edit", "tool_input": {"file_path": "src/a.py"}, "agent_id": "sub-1"},
+                None,
+                {},
+            )
+        )
+        == {}
+    )
+
+    # Crossing the soft threshold via observed cost stops the running
+    # subagent and records the cancelled id.
+    executor._cost_estimator.observe({"input_tokens": 300_000})
+    executor._check_limits()
+
+    assert executor._soft_threshold_crossed is True
+    assert executor._running_subagents == set()
+    assert "sub-1" in executor._stopped_subagent_ids
+    stopped_events = [detail for name, detail in events if name == "cost_soft_threshold_subagents_stopped"]
+    assert stopped_events and "sub-1" in stopped_events[0]
+
+    # No subagent tool call is allowed afterwards.
+    for hook_input in (
+        {"tool_name": "Edit", "tool_input": {"file_path": "src/a.py"}, "agent_id": "sub-1"},
+        {"tool_name": "Bash", "tool_input": {"command": "pytest"}, "agent_id": "sub-1"},
+        {"tool_name": "Write", "tool_input": {"file_path": "src/b.py"}, "agent_id": "sub-2"},
+    ):
+        denied = asyncio.run(pre_hook(hook_input, None, {}))
+        assert denied["hookSpecificOutput"]["permissionDecision"] == "deny"
+
+
+def test_cost_handoff_instruction_reaches_main_thread_once_subagents_stopped(
+    tmp_path: Path,
+) -> None:
+    captured: list[FakeClient] = []
+
+    def client_factory(options: object) -> FakeClient:
+        client = FakeClient(options, [result()])
+        captured.append(client)
+        return client
+
+    events: list[tuple[str, str]] = []
+    executor = ModelExecutor(
+        runtime_config(tmp_path),
+        client_factory=client_factory,
+        event_log=lambda event, detail="", issue_number=None: events.append((event, detail)),
+    )
+    asyncio.run(executor.execute(issue_body="Fix it.", working_directory=tmp_path))
+    pre_hook = captured[0].options.hooks["PreToolUse"][0].hooks[0]
+    post_hook = captured[0].options.hooks["PostToolUse"][0].hooks[0]
+
+    asyncio.run(
+        pre_hook(
+            {"tool_name": "Bash", "tool_input": {"command": "pytest"}, "agent_id": "sub-1"},
+            None,
+            {},
+        )
+    )
+    executor._cost_estimator.observe({"input_tokens": 300_000})
+    executor._check_limits()
+    assert executor._running_subagents == set()
+
+    reply = asyncio.run(
+        post_hook(
+            {
+                "tool_name": "Bash",
+                "tool_input": {"command": "pytest"},
+                "tool_response": "ok",
+                "agent_id": "sub-1",
+            },
+            None,
+            {},
+        )
+    )
+
+    assert "handoff" in reply["hookSpecificOutput"]["additionalContext"]
+    assert executor._handoff_context_delivered is True
+    assert any(name == "cost_soft_threshold_handoff_context_injected" for name, _ in events)
+
+
+def test_cost_guard_stops_in_flight_subagents_and_denies_new_launches(
     tmp_path: Path,
 ) -> None:
     captured: list[FakeClient] = []
@@ -1097,7 +1224,7 @@ def test_cost_guard_leaves_in_flight_subagents_alone_but_denies_new_launches(
             {},
         )
     )
-    assert subagent_edit == {}
+    assert subagent_edit["hookSpecificOutput"]["permissionDecision"] == "deny"
 
     subagent_bash = asyncio.run(
         pre_hook(
@@ -1106,7 +1233,7 @@ def test_cost_guard_leaves_in_flight_subagents_alone_but_denies_new_launches(
             {},
         )
     )
-    assert subagent_bash == {}
+    assert subagent_bash["hookSpecificOutput"]["permissionDecision"] == "deny"
 
     main_edit = asyncio.run(
         pre_hook({"tool_name": "Edit", "tool_input": {"file_path": "src/a.py"}}, None, {})
