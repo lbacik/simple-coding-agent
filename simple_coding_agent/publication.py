@@ -8,7 +8,8 @@ from typing import Callable, Protocol
 
 from simple_coding_agent.completion import AttemptOutcome, CompletionDecision, PublicationPath
 from simple_coding_agent.attempt_state import AttemptPhase, AttemptStateStore
-from simple_coding_agent.git_workspace import GitWorkspace, GitWorkspaceError
+from simple_coding_agent.attempt_workspace import BranchPusher
+from simple_coding_agent.git_workspace import GitWorkspaceError
 
 
 _SUCCEEDED_BUT_UNPUBLISHED = "Implementation succeeded but publication failed."
@@ -70,7 +71,7 @@ class Publisher:
 
     def __init__(
         self,
-        workspace: GitWorkspace,
+        workspace: BranchPusher,
         github: PublicationTransport,
         repository: str,
         *,

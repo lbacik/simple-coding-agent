@@ -12,6 +12,7 @@ from simple_coding_agent.git_workspace import (
     GitWorkspaceError,
     GitWorkspaceRecoveryError,
 )
+from simple_coding_agent.model_execution import ModelExecutionStatus
 
 
 def test_clones_once_fetches_and_prepares_an_attempt_from_the_verified_base(
@@ -371,31 +372,81 @@ def test_reports_the_verified_base_and_commits_added_by_the_attempt(tmp_path: Pa
     assert commits[0].revision == git(clone, "rev-parse", "HEAD")
 
 
-def test_commit_dirty_work_preserves_untracked_and_modified_changes(tmp_path: Path) -> None:
+def test_seal_preserves_untracked_and_modified_changes(tmp_path: Path) -> None:
     remote, _ = repository_with_main(tmp_path)
     clone = tmp_path / "clone"
     workspace = GitWorkspace(clone, str(remote), token_provider=lambda: "secret-token")
     prepared = workspace.prepare_attempt(base_branch="main", issue_number=19)
+    (clone / "README.md").write_text("modified work")
     (clone / "untracked.txt").write_text("dirty work")
 
-    committed = workspace.commit_dirty_work("Preserve uncommitted work before handoff")
+    sealed = workspace.seal(
+        issue_number=19, attempt_id="attempt-1", status=ModelExecutionStatus.SUCCEEDED
+    )
 
-    assert committed is True
+    assert sealed is not None
+    assert sealed.subject == "Seal attempt work for #19 (succeeded)"
+    assert sealed.revision == git(clone, "rev-parse", "HEAD")
     commits = workspace.commits_added(prepared)
-    assert [commit.subject for commit in commits] == ["Preserve uncommitted work before handoff"]
+    assert [commit.subject for commit in commits] == ["Seal attempt work for #19 (succeeded)"]
+    assert (clone / "untracked.txt").read_text() == "dirty work"
     assert git(clone, "status", "--porcelain") == ""
 
 
-def test_commit_dirty_work_is_a_noop_on_a_clean_worktree(tmp_path: Path) -> None:
+def test_seal_is_a_noop_on_a_clean_worktree(tmp_path: Path) -> None:
     remote, _ = repository_with_main(tmp_path)
     clone = tmp_path / "clone"
     workspace = GitWorkspace(clone, str(remote), token_provider=lambda: "secret-token")
     prepared = workspace.prepare_attempt(base_branch="main", issue_number=19)
 
-    committed = workspace.commit_dirty_work("Preserve uncommitted work before handoff")
+    sealed = workspace.seal(
+        issue_number=19, attempt_id="attempt-1", status=ModelExecutionStatus.SUCCEEDED
+    )
 
-    assert committed is False
+    assert sealed is None
     assert workspace.commits_added(prepared) == ()
+
+
+def test_seal_records_the_attempt_id_trailer(tmp_path: Path) -> None:
+    remote, _ = repository_with_main(tmp_path)
+    clone = tmp_path / "clone"
+    workspace = GitWorkspace(clone, str(remote), token_provider=lambda: "secret-token")
+    workspace.prepare_attempt(base_branch="main", issue_number=19)
+    (clone / "untracked.txt").write_text("dirty work")
+
+    sealed = workspace.seal(
+        issue_number=19, attempt_id="attempt-42", status=ModelExecutionStatus.SUCCEEDED
+    )
+
+    assert sealed is not None
+    assert (
+        git(clone, "log", "-1", "--format=%(trailers:key=Attempt-Id,valueonly)")
+        == "attempt-42"
+    )
+
+
+def test_seal_refuses_an_unresolved_rebase_without_committing(tmp_path: Path) -> None:
+    remote, seed = repository_with_main(tmp_path)
+    clone = tmp_path / "clone"
+    workspace = GitWorkspace(clone, str(remote), token_provider=lambda: "secret-token")
+    workspace.prepare_attempt(base_branch="main", issue_number=19)
+    write_and_commit(clone, "README.md", "branch change", "Conflicting branch commit")
+
+    write_and_commit(seed, "README.md", "upstream fix", "Conflicting upstream commit")
+    git(seed, "push", "origin", "main")
+
+    workspace.prepare_attempt(base_branch="main", issue_number=19)
+
+    assert workspace.has_unresolved_conflicts() is True
+    revision_before = git(clone, "rev-parse", "HEAD")
+
+    with pytest.raises(GitWorkspaceError, match="unresolved"):
+        workspace.seal(
+            issue_number=19, attempt_id="attempt-1", status=ModelExecutionStatus.SUCCEEDED
+        )
+
+    assert git(clone, "rev-parse", "HEAD") == revision_before
+    assert "Seal attempt work" not in git(clone, "log", "--format=%s")
 
 
 def test_cleanup_preserves_untracked_files_and_attempt_branch(tmp_path: Path) -> None:
@@ -407,8 +458,10 @@ def test_cleanup_preserves_untracked_files_and_attempt_branch(tmp_path: Path) ->
     (clone / ".venv" / "marker").write_text("keep")
     (clone / "untracked.txt").write_text("preserve")
 
-    workspace.cleanup(base_branch="main", prepared=prepared, retain_branch=False)
+    with pytest.raises(DirtyWorkspaceError):
+        workspace.cleanup(base_branch="main", prepared=prepared, retain_branch=False)
 
+    assert git(clone, "branch", "--show-current") == "agent/issue-19"
     assert (clone / "untracked.txt").exists()
     assert (clone / ".venv" / "marker").read_text() == "keep"
     assert "agent/issue-19" in git(clone, "branch", "--format=%(refname:short)").splitlines()

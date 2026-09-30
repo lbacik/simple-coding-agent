@@ -17,6 +17,7 @@ from simple_coding_agent.control import CommandAcknowledgement, ControlStore, In
 from simple_coding_agent.github_tracker import Assignment, Claim, TrackerIssue
 from simple_coding_agent.lifecycle import AgentLifecycle
 from simple_coding_agent.operating import ConsecutiveErrorStore
+from tests.fakes import FakePublisher, FakeTracker, InMemoryWorkspace
 
 
 # ---------------------------------------------------------------------------
@@ -56,62 +57,10 @@ def _evidence(outcome: AttemptOutcome | None = None):
     )
 
 
-class FakeTracker:
-    def __init__(self, next_claim: Claim | None) -> None:
-        self.next_claim = next_claim
-        self.cleanup: list[tuple[int, str, str]] = []
-        self.claimed: list[int] = []
-
-    def claim_next(self) -> Claim | None:
-        claim_value, self.next_claim = self.next_claim, None
-        if claim_value is not None:
-            self.claimed.append(claim_value.issue.number)
-        return claim_value
-
-    def recover_claim(self, issue_number: int) -> Claim | None:
-        return Claim(_issue(issue_number), Assignment(f"issue-{issue_number}", "agent-id"))
-
-    def release_attempt(self, issue_number: int, label: str, assignee_id: str) -> None:
-        self.cleanup.append((issue_number, label, assignee_id))
-
-    def release_handoff(self, issue_number: int, assignee_id: str) -> None:
-        self.cleanup.append((issue_number, "round-finished", assignee_id))
-
-
-class FakeWorkspace:
-    working_directory = Path("/repository")
-
-    def __init__(self) -> None:
-        self.cleanup_calls: list[tuple[str, bool]] = []
-        self.dirty = False
-
-    def is_clean(self) -> bool:
-        return not self.dirty
-
-    def prepare_for_profile_read(self, *, base_branch: str = "main") -> None:
-        return None
-
-    def prepare_attempt(self, *, base_branch: str, issue_number: int):
-        return type("Prepared", (), {"branch": f"agent/issue-{issue_number}"})()
-
-    def cleanup(self, *, base_branch: str, prepared: object, retain_branch: bool) -> None:
-        self.cleanup_calls.append((base_branch, retain_branch))
-
-
-class FakePublisher:
-    def __init__(self) -> None:
-        self.requests: list[object] = []
-
-    def publish(self, request: object):
-        self.requests.append(request)
-        outcome = request.decision.outcome or AttemptOutcome.COMPLETE
-        return type("Published", (), {"outcome": outcome, "branch_url": "https://example.test/x"})()
-
-
 def make_lifecycle(tmp_path: Path, *, next_claim: Claim | None = None):
     events: list[tuple[str, str]] = []
-    tracker = FakeTracker(next_claim)
-    workspace = FakeWorkspace()
+    tracker = FakeTracker(next_claim=next_claim)
+    workspace = InMemoryWorkspace(tmp_path / "workspace")
     store = ControlStore(tmp_path)
     error_store = ConsecutiveErrorStore(tmp_path)
     lifecycle = AgentLifecycle(

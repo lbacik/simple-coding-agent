@@ -26,6 +26,7 @@ from simple_coding_agent.control import (
 )
 from simple_coding_agent.github_tracker import Assignment, Claim, TrackerIssue
 from simple_coding_agent.lifecycle import AgentLifecycle, LifecycleStatus
+from tests.fakes import FakePublisher, FakeTracker, InMemoryWorkspace
 
 
 # ---------------------------------------------------------------------------
@@ -436,64 +437,11 @@ def lifecycle_evidence(outcome: AttemptOutcome | None):
     )
 
 
-class FakeTracker:
-    def __init__(self, numbers: list[int]) -> None:
-        self._pending = [claim(number) for number in numbers]
-        self.claimed: list[int] = []
-        self.cleanup: list[tuple[int, str, str]] = []
-
-    def claim_next(self) -> Claim | None:
-        if not self._pending:
-            return None
-        value = self._pending.pop(0)
-        self.claimed.append(value.issue.number)
-        return value
-
-    def recover_claim(self, issue_number: int) -> Claim | None:
-        return Claim(issue(issue_number), Assignment(f"issue-{issue_number}", "agent-id"))
-
-    def release_attempt(self, issue_number: int, label: str, assignee_id: str) -> None:
-        self.cleanup.append((issue_number, label, assignee_id))
-
-    def release_handoff(self, issue_number: int, assignee_id: str) -> None:
-        self.cleanup.append((issue_number, "round-finished", assignee_id))
-
-
-class FakeWorkspace:
-    working_directory = Path("/repository")
-
-    def __init__(self) -> None:
-        self.cleanup_calls: list[tuple[str, bool]] = []
-        self.dirty = False
-
-    def is_clean(self) -> bool:
-        return not self.dirty
-
-    def prepare_for_profile_read(self, *, base_branch: str = "main") -> None:
-        return None
-
-    def prepare_attempt(self, *, base_branch: str, issue_number: int):
-        return type("Prepared", (), {"branch": f"agent/issue-{issue_number}"})()
-
-    def cleanup(self, *, base_branch: str, prepared: object, retain_branch: bool) -> None:
-        self.cleanup_calls.append((base_branch, retain_branch))
-
-
-class FakePublisher:
-    def __init__(self) -> None:
-        self.requests: list[object] = []
-
-    def publish(self, request: object):
-        self.requests.append(request)
-        outcome = request.decision.outcome or AttemptOutcome.COMPLETE  # type: ignore[union-attr]
-        return type("Published", (), {"outcome": outcome, "branch_url": "https://example.test/x"})()
-
-
 def make_lifecycle(tmp_path: Path, numbers: list[int], outcomes: list[AttemptOutcome | None]):
     from simple_coding_agent.lifecycle import AgentLifecycle
 
-    tracker = FakeTracker(numbers)
-    workspace = FakeWorkspace()
+    tracker = FakeTracker(issues={number: issue(number) for number in numbers}, fifo=list(numbers))
+    workspace = InMemoryWorkspace(tmp_path / "workspace")
     store = ControlStore(tmp_path)
     pending = list(outcomes)
 
@@ -563,7 +511,8 @@ def test_stop_after_two_counts_active_first_then_stops(tmp_path: Path) -> None:
     assert snapshot["latest_counted_outcome"] == AttemptOutcome.COMPLETE.value
 
     lifecycle.set_attempt_runner(original_runner)
-    tracker._pending.extend([claim(26)])
+    tracker.issues.setdefault(26, issue(26))
+    tracker.fifo.append(26)
     assert lifecycle.run_once().status is LifecycleStatus.ATTEMPTED
     assert tracker.claimed == [24, 25]
     # The final counted attempt entered stopping at claim and is now stopped.
@@ -612,19 +561,13 @@ def test_all_five_outcomes_count_through_the_lifecycle(tmp_path: Path) -> None:
 def test_held_finalization_does_not_consume_a_count(tmp_path: Path) -> None:
     from simple_coding_agent.lifecycle import AgentLifecycle
 
-    tracker = FakeTracker([24])
-    workspace = FakeWorkspace()
+    tracker = FakeTracker(issues={24: issue(24)}, fifo=[24])
+    workspace = InMemoryWorkspace(tmp_path / "workspace")
     store = ControlStore(tmp_path)
 
     class UnconfirmedPublisher(FakePublisher):
-        def publish(self, request: object):
-            self.requests.append(request)
-            outcome = request.decision.outcome or AttemptOutcome.COMPLETE  # type: ignore[union-attr]
-            return type(
-                "Published",
-                (),
-                {"outcome": outcome, "branch_url": "https://example.test/x", "comment_posted": False},
-            )()
+        def __init__(self) -> None:
+            super().__init__(comment_posted=False)
 
     lifecycle = AgentLifecycle(
         tracker=tracker,
@@ -667,11 +610,11 @@ def test_recovery_after_json_record_counts_once_without_double_publish(
     )
     assert store.intake_state() is IntakeState.STOPPING
 
-    tracker = FakeTracker([])
+    tracker = FakeTracker(issues={24: issue(24)})
     restarted = AgentLifecycle(
         tracker=tracker,
         attempt_state=state,
-        workspace=FakeWorkspace(),
+        workspace=InMemoryWorkspace(tmp_path / "workspace"),
         profile_loader=lambda _: type("Profile", (), {"base_branch": "main"})(),
         publisher=FakePublisher(),
         attempt_runner=lambda c, p, r: lifecycle_evidence(AttemptOutcome.COMPLETE),
@@ -712,11 +655,11 @@ def test_recovery_with_marker_but_leftover_checkpoint_does_not_recount(
     assert store.record_attempt_finalized(checkpoint.started_at, AttemptOutcome.INCOMPLETE.value) == []
     assert store.stop_plan_snapshot()["remaining"] == 2  # type: ignore[index]
 
-    tracker = FakeTracker([])
+    tracker = FakeTracker(issues={24: issue(24)})
     restarted = AgentLifecycle(
         tracker=tracker,
         attempt_state=state,
-        workspace=FakeWorkspace(),
+        workspace=InMemoryWorkspace(tmp_path / "workspace"),
         profile_loader=lambda _: type("Profile", (), {"base_branch": "main"})(),
         publisher=FakePublisher(),
         attempt_runner=lambda c, p, r: lifecycle_evidence(AttemptOutcome.COMPLETE),

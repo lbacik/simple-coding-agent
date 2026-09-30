@@ -19,6 +19,7 @@ from simple_coding_agent.recovery import (
     parse_attempt_id,
     parse_saved_at,
 )
+from tests.fakes import FakePublisher, FakeTracker, InMemoryWorkspace
 
 
 # ---------------------------------------------------------------------------
@@ -45,75 +46,15 @@ def _claim(number: int) -> Claim:
     return Claim(_issue(number), Assignment(f"issue-{number}", "agent-id"))
 
 
-class FakeTracker:
-    def __init__(self, next_claim: Claim | None = None) -> None:
-        self.next_claim = next_claim
-        self.cleanup: list[tuple] = []
-        self.claimed: list[int] = []
-
-    def claim_next(self) -> Claim | None:
-        claim_value, self.next_claim = self.next_claim, None
-        if claim_value is not None:
-            self.claimed.append(claim_value.issue.number)
-        return claim_value
-
-    def recover_claim(self, issue_number: int) -> Claim | None:
-        return Claim(_issue(issue_number), Assignment(f"issue-{issue_number}", "agent-id"))
-
-    def release_attempt(self, issue_number: int, label: str, assignee_id: str) -> None:
-        self.cleanup.append((issue_number, label, assignee_id))
-
-    def release_handoff(self, issue_number: int, assignee_id: str) -> None:
-        self.cleanup.append((issue_number, "round-finished", assignee_id))
-
-
-class FakeWorkspace:
-    working_directory = Path("/repository")
-
-    def __init__(self, commits: tuple = ()) -> None:
-        self._commits = commits
-        self.cleanup_calls: list[tuple] = []
-        self.dirty = False
-
-    def is_clean(self) -> bool:
-        return not self.dirty
-
-    def prepare_for_profile_read(self, *, base_branch: str = "main") -> None:
-        return None
-
-    def prepare_attempt(self, *, base_branch: str, issue_number: int):
-        return type(
-            "Prepared", (), {"branch": f"agent/issue-{issue_number}", "base_revision": "abc"}
-        )()
-
-    def cleanup(self, *, base_branch: str, prepared: object, retain_branch: bool) -> None:
-        self.cleanup_calls.append((base_branch, retain_branch))
-
-    def commits_added(self, prepared: object) -> tuple:
-        return self._commits
-
-
-class FakePublisher:
-    _github = None
-    _repository = "owner/repo"
-
-    def __init__(self, comment_posted: bool = True) -> None:
-        self.requests: list[object] = []
-        self._comment_posted = comment_posted
-
-    def publish(self, request: object):
-        self.requests.append(request)
-        outcome = request.decision.outcome or AttemptOutcome.COMPLETE
-        return type(
-            "Published",
-            (),
-            {"outcome": outcome, "branch_url": "https://example.test/x", "comment_posted": self._comment_posted},
-        )()
+def _default_tracker() -> FakeTracker:
+    # Self-assigned so the retry conflict probe passes on success paths;
+    # the conflicting-human-changes test covers the unassigned case.
+    return FakeTracker(issues={24: _issue(24, assignees=("agent",))})
 
 
 def make_lifecycle(tmp_path: Path, *, tracker=None, workspace=None, publisher=None, store=None):
-    tracker = tracker or FakeTracker()
-    workspace = workspace or FakeWorkspace()
+    tracker = tracker or _default_tracker()
+    workspace = workspace or InMemoryWorkspace(tmp_path / "workspace", issue_number=24)
     publisher = publisher or FakePublisher()
     store = store or ControlStore(tmp_path)
     lifecycle = AgentLifecycle(
@@ -316,9 +257,9 @@ def test_retry_rejects_unknown_mismatched_and_finalized_ids(tmp_path: Path) -> N
         lifecycle.submit_recovery_retry("req-bad", "mismatched-id")
     with pytest.raises(RecoveryRejectedError, match="unknown attempt"):
         AgentLifecycle(
-            tracker=FakeTracker(),
+            tracker=_default_tracker(),
             attempt_state=AttemptStateStore(tmp_path.parent / "empty"),
-            workspace=FakeWorkspace(),
+            workspace=InMemoryWorkspace(tmp_path.parent / "empty-workspace", issue_number=24),
             profile_loader=lambda _: type("Profile", (), {"base_branch": "main"})(),
             publisher=FakePublisher(),
             control_store=ControlStore(tmp_path.parent / "empty"),
@@ -397,6 +338,9 @@ def test_retry_keeps_the_hold_on_conflicting_human_changes(tmp_path: Path) -> No
     assert checkpoint is not None
 
     class ConflictingTracker(FakeTracker):
+        def __init__(self) -> None:
+            super().__init__(issues={24: _issue(24, assignees=("agent",))})
+
         def fetch_issue(self, number: int):
             return _issue(number, assignees=("human",))
 
@@ -476,7 +420,7 @@ def test_release_confirms_comment_before_labels_and_records_saved_at(tmp_path: P
         def publish(self, request: object):  # pragma: no cover - release bypasses publish
             raise AssertionError("release must use the comment transport, not publish")
 
-    tracker = OrderedTracker()
+    tracker = OrderedTracker(issues={24: _issue(24, assignees=("agent",))})
     lifecycle, _, _, _, store = make_lifecycle(
         tmp_path, tracker=tracker, publisher=GithubPublisher()
     )
@@ -530,7 +474,9 @@ def test_release_never_claims_a_successful_handoff(tmp_path: Path) -> None:
             raise AssertionError("release must never take the handoff label path")
 
     lifecycle, tracker, _, _, _ = make_lifecycle(
-        tmp_path, tracker=HandoffTracker(), publisher=GithubPublisher()
+        tmp_path,
+        tracker=HandoffTracker(issues={24: _issue(24, assignees=("agent",))}),
+        publisher=GithubPublisher(),
     )
 
     record = lifecycle.submit_recovery_release("req-rel", checkpoint.started_at, "s3://bucket/work")

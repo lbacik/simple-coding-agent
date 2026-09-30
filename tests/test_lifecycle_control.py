@@ -17,6 +17,7 @@ from simple_coding_agent.control import (
 )
 from simple_coding_agent.github_tracker import Assignment, Claim, TrackerIssue
 from simple_coding_agent.lifecycle import AgentLifecycle, LifecycleStatus
+from tests.fakes import FakePublisher, FakeTracker, InMemoryWorkspace
 from datetime import UTC, datetime
 
 
@@ -293,63 +294,11 @@ def blocking_evidence(
     return run
 
 
-class FakeTracker:
-    def __init__(self, next_claim: Claim | None) -> None:
-        self.next_claim = next_claim
-        self.cleanup: list[tuple[int, str, str]] = []
-        self.claimed: list[int] = []
-
-    def claim_next(self) -> Claim | None:
-        claim_value, self.next_claim = self.next_claim, None
-        if claim_value is not None:
-            self.claimed.append(claim_value.issue.number)
-        return claim_value
-
-    def recover_claim(self, issue_number: int) -> Claim | None:
-        return Claim(issue(issue_number), Assignment(f"issue-{issue_number}", "agent-id"))
-
-    def release_attempt(self, issue_number: int, label: str, assignee_id: str) -> None:
-        self.cleanup.append((issue_number, label, assignee_id))
-
-    def release_handoff(self, issue_number: int, assignee_id: str) -> None:
-        self.cleanup.append((issue_number, "round-finished", assignee_id))
-
-
-class FakeWorkspace:
-    working_directory = Path("/repository")
-
-    def __init__(self) -> None:
-        self.cleanup_calls: list[tuple[str, bool]] = []
-        self.dirty = False
-
-    def is_clean(self) -> bool:
-        return not self.dirty
-
-    def prepare_for_profile_read(self, *, base_branch: str = "main") -> None:
-        return None
-
-    def prepare_attempt(self, *, base_branch: str, issue_number: int):
-        return type("Prepared", (), {"branch": f"agent/issue-{issue_number}"})()
-
-    def cleanup(self, *, base_branch: str, prepared: object, retain_branch: bool) -> None:
-        self.cleanup_calls.append((base_branch, retain_branch))
-
-
-class FakePublisher:
-    def __init__(self) -> None:
-        self.requests: list[object] = []
-
-    def publish(self, request: object):
-        self.requests.append(request)
-        outcome = request.decision.outcome or AttemptOutcome.COMPLETE
-        return type("Published", (), {"outcome": outcome, "branch_url": "https://example.test/x"})()
-
-
 def make_lifecycle(tmp_path: Path, *, next_claim: Claim | None):
     from simple_coding_agent.lifecycle import AgentLifecycle
 
-    tracker = FakeTracker(next_claim)
-    workspace = FakeWorkspace()
+    tracker = FakeTracker(next_claim=next_claim)
+    workspace = InMemoryWorkspace(tmp_path / "repo", issue_number=24)
     store = ControlStore(tmp_path)
     lifecycle = AgentLifecycle(
         tracker=tracker,
@@ -526,8 +475,8 @@ def test_restart_after_resume_reconciles_before_claim(tmp_path: Path) -> None:
     first.submit_resume("req-resume")
     assert store.intake_state() is IntakeState.RUNNING
 
-    tracker = FakeTracker(claim(25))
-    workspace = FakeWorkspace()
+    tracker = FakeTracker(next_claim=claim(25))
+    workspace = InMemoryWorkspace(tmp_path / "repo-restarted", issue_number=25)
     restarted = AgentLifecycle(
         tracker=tracker,
         attempt_state=AttemptStateStore(tmp_path),
@@ -548,7 +497,7 @@ def test_resume_rejected_while_unexplained_dirt_has_no_attempt(
     tmp_path: Path,
 ) -> None:
     lifecycle, tracker, store = make_lifecycle(tmp_path, next_claim=claim(24))
-    workspace_of(lifecycle).dirty = True
+    workspace_of(lifecycle).make_dirty("work.txt")
 
     with pytest.raises(ResumeBlockedError, match="dirty or untracked"):
         lifecycle.submit_resume("req-resume")
@@ -558,7 +507,7 @@ def test_resume_rejected_while_unexplained_dirt_has_no_attempt(
     assert tracker.claimed == []
 
     # After manual repair, resume is accepted again.
-    workspace_of(lifecycle).dirty = False
+    workspace_of(lifecycle).dirty.clear()
     record = lifecycle.submit_resume("req-resume")
     assert record.acknowledgement is CommandAcknowledgement.COMPLETED
 
@@ -575,7 +524,7 @@ def test_resume_during_an_active_attempt_ignores_the_attempts_own_dirt(
     assert started.wait(timeout=30)
 
     # Dirt appearing while the attempt runs is the attempt's own work.
-    workspace_of(lifecycle).dirty = True
+    workspace_of(lifecycle).make_dirty("work.txt")
     try:
         resume = lifecycle.submit_resume("req-resume")
     finally:

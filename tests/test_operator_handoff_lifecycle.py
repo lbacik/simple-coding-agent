@@ -11,6 +11,7 @@ import pytest
 
 from simple_coding_agent.agentctl import build_parser, format_status, run_handoff
 from simple_coding_agent.attempt_state import AttemptPhase, AttemptStateStore
+from simple_coding_agent.attempt_workspace import handoff_note_relpath
 from simple_coding_agent.completion import (
     AttemptOutcome,
     CompletionDecision,
@@ -26,6 +27,7 @@ from simple_coding_agent.control import (
 )
 from simple_coding_agent.control_server import ControlServer, send_request
 from simple_coding_agent.github_tracker import Assignment, Claim, TrackerIssue
+from simple_coding_agent.git_workspace import PreparedAttempt
 from simple_coding_agent.lifecycle import (
     AgentLifecycle,
     AttemptEvidence,
@@ -38,6 +40,7 @@ from simple_coding_agent.model_execution import (
     ModelExecutionStatus,
     SkillEvent,
 )
+from tests.fakes import InMemoryWorkspace
 
 
 ISSUE_NUMBER = 24
@@ -70,7 +73,12 @@ def profile() -> object:
     )
 
 
-def write_operator_note(working_directory: Path, *, reason: str = "operator_request") -> None:
+def write_operator_note(
+    working_directory: Path,
+    *,
+    reason: str = "operator_request",
+    last_work_commit: str = WORK_REV,
+) -> None:
     note_dir = working_directory / ".agent" / "handoff"
     note_dir.mkdir(parents=True, exist_ok=True)
     (note_dir / f"{ISSUE_NUMBER}.md").write_text(
@@ -78,18 +86,43 @@ def write_operator_note(working_directory: Path, *, reason: str = "operator_requ
         f"- issue: {ISSUE_NUMBER}\n"
         "- started_at: 2026-09-22T00:00:00Z\n"
         f"- reason: {reason}\n"
-        f"- last_work_commit: {WORK_REV}\n\n"
+        f"- last_work_commit: {last_work_commit}\n\n"
         "## Summary\n\nHalfway done.\n\n"
         "## Remaining work\n\nFinish the parser.\n\n"
         "## Evidence\n\nParser tests.\n"
     )
 
 
-def note_commits() -> tuple[object, object]:
-    return (
-        SimpleNamespace(subject=f"Handoff note: issue #{ISSUE_NUMBER}", revision=NOTE_REV),
-        SimpleNamespace(subject="Half-finish the parser", revision=WORK_REV),
-    )
+def seeded_workspace(
+    working_directory: Path,
+    *,
+    note: bool = False,
+    work_subject: str | None = None,
+) -> InMemoryWorkspace:
+    """Build the shared workspace double with pre-existing attempt commits.
+
+    ``note=True`` records a handoff-note commit touching the note path (so
+    path-based note detection finds it); ``work_subject`` records an ordinary
+    work commit underneath. Oldest first, like the model would leave them.
+    """
+
+    workspace = InMemoryWorkspace(working_directory)
+    if work_subject is not None:
+        workspace.model_commit(work_subject, files=("work.py",))
+    if note:
+        workspace.model_commit(
+            f"Handoff note: issue #{ISSUE_NUMBER}",
+            files=(handoff_note_relpath(ISSUE_NUMBER),),
+        )
+    return workspace
+
+
+def work_revision(workspace: InMemoryWorkspace) -> str:
+    """Oldest attempt commit: the work commit a valid note must point at."""
+
+    commits = workspace.commits_added(prepared())
+    assert commits, "seeded workspace has no commits"
+    return commits[-1].revision
 
 
 def accepted_snapshot(request_id: str) -> dict:
@@ -193,26 +226,6 @@ class FakeOperatorControl:
         self.failed.append((request_id, reason))
 
 
-class RunnerWorkspace:
-    def __init__(self, working_directory: Path, commits: tuple[object, ...] = ()) -> None:
-        self._working_directory = working_directory
-        self._commits = commits
-        self.preserved: list[str] = []
-
-    @property
-    def working_directory(self) -> Path:
-        return self._working_directory
-
-    def commits_added(self, prepared: object) -> tuple[object, ...]:
-        return self._commits
-
-    def has_unresolved_conflicts(self) -> bool:
-        return False
-
-    def commit_dirty_work(self, message: str) -> None:
-        self.preserved.append(message)
-
-
 class RunnerVerifier:
     def prepare(self, profile: object, working_directory: Path, **kwargs: object):
         setup = SimpleNamespace(succeeded=True, commands=())
@@ -230,7 +243,7 @@ def build_runner(
     tmp_path: Path,
     *,
     executor: ScriptedOperatorExecutor,
-    workspace: RunnerWorkspace,
+    workspace: InMemoryWorkspace,
     operator: FakeOperatorControl | None,
 ) -> ModelAttemptRunner:
     attempt_state = AttemptStateStore(tmp_path)
@@ -246,8 +259,8 @@ def build_runner(
     )
 
 
-def prepared() -> object:
-    return SimpleNamespace(
+def prepared() -> PreparedAttempt:
+    return PreparedAttempt(
         branch=f"agent/issue-{ISSUE_NUMBER}", base_revision="b" * 40
     )
 
@@ -273,7 +286,7 @@ def test_setup_failure_settles_the_pending_request_with_its_reason(
     attempt_state.transition(AttemptPhase.SETUP)
     runner = ModelAttemptRunner(
         attempt_state=attempt_state,
-        workspace=RunnerWorkspace(working_directory, ()),
+        workspace=seeded_workspace(working_directory),
         verifier=SetupFailingVerifier(),
         evaluator=CompletionEvaluator(frozenset()),
         model_executor=executor,
@@ -296,7 +309,10 @@ def test_setup_phase_request_waits_for_and_is_served_by_model_execution(
 ) -> None:
     working_directory = tmp_path / "work"
     working_directory.mkdir()
-    write_operator_note(working_directory)
+    workspace = seeded_workspace(
+        working_directory, note=True, work_subject="Half-finish the parser"
+    )
+    write_operator_note(working_directory, last_work_commit=work_revision(workspace))
     executor = ScriptedOperatorExecutor(
         status=ModelExecutionStatus.HANDOFF_REQUESTED, deliver=True, begun=True
     )
@@ -304,7 +320,7 @@ def test_setup_phase_request_waits_for_and_is_served_by_model_execution(
     runner = build_runner(
         tmp_path,
         executor=executor,
-        workspace=RunnerWorkspace(working_directory, note_commits()),
+        workspace=workspace,
         operator=operator,
     )
 
@@ -332,10 +348,7 @@ def test_verification_phase_request_keeps_the_ordinary_outcome_and_is_not_fulfil
     runner = build_runner(
         tmp_path,
         executor=executor,
-        workspace=RunnerWorkspace(
-            working_directory,
-            (SimpleNamespace(subject="Implement", revision=WORK_REV),),
-        ),
+        workspace=seeded_workspace(working_directory, work_subject="Implement"),
         operator=operator,
     )
     original_execute = executor.execute
@@ -372,7 +385,7 @@ def test_served_handoff_with_an_invalid_note_is_incomplete_not_infrastructure_er
     runner = build_runner(
         tmp_path,
         executor=executor,
-        workspace=RunnerWorkspace(working_directory, note_commits()),
+        workspace=seeded_workspace(working_directory, note=True, work_subject="Half-finish the parser"),
         operator=operator,
     )
 
@@ -389,7 +402,10 @@ def test_served_handoff_with_a_wrong_reason_still_publishes_but_fails_the_reques
 ) -> None:
     working_directory = tmp_path / "work"
     working_directory.mkdir()
-    write_operator_note(working_directory, reason="cost_soft_threshold")
+    workspace = seeded_workspace(
+        working_directory, note=True, work_subject="Half-finish the parser"
+    )
+    write_operator_note(working_directory, reason="cost_soft_threshold", last_work_commit=work_revision(workspace))
     executor = ScriptedOperatorExecutor(
         status=ModelExecutionStatus.HANDOFF_REQUESTED, deliver=True, begun=True
     )
@@ -397,7 +413,7 @@ def test_served_handoff_with_a_wrong_reason_still_publishes_but_fails_the_reques
     runner = build_runner(
         tmp_path,
         executor=executor,
-        workspace=RunnerWorkspace(working_directory, note_commits()),
+        workspace=workspace,
         operator=operator,
     )
 
@@ -421,10 +437,7 @@ def test_served_handoff_without_handoff_outcome_fails_with_the_ordinary_outcome(
     runner = build_runner(
         tmp_path,
         executor=executor,
-        workspace=RunnerWorkspace(
-            working_directory,
-            (SimpleNamespace(subject="Implement", revision=WORK_REV),),
-        ),
+        workspace=seeded_workspace(working_directory, work_subject="Implement"),
         operator=operator,
     )
 
@@ -442,7 +455,7 @@ def test_runner_without_operator_control_behaves_as_before(tmp_path: Path) -> No
     runner = build_runner(
         tmp_path,
         executor=executor,
-        workspace=RunnerWorkspace(working_directory, ()),
+        workspace=seeded_workspace(working_directory),
         operator=None,
     )
 
@@ -477,34 +490,6 @@ class LifecycleTracker:
         self.cleanup.append((issue_number, "round-finished", assignee_id))
 
 
-class LifecycleWorkspace:
-    def __init__(self, working_directory: Path, commits: tuple[object, ...] = ()) -> None:
-        self._working_directory = working_directory
-        self._commits = commits
-        self.cleanup_calls: list[tuple[str, bool]] = []
-
-    @property
-    def working_directory(self) -> Path:
-        return self._working_directory
-
-    def is_clean(self) -> bool:
-        return True
-
-    def prepare_for_profile_read(self, *, base_branch: str = "main") -> None:
-        return None
-
-    def prepare_attempt(self, *, base_branch: str, issue_number: int):
-        return SimpleNamespace(
-            branch=f"agent/issue-{issue_number}", base_revision="b" * 40
-        )
-
-    def commits_added(self, prepared: object) -> tuple[object, ...]:
-        return self._commits
-
-    def cleanup(self, *, base_branch: str, prepared: object, retain_branch: bool) -> None:
-        self.cleanup_calls.append((base_branch, retain_branch))
-
-
 class LifecyclePublisher:
     def __init__(self) -> None:
         self.requests: list[object] = []
@@ -521,7 +506,7 @@ def make_lifecycle(
     tmp_path: Path,
     *,
     next_claim: Claim | None,
-    workspace: LifecycleWorkspace,
+    workspace: InMemoryWorkspace,
     attempt_runner,
 ):
     tracker = LifecycleTracker(next_claim)
@@ -543,7 +528,7 @@ def make_clocked_lifecycle(
     tmp_path: Path,
     *,
     next_claim: Claim | None,
-    workspace: LifecycleWorkspace,
+    workspace: InMemoryWorkspace,
     attempt_runner,
     now: list,
     store_now: list | None = None,
@@ -593,7 +578,7 @@ def handoff_evidence() -> AttemptEvidence:
 
 
 def test_handoff_without_an_active_attempt_is_rejected(tmp_path: Path) -> None:
-    workspace = LifecycleWorkspace(tmp_path / "work")
+    workspace = seeded_workspace(tmp_path / "work")
     lifecycle, _, store = make_lifecycle(
         tmp_path, next_claim=None, workspace=workspace, attempt_runner=lambda c, p, r: None
     )
@@ -621,7 +606,7 @@ def test_failed_handoff_retains_everything_and_blocks_claims_until_recovery(
 
     working_directory = tmp_path / "work"
     working_directory.mkdir()
-    workspace = LifecycleWorkspace(working_directory)
+    workspace = seeded_workspace(working_directory)
     started = threading.Event()
     release = threading.Event()
 
@@ -683,8 +668,8 @@ def test_valid_handoff_past_its_absolute_deadline_is_not_fulfilled_and_held(
     store_now = [now[0]]
     working_directory = tmp_path / "work"
     working_directory.mkdir()
-    write_operator_note(working_directory)
-    workspace = LifecycleWorkspace(working_directory, note_commits())
+    workspace = seeded_workspace(working_directory, note=True, work_subject="Half-finish the parser")
+    write_operator_note(working_directory, last_work_commit=work_revision(workspace))
     started = threading.Event()
     release = threading.Event()
 
@@ -731,8 +716,8 @@ def test_publication_past_its_allowance_is_not_fulfilled_and_held(
     now = [datetime(2026, 9, 22, 12, 0, 0, tzinfo=UTC)]
     working_directory = tmp_path / "work"
     working_directory.mkdir()
-    write_operator_note(working_directory)
-    workspace = LifecycleWorkspace(working_directory, note_commits())
+    workspace = seeded_workspace(working_directory, note=True, work_subject="Half-finish the parser")
+    write_operator_note(working_directory, last_work_commit=work_revision(workspace))
     started = threading.Event()
     release = threading.Event()
 
@@ -786,8 +771,8 @@ def test_handoff_publication_is_bounded_by_the_remaining_acceptance_budget(
     store_now = [now[0]]
     working_directory = tmp_path / "work"
     working_directory.mkdir()
-    write_operator_note(working_directory)
-    workspace = LifecycleWorkspace(working_directory, note_commits())
+    workspace = seeded_workspace(working_directory, note=True, work_subject="Half-finish the parser")
+    write_operator_note(working_directory, last_work_commit=work_revision(workspace))
     started = threading.Event()
     release = threading.Event()
 
@@ -828,7 +813,7 @@ def test_unserved_handoff_reports_the_ordinary_outcome_as_not_fulfilled(
 ) -> None:
     working_directory = tmp_path / "work"
     working_directory.mkdir()
-    workspace = LifecycleWorkspace(working_directory)
+    workspace = seeded_workspace(working_directory)
     started = threading.Event()
     release = threading.Event()
 
@@ -875,8 +860,8 @@ def test_served_valid_handoff_completes_after_durable_finalization(
 ) -> None:
     working_directory = tmp_path / "work"
     working_directory.mkdir()
-    write_operator_note(working_directory)
-    workspace = LifecycleWorkspace(working_directory, note_commits())
+    workspace = seeded_workspace(working_directory, note=True, work_subject="Half-finish the parser")
+    write_operator_note(working_directory, last_work_commit=work_revision(workspace))
     started = threading.Event()
     release = threading.Event()
 
@@ -918,7 +903,7 @@ def test_restart_with_an_invalid_recovered_note_reports_incomplete_not_infrastru
     working_directory = tmp_path / "work"
     working_directory.mkdir()
     write_operator_note(working_directory, reason="bogus_reason")
-    workspace = LifecycleWorkspace(working_directory, note_commits())
+    workspace = seeded_workspace(working_directory, note=True, work_subject="Half-finish the parser")
     lifecycle, tracker, store = make_lifecycle(
         tmp_path, next_claim=None, workspace=workspace, attempt_runner=lambda c, p, r: None
     )
@@ -947,7 +932,7 @@ def test_retry_with_an_invalid_recovered_note_reports_incomplete_not_infrastruct
     working_directory = tmp_path / "work"
     working_directory.mkdir()
     write_operator_note(working_directory, reason="bogus_reason")
-    workspace = LifecycleWorkspace(working_directory, note_commits())
+    workspace = seeded_workspace(working_directory, note=True, work_subject="Half-finish the parser")
     lifecycle, _, _ = make_lifecycle(
         tmp_path, next_claim=None, workspace=workspace, attempt_runner=lambda c, p, r: None
     )
@@ -977,7 +962,7 @@ def test_hold_ignores_a_handoff_failure_owned_by_an_earlier_attempt(
     restart) finalizes normally so intake can proceed after resume.
     """
 
-    workspace = LifecycleWorkspace(tmp_path / "work")
+    workspace = seeded_workspace(tmp_path / "work")
     lifecycle, _, store = make_lifecycle(
         tmp_path, next_claim=None, workspace=workspace, attempt_runner=lambda c, p, r: None
     )
@@ -1016,7 +1001,7 @@ def test_hold_ignores_a_handoff_failure_owned_by_an_earlier_attempt(
 def test_orphan_handoff_with_no_checkpoint_fails_and_stops_intake(
     tmp_path: Path,
 ) -> None:
-    workspace = LifecycleWorkspace(tmp_path / "work")
+    workspace = seeded_workspace(tmp_path / "work")
     lifecycle, _, store = make_lifecycle(
         tmp_path, next_claim=None, workspace=workspace, attempt_runner=lambda c, p, r: None
     )
@@ -1038,7 +1023,7 @@ def test_orphan_handoff_with_no_checkpoint_fails_and_stops_intake(
 def test_resume_after_a_fulfilled_handoff_permits_intake_without_requeueing(
     tmp_path: Path,
 ) -> None:
-    workspace = LifecycleWorkspace(tmp_path / "work")
+    workspace = seeded_workspace(tmp_path / "work")
     lifecycle, tracker, store = make_lifecycle(
         tmp_path, next_claim=None, workspace=workspace, attempt_runner=lambda c, p, r: None
     )
@@ -1057,7 +1042,7 @@ def test_resume_after_a_fulfilled_handoff_permits_intake_without_requeueing(
 
 
 def test_status_and_format_include_the_tracked_handoff(tmp_path: Path) -> None:
-    workspace = LifecycleWorkspace(tmp_path / "work")
+    workspace = seeded_workspace(tmp_path / "work")
     started = threading.Event()
     release = threading.Event()
 

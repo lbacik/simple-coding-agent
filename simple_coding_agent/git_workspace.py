@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import datetime
 import os
 from pathlib import Path
 import stat
@@ -11,6 +12,8 @@ import subprocess
 import tempfile
 import time
 from urllib.parse import urlsplit
+
+from simple_coding_agent.model_execution import ModelExecutionStatus
 
 
 class GitWorkspaceError(RuntimeError):
@@ -75,6 +78,46 @@ class AttemptCommit:
 
     revision: str
     subject: str
+
+
+@dataclass(frozen=True)
+class ConflictState:
+    """One snapshot of the workspace's rebase/merge conflict state.
+
+    ``in_progress`` reports an unfinished rebase/merge, ``conflicted_files``
+    the paths the model must resolve, and ``resolution_problems`` the
+    deterministic post-model verification problems (markers, whitespace
+    errors, unmerged paths). An empty ``resolution_problems`` means the
+    tree is safe for setup. The state fails safe: a tree whose state cannot
+    be read reports ``in_progress=True`` with a verification problem
+    instead of looking clean.
+    """
+
+    in_progress: bool
+    conflicted_files: tuple[str, ...] = ()
+    resolution_problems: tuple[str, ...] = ()
+
+
+def handoff_note_relpath(issue_number: int) -> str:
+    """The repository-relative path of an issue's handoff note."""
+
+    return f".agent/handoff/{issue_number}.md"
+
+
+def attempt_start_epoch(attempt_id: str) -> int | None:
+    """The attempt start as whole epoch seconds, or ``None`` if unparseable.
+
+    Truncated to seconds because git author dates have second precision: a
+    commit made in the same second the attempt started still belongs to it.
+    """
+
+    try:
+        started = datetime.fromisoformat(attempt_id.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if started.tzinfo is None:
+        return None
+    return int(started.timestamp())
 
 
 GitRunner = Callable[[tuple[str, ...], Path | None, dict[str, str]], str]
@@ -251,21 +294,122 @@ class GitWorkspace:
             commits.append(AttemptCommit(revision=revision, subject=subject))
         return tuple(commits)
 
-    def commit_dirty_work(self, message: str) -> bool:
-        """Commit any dirty or untracked change on ``branch``; return whether one was made.
+    def conflict_state(self) -> ConflictState:
+        """Return one snapshot of the rebase/merge conflict state.
 
-        A safety net for the handoff path: the model is expected to commit
-        its own work, but a request produced after an interrupt may leave
-        the worktree dirty. Without this, ``cleanup``'s hard reset would
-        silently discard it before it could ever be pushed.
+        Fails safe: a tree whose state cannot be read is reported as
+        conflicted with a verification problem, so setup never runs
+        against a tree that could not be verified.
         """
 
-        status = self._git("status", "--porcelain")
-        if not status.strip():
-            return False
+        try:
+            in_progress = self.has_unresolved_conflicts()
+        except Exception:
+            return ConflictState(
+                in_progress=True,
+                conflicted_files=(),
+                resolution_problems=(
+                    "Conflict state could not be verified; treating the tree as conflicted.",
+                ),
+            )
+        try:
+            files = self.conflicted_files()
+        except Exception:
+            files = ()
+        try:
+            problems = self.rebase_resolution_problems()
+        except Exception:
+            problems = (
+                "Conflict-resolution verification failed; treating the tree as conflicted.",
+            )
+        if in_progress and not problems:
+            problems = (
+                "A rebase or merge is still in progress or paths remain unmerged.",
+            )
+        return ConflictState(
+            in_progress=in_progress,
+            conflicted_files=files,
+            resolution_problems=problems,
+        )
+
+    def seal(
+        self,
+        *,
+        issue_number: int,
+        attempt_id: str,
+        status: ModelExecutionStatus,
+    ) -> AttemptCommit | None:
+        """Commit every dirty and untracked change on the attempt branch.
+
+        This is sealing: the runner calls it unconditionally after every
+        exit from model execution, whatever the model execution status, so
+        new statuses cannot silently drop work. Returns ``None`` when the
+        tree is already clean. Refuses (raises) while a rebase/merge is
+        unresolved, so conflict markers are never committed. The commit is
+        attributed to its issue and status in the subject and to its attempt
+        by an ``Attempt-Id`` trailer.
+        """
+
+        if self.conflict_state().in_progress:
+            raise GitWorkspaceError(
+                "Cannot seal attempt work while a rebase or merge is unresolved"
+            )
+        if self.is_clean():
+            return None
+        subject = f"Seal attempt work for #{issue_number} ({status})"
         self._git("add", "-A")
-        self._git("commit", "--message", message)
-        return True
+        self._git("commit", "--message", f"{subject}\n\nAttempt-Id: {attempt_id}\n")
+        revision = self._git("rev-parse", "HEAD")
+        return AttemptCommit(revision=revision, subject=subject)
+
+    def commit_handoff_note(self, issue_number: int, content: str) -> AttemptCommit:
+        """Write the handoff note file and commit only the note.
+
+        Owns the note path (``.agent/handoff/<N>.md``): unlike sealing,
+        this stages just the note file, so other uncommitted work is left
+        for the seal commit that always runs first.
+        """
+
+        relpath = handoff_note_relpath(issue_number)
+        note_path = self._clone_dir / relpath
+        note_path.parent.mkdir(parents=True, exist_ok=True)
+        note_path.write_text(content)
+        self._git("add", "--", relpath)
+        subject = f"Handoff note: issue #{issue_number}"
+        self._git("commit", "--message", subject)
+        revision = self._git("rev-parse", "HEAD")
+        return AttemptCommit(revision=revision, subject=subject)
+
+    def handoff_note_commit(
+        self, prepared: PreparedAttempt, issue_number: int, *, attempt_id: str
+    ) -> AttemptCommit | None:
+        """Return the newest commit of this attempt touching the handoff note path.
+
+        Position-independent: a seal commit landing on top of a
+        model-committed note does not hide the note. Notes carried over from
+        earlier rounds of a continued branch are ignored: only commits
+        authored at or after the attempt start (``attempt_id`` is the
+        checkpoint's ``started_at``) count. Author dates survive the rebase
+        onto the base branch, unlike revisions. An unparseable
+        ``attempt_id`` applies no time bound.
+        """
+
+        started = attempt_start_epoch(attempt_id)
+        output = self._git(
+            "log",
+            "--format=%H%x00%at%x00%s",
+            f"{prepared.base_revision}..{prepared.branch}",
+            "--",
+            handoff_note_relpath(issue_number),
+        )
+        for line in output.splitlines():
+            revision, _, rest = line.partition("\x00")
+            authored, separator, subject = rest.partition("\x00")
+            if not separator or not revision or not authored.isdigit():
+                raise GitWorkspaceError("Git returned an invalid commit listing")
+            if started is None or int(authored) >= started:
+                return AttemptCommit(revision=revision, subject=subject)
+        return None
 
     def cleanup(
         self, *, base_branch: str, prepared: PreparedAttempt, retain_branch: bool = True
@@ -274,12 +418,22 @@ class GitWorkspace:
 
         Never delete files or branches: uncommitted/untracked files and attempt
         branches are preserved as-is for human operator inspection and cleanup.
+
+        Never switch to the base branch while the tree is dirty: the
+        workspace stays on the attempt branch and raises
+        ``DirtyWorkspaceError`` so the caller can hold intake for operator
+        inspection instead of carrying uncommitted work onto the base.
         """
 
         try:
             self._git("rebase", "--abort")
         except GitWorkspaceError:
             pass
+        if not self.is_clean():
+            raise DirtyWorkspaceError(
+                "Repository working tree contains uncommitted or untracked changes; "
+                "leaving the workspace on the attempt branch for operator inspection."
+            )
         try:
             self._git("checkout", base_branch)
         except GitWorkspaceError:

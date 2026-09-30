@@ -27,6 +27,8 @@ from pathlib import Path
 import os
 import subprocess
 
+import pytest
+
 from simple_coding_agent.attempt_state import AttemptPhase, AttemptStateStore
 from simple_coding_agent.command_runner import CommandRunner
 from simple_coding_agent.completion import AttemptOutcome, CompletionEvaluator, VerificationRunner
@@ -118,9 +120,10 @@ def test_restart_between_publication_steps_recovers_and_completes(tmp_path: Path
     # before the push happened.
     workspace = GitWorkspace(clone_dir, str(remote), token_provider=lambda: "token")
     workspace.prepare_attempt(base_branch="main", issue_number=24)
-    write_and_commit(clone_dir, "logging.py", "print('hi')", "Add logging")
+    # The checkpoint starts before the attempt's commits, as at a real claim.
     attempt_state = AttemptStateStore(data_dir)
     attempt_state.start(issue_number=24, branch="agent/issue-24")
+    write_and_commit(clone_dir, "logging.py", "print('hi')", "Add logging")
     attempt_state.transition(AttemptPhase.SETUP)
     attempt_state.transition(AttemptPhase.MODEL_RUNNING)
     attempt_state.transition(AttemptPhase.PUSHING)
@@ -397,7 +400,7 @@ def test_uncommitted_work_left_after_success_is_committed_and_published(
     assert result.outcome is AttemptOutcome.COMPLETE
     assert "agent/issue-24" in github.pull_requests
     assert remote_branch_subjects(remote, "agent/issue-24")[0] == (
-        "Preserve uncommitted work left after model completion"
+        "Seal attempt work for #24 (succeeded)"
     )
     assert git(remote, "show", "agent/issue-24:errors.py") == "first pass, reviewed and fixed"
 
@@ -483,12 +486,16 @@ def test_real_handoff_is_produced_pushed_and_labeled_without_a_pull_request(
     assert github.assignee_logins == []
 
 
-# --- Scenario 11b: a stray dirty leftover after the note breaks the note-last
-# invariant, so it publishes as ordinary incomplete progress, not as a
-# trustworthy handoff.
+# --- Scenario 11b: a seal commit on top of a model-committed note still
+# publishes as a handoff ------------------------------------------------------
+#
+# Handoff-note detection is path-based (the newest attempt commit touching
+# the note file), not positional: when the model commits its note but leaves
+# a stray dirty file behind, the seal commit lands on top and must not hide
+# the note.
 
 
-def test_stray_dirty_leftover_after_the_note_publishes_as_ordinary_incomplete(
+def test_seal_commit_on_top_of_a_model_committed_note_still_publishes_as_handoff(
     tmp_path: Path,
 ) -> None:
     remote, _ = repository_with_main(tmp_path)
@@ -499,9 +506,8 @@ def test_stray_dirty_leftover_after_the_note_publishes_as_ordinary_incomplete(
         write_and_commit(working_directory, "parser.py", "half done", "Half-finish the parser")
         write_handoff_note(working_directory, 24, "# Handoff note: issue #24\n\nHalfway done.\n")
         # A stray artifact left behind after the note was already committed
-        # (e.g. a hook side effect) must be preserved, not silently discarded
-        # -- but it also means the note is no longer trustworthy as the
-        # final word on the branch, so this cannot publish as a handoff.
+        # (e.g. a hook side effect) is sealed into its own commit on top of
+        # the note -- and the note underneath is still recognised.
         (working_directory / "stray.tmp").write_text("noise")
 
     executor = FakeModelExecutor(actions=[do_handoff], handoff=True)
@@ -509,15 +515,14 @@ def test_stray_dirty_leftover_after_the_note_publishes_as_ordinary_incomplete(
 
     result = lifecycle.run_once()
 
-    assert result.outcome is AttemptOutcome.INCOMPLETE
+    assert result.outcome is AttemptOutcome.HANDOFF
     assert remote_has_branch(remote, "agent/issue-24")
-    assert github.added_labels == []
-    [comment] = github.comments
-    assert "## Agent Attempt Result: incomplete" in comment.body
-    assert "no committed handoff note is the final commit" in comment.body
+    assert github.added_labels == [("issue-24", "round-finished")]
+    [comment] = [c for c in github.comments if "Agent Attempt Result: handoff" in c.body]
+    assert "Halfway done." in comment.body
     subjects = git(clone_dir, "log", "agent/issue-24", "--format=%s").splitlines()
     assert subjects[:3] == [
-        "Preserve uncommitted work before handoff",
+        "Seal attempt work for #24 (handoff_requested)",
         "Handoff note: issue #24",
         "Half-finish the parser",
     ]
@@ -532,8 +537,8 @@ def test_valid_handoff_survives_locally_when_push_retries_are_exhausted(
 ) -> None:
     """A well-formed handoff (work, then note, nothing dirty after) whose push fails.
 
-    Nothing is left dirty by the time push is attempted -- ``commit_dirty_work``
-    already ran -- so this proves the "note commit or push fails" preservation
+    Nothing is left dirty by the time push is attempted -- the runner seals
+    unconditionally after model execution -- so this proves the "note commit or push fails" preservation
     guarantee for the ordinary case: local content, not merely branch
     existence, survives an exhausted push.
     """
@@ -582,7 +587,7 @@ def test_handoff_without_a_committed_note_publishes_as_ordinary_incomplete(tmp_p
     assert github.added_labels == []
     [comment] = github.comments
     assert "## Agent Attempt Result: incomplete" in comment.body
-    assert "no committed handoff note is the final commit" in comment.body
+    assert "no handoff note commit is on the branch" in comment.body
 
 
 def test_handoff_with_an_uncommitted_note_publishes_as_ordinary_incomplete(tmp_path: Path) -> None:
@@ -613,9 +618,15 @@ def test_handoff_with_an_uncommitted_note_publishes_as_ordinary_incomplete(tmp_p
     )
 
 
-def test_handoff_note_commit_with_the_expected_subject_but_no_note_file_publishes_as_ordinary_incomplete(
+def test_handoff_note_subject_without_a_note_file_publishes_as_ordinary_incomplete(
     tmp_path: Path,
 ) -> None:
+    """Note detection is path-based: a matching subject alone proves nothing.
+
+    An empty commit carrying the expected ``Handoff note`` subject touches
+    no files, so no commit on the branch touches the note path and the
+    attempt publishes as ordinary incomplete progress.
+    """
     remote, _ = repository_with_main(tmp_path)
     github = FakeGitHub(issue(24, body="Rewrite the parser.", labels=frozenset({"ready-for-agent"})))
     clone_dir = tmp_path / "clone"
@@ -634,7 +645,7 @@ def test_handoff_note_commit_with_the_expected_subject_but_no_note_file_publishe
     assert github.added_labels == []
     [comment] = github.comments
     assert "## Agent Attempt Result: incomplete" in comment.body
-    assert "could not be read from the committed branch state" in comment.body
+    assert "no handoff note commit is on the branch" in comment.body
 
 
 def test_handoff_note_with_stale_last_work_commit_publishes_as_ordinary_incomplete(tmp_path: Path) -> None:
@@ -664,13 +675,14 @@ def test_handoff_note_with_stale_last_work_commit_publishes_as_ordinary_incomple
     assert "last_work_commit" in comment.body
 
 
-def test_handoff_reports_infrastructure_error_when_the_note_commit_fails(tmp_path: Path) -> None:
-    """Apply the same evidence-preserving outcome when the note commit itself fails.
+def test_handoff_holds_for_the_operator_when_the_seal_commit_fails(tmp_path: Path) -> None:
+    """Apply the evidence-preserving hold when the seal commit itself fails.
 
     A failed commit is simulated with a rejecting pre-commit hook rather than
-    the note validation path above: the note is left dirty on disk (as the
-    model would leave it after a failed ``git commit``), so this exercises
-    ``commit_dirty_work`` raising instead of a bad-but-committed note.
+    the note validation path above: the seal cannot land, so the attempt
+    records an infrastructure error with no publication -- and because the
+    tree is still dirty, ``cleanup`` refuses to leave the attempt branch and
+    holds intake for the operator instead of carrying work onto the base.
     """
 
     remote, _ = repository_with_main(tmp_path)
@@ -691,13 +703,16 @@ def test_handoff_reports_infrastructure_error_when_the_note_commit_fails(tmp_pat
     executor = FakeModelExecutor(actions=[do_handoff], handoff=True)
     lifecycle = build_lifecycle(remote, clone_dir, tmp_path / "data", github, executor)
 
-    result = lifecycle.run_once()
+    with pytest.raises(SystemExit):
+        lifecycle.run_once()
 
-    assert result.outcome is AttemptOutcome.INFRASTRUCTURE_ERROR
     assert not remote_has_branch(remote, "agent/issue-24")
     assert github.added_labels == []
-    # The local branch is retained (not deleted) so the evidence stays inspectable.
+    # The local branch is retained (not deleted) so the evidence stays inspectable,
+    # and the workspace is still on the attempt branch with the work intact.
     assert git(clone_dir, "rev-parse", "--verify", "agent/issue-24")
+    assert git(clone_dir, "branch", "--show-current") == "agent/issue-24"
+    assert git(clone_dir, "show", "agent/issue-24:parser.py") == "half done"
 
 
 # --- Scenario 12: note-only handoff preserves progress and publishes as handoff
@@ -787,10 +802,11 @@ def test_restart_mid_handoff_publication_recovers_as_handoff_not_complete(
     # PUSHING, then "crashed" before the push happened.
     workspace = GitWorkspace(clone_dir, str(remote), token_provider=lambda: "token")
     workspace.prepare_attempt(base_branch="main", issue_number=24)
-    write_and_commit(clone_dir, "parser.py", "half done", "Half-finish the parser")
-    write_handoff_note(clone_dir, 24, "# Handoff note: issue #24\n\nHalfway done.\n")
+    # The checkpoint starts before the attempt's commits, as at a real claim.
     attempt_state = AttemptStateStore(data_dir)
     attempt_state.start(issue_number=24, branch="agent/issue-24")
+    write_and_commit(clone_dir, "parser.py", "half done", "Half-finish the parser")
+    write_handoff_note(clone_dir, 24, "# Handoff note: issue #24\n\nHalfway done.\n")
     attempt_state.transition(AttemptPhase.SETUP)
     attempt_state.transition(AttemptPhase.MODEL_RUNNING)
     attempt_state.transition(AttemptPhase.PUSHING)
@@ -829,11 +845,12 @@ def test_restart_after_a_successful_handoff_push_before_the_marker_persists(
     # checkpoint transition was persisted.
     workspace = GitWorkspace(clone_dir, str(remote), token_provider=lambda: "token")
     workspace.prepare_attempt(base_branch="main", issue_number=24)
+    # The checkpoint starts before the attempt's commits, as at a real claim.
+    attempt_state = AttemptStateStore(data_dir)
+    attempt_state.start(issue_number=24, branch="agent/issue-24")
     write_and_commit(clone_dir, "parser.py", "half done", "Half-finish the parser")
     write_handoff_note(clone_dir, 24, "# Handoff note: issue #24\n\nHalfway done.\n")
     workspace.push_attempt_branch("agent/issue-24", max_retries=3)
-    attempt_state = AttemptStateStore(data_dir)
-    attempt_state.start(issue_number=24, branch="agent/issue-24")
     attempt_state.transition(AttemptPhase.SETUP)
     attempt_state.transition(AttemptPhase.MODEL_RUNNING)
     attempt_state.transition(AttemptPhase.PUSHING)

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -12,6 +12,7 @@ from simple_coding_agent.git_workspace import GitWorkspaceRecoveryError, RebaseC
 from simple_coding_agent.github_tracker import Assignment, Claim, TrackerIssue
 from simple_coding_agent.lifecycle import AgentLifecycle, AttemptEvidence, LifecycleStatus
 from simple_coding_agent.operating import ConsecutiveErrorStore
+from tests.fakes import FakePublisher, FakeTracker, InMemoryWorkspace
 
 
 def test_interruption_handler_logs_a_terminal_event_then_resignals(tmp_path: Path) -> None:
@@ -67,8 +68,8 @@ def test_keyboard_interrupt_still_publishes_a_terminal_outcome(tmp_path: Path) -
     """KeyboardInterrupt bypasses `except Exception`; it must still log and publish."""
 
     claim = Claim(issue(24), Assignment("issue-24", "agent-id"))
-    tracker = FakeTracker(claim)
-    workspace = FakeWorkspace()
+    tracker = FakeTracker(next_claim=claim)
+    workspace = InMemoryWorkspace(tmp_path / "repo", issue_number=24)
     publisher = FakePublisher()
     events: list[tuple[str, str, int | None]] = []
     state = AttemptStateStore(tmp_path)
@@ -102,8 +103,8 @@ def test_setup_failure_posts_result_then_releases_only_the_agent_claim(
 ) -> None:
     claim = Claim(issue(24), Assignment("issue-24", "agent-id"))
     state = AttemptStateStore(tmp_path)
-    tracker = FakeTracker(claim)
-    workspace = FakeWorkspace()
+    tracker = FakeTracker(next_claim=claim)
+    workspace = InMemoryWorkspace(tmp_path / "repo", issue_number=24)
     publisher = FakePublisher()
     lifecycle = AgentLifecycle(
         tracker=tracker,
@@ -129,9 +130,9 @@ def test_empty_queue_sleeps_once_without_attempting_work(tmp_path: Path) -> None
     sleeps: list[int] = []
     events: list[tuple[str, str, str]] = []
     lifecycle = AgentLifecycle(
-        tracker=FakeTracker(None),
+        tracker=FakeTracker(),
         attempt_state=AttemptStateStore(tmp_path),
-        workspace=FakeWorkspace(),
+        workspace=InMemoryWorkspace(tmp_path / "repo", issue_number=24),
         profile_loader=lambda _: None,
         publisher=FakePublisher(),
         poll_interval=17,
@@ -153,9 +154,9 @@ def test_empty_queue_sleeps_once_without_attempting_work(tmp_path: Path) -> None
 def test_stops_after_the_persisted_consecutive_infrastructure_error_limit(tmp_path: Path) -> None:
     events: list[tuple[str, str]] = []
     lifecycle = AgentLifecycle(
-        tracker=FakeTracker(Claim(issue(24), Assignment("issue-24", "agent-id"))),
+        tracker=FakeTracker(next_claim=Claim(issue(24), Assignment("issue-24", "agent-id"))),
         attempt_state=AttemptStateStore(tmp_path),
-        workspace=FakeWorkspace(),
+        workspace=InMemoryWorkspace(tmp_path / "repo", issue_number=24),
         profile_loader=lambda _: (_ for _ in ()).throw(OSError("profile is missing")),
         publisher=FakePublisher(),
         error_store=ConsecutiveErrorStore(tmp_path),
@@ -187,8 +188,10 @@ def test_startup_recovers_pre_model_checkpoint_before_claiming_new_work(
     tmp_path: Path, phase: AttemptPhase
 ) -> None:
     state = state_at(tmp_path, phase)
-    tracker = FakeTracker(Claim(issue(25), Assignment("issue-25", "agent-id")))
-    workspace = FakeWorkspace()
+    tracker = FakeTracker(
+        {24: issue(24)}, next_claim=Claim(issue(25), Assignment("issue-25", "agent-id"))
+    )
+    workspace = InMemoryWorkspace(tmp_path / "repo", issue_number=24)
     publisher = FakePublisher()
     lifecycle = AgentLifecycle(
         tracker=tracker,
@@ -228,10 +231,11 @@ def test_startup_recovers_an_interrupted_final_check_as_infrastructure_error(
         {"final_check_started": "2026-09-24T08:15:00Z"}
     )
     events: list[tuple[str, int | None]] = []
-    workspace = FakeWorkspace(commits=("completed",))
+    workspace = InMemoryWorkspace(tmp_path / "repo", issue_number=24)
+    workspace.model_commit("completed")
     publisher = FakePublisher()
     lifecycle = AgentLifecycle(
-        tracker=FakeTracker(None),
+        tracker=FakeTracker({24: issue(24)}),
         attempt_state=state,
         workspace=workspace,
         profile_loader=lambda _: profile(),
@@ -266,10 +270,11 @@ def test_startup_recovers_a_finished_final_check_as_model_work(tmp_path: Path) -
             "final_check_finished": "2026-09-24T08:16:00Z",
         }
     )
-    workspace = FakeWorkspace(commits=("completed",))
+    workspace = InMemoryWorkspace(tmp_path / "repo", issue_number=24)
+    workspace.model_commit("completed")
     publisher = FakePublisher()
     lifecycle = AgentLifecycle(
-        tracker=FakeTracker(None),
+        tracker=FakeTracker({24: issue(24)}),
         attempt_state=state,
         workspace=workspace,
         profile_loader=lambda _: profile(),
@@ -289,10 +294,11 @@ def test_startup_recovers_model_work_by_publishing_partial_branch_without_sdk_re
     tmp_path: Path,
 ) -> None:
     state = state_at(tmp_path, AttemptPhase.MODEL_RUNNING)
-    workspace = FakeWorkspace(commits=("unfinished",))
+    workspace = InMemoryWorkspace(tmp_path / "repo", issue_number=24)
+    workspace.model_commit("unfinished")
     publisher = FakePublisher()
     lifecycle = AgentLifecycle(
-        tracker=FakeTracker(None),
+        tracker=FakeTracker({24: issue(24)}),
         attempt_state=state,
         workspace=workspace,
         profile_loader=lambda _: profile(),
@@ -314,9 +320,9 @@ def test_startup_recovers_model_checkpoint_without_commits_as_infrastructure_err
     state = state_at(tmp_path, AttemptPhase.MODEL_RUNNING)
     publisher = FakePublisher()
     lifecycle = AgentLifecycle(
-        tracker=FakeTracker(None),
+        tracker=FakeTracker({24: issue(24)}),
         attempt_state=state,
-        workspace=FakeWorkspace(),
+        workspace=InMemoryWorkspace(tmp_path / "repo", issue_number=24),
         profile_loader=lambda _: profile(),
         publisher=publisher,
         sleeper=lambda _: None,
@@ -329,8 +335,8 @@ def test_startup_recovers_model_checkpoint_without_commits_as_infrastructure_err
 
 def test_startup_recovers_a_missing_profile_with_standard_cleanup(tmp_path: Path) -> None:
     state = state_at(tmp_path, AttemptPhase.SETUP)
-    tracker = FakeTracker(None)
-    workspace = FakeWorkspace()
+    tracker = FakeTracker({24: issue(24)})
+    workspace = InMemoryWorkspace(tmp_path / "repo", issue_number=24)
     publisher = FakePublisher()
     lifecycle = AgentLifecycle(
         tracker=tracker,
@@ -355,12 +361,14 @@ def test_startup_retries_completed_publication_and_deduplicates_cleanup(
     tmp_path: Path, phase: AttemptPhase
 ) -> None:
     state = state_at(tmp_path, phase)
-    tracker = FakeTracker(None)
+    tracker = FakeTracker({24: issue(24)})
     publisher = FakePublisher()
+    workspace = InMemoryWorkspace(tmp_path / "repo", issue_number=24)
+    workspace.model_commit("completed")
     lifecycle = AgentLifecycle(
         tracker=tracker,
         attempt_state=state,
-        workspace=FakeWorkspace(commits=("completed",)),
+        workspace=workspace,
         profile_loader=lambda _: profile(),
         publisher=publisher,
         sleeper=lambda _: None,
@@ -368,7 +376,7 @@ def test_startup_retries_completed_publication_and_deduplicates_cleanup(
 
     lifecycle.run_once()
 
-    assert publisher.outcomes == [None]
+    assert publisher.outcomes == [AttemptOutcome.COMPLETE]
     assert publisher.requests[0].decision.publication_eligible
     assert tracker.cleanup == [(24, "ready-for-agent", "agent-id")]
     assert state.read() is None
@@ -376,13 +384,14 @@ def test_startup_retries_completed_publication_and_deduplicates_cleanup(
 
 def test_startup_preserves_commits_when_recovered_push_fails(tmp_path: Path) -> None:
     state = state_at(tmp_path, AttemptPhase.PUSHING)
-    workspace = FakeWorkspace(commits=("completed",))
+    workspace = InMemoryWorkspace(tmp_path / "repo", issue_number=24)
+    workspace.model_commit("completed")
     lifecycle = AgentLifecycle(
-        tracker=FakeTracker(None),
+        tracker=FakeTracker({24: issue(24)}),
         attempt_state=state,
         workspace=workspace,
         profile_loader=lambda _: profile(),
-        publisher=PushFailingPublisher(),
+        publisher=FakePublisher(outcome=AttemptOutcome.INFRASTRUCTURE_ERROR),
         sleeper=lambda _: None,
     )
 
@@ -395,13 +404,14 @@ def test_startup_preserves_commits_when_recovered_push_fails(tmp_path: Path) -> 
 
 def test_startup_retries_recovery_after_result_comment_failure(tmp_path: Path) -> None:
     state = state_at(tmp_path, AttemptPhase.PUSHING)
-    workspace = FakeWorkspace(commits=("completed",))
+    workspace = InMemoryWorkspace(tmp_path / "repo", issue_number=24)
+    workspace.model_commit("completed")
     first = AgentLifecycle(
-        tracker=FakeTracker(None),
+        tracker=FakeTracker({24: issue(24)}),
         attempt_state=state,
         workspace=workspace,
         profile_loader=lambda _: profile(),
-        publisher=CommentFailingPublisher(),
+        publisher=FakePublisher(comment_posted=False),
         sleeper=lambda _: None,
     )
 
@@ -410,7 +420,7 @@ def test_startup_retries_recovery_after_result_comment_failure(tmp_path: Path) -
     assert state.read() is not None
     assert workspace.cleanup_calls == [("main", True)]
 
-    tracker = FakeTracker(None)
+    tracker = FakeTracker({24: issue(24)})
     second = AgentLifecycle(
         tracker=tracker,
         attempt_state=state,
@@ -428,8 +438,8 @@ def test_startup_retries_recovery_after_result_comment_failure(tmp_path: Path) -
 
 def test_attempt_runs_the_injected_workflow_then_publishes_before_cleanup(tmp_path: Path) -> None:
     claim = Claim(issue(24), Assignment("issue-24", "agent-id"))
-    tracker = FakeTracker(claim)
-    workspace = FakeWorkspace()
+    tracker = FakeTracker(next_claim=claim)
+    workspace = InMemoryWorkspace(tmp_path / "repo", issue_number=24)
     publisher = FakePublisher()
     calls: list[str] = []
 
@@ -458,7 +468,7 @@ def test_attempt_runs_the_injected_workflow_then_publishes_before_cleanup(tmp_pa
 
     assert result.outcome is AttemptOutcome.COMPLETE
     assert calls == ["workflow"]
-    assert publisher.outcomes == [None]
+    assert publisher.outcomes == [AttemptOutcome.COMPLETE]
     assert tracker.cleanup == [(24, "ready-for-agent", "agent-id")]
     assert workspace.cleanup_calls == [("main", False)]
 
@@ -467,9 +477,9 @@ def test_partial_push_failure_keeps_incomplete_and_retains_the_local_branch(
     tmp_path: Path,
 ) -> None:
     claim = Claim(issue(24), Assignment("issue-24", "agent-id"))
-    tracker = FakeTracker(claim)
-    workspace = FakeWorkspace()
-    publisher = IncompletePushFailingPublisher()
+    tracker = FakeTracker(next_claim=claim)
+    workspace = InMemoryWorkspace(tmp_path / "repo", issue_number=24)
+    publisher = FakePublisher(outcome=AttemptOutcome.INCOMPLETE, branch_url=None)
     store = ConsecutiveErrorStore(tmp_path)
 
     def run_workflow(received_claim: Claim, profile: object, prepared: object) -> AttemptEvidence:
@@ -505,6 +515,62 @@ def test_partial_push_failure_keeps_incomplete_and_retains_the_local_branch(
     assert store.read().count == 0
 
 
+def test_dirty_tree_at_cleanup_holds_the_workspace_on_the_attempt_branch(
+    tmp_path: Path,
+) -> None:
+    """Uncommitted work left at cleanup holds intake with the branch preserved.
+
+    The workflow leaves dirty work behind (as an unverified final check
+    would); cleanup must refuse to check out the base branch, emit
+    ``workspace_hold``, and pause the loop via ``SystemExit(1)`` without
+    finalizing the checkpoint.
+    """
+
+    claim = Claim(issue(24), Assignment("issue-24", "agent-id"))
+    tracker = FakeTracker(next_claim=claim)
+    workspace = InMemoryWorkspace(tmp_path / "repo", issue_number=24)
+    publisher = FakePublisher()
+    events: list[tuple[str, str, str, int | None]] = []
+    state = AttemptStateStore(tmp_path)
+
+    def run_workflow(received_claim: Claim, profile: object, prepared: object) -> AttemptEvidence:
+        workspace.make_dirty("uncommitted.py", "leftover work")
+        return AttemptEvidence(
+            decision=CompletionDecision(None, True, PublicationPath.COMPLETE, ("ready",)),
+            check_command="pytest",
+            check_exit_code=0,
+            review_cycles=1,
+            review_findings="all clear",
+            details="Implemented the lifecycle.",
+        )
+
+    lifecycle = AgentLifecycle(
+        tracker=tracker,
+        attempt_state=state,
+        workspace=workspace,
+        profile_loader=lambda _: profile(),
+        publisher=publisher,
+        attempt_runner=run_workflow,
+        event_log=lambda event, detail="", level="INFO", issue_number=None: events.append(
+            (event, detail, level, issue_number)
+        ),
+    )
+
+    with pytest.raises(SystemExit) as held:
+        lifecycle.run_once()
+
+    assert held.value.code == 1
+    # Cleanup was attempted but refused to leave the attempt branch.
+    assert workspace.cleanup_calls == [("main", False)]
+    assert workspace.current_branch == "agent/issue-24"
+    assert any(
+        event == "workspace_hold" and level == "WARNING" and issue_number == 24
+        for event, _, level, issue_number in events
+    )
+    # The checkpoint is retained for operator recovery, not finalized.
+    assert state.read() is not None
+
+
 def test_logs_every_stage_from_claiming_the_issue_to_dispatching_the_model(
     tmp_path: Path,
 ) -> None:
@@ -516,8 +582,8 @@ def test_logs_every_stage_from_claiming_the_issue_to_dispatching_the_model(
     """
 
     claim = Claim(issue(24), Assignment("issue-24", "agent-id"))
-    tracker = FakeTracker(claim)
-    workspace = FakeWorkspace()
+    tracker = FakeTracker(next_claim=claim)
+    workspace = InMemoryWorkspace(tmp_path / "repo", issue_number=24)
     publisher = FakePublisher()
     events: list[tuple[str, int | None]] = []
 
@@ -559,11 +625,13 @@ def test_logs_every_stage_from_claiming_the_issue_to_dispatching_the_model(
 
 def test_keeps_the_checkpoint_when_remote_cleanup_is_interrupted(tmp_path: Path) -> None:
     state = AttemptStateStore(tmp_path)
-    tracker = FailingCleanupTracker(Claim(issue(24), Assignment("issue-24", "agent-id")))
+    tracker = FailingCleanupTracker(
+        next_claim=Claim(issue(24), Assignment("issue-24", "agent-id"))
+    )
     lifecycle = AgentLifecycle(
         tracker=tracker,
         attempt_state=state,
-        workspace=FakeWorkspace(),
+        workspace=InMemoryWorkspace(tmp_path / "repo", issue_number=24),
         profile_loader=lambda _: (_ for _ in ()).throw(OSError("profile is missing")),
         publisher=FakePublisher(),
     )
@@ -575,9 +643,9 @@ def test_keeps_the_checkpoint_when_remote_cleanup_is_interrupted(tmp_path: Path)
 
 
 def test_recreates_the_attempt_branch_from_a_profile_base_branch(tmp_path: Path) -> None:
-    workspace = FakeWorkspace()
+    workspace = InMemoryWorkspace(tmp_path / "repo", issue_number=24)
     lifecycle = AgentLifecycle(
-        tracker=FakeTracker(Claim(issue(24), Assignment("issue-24", "agent-id"))),
+        tracker=FakeTracker(next_claim=Claim(issue(24), Assignment("issue-24", "agent-id"))),
         attempt_state=AttemptStateStore(tmp_path),
         workspace=workspace,
         profile_loader=lambda _: profile("release"),
@@ -595,14 +663,14 @@ def test_recreates_the_attempt_branch_from_a_profile_base_branch(tmp_path: Path)
 
 def test_does_not_start_cleanup_when_the_result_comment_was_not_posted(tmp_path: Path) -> None:
     state = AttemptStateStore(tmp_path)
-    tracker = FakeTracker(Claim(issue(24), Assignment("issue-24", "agent-id")))
-    workspace = FakeWorkspace()
+    tracker = FakeTracker(next_claim=Claim(issue(24), Assignment("issue-24", "agent-id")))
+    workspace = InMemoryWorkspace(tmp_path / "repo", issue_number=24)
     lifecycle = AgentLifecycle(
         tracker=tracker,
         attempt_state=state,
         workspace=workspace,
         profile_loader=lambda _: (_ for _ in ()).throw(OSError("profile is missing")),
-        publisher=CommentFailingPublisher(),
+        publisher=FakePublisher(comment_posted=False),
     )
 
     lifecycle.run_once()
@@ -618,8 +686,8 @@ def test_stops_without_touching_the_issue_when_the_workspace_cannot_be_repaired(
 ) -> None:
     events: list[tuple[str, str, str]] = []
     state = AttemptStateStore(tmp_path)
-    tracker = FakeTracker(Claim(issue(24), Assignment("issue-24", "agent-id")))
-    workspace = RecoveryFailingWorkspace()
+    tracker = FakeTracker(next_claim=Claim(issue(24), Assignment("issue-24", "agent-id")))
+    workspace = RecoveryFailingWorkspace(tmp_path / "repo")
     lifecycle = AgentLifecycle(
         tracker=tracker,
         attempt_state=state,
@@ -658,7 +726,7 @@ def test_unresolved_rebase_conflict_after_the_model_reports_infrastructure_error
 
     events: list[tuple[str, str, str]] = []
     claim = Claim(issue(24), Assignment("issue-24", "agent-id"))
-    workspace = RebaseConflictingWorkspace()
+    workspace = RebaseConflictingWorkspace(tmp_path / "repo")
     publisher = FakePublisher()
     calls: list[str] = []
 
@@ -675,7 +743,7 @@ def test_unresolved_rebase_conflict_after_the_model_reports_infrastructure_error
         )
 
     lifecycle = AgentLifecycle(
-        tracker=FakeTracker(claim),
+        tracker=FakeTracker(next_claim=claim),
         attempt_state=AttemptStateStore(tmp_path),
         workspace=workspace,
         profile_loader=lambda _: profile("develop"),
@@ -712,7 +780,7 @@ def test_rebase_conflict_on_the_profile_base_reports_infrastructure_error(tmp_pa
 
     events: list[tuple[str, str, str]] = []
     claim = Claim(issue(24), Assignment("issue-24", "agent-id"))
-    workspace = RebaseConflictingWorkspace(conflict_bases=("main",))
+    workspace = RebaseConflictingWorkspace(tmp_path / "repo", conflict_bases=("main",))
     publisher = FakePublisher()
     calls: list[str] = []
 
@@ -727,7 +795,7 @@ def test_rebase_conflict_on_the_profile_base_reports_infrastructure_error(tmp_pa
         )
 
     lifecycle = AgentLifecycle(
-        tracker=FakeTracker(claim),
+        tracker=FakeTracker(next_claim=claim),
         attempt_state=AttemptStateStore(tmp_path),
         workspace=workspace,
         profile_loader=lambda _: profile("main"),
@@ -757,7 +825,7 @@ def test_conflicted_prepare_still_dispatches_the_model(tmp_path: Path) -> None:
     """
 
     claim = Claim(issue(24), Assignment("issue-24", "agent-id"))
-    workspace = RebaseConflictingWorkspace()
+    workspace = RebaseConflictingWorkspace(tmp_path / "repo")
     publisher = FakePublisher()
     calls: list[str] = []
 
@@ -774,7 +842,7 @@ def test_conflicted_prepare_still_dispatches_the_model(tmp_path: Path) -> None:
         )
 
     lifecycle = AgentLifecycle(
-        tracker=FakeTracker(claim),
+        tracker=FakeTracker(next_claim=claim),
         attempt_state=AttemptStateStore(tmp_path),
         workspace=workspace,
         profile_loader=lambda _: profile("develop"),
@@ -799,9 +867,9 @@ def test_non_main_profile_prepares_the_attempt_only_onto_the_profile_base(
     conflict before the profile was ever loaded.
     """
 
-    workspace = FakeWorkspace()
+    workspace = InMemoryWorkspace(tmp_path / "repo", issue_number=24)
     lifecycle = AgentLifecycle(
-        tracker=FakeTracker(Claim(issue(24), Assignment("issue-24", "agent-id"))),
+        tracker=FakeTracker(next_claim=Claim(issue(24), Assignment("issue-24", "agent-id"))),
         attempt_state=AttemptStateStore(tmp_path),
         workspace=workspace,
         profile_loader=lambda _: profile("develop"),
@@ -819,9 +887,9 @@ def test_startup_recovery_prepares_only_onto_the_profile_base(tmp_path: Path) ->
     """The continuation path must share the single-prepare bootstrap behavior."""
 
     state = state_at(tmp_path, AttemptPhase.SETUP)
-    workspace = FakeWorkspace()
+    workspace = InMemoryWorkspace(tmp_path / "repo", issue_number=24)
     lifecycle = AgentLifecycle(
-        tracker=FakeTracker(None),
+        tracker=FakeTracker({24: issue(24)}),
         attempt_state=state,
         workspace=workspace,
         profile_loader=lambda _: profile("develop"),
@@ -836,127 +904,32 @@ def test_startup_recovery_prepares_only_onto_the_profile_base(tmp_path: Path) ->
     assert workspace.cleanup_calls == [("develop", False)]
 
 
-@dataclass
-class FakeTracker:
-    next_claim: Claim | None
-
-    def __post_init__(self) -> None:
-        self.cleanup: list[tuple[int, str, str]] = []
-        self.claimed: list[int] = []
-
-    def claim_next(self) -> Claim | None:
-        claim, self.next_claim = self.next_claim, None
-        if claim is not None:
-            self.claimed.append(claim.issue.number)
-        return claim
-
-    def recover_claim(self, issue_number: int) -> Claim | None:
-        return Claim(issue(issue_number), Assignment(f"issue-{issue_number}", "agent-id"))
-
-    def release_attempt(self, issue_number: int, label: str, assignee_id: str) -> None:
-        self.cleanup.append((issue_number, label, assignee_id))
-
-
 class FailingCleanupTracker(FakeTracker):
     def release_attempt(self, issue_number: int, label: str, assignee_id: str) -> None:
         raise OSError("GitHub unavailable")
 
 
-class FakeWorkspace:
-    working_directory = Path("/repository")
-
-    def __init__(self, *, commits: tuple[str, ...] = ()) -> None:
-        self.cleanup_calls: list[tuple[str, bool]] = []
-        self.bootstrap_bases: list[str] = []
-        self.prepared_bases: list[str] = []
-        self._commits = commits
-
-    def prepare_for_profile_read(self, *, base_branch: str = "main") -> None:
-        self.bootstrap_bases.append(base_branch)
-
-    def prepare_attempt(self, *, base_branch: str, issue_number: int):
-        self.prepared_bases.append(base_branch)
-        return type("Prepared", (), {"branch": f"agent/issue-{issue_number}"})()
-
-    def cleanup(self, *, base_branch: str, prepared: object, retain_branch: bool) -> None:
-        self.cleanup_calls.append((base_branch, retain_branch))
-
-    def commits_added(self, prepared: object) -> tuple[str, ...]:
-        return self._commits
-
-
-class RecoveryFailingWorkspace(FakeWorkspace):
-    def prepare_for_profile_read(self, *, base_branch: str = "main") -> None:
+class RecoveryFailingWorkspace(InMemoryWorkspace):
+    def prepare_for_profile_read(self, *, base_branch: str = "main") -> str:
         raise GitWorkspaceRecoveryError("workspace is broken")
 
     def prepare_attempt(self, *, base_branch: str, issue_number: int):
         raise GitWorkspaceRecoveryError("workspace is broken")
 
 
-class RebaseConflictingWorkspace(FakeWorkspace):
-    """Leave a conflicting rebase in place on the configured base branches."""
+class RebaseConflictingWorkspace(InMemoryWorkspace):
+    """Report a conflicting rebase on the configured bases, leaving it in place."""
 
-    def __init__(
-        self, *, commits: tuple[str, ...] = (), conflict_bases: tuple[str, ...] = ("develop",)
-    ) -> None:
-        super().__init__(commits=commits)
+    def __init__(self, root: Path, *, conflict_bases: tuple[str, ...] = ("develop",)) -> None:
+        super().__init__(root, issue_number=24)
         self._conflict_bases = conflict_bases
 
     def prepare_attempt(self, *, base_branch: str, issue_number: int):
-        self.prepared_bases.append(base_branch)
+        prepared = super().prepare_attempt(base_branch=base_branch, issue_number=issue_number)
         if base_branch in self._conflict_bases:
-            return type(
-                "Prepared",
-                (),
-                {
-                    "branch": f"agent/issue-{issue_number}",
-                    "rebase_conflicts": ("SubscriptionController.php",),
-                    "pre_rebase_revision": "abc123",
-                },
-            )()
-        return type("Prepared", (), {"branch": f"agent/issue-{issue_number}"})()
-
-
-class FakePublisher:
-    def __init__(self) -> None:
-        self.outcomes: list[AttemptOutcome] = []
-        self.requests: list[object] = []
-
-    def publish(self, request: object):
-        self.requests.append(request)
-        self.outcomes.append(request.decision.outcome)
-        outcome = request.decision.outcome or AttemptOutcome.COMPLETE
-        branch_url = (
-            None
-            if outcome is AttemptOutcome.INFRASTRUCTURE_ERROR
-            else "https://example.test/tree/agent/issue-24"
-        )
-        return type("Published", (), {"outcome": outcome, "branch_url": branch_url})()
-
-
-class CommentFailingPublisher(FakePublisher):
-    def publish(self, request: object):
-        return type("Published", (), {"outcome": request.decision.outcome, "comment_posted": False})()
-
-
-class PushFailingPublisher(FakePublisher):
-    def publish(self, request: object):
-        self.requests.append(request)
-        self.outcomes.append(AttemptOutcome.INFRASTRUCTURE_ERROR)
-        return type("Published", (), {
-            "outcome": AttemptOutcome.INFRASTRUCTURE_ERROR,
-            "branch_url": None,
-        })()
-
-
-class IncompletePushFailingPublisher(FakePublisher):
-    def publish(self, request: object):
-        self.requests.append(request)
-        self.outcomes.append(AttemptOutcome.INCOMPLETE)
-        return type("Published", (), {
-            "outcome": AttemptOutcome.INCOMPLETE,
-            "branch_url": None,
-        })()
+            self.leave_conflict(("SubscriptionController.php",))
+            prepared = replace(prepared, rebase_conflicts=("SubscriptionController.php",))
+        return prepared
 
 
 def profile(base_branch: str = "main"):
