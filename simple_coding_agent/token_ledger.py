@@ -115,7 +115,7 @@ def _total_input_of(usage: Mapping[str, int]) -> int:
     return usage["input_tokens"] + usage["cache_read_input_tokens"] + usage["cache_creation_input_tokens"]
 
 
-def _hit_rate_of(totals: Mapping[str, int]) -> float | None:
+def hit_rate_of(totals: Mapping[str, int]) -> float | None:
     """Cache-read share of summed input; ``None`` when the denominator is 0."""
 
     denominator = (
@@ -291,7 +291,7 @@ class TokenLedger:
 
         if usage is None:
             return
-        merged = {category: self._category_value(usage, category) for category in USAGE_CATEGORIES}
+        merged = {category: _category_value(usage, category) for category in USAGE_CATEGORIES}
         if sum(merged.values()) == 0:
             return
         thread = self._threads[thread_id]
@@ -434,7 +434,7 @@ class TokenLedger:
         ``limit`` is None). ``None`` when the denominator is 0.
         """
 
-        return _hit_rate_of(self.main_measured_by_category(limit))
+        return hit_rate_of(self.main_measured_by_category(limit))
 
     def main_cache_stats(self, limit: int | None = None) -> MainCacheStats:
         """Hit rate and miss accounting over the first ``limit`` measured main responses."""
@@ -488,7 +488,7 @@ class TokenLedger:
             input_tokens=response.usage["input_tokens"],
             cache_read_tokens=response.usage["cache_read_input_tokens"],
             cache_creation_tokens=response.usage["cache_creation_input_tokens"],
-            hit_rate=_hit_rate_of(response.usage),
+            hit_rate=hit_rate_of(response.usage),
             miss_tokens=miss,
         )
 
@@ -567,10 +567,6 @@ class TokenLedger:
         if thread.responses:
             return thread.responses[-1]
         return None
-
-    @staticmethod
-    def _category_value(usage: Mapping[str, Any], category: str) -> int:
-        return _category_value(usage, category)
 
     def _measured_main_responses(self, limit: int | None) -> list[_Response]:
         """Measured main-thread responses in counting order (first ``limit``)."""

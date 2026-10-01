@@ -29,6 +29,7 @@ from simple_coding_agent.config import RuntimeConfig
 from simple_coding_agent.token_ledger import (
     USAGE_CATEGORIES,
     TokenLedger,
+    hit_rate_of,
     usage_by_category,
 )
 
@@ -1318,15 +1319,7 @@ class ModelExecutor:
         reconciliation = self._ledger.reconcile(usage)
         actual_totals = _sum_usage_by_category(usage) if usage is not None else None
         main_stats = self._ledger.main_cache_stats()
-        all_threads_hit_rate = None
-        if actual_totals is not None:
-            denominator = (
-                actual_totals["input_tokens"]
-                + actual_totals["cache_read_input_tokens"]
-                + actual_totals["cache_creation_input_tokens"]
-            )
-            if denominator > 0:
-                all_threads_hit_rate = actual_totals["cache_read_input_tokens"] / denominator
+        all_threads_hit_rate = None if actual_totals is None else hit_rate_of(actual_totals)
         summary: dict[str, Any] = {
             "mode": reconciliation.mode,
             "max_budget_tokens": self._config.max_budget_tokens,
