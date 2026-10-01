@@ -48,11 +48,13 @@ def _handoff_target(issue_number: int | None) -> str:
     """Name the issue and the exact note path every handoff instruction must carry."""
 
     if issue_number is None:
-        note = "`.agent/handoff/<issue-number>.md`"
-        return f"the handoff note path is {note} (use the number of the issue you are working on)"
+        return (
+            "The handoff note path is `.agent/handoff/<issue-number>.md` (use the"
+            " number of the issue you are working on)."
+        )
     return (
-        f"you are working on issue #{issue_number}; the handoff note path is exactly"
-        f" `.agent/handoff/{issue_number}.md`"
+        f"You are working on issue #{issue_number}; the handoff note path is exactly"
+        f" `.agent/handoff/{issue_number}.md`."
     )
 
 
@@ -66,7 +68,7 @@ def _cost_handoff_instruction(issue_number: int | None) -> str:
     return (
         "This attempt is approaching its token budget. Invoke the `handoff` skill now "
         "to preserve your progress cooperatively instead of continuing further work. "
-        f"{_HANDOFF_SKILL_TOOL_HINT} {_handoff_target(issue_number).capitalize()}."
+        f"{_HANDOFF_SKILL_TOOL_HINT} {_handoff_target(issue_number)}"
     )
 
 
@@ -75,7 +77,7 @@ def _cost_handoff_followup_prompt(issue_number: int | None) -> str:
         "This attempt crossed its token soft threshold and must now end by handing off. "
         "Invoke the `handoff` skill now to preserve your progress: commit any outstanding "
         "work, then write and commit the handoff note. Do not attempt further implementation "
-        f"work. {_HANDOFF_SKILL_TOOL_HINT} {_handoff_target(issue_number).capitalize()}."
+        f"work. {_HANDOFF_SKILL_TOOL_HINT} {_handoff_target(issue_number)}"
     )
 
 
@@ -87,7 +89,7 @@ def _operator_handoff_instruction(issue_number: int | None) -> str:
         " commits, then write the handoff note with `reason: operator_request` and"
         " commit it separately as the final commit. Do not start another"
         f" implementation step. {_HANDOFF_SKILL_TOOL_HINT}"
-        f" {_handoff_target(issue_number).capitalize()}."
+        f" {_handoff_target(issue_number)}"
     )
 
 
@@ -96,7 +98,7 @@ def _limit_handoff_followup_prompt(issue_number: int | None) -> str:
         "Execution reached its turn or time limit. Invoke the `handoff` skill now to "
         "preserve your progress: commit any outstanding work, then write and commit "
         f"the handoff note. Do not attempt further implementation work. {_HANDOFF_SKILL_TOOL_HINT}"
-        f" {_handoff_target(issue_number).capitalize()}."
+        f" {_handoff_target(issue_number)}"
     )
 
 
@@ -107,7 +109,7 @@ def _operator_handoff_followup_prompt(issue_number: int | None) -> str:
         " progress: commit any outstanding work in ordinary work commits, then write"
         " the handoff note with `reason: operator_request` and commit it separately"
         " as the final commit. Do not attempt further implementation work."
-        f" {_HANDOFF_SKILL_TOOL_HINT} {_handoff_target(issue_number).capitalize()}."
+        f" {_HANDOFF_SKILL_TOOL_HINT} {_handoff_target(issue_number)}"
     )
 
 
