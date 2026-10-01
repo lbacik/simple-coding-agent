@@ -544,9 +544,6 @@ def test_next_issue_over_the_socket_and_status(tmp_path: Path) -> None:
 
 
 def test_agentctl_next_issue_cli(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
-    import socket as stdlib_socket
-    import json
-
     from simple_coding_agent.agentctl import main as agentctl_main
     from simple_coding_agent.control_server import ControlServer
 

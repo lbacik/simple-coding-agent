@@ -5,7 +5,6 @@ from __future__ import annotations
 import io
 import json
 from collections.abc import Callable
-from datetime import UTC, datetime
 from pathlib import Path
 
 from simple_coding_agent.observability import AttemptArchive, JsonEventLogger

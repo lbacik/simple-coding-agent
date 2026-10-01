@@ -438,8 +438,6 @@ def lifecycle_evidence(outcome: AttemptOutcome | None):
 
 
 def make_lifecycle(tmp_path: Path, numbers: list[int], outcomes: list[AttemptOutcome | None]):
-    from simple_coding_agent.lifecycle import AgentLifecycle
-
     tracker = FakeTracker(issues={number: issue(number) for number in numbers}, fifo=list(numbers))
     workspace = InMemoryWorkspace(tmp_path / "workspace")
     store = ControlStore(tmp_path)
@@ -559,8 +557,6 @@ def test_all_five_outcomes_count_through_the_lifecycle(tmp_path: Path) -> None:
 
 
 def test_held_finalization_does_not_consume_a_count(tmp_path: Path) -> None:
-    from simple_coding_agent.lifecycle import AgentLifecycle
-
     tracker = FakeTracker(issues={24: issue(24)}, fifo=[24])
     workspace = InMemoryWorkspace(tmp_path / "workspace")
     store = ControlStore(tmp_path)
@@ -593,7 +589,6 @@ def test_recovery_after_json_record_counts_once_without_double_publish(
     tmp_path: Path,
 ) -> None:
     from simple_coding_agent.finalization import AttemptCompletionStore
-    from simple_coding_agent.lifecycle import AgentLifecycle
 
     state = AttemptStateStore(tmp_path)
     checkpoint = state.start(issue_number=24, branch="agent/issue-24")
@@ -636,7 +631,6 @@ def test_recovery_with_marker_but_leftover_checkpoint_does_not_recount(
     tmp_path: Path,
 ) -> None:
     from simple_coding_agent.finalization import AttemptCompletionStore
-    from simple_coding_agent.lifecycle import AgentLifecycle
 
     state = AttemptStateStore(tmp_path)
     checkpoint = state.start(issue_number=24, branch="agent/issue-24")

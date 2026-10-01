@@ -33,7 +33,6 @@ from simple_coding_agent.lifecycle import (
     AttemptEvidence,
     LifecycleStatus,
     ModelAttemptRunner,
-    OperatorHandoff,
 )
 from simple_coding_agent.model_execution import (
     ModelExecution,
@@ -510,7 +509,6 @@ def make_clocked_lifecycle(
     clock, so acceptance can be aged by moving it before ``submit_handoff``.
     """
 
-    from datetime import datetime
 
     tracker = FakeTracker(
         {ISSUE_NUMBER: issue(ISSUE_NUMBER, assignee_logins=("agent",))},
