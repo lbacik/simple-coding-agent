@@ -870,3 +870,39 @@ def test_model_limit_on_a_continuation_ignores_an_earlier_rounds_note(
         "Seal attempt work for #24 (model_limit_reached)",
         "Handoff note: issue #24",
     ]
+
+
+def test_missing_transcript_source_logs_failure_and_leaves_outcome_unchanged(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A missing CLI transcripts directory must not change the attempt outcome."""
+
+    from simple_coding_agent.observability import AttemptArchive
+
+    monkeypatch.setenv("HOME", str(tmp_path / "empty-home"))
+
+    class SessionedExecutor(FakeModelExecutor):
+        cli_session_id = "no-such-session"
+
+    executor = SessionedExecutor(status=ModelExecutionStatus.SUCCEEDED)
+    workspace = FakeWorkspace(commits=("Implemented",))
+    events: list[tuple[str, str, str]] = []
+    runner = build_runner(
+        tmp_path,
+        model_executor=executor,
+        workspace=workspace,
+        event_log=lambda event, detail="", level="INFO", issue_number=None: events.append(
+            (event, level, detail)
+        ),
+    )
+    runner._attempt_archive_factory = lambda issue_number, started_at: AttemptArchive(
+        tmp_path / "data", issue_number=issue_number, started_at=started_at
+    )
+
+    evidence = runner(claim(issue_number=24, issue_body="Fix the parser."), profile(), FakePrepared())
+
+    assert evidence.decision.outcome is AttemptOutcome.INCOMPLETE
+    failures = [detail for event, level, detail in events if event == "transcripts_copy_failed"]
+    assert len(failures) == 1
+    assert "no-such-session" in failures[0]
+    assert any(level == "WARNING" for event, level, _ in events if event == "transcripts_copy_failed")

@@ -19,6 +19,7 @@ from claude_agent_sdk import (
     ClaudeSDKClient,
     HookMatcher,
     ResultMessage,
+    SystemMessage,
     TextBlock,
 )
 
@@ -267,6 +268,7 @@ class ModelExecutor:
         self._operator_fallback_used = False
         self._operator_begun = False
         self._operator_deadline_expired = False
+        self._cli_session_id: str | None = None
 
     def set_operator_handoff_provider(
         self, provider: OperatorHandoffProvider | None
@@ -300,6 +302,34 @@ class ModelExecutor:
 
         latched = self._operator_handoff
         return latched.request_id if latched is not None else None
+
+    @property
+    def cli_session_id(self) -> str | None:
+        """The CLI session id latched during this execution, if any."""
+
+        return self._cli_session_id
+
+    def _record_cli_session_id(self, message: object) -> None:
+        """Latch the CLI session id from the init message or any sessioned message.
+
+        The pinned SDK exposes ``session_id`` directly on ``ResultMessage``
+        (and on ``AssistantMessage``); the init ``SystemMessage`` carries it
+        inside ``data`` instead, so both shapes are read. Every message in one
+        execution belongs to the same CLI session, so later messages may
+        overwrite earlier ones.
+        """
+
+        session_id = getattr(message, "session_id", None)
+        if not isinstance(session_id, str) or not session_id:
+            session_id = None
+            if isinstance(message, SystemMessage) and message.subtype == "init":
+                data = getattr(message, "data", None)
+                if isinstance(data, Mapping):
+                    candidate = data.get("session_id")
+                    if isinstance(candidate, str) and candidate:
+                        session_id = candidate
+        if session_id is not None:
+            self._cli_session_id = session_id
 
     def _poll_operator_handoff(self) -> None:
         """Latch the newest operator handoff request that may still be served.
@@ -519,6 +549,7 @@ class ModelExecutor:
         self._operator_fallback_used = False
         self._operator_begun = False
         self._operator_deadline_expired = False
+        self._cli_session_id = None
         soft_threshold = self._config.max_budget_usd * (1 - self._config.soft_threshold_percentage)
         self._log(
             "model_execution_started",
@@ -819,6 +850,7 @@ class ModelExecutor:
                         message = task.result()
                     except StopAsyncIteration:
                         return None, tuple(observed_models)
+                self._record_cli_session_id(message)
                 if isinstance(message, ResultMessage) or _looks_like_result(message):
                     return message, tuple(observed_models)
                 if isinstance(message, AssistantMessage):

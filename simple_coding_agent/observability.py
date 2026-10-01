@@ -130,6 +130,106 @@ class AttemptArchive:
         path.write_text(str(self._redactor.redact(content)))
         return path
 
+    def copy_cli_transcripts(
+        self,
+        session_id: str | None,
+        *,
+        issue_number: int | None = None,
+        event_log: Callable[..., None] | None = None,
+        projects_dir: Path | None = None,
+    ) -> tuple[int, int]:
+        """Copy this attempt's CLI session transcripts into ``transcripts/``, redacted.
+
+        On-disk layout under the pinned CLI (``@anthropic-ai/claude-code@2.1.276``,
+        verified against ``$HOME/.claude/projects`` in the container and the
+        SDK's ``session_store.file_path_to_session_key`` documentation):
+
+        - ``$HOME/.claude/projects/<project_key>/<session_id>.jsonl`` is the
+          main-loop transcript, where ``<project_key>`` is the CLI's sanitized
+          form of the working directory (``/data/repo`` becomes ``-data-repo``).
+        - ``$HOME/.claude/projects/<project_key>/<session_id>/subagents/``
+          holds the subagent transcripts (``agent-<id>.jsonl``).
+        - The ``<session_id>/`` sidecar directory also holds non-transcript
+          files (for example ``tool-results/``), which are not copied.
+
+        The project key is not derived here: every project directory is
+        searched for the exact ``<session_id>.jsonl`` name (a literal
+        filename comparison, never a glob, so a session id containing
+        glob metacharacters cannot match another session), so only this
+        attempt's session (main file plus its ``subagents/`` tree) is copied
+        and no other session's transcripts are touched. Each line is passed
+        through this archive's ``Redactor`` before writing. A CLI session
+        belongs to exactly one project directory; if several mains ever
+        matched, each would be copied and later ones would overwrite
+        earlier ones under the same destination names.
+
+        Best-effort: a missing session id, a missing directory, missing files,
+        or an I/O error is reported as a WARNING ``transcripts_copy_failed``
+        event (with the reason) and never raises. Success logs an INFO
+        ``transcripts_copied`` event with the file count and total bytes.
+        Returns ``(file_count, total_bytes)``.
+        """
+
+        def emit(event: str, detail: str, level: str) -> None:
+            if event_log is not None:
+                event_log(event, detail, level=level, issue_number=issue_number)
+
+        def fail(reason: str) -> tuple[int, int]:
+            emit("transcripts_copy_failed", f"session_id={session_id}; reason={reason}", "WARNING")
+            return (0, 0)
+
+        if not session_id or Path(session_id).name != session_id:
+            return fail("no CLI session id was recorded for this attempt")
+        base = projects_dir if projects_dir is not None else Path.home() / ".claude" / "projects"
+        try:
+            if not base.is_dir():
+                return fail(f"CLI transcripts directory is missing: {base}")
+            mains = sorted(
+                candidate
+                for project in base.iterdir()
+                if project.is_dir()
+                for candidate in (project / f"{session_id}.jsonl",)
+                if candidate.is_file()
+            )
+            if not mains:
+                return fail(f"no transcript found for this session under {base}")
+            pending: list[tuple[Path, Path]] = []
+            for main in mains:
+                pending.append((main, Path(f"{session_id}.jsonl")))
+                subagents = main.parent / session_id / "subagents"
+                if subagents.is_dir():
+                    for child in sorted(subagents.rglob("*.jsonl")):
+                        if child.is_file():
+                            pending.append(
+                                (child, Path(session_id) / "subagents" / child.relative_to(subagents))
+                            )
+            copied = 0
+            total_bytes = 0
+            for source, relative in pending:
+                try:
+                    content = source.read_text(encoding="utf-8")
+                except OSError as error:
+                    return fail(f"failed to read {source}: {error}")
+                redacted = "".join(
+                    str(self._redactor.redact(line)) for line in content.splitlines(keepends=True)
+                )
+                destination = self.directory / "transcripts" / relative
+                try:
+                    destination.parent.mkdir(parents=True, exist_ok=True)
+                    destination.write_text(redacted, encoding="utf-8")
+                except OSError as error:
+                    return fail(f"failed to write {destination}: {error}")
+                copied += 1
+                total_bytes += len(redacted.encode("utf-8"))
+        except OSError as error:
+            return fail(f"failed to copy transcripts for this session: {error}")
+        emit(
+            "transcripts_copied",
+            f"session_id={session_id}; files={copied}; bytes={total_bytes}",
+            "INFO",
+        )
+        return (copied, total_bytes)
+
     def _write_json(self, name: str, value: dict[str, object]) -> None:
         self.directory.mkdir(parents=True, exist_ok=True)
         (self.directory / name).write_text(json.dumps(self._redactor.redact(value), sort_keys=True))
