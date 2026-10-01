@@ -9,7 +9,7 @@ from pathlib import Path
 import pytest
 
 from simple_coding_agent.attempt_state import AttemptPhase, AttemptStateStore
-from simple_coding_agent.completion import AttemptOutcome, CompletionDecision, PublicationPath
+from simple_coding_agent.completion import AttemptOutcome
 from simple_coding_agent.control import CommandAcknowledgement, ControlStore
 from simple_coding_agent.finalization import AttemptCompletionStore
 from simple_coding_agent.github_tracker import Assignment, Claim, TrackerIssue
@@ -74,7 +74,7 @@ def make_lifecycle(tmp_path: Path, *, tracker=None, workspace=None, publisher=No
 
 def start_checkpoint(tmp_path: Path, phase: AttemptPhase = AttemptPhase.CLAIMED):
     state = AttemptStateStore(tmp_path)
-    checkpoint = state.start(issue_number=24, branch="agent/issue-24")
+    state.start(issue_number=24, branch="agent/issue-24")
     order = (AttemptPhase.SETUP, AttemptPhase.MODEL_RUNNING, AttemptPhase.PUSHING, AttemptPhase.PUBLISHING)
     for next_phase in order:
         current = state.read()

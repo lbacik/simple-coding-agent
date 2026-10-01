@@ -491,7 +491,7 @@ class GitWorkspace:
             try:
                 observed = self._remote_branch_revision(branch)
             except GitWorkspaceError:
-                raise fetch_error
+                raise fetch_error from None
             if observed is not None:
                 raise fetch_error
             return None

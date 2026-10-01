@@ -11,7 +11,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from simple_coding_agent.agentctl import format_status
-from simple_coding_agent.attempt_state import AttemptPhase, AttemptStateStore
+from simple_coding_agent.attempt_state import AttemptStateStore
 from simple_coding_agent.completion import AttemptOutcome, CompletionDecision, PublicationPath
 from simple_coding_agent.control import CommandAcknowledgement, ControlStore, IntakeState
 from simple_coding_agent.github_tracker import Assignment, Claim, TrackerIssue

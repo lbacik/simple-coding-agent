@@ -3,7 +3,6 @@ from __future__ import annotations
 import os
 from pathlib import Path
 import sys
-import time
 
 from simple_coding_agent.command_runner import CommandRunner, CommandStatus
 

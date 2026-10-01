@@ -1131,7 +1131,7 @@ class AgentLifecycle:
         intake stays blocked.
         """
 
-        from simple_coding_agent.recovery import RecoveryRejectedError, parse_attempt_id
+        from simple_coding_agent.recovery import parse_attempt_id
 
         if self._control_store is None:
             raise ControlStoreError("Operator control is not configured")
@@ -1191,7 +1191,6 @@ class AgentLifecycle:
         """
 
         from simple_coding_agent.recovery import (
-            RecoveryRejectedError,
             parse_attempt_id,
             parse_saved_at,
         )
