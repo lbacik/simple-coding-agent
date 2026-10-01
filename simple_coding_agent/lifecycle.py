@@ -1095,14 +1095,8 @@ class AgentLifecycle:
                 # eligibility change after acceptance cannot alter history.
                 return store.submit_next_issue(request_id, issue)
             number = parse_next_issue(issue)
-            fetcher = _tracker_method(self._tracker, "fetch_issue")
-            if fetcher is None:
-                raise NextIssueRejectedError(
-                    f"issue #{number} cannot be verified: the tracker cannot"
-                    " fetch issues. No control change was accepted."
-                )
             try:
-                fresh = fetcher(number)
+                fresh = self._tracker.fetch_issue(number)
             except NextIssueRejectedError:
                 raise
             except Exception as error:
@@ -1918,13 +1912,8 @@ class AgentLifecycle:
         conflicting (the retry must not overwrite it).
         """
 
-        fetcher = _tracker_method(self._tracker, "fetch_issue") or _tracker_method(
-            self._tracker, "get_issue"
-        )
-        if fetcher is None:
-            return None
         try:
-            fresh = fetcher(checkpoint.issue_number)
+            fresh = self._tracker.fetch_issue(checkpoint.issue_number)
         except Exception as error:
             return (
                 "remote issue state is ambiguous"
@@ -1936,29 +1925,27 @@ class AgentLifecycle:
                 f"issue #{checkpoint.issue_number} is unavailable on GitHub;"
                 " the retry must not replay a side effect it cannot verify."
             )
-        probe = _tracker_method(self._tracker, "is_self_assigned")
-        if probe is not None:
-            try:
-                self_assigned = bool(probe(fresh))
-            except Exception as error:
+        try:
+            self_assigned = bool(self._tracker.is_self_assigned(fresh))
+        except Exception as error:
+            return (
+                "remote assignment is ambiguous"
+                f" ({_exception_detail(error)}); the retry must not replay"
+                " a side effect it cannot verify."
+            )
+        if not self_assigned:
+            holders = ", ".join(getattr(fresh, "assignee_logins", ()) or ())
+            if holders:
                 return (
-                    "remote assignment is ambiguous"
-                    f" ({_exception_detail(error)}); the retry must not replay"
-                    " a side effect it cannot verify."
+                    f"issue #{checkpoint.issue_number} shows conflicting"
+                    f" human changes (assigned to {holders}); the retry"
+                    " must not overwrite them and requires operator repair."
                 )
-            if not self_assigned:
-                holders = ", ".join(getattr(fresh, "assignee_logins", ()) or ())
-                if holders:
-                    return (
-                        f"issue #{checkpoint.issue_number} shows conflicting"
-                        f" human changes (assigned to {holders}); the retry"
-                        " must not overwrite them and requires operator repair."
-                    )
-                return (
-                    f"issue #{checkpoint.issue_number} shows conflicting human"
-                    " changes (it is no longer assigned to this agent); the"
-                    " retry must not overwrite them and requires operator repair."
-                )
+            return (
+                f"issue #{checkpoint.issue_number} shows conflicting human"
+                " changes (it is no longer assigned to this agent); the"
+                " retry must not overwrite them and requires operator repair."
+            )
         return None
 
     def _recovery_snapshot_locked(
@@ -2084,15 +2071,11 @@ class AgentLifecycle:
     def _is_self_assignment(self, found: TrackerIssue) -> bool:
         """Whether a revalidated target is assigned to this agent itself.
 
-        Missing tracker support degrades to ``False`` (the assignment is
-        then treated as ordinary ineligibility); a failed identity read
-        propagates as ambiguity with the priority preserved.
+        A failed identity read propagates as ambiguity with the priority
+        preserved.
         """
 
-        probe = _tracker_method(self._tracker, "is_self_assigned")
-        if probe is None:
-            return False
-        return bool(probe(found))
+        return bool(self._tracker.is_self_assigned(found))
 
     def get_command(self, request_id: str) -> CommandRecord | None:
         """Return one command's current durable acknowledgement."""
@@ -2592,13 +2575,8 @@ class AgentLifecycle:
         if snapshot is None:
             return None
         target_number = int(snapshot["issue_number"])
-        fetcher = _tracker_method(self._tracker, "fetch_issue")
-        if fetcher is None:
-            raise ControlStoreError(
-                "The tracker cannot revalidate the prioritized issue"
-            )
         try:
-            fresh = fetcher(target_number)
+            fresh = self._tracker.fetch_issue(target_number)
         except Exception as error:
             self._event_log(
                 "next_issue_claim_ambiguous",
@@ -2643,13 +2621,8 @@ class AgentLifecycle:
             )
             return None
         assert fresh is not None  # eligibility implies presence
-        claim_verified = _tracker_method(self._tracker, "claim_verified")
-        if claim_verified is None:
-            raise ControlStoreError(
-                "The tracker cannot claim the prioritized issue"
-            )
         try:
-            claim = claim_verified(fresh)
+            claim = self._tracker.claim_verified(fresh)
         except Exception as error:
             self._event_log(
                 "next_issue_claim_ambiguous",
@@ -3613,13 +3586,6 @@ class AgentLifecycle:
                     "duration_seconds": (completed_at - started).total_seconds(),
                 }
             )
-
-
-def _tracker_method(tracker: object, name: str) -> Callable[..., object] | None:
-    """Return the tracker's ``name`` method, if it provides a callable one."""
-
-    probe = getattr(tracker, name, None)
-    return probe if callable(probe) else None
 
 
 def _final_check_was_interrupted(archive: AttemptArchive | None) -> bool:
