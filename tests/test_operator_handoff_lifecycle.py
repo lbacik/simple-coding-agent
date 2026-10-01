@@ -40,7 +40,7 @@ from simple_coding_agent.model_execution import (
     ModelExecutionStatus,
     SkillEvent,
 )
-from tests.fakes import InMemoryWorkspace
+from tests.fakes import FakePublisher, FakeTracker, InMemoryWorkspace
 
 
 ISSUE_NUMBER = 24
@@ -48,7 +48,7 @@ WORK_REV = "c" * 40
 NOTE_REV = "a" * 40
 
 
-def issue(number: int = ISSUE_NUMBER) -> TrackerIssue:
+def issue(number: int = ISSUE_NUMBER, assignee_logins: tuple[str, ...] = ()) -> TrackerIssue:
     return TrackerIssue(
         id=f"issue-{number}",
         number=number,
@@ -57,7 +57,7 @@ def issue(number: int = ISSUE_NUMBER) -> TrackerIssue:
         created_at=datetime(2026, 9, 20, tzinfo=UTC),
         state="OPEN",
         labels=frozenset({"ready-for-agent"}),
-        assignee_logins=(),
+        assignee_logins=assignee_logins,
         blocked_by=0,
         author_login="reporter",
     )
@@ -465,41 +465,7 @@ def test_runner_without_operator_control_behaves_as_before(tmp_path: Path) -> No
     assert executor.provider is None
 
 
-# --- lifecycle fakes ---------------------------------------------------------
-
-
-class LifecycleTracker:
-    def __init__(self, next_claim: Claim | None) -> None:
-        self.next_claim = next_claim
-        self.claimed: list[int] = []
-        self.cleanup: list[tuple[int, str, str]] = []
-
-    def claim_next(self) -> Claim | None:
-        claim_value, self.next_claim = self.next_claim, None
-        if claim_value is not None:
-            self.claimed.append(claim_value.issue.number)
-        return claim_value
-
-    def recover_claim(self, issue_number: int) -> Claim | None:
-        return Claim(issue(issue_number), Assignment(f"issue-{issue_number}", "agent-id"))
-
-    def release_attempt(self, issue_number: int, label: str, assignee_id: str) -> None:
-        self.cleanup.append((issue_number, label, assignee_id))
-
-    def release_handoff(self, issue_number: int, assignee_id: str) -> None:
-        self.cleanup.append((issue_number, "round-finished", assignee_id))
-
-
-class LifecyclePublisher:
-    def __init__(self) -> None:
-        self.requests: list[object] = []
-        self.timeouts: list[float | None] = []
-
-    def publish(self, request: object, *, timeout: float | None = None):
-        self.requests.append(request)
-        self.timeouts.append(timeout)
-        outcome = request.decision.outcome or AttemptOutcome.COMPLETE
-        return SimpleNamespace(outcome=outcome, branch_url="https://example.test/x")
+# --- lifecycle helpers ---------------------------------------------------------
 
 
 def make_lifecycle(
@@ -509,14 +475,17 @@ def make_lifecycle(
     workspace: InMemoryWorkspace,
     attempt_runner,
 ):
-    tracker = LifecycleTracker(next_claim)
+    tracker = FakeTracker(
+        {ISSUE_NUMBER: issue(ISSUE_NUMBER, assignee_logins=("agent",))},
+        next_claim=next_claim,
+    )
     store = ControlStore(tmp_path)
     lifecycle = AgentLifecycle(
         tracker=tracker,
         attempt_state=AttemptStateStore(tmp_path),
         workspace=workspace,
         profile_loader=lambda _: SimpleNamespace(base_branch="main"),
-        publisher=LifecyclePublisher(),
+        publisher=FakePublisher(),
         attempt_runner=attempt_runner,
         control_store=store,
         sleeper=lambda seconds: None,
@@ -543,7 +512,10 @@ def make_clocked_lifecycle(
 
     from datetime import datetime
 
-    tracker = LifecycleTracker(next_claim)
+    tracker = FakeTracker(
+        {ISSUE_NUMBER: issue(ISSUE_NUMBER, assignee_logins=("agent",))},
+        next_claim=next_claim,
+    )
     store_clock = store_now if store_now is not None else now
     store = ControlStore(tmp_path, clock=lambda: store_clock[0])
     lifecycle = AgentLifecycle(
@@ -551,7 +523,7 @@ def make_clocked_lifecycle(
         attempt_state=AttemptStateStore(tmp_path),
         workspace=workspace,
         profile_loader=lambda _: SimpleNamespace(base_branch="main"),
-        publisher=publisher if publisher is not None else LifecyclePublisher(),
+        publisher=publisher if publisher is not None else FakePublisher(),
         attempt_runner=attempt_runner,
         control_store=store,
         sleeper=lambda seconds: None,
@@ -726,7 +698,7 @@ def test_publication_past_its_allowance_is_not_fulfilled_and_held(
         assert release.wait(timeout=30)
         return handoff_evidence()
 
-    publisher = LifecyclePublisher()
+    publisher = FakePublisher()
     original_publish = publisher.publish
 
     def slow_publish(request: object, *, timeout: float | None = None):
@@ -781,7 +753,7 @@ def test_handoff_publication_is_bounded_by_the_remaining_acceptance_budget(
         assert release.wait(timeout=30)
         return handoff_evidence()
 
-    publisher = LifecyclePublisher()
+    publisher = FakePublisher()
     lifecycle, tracker, store = make_clocked_lifecycle(
         tmp_path,
         next_claim=claim(),
