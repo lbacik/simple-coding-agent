@@ -10,6 +10,8 @@ from pathlib import Path
 import subprocess
 from typing import Any
 
+from simple_coding_agent.agent_version import UNKNOWN_VERSION, agent_version
+
 
 REQUIRED_SKILLS = ("implement", "tdd", "code-review", "codebase-design")
 
@@ -31,6 +33,12 @@ class ProvenanceEvidence:
     skill_hashes: dict[str, str]
     sdk_version: str
     cli_version: str
+    agent_version: str = UNKNOWN_VERSION
+
+    def summary(self) -> str:
+        """One-line startup log detail naming the agent, SDK and CLI versions."""
+
+        return f"agent={self.agent_version}; sdk={self.sdk_version}; cli={self.cli_version}"
 
 
 class ProvenanceVerifier:
@@ -72,7 +80,7 @@ class ProvenanceVerifier:
         cli_version = _version(self._run(("claude", "--version")))
         if cli_version != self._expected_cli_version:
             raise ProvenanceError("Claude Code CLI version does not match the pinned runtime")
-        return ProvenanceEvidence(hashes, sdk_version, cli_version)
+        return ProvenanceEvidence(hashes, sdk_version, cli_version, agent_version())
 
 
 def _artifacts(output: str) -> dict[str, dict[str, Any]]:

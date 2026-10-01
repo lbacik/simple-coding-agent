@@ -8,6 +8,8 @@ import json
 from pathlib import Path
 from typing import TextIO
 
+from simple_coding_agent.agent_version import agent_version
+
 
 class Redactor:
     """Apply write-time credential redaction to all operational evidence."""
@@ -100,6 +102,7 @@ class AttemptArchive:
             existing = {}
         evidence = existing if isinstance(existing, dict) else {}
         evidence.update(metadata)
+        evidence.setdefault("agent_version", agent_version())
         self._write_json("attempt.json", evidence)
 
     def read_attempt(self) -> dict[str, object]:

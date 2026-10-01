@@ -219,6 +219,17 @@ writing a result comment. Cleanup remains ordered as comment, queue label,
 agent assignee, then checkpoint deletion, so a later restart can finish an
 interrupted cleanup without duplicating a result.
 
+## Releasing
+
+1. Bump `version` in `pyproject.toml` and merge the change to `main`.
+2. Tag that commit `v<version>` (for example `v0.3.0`) and push the tag.
+
+CI runs `scripts/check_tag_version.py` on every `v*` tag push and fails when the
+tag is not exactly `v` + the `pyproject.toml` version, naming both values. The
+agent never creates or pushes tags. The running version is reported in the
+startup `provenance_verified` event, each attempt's `attempt.json`
+(`agent_version`) and `agentctl status`.
+
 ## Development
 
 ```shell

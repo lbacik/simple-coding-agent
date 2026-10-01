@@ -17,6 +17,7 @@ import uuid
 from collections.abc import Callable
 from pathlib import Path
 
+from simple_coding_agent.agent_version import UNKNOWN_VERSION
 from simple_coding_agent.control_server import (
     ControlUnavailableError,
     resolve_socket_path,
@@ -181,6 +182,7 @@ def submit_mutating(
 def format_status(status: dict) -> str:
     lines = [
         f"repository: {status.get('repository')}",
+        f"agent version: {status.get('agent_version', UNKNOWN_VERSION)}",
         f"intake: {status.get('intake')}",
     ]
     active = status.get("active_attempt")

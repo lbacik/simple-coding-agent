@@ -25,6 +25,8 @@ import sqlite3
 import threading
 from pathlib import Path
 
+from simple_coding_agent.agent_version import agent_version
+
 
 class IntakeState(StrEnum):
     """Durable issue-intake state of one agent instance."""
@@ -2085,6 +2087,7 @@ def build_status(
 
     pending = get_command(pending_command_id) if pending_command_id else None
     return {
+        "agent_version": agent_version(),
         "repository": repository,
         "intake": "recovering" if recovering else intake.value,
         "recovering": recovering,
