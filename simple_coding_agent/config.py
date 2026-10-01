@@ -3,12 +3,16 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import logging
 import os
 from pathlib import Path
 import re
 from typing import Mapping
 
 import yaml
+
+
+logger = logging.getLogger(__name__)
 
 
 class ConfigurationError(ValueError):
@@ -51,8 +55,15 @@ class RuntimeConfig:
     claude_agent_sdk_version: str = _DEFAULT_CLAUDE_AGENT_SDK_VERSION
     claude_code_version: str = _DEFAULT_CLAUDE_CODE_VERSION
     max_turns: int = 60
-    max_budget_usd: int = 5
+    max_budget_usd: int = 20
+    max_budget_tokens: int = 4_000_000
     soft_threshold_percentage: float = 0.2
+
+    @property
+    def soft_threshold_tokens(self) -> int:
+        """Token budget reading past which the attempt must hand off."""
+
+        return int(self.max_budget_tokens * (1 - self.soft_threshold_percentage))
 
 
 @dataclass(frozen=True)
@@ -83,7 +94,7 @@ def load_runtime_config(environ: Mapping[str, str] | None = None) -> RuntimeConf
     if log_level not in _LOG_LEVELS:
         raise ConfigurationError("LOG_LEVEL must be a standard Python logging level")
 
-    return RuntimeConfig(
+    config = RuntimeConfig(
         github_token=github_token,
         meta_api_key=meta_api_key,
         target_repo=target_repo,
@@ -107,9 +118,12 @@ def load_runtime_config(environ: Mapping[str, str] | None = None) -> RuntimeConf
             values, "CLAUDE_CODE_VERSION", _DEFAULT_CLAUDE_CODE_VERSION
         ),
         max_turns=_positive_integer(values, "MAX_TURNS", 60),
-        max_budget_usd=_positive_integer(values, "MAX_BUDGET_USD", 5),
+        max_budget_usd=_positive_integer(values, "MAX_BUDGET_USD", 20),
+        max_budget_tokens=_positive_integer(values, "MAX_BUDGET_TOKENS", 4_000_000),
         soft_threshold_percentage=_fraction(values, "SOFT_THRESHOLD_PERCENTAGE", 0.2),
     )
+    _warn_when_usd_backstop_is_tighter(config)
+    return config
 
 
 def load_repository_profile(repository_dir: Path, profile_path: str = "") -> RepositoryProfile:
@@ -148,6 +162,26 @@ def load_repository_profile(repository_dir: Path, profile_path: str = "") -> Rep
         setup_timeout=_profile_duration(raw_profile, "setup_timeout", 120),
         env=_profile_environment(raw_profile),
     )
+
+
+def _warn_when_usd_backstop_is_tighter(config: RuntimeConfig) -> None:
+    """Warn when the USD backstop is tighter than the token budget.
+
+    The token budget priced at the CLI default uncached input rate
+    ($5/MTok) must not exceed the USD backstop, or the backstop trips
+    before the token budget is reached.
+    """
+
+    floor_usd = config.max_budget_tokens * 5 / 1_000_000
+    if config.max_budget_usd < floor_usd:
+        logger.warning(
+            "MAX_BUDGET_USD=%d is below the $5/MTok cost of MAX_BUDGET_TOKENS=%d "
+            "(about $%.0f); the USD backstop may trip before the token budget "
+            "is reached",
+            config.max_budget_usd,
+            config.max_budget_tokens,
+            floor_usd,
+        )
 
 
 def _required(values: Mapping[str, str], name: str) -> str:
