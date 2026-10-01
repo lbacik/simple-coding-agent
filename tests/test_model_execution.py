@@ -1527,6 +1527,49 @@ def test_every_handoff_prompt_names_the_issue_note_path_and_skill_tool(tmp_path:
         assert "`Skill` tool" in text
 
 
+def test_turn_limit_followup_names_the_issue_note_path_and_skill_tool(tmp_path: Path) -> None:
+    captured: list[FakeClient] = []
+
+    def client_factory(options: object) -> FakeClient:
+        client = FakeClient(
+            options,
+            [result(stop_reason="max_turns_exceeded")],
+            followup_messages=[result(stop_reason="end_turn")],
+        )
+        captured.append(client)
+        return client
+
+    executor = ModelExecutor(runtime_config(tmp_path), client_factory=client_factory)
+    asyncio.run(
+        executor.execute(issue_body="Fix it.", working_directory=tmp_path, issue_number=31)
+    )
+
+    prompt = captured[0].queried_prompts[0]
+    assert "#31" in prompt
+    assert ".agent/handoff/31.md" in prompt
+    assert "`Skill` tool" in prompt
+
+
+def test_handoff_prompt_without_an_issue_number_keeps_the_placeholder_path(
+    tmp_path: Path,
+) -> None:
+    captured: list[FakeClient] = []
+
+    def client_factory(options: object) -> FakeClient:
+        client = FakeClient(
+            options,
+            [result(stop_reason="max_turns_exceeded")],
+            followup_messages=[result(stop_reason="end_turn")],
+        )
+        captured.append(client)
+        return client
+
+    executor = ModelExecutor(runtime_config(tmp_path), client_factory=client_factory)
+    asyncio.run(executor.execute(issue_body="Fix it.", working_directory=tmp_path))
+
+    assert ".agent/handoff/<issue-number>.md" in captured[0].queried_prompts[0]
+
+
 def test_token_followup_is_skipped_when_remaining_budget_is_below_the_main_context(
     tmp_path: Path,
 ) -> None:
