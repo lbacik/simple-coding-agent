@@ -398,6 +398,7 @@ class ModelAttemptRunner:
                         "model_usage": execution.model_usage,
                         "skill_events": [event.__dict__ for event in execution.skill_events],
                         "model_stop_reason": execution.stop_reason,
+                        "token_budget": execution.token_budget,
                     }
                 )
             served_operator_request, late_operator_snapshot = self._read_operator_request()

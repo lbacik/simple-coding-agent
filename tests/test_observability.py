@@ -35,7 +35,7 @@ def test_archives_attempt_metadata_without_credentials(tmp_path: Path) -> None:
     directory = tmp_path / "logs" / "26" / "2026-09-20T13-00-00Z"
     metadata = json.loads((directory / "attempt.json").read_text())
     assert metadata["token_estimate_usd"] == "[REDACTED]"
-    assert metadata["token_estimate_authority"] == "non-authoritative"
+    assert "token_estimate_authority" not in metadata
     assert (directory / "setup_stdout.log").read_text() == "[REDACTED]"
 
 

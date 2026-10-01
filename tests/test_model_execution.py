@@ -2062,3 +2062,166 @@ def test_sdk_budget_error_at_the_token_ceiling_gets_no_followup(
     assert execution.token_hard_ceiling_reached is True
     assert captured[0].queried_prompts == []
     assert _classify_handoff_reason(execution) == "token_hard_ceiling"
+
+
+def _result_with_usage(model_usage: dict[str, dict[str, int]], **extra: object) -> object:
+    return SimpleNamespace(
+        is_error=False, stop_reason="end_turn", model_usage=model_usage, **extra
+    )
+
+
+def _execute_with(tmp_path: Path, messages: list[object], **overrides: object):
+    events: list[tuple[str, str, str]] = []
+    executor = ModelExecutor(
+        replace(runtime_config(tmp_path), **overrides),
+        client_factory=lambda options: FakeClient(options, messages),
+        event_log=lambda event, detail="", level="INFO", issue_number=None: events.append(
+            (event, detail, level)
+        ),
+    )
+    execution = asyncio.run(executor.execute(issue_body="Fix it.", working_directory=tmp_path))
+    return execution, events, executor
+
+
+def test_measured_attempt_summarises_the_token_budget(tmp_path: Path) -> None:
+    execution, events, _ = _execute_with(
+        tmp_path,
+        [
+            AssistantMessage(
+                content=[TextBlock(text="hi")],
+                model="muse-spark-1.3-contributor",
+                message_id="r1",
+                usage={"input_tokens": 1000, "output_tokens": 200},
+            ),
+            _result_with_usage(
+                {"muse-spark-1.3-contributor": {"input_tokens": 1000, "output_tokens": 200}},
+                total_cost_usd=1.5,
+            ),
+        ],
+    )
+
+    budget = execution.token_budget
+    assert budget["mode"] == "measured"
+    assert budget["actual_tokens"] == 1200
+    assert budget["error_ratio"] == pytest.approx(0, abs=0.01)
+    assert budget["unreported"]["estimated_tokens"] == 0
+    assert budget["soft_threshold_crossed"] is False
+    assert budget["soft_threshold_crossed_at_tokens"] is None
+    assert budget["hard_ceiling_reached"] is False
+    assert budget["total_cost_usd"] == 1.5
+    assert budget["max_budget_tokens"] == executor_config_value(tmp_path, "max_budget_tokens")
+    reconciled = [(detail, level) for name, detail, level in events if name == "token_budget_reconciled"]
+    assert len(reconciled) == 1 and reconciled[0][1] == "INFO"
+    assert '"mode": "measured"' in reconciled[0][0]
+
+
+def executor_config_value(tmp_path: Path, name: str) -> object:
+    return getattr(runtime_config(tmp_path), name)
+
+
+def test_zero_usage_attempt_is_estimated_with_unreported_equal_to_the_attempt(
+    tmp_path: Path,
+) -> None:
+    execution, _, _ = _execute_with(
+        tmp_path,
+        [
+            AssistantMessage(
+                content=[TextBlock(text="x" * 3000)],
+                model="muse-spark-1.3-contributor",
+                message_id="r1",
+                usage={"input_tokens": 0, "output_tokens": 0},
+            ),
+            _result_with_usage({"muse-spark-1.3-contributor": {"input_tokens": 5000}}),
+        ],
+    )
+
+    budget = execution.token_budget
+    assert budget["mode"] == "estimated"
+    assert budget["actual_tokens"] == 5000
+    assert budget["unreported"]["actual_tokens"] == 5000
+    assert budget["unreported"]["estimated_tokens"] == budget["estimated_tokens"] > 0
+    assert budget["unreported"]["error_ratio"] == budget["error_ratio"] is not None
+
+
+def test_measured_main_with_unreported_subagent_is_mixed(tmp_path: Path) -> None:
+    execution, _, _ = _execute_with(
+        tmp_path,
+        [
+            AssistantMessage(
+                content=[],
+                model="muse-spark-1.3-contributor",
+                message_id="m1",
+                usage={"input_tokens": 1000},
+            ),
+            AssistantMessage(
+                content=[TextBlock(text="y" * 3000)],
+                model="muse-spark-1.3-contributor",
+                message_id="s1",
+                parent_tool_use_id="toolu_sub",
+                usage={"input_tokens": 0, "output_tokens": 0},
+            ),
+            _result_with_usage({"muse-spark-1.3-contributor": {"input_tokens": 4000}}),
+        ],
+    )
+
+    budget = execution.token_budget
+    assert budget["mode"] == "mixed"
+    assert budget["actual_tokens"] == 4000
+    assert budget["unreported"]["actual_tokens"] == 3000
+
+
+def test_hard_ceiling_without_a_terminal_has_null_actuals(tmp_path: Path) -> None:
+    execution, _, _ = _execute_with(
+        tmp_path,
+        [
+            AssistantMessage(
+                content=[],
+                model="muse-spark-1.3-contributor",
+                message_id="r-big",
+                usage={"input_tokens": 1_100_000},
+            ),
+        ],
+        max_budget_tokens=1_000_000,
+    )
+
+    budget = execution.token_budget
+    assert budget["hard_ceiling_reached"] is True
+    assert budget["actual_tokens"] is None
+    assert budget["error_ratio"] is None
+    assert budget["unreported"]["actual_tokens"] is None
+    assert budget["unreported"]["error_ratio"] is None
+
+
+def test_compact_boundary_is_logged_without_touching_the_ledger(tmp_path: Path) -> None:
+    from claude_agent_sdk import SystemMessage
+
+    def run(messages: list[object]):
+        return _execute_with(tmp_path, messages)
+
+    usage = AssistantMessage(
+        content=[],
+        model="muse-spark-1.3-contributor",
+        message_id="r1",
+        usage={"input_tokens": 1000},
+    )
+    done = _result_with_usage({"muse-spark-1.3-contributor": {"input_tokens": 1000}})
+    baseline, _, _ = run([usage, done])
+    with_meta, events_a, _ = run(
+        [
+            usage,
+            SystemMessage(
+                subtype="compact_boundary",
+                data={"compact_metadata": {"trigger": "auto", "pre_tokens": 150000}},
+            ),
+            done,
+        ]
+    )
+    without_meta, events_b, _ = run(
+        [usage, SystemMessage(subtype="compact_boundary", data={}), done]
+    )
+
+    logged_a = [d for n, d, lvl in events_a if n == "context_compacted"]
+    logged_b = [d for n, d, lvl in events_b if n == "context_compacted"]
+    assert logged_a == ["thread=main; trigger=auto; pre_tokens=150000"]
+    assert logged_b == ["thread=main; trigger=None; pre_tokens=None"]
+    assert with_meta.token_budget == baseline.token_budget == without_meta.token_budget
