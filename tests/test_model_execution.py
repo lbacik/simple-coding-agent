@@ -1540,3 +1540,58 @@ def test_quiet_stream_longer_than_operator_wait_still_reaches_terminal(
 
 
 
+
+
+def test_records_cli_session_id_from_init_and_result_messages(tmp_path: Path) -> None:
+    from claude_agent_sdk import SystemMessage
+
+    terminal = SimpleNamespace(
+        is_error=False,
+        stop_reason="end_turn",
+        model_usage={"muse-spark-1.3-contributor": {"input_tokens": 12}},
+        session_id="session-terminal",
+    )
+
+    def client_factory(options: object) -> FakeClient:
+        return FakeClient(
+            options,
+            [
+                SystemMessage(subtype="init", data={"session_id": "session-init"}),
+                SimpleNamespace(model="muse-spark-1.3-contributor"),
+                terminal,
+            ],
+        )
+
+    executor = ModelExecutor(runtime_config(tmp_path), client_factory=client_factory)
+    assert executor.cli_session_id is None
+
+    execution = asyncio.run(
+        executor.execute(issue_body="Fix it.", working_directory=tmp_path)
+    )
+
+    assert execution.status is ModelExecutionStatus.SUCCEEDED
+    assert executor.cli_session_id == "session-terminal"
+
+
+def test_cli_session_id_resets_between_executions(tmp_path: Path) -> None:
+    terminal = SimpleNamespace(
+        is_error=False,
+        stop_reason="end_turn",
+        model_usage={"muse-spark-1.3-contributor": {"input_tokens": 12}},
+        session_id="session-one",
+    )
+    calls = 0
+
+    def client_factory(options: object) -> FakeClient:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return FakeClient(options, [terminal])
+        return FakeClient(options, [result()])
+
+    executor = ModelExecutor(runtime_config(tmp_path), client_factory=client_factory)
+    asyncio.run(executor.execute(issue_body="Fix it.", working_directory=tmp_path))
+    assert executor.cli_session_id == "session-one"
+
+    asyncio.run(executor.execute(issue_body="Fix it.", working_directory=tmp_path))
+    assert executor.cli_session_id is None

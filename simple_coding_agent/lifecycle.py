@@ -391,6 +391,7 @@ class ModelAttemptRunner:
                     archive=archive,
                 )
             )
+            self._archive_cli_transcripts(archive, claim.issue.number)
             if archive is not None:
                 archive.write_attempt(
                     {
@@ -401,12 +402,14 @@ class ModelAttemptRunner:
                 )
             served_operator_request, late_operator_snapshot = self._read_operator_request()
         except BaseException:
-            # Model execution, or recording its result, failed: still seal
-            # whatever the model left behind, then propagate so the attempt
-            # finalizes as an infrastructure error with the work sealed on
-            # the branch. A seal failure is only logged here. It refuses on
+            # Model execution, or recording its result, failed: still archive
+            # whatever transcripts the model left behind and seal whatever
+            # work is on the branch, then propagate so the attempt finalizes
+            # as an infrastructure error with the work sealed on the branch.
+            # A seal failure is only logged here. It refuses on
             # an unresolved rebase, which cleanup then aborts; any other
             # dirty tree makes cleanup hold the workspace for the operator.
+            self._archive_cli_transcripts(archive, claim.issue.number)
             try:
                 self._workspace.seal(
                     issue_number=claim.issue.number,
@@ -681,6 +684,35 @@ class ModelAttemptRunner:
         )
         if callable(set_reporter):
             set_reporter(reporter)
+
+    def _archive_cli_transcripts(
+        self, archive: AttemptArchive | None, issue_number: int
+    ) -> None:
+        """Copy this attempt's CLI session transcripts into the attempt archive.
+
+        Best-effort: the copy never changes the attempt's status or outcome.
+        Executors without the session seam (older fakes) and archives without
+        the copy seam are left alone.
+        """
+
+        if archive is None:
+            return
+        copy = getattr(archive, "copy_cli_transcripts", None)
+        if not callable(copy):
+            return
+        try:
+            copy(
+                getattr(self._model_executor, "cli_session_id", None),
+                issue_number=issue_number,
+                event_log=self._event_log,
+            )
+        except Exception as error:
+            self._event_log(
+                "transcripts_copy_failed",
+                f"reason={_exception_detail(error)}",
+                level="WARNING",
+                issue_number=issue_number,
+            )
 
     def _read_operator_request(
         self,
