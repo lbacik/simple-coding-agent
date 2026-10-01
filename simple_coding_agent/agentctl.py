@@ -181,6 +181,7 @@ def submit_mutating(
 def format_status(status: dict) -> str:
     lines = [
         f"repository: {status.get('repository')}",
+        f"agent version: {status.get('agent_version', 'unknown')}",
         f"intake: {status.get('intake')}",
     ]
     active = status.get("active_attempt")

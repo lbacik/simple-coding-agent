@@ -59,7 +59,10 @@ def main() -> None:
     logger.emit(
         "provenance_verified",
         phase="startup",
-        detail=f"sdk={provenance.sdk_version}; cli={provenance.cli_version}",
+        detail=(
+            f"agent={provenance.agent_version}; sdk={provenance.sdk_version};"
+            f" cli={provenance.cli_version}"
+        ),
     )
     github = GitHubGraphQLTransport(config.github_token, max_retries=config.max_retries)
     workspace = GitWorkspace(
