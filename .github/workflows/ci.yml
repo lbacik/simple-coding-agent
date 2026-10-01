@@ -29,4 +29,8 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
       - run: uv sync --extra dev
+      # Several tests commit to throwaway repos and rely on an ambient identity.
+      - run: |
+          git config --global user.name "CI"
+          git config --global user.email "ci@example.invalid"
       - run: uv run pytest
