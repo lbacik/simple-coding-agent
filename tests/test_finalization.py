@@ -213,7 +213,9 @@ def test_dirty_worktree_during_startup_holds_without_publishing(
     assert completions.read_all() == {}
 
 
-def test_malformed_checkpoint_holds_intake_without_claiming(tmp_path: Path) -> None:
+def test_malformed_checkpoint_holds_intake_without_claiming(
+    tmp_path: Path, workspace: InMemoryWorkspace, publisher: FakePublisher
+) -> None:
     path = tmp_path / "state" / "attempt.json"
     path.parent.mkdir(parents=True)
     path.write_text("{not JSON")
@@ -254,7 +256,9 @@ def test_dirty_tree_without_checkpoint_holds_intake(
     assert AttemptStateStore(tmp_path).read() is None
 
 
-def test_error_limit_trips_before_the_completion_record(tmp_path: Path) -> None:
+def test_error_limit_trips_before_the_completion_record(
+    tmp_path: Path, workspace: InMemoryWorkspace, publisher: FakePublisher
+) -> None:
     """The circuit breaker must fire without recording a completion it never reached.
 
     Accounting precedes the ledger entry so a limit trip leaves the checkpoint
@@ -266,11 +270,11 @@ def test_error_limit_trips_before_the_completion_record(tmp_path: Path) -> None:
     completions = AttemptCompletionStore(tmp_path)
     errors = ConsecutiveErrorStore(tmp_path)
     lifecycle = AgentLifecycle(
-        tracker=_FakeTracker(claim),
+        tracker=FakeTracker(next_claim=claim),
         attempt_state=AttemptStateStore(tmp_path),
-        workspace=_FakeWorkspace(),
+        workspace=workspace,
         profile_loader=lambda _: _profile(),
-        publisher=_FakePublisher(),
+        publisher=publisher,
         attempt_runner=_evidence_runner(AttemptOutcome.INFRASTRUCTURE_ERROR),
         error_store=errors,
         max_consecutive_errors=1,
@@ -285,17 +289,19 @@ def test_error_limit_trips_before_the_completion_record(tmp_path: Path) -> None:
     assert errors.read().count == 1
 
 
-def test_error_limit_survives_restart_replay_without_a_new_claim(tmp_path: Path) -> None:
+def test_error_limit_survives_restart_replay_without_a_new_claim(
+    tmp_path: Path, workspace: InMemoryWorkspace, publisher: FakePublisher
+) -> None:
     """Replay after a limit trip re-trips the limit instead of claiming anew."""
     claim = Claim(_issue(24), Assignment("issue-24", "agent-id"))
     completions = AttemptCompletionStore(tmp_path)
     errors = ConsecutiveErrorStore(tmp_path)
     first = AgentLifecycle(
-        tracker=_FakeTracker(claim),
+        tracker=FakeTracker(next_claim=claim),
         attempt_state=AttemptStateStore(tmp_path),
-        workspace=_FakeWorkspace(),
+        workspace=workspace,
         profile_loader=lambda _: _profile(),
-        publisher=_FakePublisher(),
+        publisher=publisher,
         attempt_runner=_evidence_runner(AttemptOutcome.INFRASTRUCTURE_ERROR),
         error_store=errors,
         max_consecutive_errors=1,
@@ -305,13 +311,13 @@ def test_error_limit_survives_restart_replay_without_a_new_claim(tmp_path: Path)
     with pytest.raises(SystemExit):
         first.run_once()
 
-    tracker = _FakeTracker(None)
+    tracker = FakeTracker({24: _issue(24)})
     second = AgentLifecycle(
         tracker=tracker,
         attempt_state=AttemptStateStore(tmp_path),
-        workspace=_FakeWorkspace(),
+        workspace=workspace,
         profile_loader=lambda _: _profile(),
-        publisher=_FakePublisher(),
+        publisher=publisher,
         error_store=errors,
         max_consecutive_errors=1,
         completion_store=completions,
@@ -325,20 +331,21 @@ def test_error_limit_survives_restart_replay_without_a_new_claim(tmp_path: Path)
     assert AttemptStateStore(tmp_path).read() is not None
 
 
-def test_live_dirty_worktree_holds_without_publishing(tmp_path: Path) -> None:
+def test_live_dirty_worktree_holds_without_publishing(
+    tmp_path: Path, publisher: FakePublisher
+) -> None:
     """Dirty work found while preparing a live attempt holds like recovery does.
 
     No result comment, no issue release, no ledger entry: the branch,
     checkpoint, and working tree stay available for inspection.
     """
     claim = Claim(_issue(24), Assignment("issue-24", "agent-id"))
-    tracker = _FakeTracker(claim)
-    publisher = _FakePublisher()
+    tracker = FakeTracker(next_claim=claim)
     completions = AttemptCompletionStore(tmp_path)
     lifecycle = AgentLifecycle(
         tracker=tracker,
         attempt_state=AttemptStateStore(tmp_path),
-        workspace=_PrepareDirtyWorkspace(),
+        workspace=PrepareDirtyWorkspace(tmp_path / "repo"),
         profile_loader=lambda _: _profile(),
         publisher=publisher,
         attempt_runner=_evidence_runner(AttemptOutcome.INCOMPLETE),
@@ -354,16 +361,18 @@ def test_live_dirty_worktree_holds_without_publishing(tmp_path: Path) -> None:
     assert AttemptStateStore(tmp_path).read() is not None
 
 
-def test_cleanup_failure_holds_with_a_visible_event(tmp_path: Path) -> None:
+def test_cleanup_failure_holds_with_a_visible_event(
+    tmp_path: Path, publisher: FakePublisher
+) -> None:
     """A confirmed comment and release with failed cleanup keeps the checkpoint visibly."""
     claim = Claim(_issue(24), Assignment("issue-24", "agent-id"))
     events: list[str] = []
     lifecycle = AgentLifecycle(
-        tracker=_FakeTracker(claim),
+        tracker=FakeTracker(next_claim=claim),
         attempt_state=AttemptStateStore(tmp_path),
-        workspace=_CleanupFailingWorkspace(),
+        workspace=CleanupFailingWorkspace(tmp_path / "repo"),
         profile_loader=lambda _: _profile(),
-        publisher=_FakePublisher(),
+        publisher=publisher,
         attempt_runner=_evidence_runner(AttemptOutcome.INCOMPLETE),
         event_log=lambda event, detail="", level="INFO", issue_number=None: events.append(event),
         completion_store=AttemptCompletionStore(tmp_path),
@@ -377,19 +386,22 @@ def test_cleanup_failure_holds_with_a_visible_event(tmp_path: Path) -> None:
     assert AttemptCompletionStore(tmp_path).read_all() == {}
 
 
-def test_malformed_completion_ledger_holds_intake_without_claiming(tmp_path: Path) -> None:
+def test_malformed_completion_ledger_holds_intake_without_claiming(
+    tmp_path: Path, workspace: InMemoryWorkspace, publisher: FakePublisher
+) -> None:
     path = tmp_path / "state" / "completed_attempts.json"
     path.parent.mkdir(parents=True)
     path.write_text("{not JSON")
     _state_at(tmp_path, AttemptPhase.PUSHING)
     events: list[str] = []
-    tracker = _FakeTracker(None)
+    tracker = FakeTracker({24: _issue(24)})
+    workspace.model_commit("completed", files=("completed",))
     lifecycle = AgentLifecycle(
         tracker=tracker,
         attempt_state=AttemptStateStore(tmp_path),
-        workspace=_FakeWorkspace(commits=("completed",)),
+        workspace=workspace,
         profile_loader=lambda _: _profile(),
-        publisher=_FakePublisher(),
+        publisher=publisher,
         event_log=lambda event, detail="", level="INFO", issue_number=None: events.append(event),
         completion_store=AttemptCompletionStore(tmp_path),
     )
