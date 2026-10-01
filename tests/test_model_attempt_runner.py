@@ -854,7 +854,7 @@ def test_missing_transcript_source_logs_failure_and_leaves_outcome_unchanged(
         cli_session_id = "no-such-session"
 
     executor = SessionedExecutor(status=ModelExecutionStatus.SUCCEEDED)
-    workspace = FakeWorkspace(commits=("Implemented",))
+    workspace = seeded_workspace(tmp_path / "repo", "Implemented")
     events: list[tuple[str, str, str]] = []
     runner = build_runner(
         tmp_path,
