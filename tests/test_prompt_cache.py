@@ -24,7 +24,6 @@ from simple_coding_agent.config import RuntimeConfig
 from simple_coding_agent.model_execution import (
     PROMPT_CACHE_HIT_RATE_THRESHOLD,
     PROMPT_CACHE_MIN_MEASURED_RESPONSES,
-    ModelExecutionStatus,
     ModelExecutor,
 )
 from simple_coding_agent.token_ledger import TokenLedger, usage_by_category
