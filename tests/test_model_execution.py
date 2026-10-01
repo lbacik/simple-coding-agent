@@ -89,6 +89,20 @@ def result(*, is_error: bool = False, stop_reason: str | None = "end_turn") -> o
     )
 
 
+def soft_crossing_messages(*, responses: int = 10, per_response: int = 90_000) -> list[object]:
+    """Responses with a realistic ~90k main context that cross 80% of a 1M budget."""
+
+    return [
+        AssistantMessage(
+            content=[],
+            model="muse-spark-1.3-contributor",
+            usage={"input_tokens": per_response},
+            message_id=f"r{index}",
+        )
+        for index in range(responses)
+    ]
+
+
 def test_dispatches_the_issue_body_to_the_pinned_sdk_and_returns_execution_evidence(
     tmp_path: Path,
 ) -> None:
@@ -489,12 +503,7 @@ def test_crossing_the_soft_cost_threshold_injects_additional_context_once(
     def client_factory(options: object) -> FakeClient:
         client = FakeClient(
             options,
-            [
-                AssistantMessage(
-                    content=[], model="muse-spark-1.3-contributor", usage={"input_tokens": 900_000}
-                ),
-                result(),
-            ],
+            [*soft_crossing_messages(), result()],
         )
         captured.append(client)
         return client
@@ -1298,12 +1307,7 @@ def test_soft_threshold_without_handoff_gets_one_followup_then_model_limit(
     def client_factory(options: object) -> FakeClient:
         client = FakeClient(
             options,
-            [
-                AssistantMessage(
-                    content=[], model="muse-spark-1.3-contributor", usage={"input_tokens": 900_000}
-                ),
-                result(),
-            ],
+            [*soft_crossing_messages(), result()],
             followup_messages=[result(stop_reason="end_turn")],
         )
         captured.append(client)
@@ -1333,12 +1337,7 @@ def test_soft_threshold_followup_that_hands_off_reports_handoff_requested(
     def client_factory(options: object) -> FakeClient:
         return FakeClient(
             options,
-            [
-                AssistantMessage(
-                    content=[], model="muse-spark-1.3-contributor", usage={"input_tokens": 900_000}
-                ),
-                result(),
-            ],
+            [*soft_crossing_messages(), result()],
             followup_messages=[result(stop_reason="end_turn")],
             on_query=invoke_handoff_skill,
         )
@@ -1446,6 +1445,121 @@ def test_cost_guard_accepts_handoff_commits_with_output_filters(tmp_path: Path) 
             pre_hook({"tool_name": "Bash", "tool_input": {"command": command}}, None, {})
         )
         assert decision["hookSpecificOutput"]["permissionDecision"] == "deny", command
+
+
+def test_cost_guard_allows_git_branch_show_current_only(tmp_path: Path) -> None:
+    captured: list[FakeClient] = []
+
+    def client_factory(options: object) -> FakeClient:
+        client = FakeClient(options, [result()])
+        captured.append(client)
+        return client
+
+    executor = ModelExecutor(runtime_config(tmp_path), client_factory=client_factory)
+    asyncio.run(executor.execute(issue_body="Fix it.", working_directory=tmp_path))
+    executor._soft_threshold_crossed = True
+    pre_hook = captured[0].options.hooks["PreToolUse"][0].hooks[0]
+
+    for command in [
+        "git branch --show-current",
+        "git -C /data/repo branch --show-current; git -C /data/repo log --oneline -3",
+        "git branch",
+    ]:
+        decision = asyncio.run(
+            pre_hook({"tool_name": "Bash", "tool_input": {"command": command}}, None, {})
+        )
+        assert decision == {}, command
+
+    for command in ["git branch -D main", "git branch new-branch", "git checkout main"]:
+        decision = asyncio.run(
+            pre_hook({"tool_name": "Bash", "tool_input": {"command": command}}, None, {})
+        )
+        assert decision["hookSpecificOutput"]["permissionDecision"] == "deny", command
+
+
+def test_cost_guard_denial_names_the_allowed_handoff_commands(tmp_path: Path) -> None:
+    captured: list[FakeClient] = []
+
+    def client_factory(options: object) -> FakeClient:
+        client = FakeClient(options, [result()])
+        captured.append(client)
+        return client
+
+    executor = ModelExecutor(runtime_config(tmp_path), client_factory=client_factory)
+    asyncio.run(executor.execute(issue_body="Fix it.", working_directory=tmp_path))
+    executor._soft_threshold_crossed = True
+    pre_hook = captured[0].options.hooks["PreToolUse"][0].hooks[0]
+
+    decision = asyncio.run(
+        pre_hook({"tool_name": "Bash", "tool_input": {"command": "pytest -q"}}, None, {})
+    )
+    reason = decision["hookSpecificOutput"]["permissionDecisionReason"]
+
+    for allowed in ("git status", "git add", "git commit", "git branch --show-current", ".agent/handoff/"):
+        assert allowed in reason
+    assert "denied as a whole" in reason
+
+
+def test_every_handoff_prompt_names_the_issue_note_path_and_skill_tool(tmp_path: Path) -> None:
+    captured: list[FakeClient] = []
+
+    def client_factory(options: object) -> FakeClient:
+        client = FakeClient(
+            options,
+            [*soft_crossing_messages(), result()],
+        )
+        captured.append(client)
+        return client
+
+    executor = ModelExecutor(
+        replace(runtime_config(tmp_path), max_budget_tokens=1_000_000), client_factory=client_factory
+    )
+    asyncio.run(
+        executor.execute(issue_body="Fix it.", working_directory=tmp_path, issue_number=149)
+    )
+    post_hook = captured[0].options.hooks["PostToolUse"][0].hooks[0]
+    tool_event = {"tool_name": "Bash", "tool_input": {"command": "pytest"}, "tool_response": "ok"}
+    notice = asyncio.run(post_hook(tool_event, None, {}))["hookSpecificOutput"]["additionalContext"]
+
+    for text in (notice, captured[0].queried_prompts[0]):
+        assert "#149" in text
+        assert ".agent/handoff/149.md" in text
+        assert "`Skill` tool" in text
+
+
+def test_token_followup_is_skipped_when_remaining_budget_is_below_the_main_context(
+    tmp_path: Path,
+) -> None:
+    captured: list[FakeClient] = []
+    events: list[tuple[str, str]] = []
+
+    def client_factory(options: object) -> FakeClient:
+        client = FakeClient(
+            options,
+            [
+                AssistantMessage(
+                    content=[], model="muse-spark-1.3-contributor", usage={"input_tokens": 950_000}
+                ),
+                result(),
+            ],
+            followup_messages=[result(stop_reason="end_turn")],
+        )
+        captured.append(client)
+        return client
+
+    executor = ModelExecutor(
+        replace(runtime_config(tmp_path), max_budget_tokens=1_000_000),
+        client_factory=client_factory,
+        event_log=lambda event, detail="", level="INFO", issue_number=None: events.append(
+            (event, detail)
+        ),
+    )
+    execution = asyncio.run(executor.execute(issue_body="Fix it.", working_directory=tmp_path))
+
+    assert execution.status is ModelExecutionStatus.MODEL_LIMIT_REACHED
+    assert captured[0].queried_prompts == []
+    blocked = [detail for name, detail in events if name == "token_soft_threshold_handoff_followup_blocked"]
+    assert blocked and "remaining_budget_tokens" in blocked[0]
 
 
 def test_tool_events_record_the_calling_thread(tmp_path: Path) -> None:

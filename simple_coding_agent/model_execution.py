@@ -44,35 +44,79 @@ _HANDOFF_FOLLOWUP_TIMEOUT = 300
 _OPERATOR_HANDOFF_DELIVERY_WINDOW_SECONDS = 60
 _OPERATOR_HANDOFF_MODEL_DEADLINE_SECONDS = 240
 
-_COST_HANDOFF_INSTRUCTION = (
-    "This attempt is approaching its token budget. Invoke the `handoff` skill now "
-    "to preserve your progress cooperatively instead of continuing further work."
+def _handoff_target(issue_number: int | None) -> str:
+    """Name the issue and the exact note path every handoff instruction must carry."""
+
+    if issue_number is None:
+        note = "`.agent/handoff/<issue-number>.md`"
+        return f"the handoff note path is {note} (use the number of the issue you are working on)"
+    return (
+        f"you are working on issue #{issue_number}; the handoff note path is exactly"
+        f" `.agent/handoff/{issue_number}.md`"
+    )
+
+
+_HANDOFF_SKILL_TOOL_HINT = (
+    "Invoke it with the `Skill` tool (skill name `handoff`); do not just read"
+    " `SKILL.md`, because reading it does not register the handoff."
 )
-_COST_HANDOFF_FOLLOWUP_PROMPT = (
-    "This attempt crossed its token soft threshold and must now end by handing off. "
-    "Invoke the `handoff` skill now to preserve your progress: commit any outstanding "
-    "work, then write and commit the handoff note. Do not attempt further implementation work."
-)
-_OPERATOR_HANDOFF_INSTRUCTION = (
-    "The operator requested a handoff (`agentctl handoff now`). Invoke the"
-    " `handoff` skill now to preserve your progress cooperatively instead of"
-    " continuing further work: commit any outstanding work in ordinary work"
-    " commits, then write `.agent/handoff/<issue-number>.md` with"
-    " `reason: operator_request` and commit it separately as the final commit."
-    " Do not start another implementation step."
-)
-_LIMIT_HANDOFF_FOLLOWUP_PROMPT = (
-    "Execution reached its turn or time limit. Invoke the `handoff` skill now to "
-    "preserve your progress: commit any outstanding work, then write and commit "
-    "the handoff note. Do not attempt further implementation work."
-)
-_OPERATOR_HANDOFF_FOLLOWUP_PROMPT = (
-    "The operator requested a handoff (`agentctl handoff now`) and the safe"
-    " boundary was missed. Invoke the `handoff` skill now to preserve your"
-    " progress: commit any outstanding work in ordinary work commits, then write"
-    " `.agent/handoff/<issue-number>.md` with `reason: operator_request` and"
-    " commit it separately as the final commit. Do not attempt further"
-    " implementation work."
+
+
+def _cost_handoff_instruction(issue_number: int | None) -> str:
+    return (
+        "This attempt is approaching its token budget. Invoke the `handoff` skill now "
+        "to preserve your progress cooperatively instead of continuing further work. "
+        f"{_HANDOFF_SKILL_TOOL_HINT} {_handoff_target(issue_number).capitalize()}."
+    )
+
+
+def _cost_handoff_followup_prompt(issue_number: int | None) -> str:
+    return (
+        "This attempt crossed its token soft threshold and must now end by handing off. "
+        "Invoke the `handoff` skill now to preserve your progress: commit any outstanding "
+        "work, then write and commit the handoff note. Do not attempt further implementation "
+        f"work. {_HANDOFF_SKILL_TOOL_HINT} {_handoff_target(issue_number).capitalize()}."
+    )
+
+
+def _operator_handoff_instruction(issue_number: int | None) -> str:
+    return (
+        "The operator requested a handoff (`agentctl handoff now`). Invoke the"
+        " `handoff` skill now to preserve your progress cooperatively instead of"
+        " continuing further work: commit any outstanding work in ordinary work"
+        " commits, then write the handoff note with `reason: operator_request` and"
+        " commit it separately as the final commit. Do not start another"
+        f" implementation step. {_HANDOFF_SKILL_TOOL_HINT}"
+        f" {_handoff_target(issue_number).capitalize()}."
+    )
+
+
+def _limit_handoff_followup_prompt(issue_number: int | None) -> str:
+    return (
+        "Execution reached its turn or time limit. Invoke the `handoff` skill now to "
+        "preserve your progress: commit any outstanding work, then write and commit "
+        f"the handoff note. Do not attempt further implementation work. {_HANDOFF_SKILL_TOOL_HINT}"
+        f" {_handoff_target(issue_number).capitalize()}."
+    )
+
+
+def _operator_handoff_followup_prompt(issue_number: int | None) -> str:
+    return (
+        "The operator requested a handoff (`agentctl handoff now`) and the safe"
+        " boundary was missed. Invoke the `handoff` skill now to preserve your"
+        " progress: commit any outstanding work in ordinary work commits, then write"
+        " the handoff note with `reason: operator_request` and commit it separately"
+        " as the final commit. Do not attempt further implementation work."
+        f" {_HANDOFF_SKILL_TOOL_HINT} {_handoff_target(issue_number).capitalize()}."
+    )
+
+
+#: Appended to every soft-threshold denial so the model knows what stays allowed.
+_COST_ALLOWED_COMMANDS = (
+    "Still allowed: `git status`, `git diff`, `git add`, `git commit`, `git log`,"
+    " `git rev-parse`, `git rev-list`, `git branch --show-current`, and writing the"
+    " handoff note under `.agent/handoff/`. A compound command (`&&`, `;`, `|`) is"
+    " denied as a whole if any part of it is not allowed, so split it up."
 )
 
 
@@ -431,7 +475,7 @@ class ModelExecutor:
         await client.interrupt()
         await self._drain(client)
         try:
-            await client.query(_OPERATOR_HANDOFF_FOLLOWUP_PROMPT)
+            await client.query(_operator_handoff_followup_prompt(self._issue_number))
             followup_terminal, followup_models = await self._receive_terminal(client)
         except Exception:
             return None
@@ -595,7 +639,7 @@ class ModelExecutor:
                     followup = await self._attempt_handoff_followup(
                         client,
                         observed_models,
-                        prompt=_COST_HANDOFF_FOLLOWUP_PROMPT,
+                        prompt=_cost_handoff_followup_prompt(self._issue_number),
                         success_explanation=(
                             "Model invoked the handoff skill after a token"
                             " soft-threshold instruction."
@@ -691,6 +735,28 @@ class ModelExecutor:
 
         return self._hard_token_limit_reached()
 
+    def _cost_followup_cannot_fit(self) -> bool:
+        """Whether one more main-thread response would overrun the hard ceiling.
+
+        The follow-up's first response is estimated at no less than the main
+        context, so a remaining budget below it would trip the hard ceiling
+        before the model could act; the system-written handoff is used instead.
+        """
+
+        if not self._ledger.has_thread("main"):
+            return False
+        remaining = self._config.max_budget_tokens - self._ledger.budget_tokens
+        main_context = self._ledger.context_tokens("main")
+        if remaining >= main_context:
+            return False
+        self._log(
+            "token_soft_threshold_handoff_followup_blocked",
+            f"remaining_budget_tokens={remaining:.0f} is below"
+            f" main_context_tokens={main_context:.0f}, so the follow-up could not"
+            " complete one response; the system-written handoff is used instead",
+        )
+        return True
+
     def _needs_cost_handoff_followup(
         self, terminal: ResultMessage, observed_models: tuple[str, ...]
     ) -> bool:
@@ -711,6 +777,8 @@ class ModelExecutor:
                 " follow-up query is issued and the terminal result decides"
                 " the outcome",
             )
+            return False
+        if self._cost_followup_cannot_fit():
             return False
         if getattr(terminal, "is_error", False):
             return False
@@ -738,7 +806,7 @@ class ModelExecutor:
         client: SDKClient,
         observed_models: tuple[str, ...],
         *,
-        prompt: str = _LIMIT_HANDOFF_FOLLOWUP_PROMPT,
+        prompt: str | None = None,
         success_explanation: str = (
             "Model invoked the handoff skill after reaching a turns/timeout limit."
         ),
@@ -752,6 +820,8 @@ class ModelExecutor:
         out is itself evidence that handoff is not achievable right now.
         """
 
+        if prompt is None:
+            prompt = _limit_handoff_followup_prompt(self._issue_number)
         try:
             await client.query(prompt)
             async with asyncio.timeout(_HANDOFF_FOLLOWUP_TIMEOUT):
@@ -1384,7 +1454,7 @@ class ModelExecutor:
                 # frees the remaining budget for the handoff.
                 self._handoff_context_delivered = True
                 self._log("token_soft_threshold_handoff_context_injected")
-                contexts.append(_COST_HANDOFF_INSTRUCTION)
+                contexts.append(_cost_handoff_instruction(self._issue_number))
             else:
                 # Subagents are still recorded as running (for example the
                 # crossing flag was set without going through the stop
@@ -1398,7 +1468,7 @@ class ModelExecutor:
                 "operator_handoff_context_delivered",
                 f"request={self._operator_handoff.request_id}",
             )
-            contexts.append(_OPERATOR_HANDOFF_INSTRUCTION)
+            contexts.append(_operator_handoff_instruction(self._issue_number))
         if contexts:
             return {
                 "hookSpecificOutput": {
@@ -1533,7 +1603,8 @@ def _cost_deny(restriction: str) -> dict[str, Any]:
     return _deny(
         "Token soft threshold reached. "
         f"{restriction} "
-        "You must invoke the `handoff` skill now to preserve your progress."
+        "You must invoke the `handoff` skill now to preserve your progress. "
+        f"{_COST_ALLOWED_COMMANDS}"
     )
 
 
@@ -1742,6 +1813,11 @@ def _is_handoff_command(command: str) -> bool:
             subcommand = _git_subcommand(arguments)
             if subcommand in ("status", "diff", "add", "commit", "log", "rev-parse", "rev-list"):
                 continue
+            if subcommand == "branch" and _git_subcommand_arguments(arguments) in (
+                [],
+                ["--show-current"],
+            ):
+                continue
             return False
         if executable in ("date", "mkdir", "echo", "cat", "pwd", "ls", "test", "true"):
             continue
@@ -1761,6 +1837,21 @@ def _git_subcommand(arguments: list[str]) -> str | None:
             index += 1
         else:
             return argument
+    return None
+
+
+def _git_subcommand_arguments(arguments: list[str]) -> list[str] | None:
+    """Arguments after the git subcommand, skipping the global ``-C <dir>`` options."""
+
+    index = 0
+    while index < len(arguments):
+        argument = arguments[index]
+        if argument == "-C" and index + 1 < len(arguments):
+            index += 2
+        elif argument.startswith("-"):
+            index += 1
+        else:
+            return arguments[index + 1 :]
     return None
 
 
