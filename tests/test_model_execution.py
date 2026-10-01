@@ -1168,8 +1168,10 @@ def test_cost_handoff_instruction_reaches_main_thread_once_subagents_stopped(
         return client
 
     events: list[tuple[str, str]] = []
+    # Pinned to the pre-token-budget USD regime: this test exercises USD threshold behavior.
+    config = replace(runtime_config(tmp_path), max_budget_usd=5)
     executor = ModelExecutor(
-        runtime_config(tmp_path),
+        config,
         client_factory=client_factory,
         event_log=lambda event, detail="", issue_number=None: events.append((event, detail)),
     )
@@ -1285,7 +1287,9 @@ def test_soft_threshold_without_handoff_gets_one_followup_then_model_limit(
         captured.append(client)
         return client
 
-    executor = ModelExecutor(runtime_config(tmp_path), client_factory=client_factory)
+    executor = ModelExecutor(
+        replace(runtime_config(tmp_path), max_budget_usd=5), client_factory=client_factory
+    )
     execution = asyncio.run(executor.execute(issue_body="Fix it.", working_directory=tmp_path))
 
     assert execution.status is ModelExecutionStatus.MODEL_LIMIT_REACHED
@@ -1317,7 +1321,10 @@ def test_soft_threshold_followup_that_hands_off_reports_handoff_requested(
             on_query=invoke_handoff_skill,
         )
 
-    executor = ModelExecutor(runtime_config(tmp_path), client_factory=client_factory)
+    # Pinned to the pre-token-budget USD regime: this test exercises USD threshold behavior.
+    executor = ModelExecutor(
+        replace(runtime_config(tmp_path), max_budget_usd=5), client_factory=client_factory
+    )
     holder["executor"] = executor
 
     execution = asyncio.run(executor.execute(issue_body="Fix it.", working_directory=tmp_path))
@@ -1344,7 +1351,9 @@ def test_soft_threshold_followup_is_skipped_past_the_hard_cost_ceiling(
         captured.append(client)
         return client
 
-    executor = ModelExecutor(runtime_config(tmp_path), client_factory=client_factory)
+    executor = ModelExecutor(
+        replace(runtime_config(tmp_path), max_budget_usd=5), client_factory=client_factory
+    )
     execution = asyncio.run(executor.execute(issue_body="Fix it.", working_directory=tmp_path))
 
     assert execution.status is ModelExecutionStatus.MODEL_LIMIT_REACHED

@@ -9,6 +9,7 @@ original 240-second deadline and never bypasses the hard cost limit.
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -329,8 +330,9 @@ def test_fallback_never_bypasses_the_hard_cost_limit(tmp_path: Path) -> None:
     )
     client = FakeClient(object(), [heavy_usage, result()])
     current: list[OperatorHandoff | None] = [None]
+    # Pinned to the pre-token-budget USD regime: this test exercises the USD hard ceiling.
     executor = ModelExecutor(
-        runtime_config(tmp_path),
+        replace(runtime_config(tmp_path), max_budget_usd=5),
         client_factory=lambda options: client,
         clock=lambda: now,
     )
