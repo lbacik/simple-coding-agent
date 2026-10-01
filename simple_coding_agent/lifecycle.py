@@ -3807,7 +3807,13 @@ def _classify_handoff_reason(execution: object) -> str:
         or "turn" in stop
     ):
         return "turn_limit"
-    if stop == "timeout" or "timeout" in terminal or "timeout" in stop:
+    if (
+        stop == "timeout"
+        or "timeout" in terminal
+        or "timeout" in stop
+        or stop.startswith("aborted_")
+        or terminal.startswith("aborted_")
+    ):
         return "time_limit"
     return "cost_hard_limit"
 

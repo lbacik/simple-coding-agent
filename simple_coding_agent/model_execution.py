@@ -841,9 +841,7 @@ class ModelExecutor:
                 if self._token_hard_ceiling_reached:
                     await client.interrupt()
                     drained = await self._drain(client)
-                    if drained is not None:
-                        return drained, tuple(observed_models)
-                    return None, tuple(observed_models)
+                    return drained, tuple(observed_models)
                 model = getattr(message, "model", None)
                 if isinstance(model, str):
                     observed_models.append(model)
@@ -1044,7 +1042,7 @@ class ModelExecutor:
                         terminal = message
         except Exception:
             # Client teardown still runs; drain evidence is secondary to avoiding an orphan.
-            return terminal
+            pass
         return terminal
 
     def _classify(
