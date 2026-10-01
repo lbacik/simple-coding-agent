@@ -107,6 +107,10 @@ class InMemoryWorkspace:
     conflict state including an unresolved rebase, and branch position for
     cleanup assertions. Handoff notes are written as real files under
     ``working_directory`` so lifecycle note reads work unchanged.
+    ``leave_conflict`` plus ``note_model_finished`` (wired as the model
+    executor's ``after_execute`` hook) simulates the model resolving the
+    conflict during its turn; pass ``resolve_after_model=False`` to simulate
+    the model leaving it unresolved.
     """
 
     def __init__(
@@ -115,11 +119,14 @@ class InMemoryWorkspace:
         *,
         issue_number: int = 24,
         base_revision: str = "base-revision-0",
+        resolve_after_model: bool = True,
     ) -> None:
         self.working_directory = root
         root.mkdir(parents=True, exist_ok=True)
         self._branch = f"agent/issue-{issue_number}"
         self._base_revision = base_revision
+        self._resolve_after_model = resolve_after_model
+        self._model_finished = False
         self.current_branch = self._branch
         self.dirty: set[str] = set()
         self._commits: list[_RecordedCommit] = []
@@ -195,6 +202,19 @@ class InMemoryWorkspace:
         """Clear a simulated conflict, as if the model resolved it."""
 
         self._conflict = ConflictState(in_progress=False)
+
+    def note_model_finished(self) -> None:
+        """Simulate the model's turn ending so a resolution can take effect.
+
+        Wire as the model executor's ``after_execute`` hook: when
+        ``resolve_after_model`` holds (the default), a conflict left via
+        ``leave_conflict`` is resolved as if the model resolved it during
+        its turn; otherwise the conflict stays in place.
+        """
+
+        self._model_finished = True
+        if self._resolve_after_model:
+            self.resolve_conflict()
 
     def abort_unresolved_rebase(self, prepared: PreparedAttempt) -> None:
         self.abort_calls.append(prepared)
@@ -394,7 +414,9 @@ class FakePublisher:
     production publisher), while every other outcome publishes the example
     URL. Pass ``branch_url`` explicitly (including ``None``) or ``outcome``
     to pin publication behaviour, and ``comment_posted=False`` to simulate
-    an unconfirmed result comment.
+    an unconfirmed result comment. Per-call publication budgets arrive via
+    the ``timeout`` keyword (like the production publisher) and are recorded
+    on ``timeouts``.
     """
 
     _DEFAULT_BRANCH_URL = "https://example.test/tree/agent/issue-24"
@@ -411,9 +433,11 @@ class FakePublisher:
         self._comment_posted = comment_posted
         self.requests: list[object] = []
         self.outcomes: list[AttemptOutcome] = []
+        self.timeouts: list[float | None] = []
 
-    def publish(self, request: object) -> PublishedAttempt:
+    def publish(self, request: object, *, timeout: float | None = None) -> PublishedAttempt:
         self.requests.append(request)
+        self.timeouts.append(timeout)
         outcome = self._outcome or request.decision.outcome or AttemptOutcome.COMPLETE
         self.outcomes.append(outcome)
         if self._branch_url == FakePublisher._DEFAULT_BRANCH_URL:

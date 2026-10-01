@@ -19,12 +19,12 @@ from simple_coding_agent.control import (
 )
 from simple_coding_agent.github_tracker import (
     Assignment,
-    Claim,
     GitHubTracker,
     GitHubTrackerError,
     TrackerIssue,
     ineligibility_reason,
 )
+from tests.fakes import FakePublisher, FakeTracker, InMemoryWorkspace
 
 
 def issue(number: int, **overrides: object) -> TrackerIssue:
@@ -302,7 +302,7 @@ def test_prioritized_claim_is_rechecked_and_consumed_once(tmp_path: Path) -> Non
     assert store.get_command("req-next").acknowledgement is CommandAcknowledgement.COMPLETED  # type: ignore[union-attr]
 
     # The one-shot priority is consumed: the next cycle uses FIFO again.
-    tracker.fifo = [claim_for(tracker.issues[25])]
+    tracker.fifo = [25]
     assert lifecycle.run_once().status.value == "attempted"
     assert tracker.fifo_claims == [25]
 
@@ -578,108 +578,21 @@ def test_agentctl_next_issue_cli(tmp_path: Path, capsys: pytest.CaptureFixture[s
 
 
 # ---------------------------------------------------------------------------
-# fakes
+# lifecycle helpers
 # ---------------------------------------------------------------------------
-
-
-def claim_for(found: TrackerIssue) -> Claim:
-    return Claim(issue=found, assignment=Assignment(issue_id=found.id, assignee_id="viewer-id"))
-
-
-class FakeTracker:
-    def __init__(
-        self,
-        issues: dict[int, TrackerIssue],
-        *,
-        fifo: list[int] | None = None,
-    ) -> None:
-        self.issues = dict(issues)
-        self.fifo: list[Claim] = (
-            [claim_for(self.issues[number]) for number in fifo]
-            if fifo is not None
-            else []
-        )
-        self.fetch_errors: dict[int, Exception] = {}
-        self.assign_errors: dict[int, Exception] = {}
-        self.claimed_verified: list[int] = []
-        self.fifo_claims: list[int] = []
-        self.removed_labels: list[tuple[str, str]] = []
-
-    def fetch_issue(self, number: int) -> TrackerIssue | None:
-        if number in self.fetch_errors:
-            raise self.fetch_errors[number]
-        return self.issues.get(number)
-
-    def is_self_assigned(self, found: TrackerIssue) -> bool:
-        return "agent" in found.assignee_logins
-
-    def claim_verified(self, found: TrackerIssue) -> Claim:
-        if found.number in self.assign_errors:
-            raise self.assign_errors[found.number]
-        current = self.issues.get(found.number)
-        assert current is not None
-        from simple_coding_agent.github_tracker import ROUND_FINISHED
-
-        if ROUND_FINISHED in current.labels:
-            self.removed_labels.append((current.id, ROUND_FINISHED))
-        self.claimed_verified.append(found.number)
-        return Claim(issue=current, assignment=Assignment(issue_id=current.id, assignee_id="viewer-id"))
-
-    def claim_next(self) -> Claim | None:
-        if not self.fifo:
-            return None
-        claim = self.fifo.pop(0)
-        self.fifo_claims.append(claim.issue.number)
-        return claim
-
-    def recover_claim(self, issue_number: int) -> Claim | None:
-        found = self.issues.get(issue_number)
-        if found is None:
-            return None
-        return claim_for(found)
-
-    def release_attempt(self, issue_number: int, label: str, assignee_id: str) -> None:
-        return None
-
-    def release_handoff(self, issue_number: int, assignee_id: str) -> None:
-        return None
-
-
-class FakeWorkspace:
-    working_directory = Path("/repository")
-
-    def is_clean(self) -> bool:
-        return True
-
-    def prepare_for_profile_read(self, *, base_branch: str = "main") -> None:
-        return None
-
-    def prepare_attempt(self, *, base_branch: str, issue_number: int):
-        return type("Prepared", (), {"branch": f"agent/issue-{issue_number}"})()
-
-    def cleanup(self, *, base_branch: str, prepared: object, retain_branch: bool) -> None:
-        return None
-
-
-class FakePublisher:
-    def publish(self, request: object):
-        return type("Published", (), {"outcome": AttemptOutcome.COMPLETE, "branch_url": "https://example.test/x"})()
 
 
 def make_lifecycle(tmp_path: Path, issues: dict[int, TrackerIssue], *, fifo: list[int] | None = None):
     from simple_coding_agent.lifecycle import AgentLifecycle
 
-    tracker = FakeTracker(issues, fifo=fifo if fifo is not None else [next(iter(issues))] if issues else [])
-    # Default FIFO follows dict order unless overridden.
-    if fifo is None and issues:
-        tracker.fifo = [claim_for(issues[number]) for number in issues]
+    tracker = FakeTracker(issues, fifo=fifo if fifo is not None else list(issues))
     store = ControlStore(tmp_path)
     lifecycle = AgentLifecycle(
-        tracker=tracker,  # type: ignore[arg-type]
+        tracker=tracker,
         attempt_state=AttemptStateStore(tmp_path),
-        workspace=FakeWorkspace(),  # type: ignore[arg-type]
+        workspace=InMemoryWorkspace(tmp_path / "repo"),
         profile_loader=lambda _: type("Profile", (), {"base_branch": "main"})(),
-        publisher=FakePublisher(),  # type: ignore[arg-type]
+        publisher=FakePublisher(),
         attempt_runner=lambda received_claim, profile, prepared: _evidence(),
         control_store=store,
         sleeper=lambda seconds: None,
