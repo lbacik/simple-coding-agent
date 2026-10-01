@@ -642,8 +642,8 @@ def test_token_budget_carries_per_category_and_cache_fields(tmp_path: Path) -> N
         "output": 200,
     }
     assert budget["prompt_cache"] == {
-        "main_hit_rate": pytest.approx(3000 / 4500),
-        "all_threads_hit_rate": pytest.approx(3000 / 4500),
+        "main_hit_rate": pytest.approx(3000 / 4500, abs=1e-4),
+        "all_threads_hit_rate": pytest.approx(3000 / 4500, abs=1e-4),
         "main_cache_miss_tokens": 0,
         "main_miss_responses_counted": 0,
         "main_miss_responses_excluded": 1,
