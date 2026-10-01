@@ -94,6 +94,13 @@ integer number of dollars) and the turn cap with `MAX_TURNS` (default 60).
 The only model used is `muse-spark-1.3-contributor`; no fallback is
 configured.
 
+USD figures for the Meta backend come from the container's managed-settings
+`modelPricing` entry (`docker/managed-settings.json`, installed at
+`/etc/claude-code/managed-settings.json`), which prices
+`muse-spark-1.3-contributor` at Meta's published rates instead of the CLI's
+default-model rates.  They are still estimates for observability, not a
+measured bill: rely on Meta's billing dashboard for accurate cost data.
+
 Before the hard ceiling, the agent tries a cooperative `handoff`: once
 estimated spend crosses `soft = max_budget_usd - max_budget_usd *
 SOFT_THRESHOLD_PERCENTAGE` (default `SOFT_THRESHOLD_PERCENTAGE=0.2`, i.e. 80%

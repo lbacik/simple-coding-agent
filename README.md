@@ -33,6 +33,20 @@ The agent uses only `muse-spark-1.3-contributor`; no fallback model is set.
 The runtime pair is pinned to `claude-agent-sdk==0.2.156` and
 `@anthropic-ai/claude-code@2.1.276`.
 
+The image ships a managed-settings file (`docker/managed-settings.json`,
+installed at `/etc/claude-code/managed-settings.json`) with a `modelPricing`
+override for `muse-spark-1.3-contributor` at Meta's published rates ($1.25
+input, $0.15 cached input, $4.25 output per million tokens), so the SDK's
+`total_cost_usd` and the `max_budget_usd` backstop reflect Meta's rates
+instead of the CLI's default-model rates (about 4x higher). The override row
+keys (`input`, `output`, `cacheRead`, `cacheWrite`) are USD-per-million-token
+rates, verified against the pinned CLI 2.1.276 bundle (its pricing-row
+compiler maps exactly these four keys onto the internal per-token costs) and
+the [`modelPricing` settings reference](https://code.claude.com/docs/en/settings-reference).
+Meta publishes no cache-write rate and reports zero cache-creation tokens, so
+`cacheWrite` is set equal to the input rate. Anthropic models have no entry
+and keep the CLI price table.
+
 `AGENT_TRUST_PROJECT_SETTINGS` is operator-only and defaults to `false`. When
 false, only user settings load. When true, hooks are disabled and strict MCP
 configuration is used, but a target repository's `apiKeyHelper`, settings

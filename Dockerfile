@@ -68,6 +68,17 @@ RUN npm install --global @anthropic-ai/claude-code@2.1.276
 # so keep this in step with its INSTALLER_VERSION.
 RUN npm install --global agent-installer@0.7.2
 
+# Managed settings (root-owned): Meta model pricing for the CLI cost ledger.
+# The pinned CLI reads managed settings from /etc/claude-code/ on Linux and
+# prices muse-spark-1.3-contributor with its default-model rates ($5 input /
+# $25 output / $0.50 cache read per MTok, ~4x Meta's rates) unless overridden
+# here. Row keys (input, output, cacheRead, cacheWrite) are USD-per-million-
+# token rates per the pinned CLI's modelPricing schema; see README.md.
+# Anthropic models are intentionally absent, so they keep the CLI price table.
+# The file is installed as root with a non-writable mode: the agent user can
+# read it but cannot change the rates its own budget is measured against.
+COPY --chmod=644 docker/managed-settings.json /etc/claude-code/managed-settings.json
+
 # ---------------------------------------------------------------------------
 # Skill bundle (run as agent user so paths land in /home/agent)
 # ---------------------------------------------------------------------------
