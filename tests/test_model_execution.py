@@ -1694,9 +1694,10 @@ def test_measured_usage_from_deltas_sums_once_per_response(tmp_path: Path) -> No
     detail, level = limits_events[0]
     assert level == "INFO"
     assert "thread=main" in detail
-    assert "budget_tokens=4600" in detail
-    assert "measured_tokens=4600" in detail
-    assert "estimated_tokens=0" in detail
+    # Logged as r1 settles: r1 measured, r2 only counted as an estimate so far.
+    assert "measured_tokens=1200" in detail
+    assert "estimated_tokens=1352" in detail
+    assert "budget_tokens=2552" in detail
     assert "soft_threshold_tokens=3200000" in detail
     assert "max_budget_tokens=4000000" in detail
     assert "main_context_tokens=" in detail
