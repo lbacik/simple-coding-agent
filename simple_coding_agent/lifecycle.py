@@ -3768,6 +3768,7 @@ def _continuation_expected(
 _ALLOWED_HANDOFF_REASONS = frozenset(
     {
         "token_soft_threshold",
+        "token_hard_ceiling",
         "cost_soft_threshold",
         "cost_hard_limit",
         "turn_limit",
@@ -3778,13 +3779,41 @@ _ALLOWED_HANDOFF_REASONS = frozenset(
 
 
 def _classify_handoff_reason(execution: object) -> str:
-    explanation = getattr(execution, "explanation", "").lower()
-    terminal_reason = (getattr(execution, "terminal_reason", None) or "").lower()
-    if "budget" in terminal_reason or "hard cost ceiling" in explanation or "budget" in explanation:
+    """Classify the emergency handoff note reason from structured signals.
+
+    The latched token hard-ceiling flag wins over every terminal signal; the
+    SDK budget signals map to ``cost_hard_limit``, turn signals to
+    ``turn_limit``, and timeout signals to ``time_limit``. The explanation
+    text is never read. Unknown signals default to ``cost_hard_limit``.
+    """
+
+    if bool(getattr(execution, "token_hard_ceiling_reached", False)):
+        return "token_hard_ceiling"
+    stop_reason = getattr(execution, "stop_reason", None) or ""
+    terminal_reason = getattr(execution, "terminal_reason", None) or ""
+    stop = stop_reason.lower() if isinstance(stop_reason, str) else ""
+    terminal = terminal_reason.lower() if isinstance(terminal_reason, str) else ""
+    if (
+        terminal in ("budget_exhausted", "error_max_budget_usd")
+        or "budget" in terminal
+        or stop == "max_budget_usd_exceeded"
+        or "budget" in stop
+    ):
         return "cost_hard_limit"
-    if "turn" in terminal_reason or "max_turns" in explanation:
+    if (
+        terminal in ("max_turns", "error_max_turns")
+        or "turn" in terminal
+        or stop == "max_turns_exceeded"
+        or "turn" in stop
+    ):
         return "turn_limit"
-    if "timeout" in explanation or "time" in terminal_reason:
+    if (
+        stop == "timeout"
+        or "timeout" in terminal
+        or "timeout" in stop
+        or stop.startswith("aborted_")
+        or terminal.startswith("aborted_")
+    ):
         return "time_limit"
     return "cost_hard_limit"
 

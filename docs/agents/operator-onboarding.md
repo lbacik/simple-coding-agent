@@ -118,13 +118,22 @@ read/inspection or git wrap-up commands (e.g. `git status`, `git add`, `git comm
 Turns and `MODEL_TIMEOUT` get no soft threshold: reaching either limit gets
 one best-effort same-client handoff follow-up instead.
 
-If the hard ceiling (`max_budget_usd`) is reached, or the model limit is hit
-without a cooperative handoff note, the agent performs an **emergency handoff**:
-any uncommitted dirty work is automatically committed, an emergency handoff note
-documenting the limit (`cost_hard_limit` or `model_limit`) and touched files is
-created and committed, and the outcome is recorded as `handoff` so that no work
-is lost. If zero work was accomplished before hitting the limit, the attempt
-downgrades cleanly to `no_changes`.
+If the token hard ceiling (`MAX_BUDGET_TOKENS` tokens, default 4000000) is
+reached, the attempt is stopped unconditionally, regardless of the model and
+whether or not it has handed off: every tool call is denied (the `handoff`
+skill and its git commands included), the stream is interrupted and drained,
+and no follow-up prompt of any kind is issued. The attempt is classified as a
+model limit and the agent performs an **emergency handoff**: any uncommitted
+dirty work is automatically committed, an emergency handoff note with
+`reason: token_hard_ceiling` is created and committed, and the outcome is
+recorded as `handoff` so that no work is lost. If zero work was accomplished
+before hitting the ceiling, the attempt downgrades cleanly to `no_changes`.
+The SDK's client-side USD backstop (`max_budget_usd`, default `20`) only
+applies while the token budget is still below the ceiling: if it fires first,
+the model gets one best-effort same-client handoff follow-up and the
+emergency note carries `reason: cost_hard_limit`. A turn/time limit reached
+without a cooperative handoff note likewise ends in an emergency handoff
+(`turn_limit`).
 
 A `handoff` outcome pushes the attempt branch (no pull request), posts the
 handoff note as an issue comment, removes `ready-for-agent`, and adds

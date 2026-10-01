@@ -321,7 +321,9 @@ def test_fallback_never_bypasses_the_hard_cost_limit(tmp_path: Path) -> None:
     # estimate past the hard ceiling: the single fallback must be consumed
     # without issuing its query, and the stream's own terminal result wins.
     # The soft threshold was crossed along the way with no handoff, so the
-    # attempt ends incomplete rather than succeeding silently.
+    # attempt ends incomplete rather than succeeding silently. The hard
+    # ceiling stops the stream unconditionally with an interrupt, so the
+    # late operator request never reaches a follow-up.
     now = datetime.now(UTC)
     heavy_usage = AssistantMessage(
         content=[],
@@ -351,8 +353,9 @@ def test_fallback_never_bypasses_the_hard_cost_limit(tmp_path: Path) -> None:
     execution = asyncio.run(run())
 
     assert execution.status is ModelExecutionStatus.MODEL_LIMIT_REACHED
+    assert execution.token_hard_ceiling_reached is True
     assert client.queried_prompts == []
-    assert client.interrupted is False
+    assert client.interrupted is True
 
 
 def test_model_handoff_work_ends_at_the_original_deadline(tmp_path: Path) -> None:

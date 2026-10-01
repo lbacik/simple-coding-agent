@@ -961,3 +961,58 @@ def issue(number: int) -> TrackerIssue:
         blocked_by=0,
         author_login="reporter",
     )
+
+
+def test_classify_handoff_reason_prefers_structured_signals_over_explanation() -> None:
+    from types import SimpleNamespace
+
+    from simple_coding_agent.lifecycle import _classify_handoff_reason
+
+    assert (
+        _classify_handoff_reason(
+            SimpleNamespace(
+                token_hard_ceiling_reached=True,
+                stop_reason="max_turns_exceeded",
+                terminal_reason="max_turns",
+                explanation="Model execution reached max_turns.",
+            )
+        )
+        == "token_hard_ceiling"
+    )
+    assert (
+        _classify_handoff_reason(
+            SimpleNamespace(
+                token_hard_ceiling_reached=False,
+                stop_reason="tool_use",
+                terminal_reason="budget_exhausted",
+                explanation="anything at all",
+            )
+        )
+        == "cost_hard_limit"
+    )
+    assert (
+        _classify_handoff_reason(
+            SimpleNamespace(
+                stop_reason="max_budget_usd_exceeded",
+                terminal_reason=None,
+                explanation="",
+            )
+        )
+        == "cost_hard_limit"
+    )
+    assert (
+        _classify_handoff_reason(
+            SimpleNamespace(
+                stop_reason="max_turns_exceeded",
+                terminal_reason="max_turns",
+                explanation="",
+            )
+        )
+        == "turn_limit"
+    )
+    assert (
+        _classify_handoff_reason(
+            SimpleNamespace(stop_reason="timeout", terminal_reason=None, explanation="")
+        )
+        == "time_limit"
+    )

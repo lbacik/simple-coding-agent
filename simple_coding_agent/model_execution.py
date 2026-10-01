@@ -123,6 +123,7 @@ class ModelExecution:
     observed_models: tuple[str, ...]
     skill_events: tuple[SkillEvent, ...]
     terminal_reason: str | None = None
+    token_hard_ceiling_reached: bool = False
 
 
 class SDKClient(Protocol):
@@ -202,6 +203,7 @@ class ModelExecutor:
         self._operator_begun = False
         self._operator_deadline_expired = False
         self._cli_session_id: str | None = None
+        self._token_hard_ceiling_reached = False
         self._reset_ledger_state()
 
     def _reset_ledger_state(self) -> None:
@@ -365,7 +367,10 @@ class ModelExecutor:
         return max(min(targets), 0.0)
 
     def _hard_token_limit_reached(self) -> bool:
-        return self._ledger.budget_tokens >= self._config.max_budget_tokens
+        return (
+            self._token_hard_ceiling_reached
+            or self._ledger.budget_tokens >= self._config.max_budget_tokens
+        )
 
     def _operator_fallback_blocked(self) -> bool:
         """Whether the single fallback query would bypass the hard token limit."""
@@ -505,6 +510,7 @@ class ModelExecutor:
         self._event_sequence = 0
         self._started_at = self._clock()
         self._soft_threshold_crossed = False
+        self._token_hard_ceiling_reached = False
         self._handoff_context_delivered = False
         self._running_subagents = set()
         self._stopped_subagent_ids = []
@@ -536,6 +542,8 @@ class ModelExecutor:
                 except TimeoutError:
                     await client.interrupt()
                     await self._drain(client)
+                    if self._token_hard_ceiling_reached:
+                        return self._hard_ceiling_evidence(None, ())
                     followup = await self._attempt_handoff_followup(client, ())
                     if followup is not None:
                         return followup
@@ -546,6 +554,8 @@ class ModelExecutor:
                         None,
                         (),
                     )
+                if self._token_hard_ceiling_reached:
+                    return self._classify(terminal, observed_models)
                 if terminal is not None and self._is_model_limit(terminal, observed_models):
                     followup = await self._attempt_handoff_followup(client, observed_models)
                     if followup is not None:
@@ -828,6 +838,10 @@ class ModelExecutor:
                     self._observe_stream_event(message)
                 elif isinstance(message, UserMessage):
                     self._observe_user_message(message)
+                if self._token_hard_ceiling_reached:
+                    await client.interrupt()
+                    drained = await self._drain(client)
+                    return drained, tuple(observed_models)
                 model = getattr(message, "model", None)
                 if isinstance(model, str):
                     observed_models.append(model)
@@ -986,7 +1000,7 @@ class ModelExecutor:
         return max(0, int(delta))
 
     def _check_limits(self, thread_id: str = "main") -> None:
-        """Latch a one-time soft-threshold crossing from the token ledger."""
+        """Latch one-time soft-threshold and hard-ceiling crossings from the ledger."""
 
         budget = self._ledger.budget_tokens
         threshold = self._config.soft_threshold_tokens
@@ -998,21 +1012,49 @@ class ModelExecutor:
                 f"thread={thread_id}",
             )
             self._stop_running_subagents()
+        ceiling = self._config.max_budget_tokens
+        if not self._token_hard_ceiling_reached and budget >= ceiling:
+            self._token_hard_ceiling_reached = True
+            self._log(
+                "token_hard_ceiling_reached",
+                f"budget_tokens={budget:.0f}; max_budget_tokens={ceiling}; "
+                f"thread={thread_id}; "
+                f"in_flight_estimated_tokens={self._ledger.estimated_tokens:.0f}",
+                level="WARNING",
+            )
 
-    async def _drain(self, client: SDKClient) -> None:
-        """Consume buffered messages after interrupting before client teardown."""
+    async def _drain(self, client: SDKClient) -> ResultMessage | None:
+        """Consume buffered messages after interrupting before client teardown.
 
+        A terminal ``ResultMessage`` that arrives while draining is returned
+        so its ``model_usage`` stays available for reconciliation; every other
+        message is discarded.
+        """
+
+        terminal: ResultMessage | None = None
         try:
             async with asyncio.timeout(10):
-                async for _ in client.receive_response():
-                    pass
+                async for message in client.receive_response():
+                    if terminal is None and (
+                        isinstance(message, ResultMessage)
+                        or _looks_like_result(message)
+                    ):
+                        terminal = message
         except Exception:
             # Client teardown still runs; drain evidence is secondary to avoiding an orphan.
-            return
+            pass
+        return terminal
 
     def _classify(
-        self, terminal: ResultMessage, observed_models: tuple[str, ...]
+        self, terminal: ResultMessage | None, observed_models: tuple[str, ...]
     ) -> ModelExecution:
+        if self._token_hard_ceiling_reached:
+            return self._hard_ceiling_evidence(
+                getattr(terminal, "model_usage", None),
+                observed_models,
+                stop_reason=getattr(terminal, "stop_reason", None),
+                terminal_reason=getattr(terminal, "terminal_reason", None),
+            )
         # SDK 0.2.156 exposes these runtime fields, unlike the current reference
         # documentation's terminal_reason/total_cost_usd/input_tokens examples.
         model_usage = getattr(terminal, "model_usage", None)
@@ -1137,6 +1179,35 @@ class ModelExecutor:
             terminal_reason=terminal_reason,
         )
 
+    def _hard_ceiling_evidence(
+        self,
+        model_usage: Mapping[str, Any] | None,
+        observed_models: tuple[str, ...],
+        *,
+        stop_reason: str | None = None,
+        terminal_reason: str | None = None,
+    ) -> ModelExecution:
+        """Classify a latched token hard-ceiling stop as ``MODEL_LIMIT_REACHED``.
+
+        The flag alone decides: a missing terminal ``ResultMessage`` after the
+        interrupt is not an infrastructure error, and no follow-up of any
+        kind is issued. ``model_usage`` from a terminal that arrived while
+        draining is kept for reconciliation.
+        """
+
+        return self._evidence(
+            ModelExecutionStatus.MODEL_LIMIT_REACHED,
+            "Token budget reached the hard ceiling "
+            f"(budget_tokens={self._ledger.budget_tokens:.0f}; "
+            f"max_budget_tokens={self._config.max_budget_tokens}); "
+            "the attempt was stopped unconditionally and no further "
+            "implementation work was permitted.",
+            stop_reason,
+            model_usage,
+            observed_models,
+            terminal_reason=terminal_reason,
+        )
+
     def _evidence(
         self,
         status: ModelExecutionStatus,
@@ -1155,11 +1226,19 @@ class ModelExecutor:
             observed_models=observed_models,
             skill_events=self.skill_events,
             terminal_reason=terminal_reason,
+            token_hard_ceiling_reached=self._token_hard_ceiling_reached,
         )
 
     async def _guard_and_record_pre_tool_use(
         self, hook_input: Any, tool_use_id: str | None, context: Any
     ) -> dict[str, Any]:
+        if self._token_hard_ceiling_reached:
+            return _deny(
+                "Token budget reached the hard ceiling "
+                f"(max_budget_tokens={self._config.max_budget_tokens}); "
+                "the attempt was stopped unconditionally and no further tool"
+                " use is allowed, including the handoff skill and git commands."
+            )
         self._log_tool_use("tool_call", hook_input)
         await self._record_skill_event("PreToolUse", hook_input, tool_use_id, context)
         self._start_launch_thread(hook_input, tool_use_id)
