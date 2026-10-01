@@ -270,10 +270,10 @@ class TokenLedger:
 
         for thread in self._threads.values():
             self._settle(thread)
-        estimated = self.budget_tokens
+        estimated_total = self.budget_tokens
         measured = self.measured_tokens
         unreported_estimated = self.estimated_tokens
-        if estimated > 0:
+        if unreported_estimated > 0:
             mode: Literal["measured", "mixed", "estimated"] = (
                 "mixed" if measured > 0 else "estimated"
             )
@@ -282,7 +282,7 @@ class TokenLedger:
         if model_usage is None:
             return Reconciliation(
                 mode=mode,
-                estimated_tokens=estimated,
+                estimated_tokens=estimated_total,
                 actual_tokens=None,
                 error_ratio=None,
                 unreported_estimated_tokens=unreported_estimated,
@@ -293,9 +293,9 @@ class TokenLedger:
         unreported_actual = actual - int(measured)
         return Reconciliation(
             mode=mode,
-            estimated_tokens=estimated,
+            estimated_tokens=estimated_total,
             actual_tokens=actual,
-            error_ratio=(estimated - actual) / actual if actual > 0 else None,
+            error_ratio=(estimated_total - actual) / actual if actual > 0 else None,
             unreported_estimated_tokens=unreported_estimated,
             unreported_actual_tokens=unreported_actual,
             unreported_error_ratio=(
