@@ -1,0 +1,422 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Token Estimator Prototype</title>
+<style>
+  :root { --fg:#1d2330; --muted:#667085; --line:#e4e7ec; --bg:#fafbfc; --card:#fff; --accent:#3b5bdb; --warn:#b54708; --ok:#067647; --bad:#b42318; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg); font:14px/1.5 -apple-system, "Segoe UI", Roboto, sans-serif; }
+  main { max-width:1180px; margin:0 auto; padding:24px 16px 64px; }
+  h1 { font-size:22px; margin:0 0 4px; }
+  h2 { font-size:15px; margin:0 0 10px; text-transform:uppercase; letter-spacing:.04em; color:var(--muted); }
+  .tag { display:inline-block; font-size:11px; padding:1px 7px; border-radius:10px; background:#fef0c7; color:var(--warn); font-weight:600; vertical-align:middle; }
+  .intro { color:#344054; max-width:880px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:16px; margin-top:16px; }
+  .grid { display:grid; grid-template-columns: 1.3fr 1fr; gap:16px; }
+  @media (max-width: 860px) { .grid { grid-template-columns: 1fr; } }
+  .stats { display:grid; grid-template-columns: repeat(4, 1fr); gap:10px; }
+  @media (max-width: 600px) { .stats { grid-template-columns: repeat(2, 1fr); } }
+  .stat { border:1px solid var(--line); border-radius:8px; padding:8px 10px; }
+  .stat b { display:block; font-size:18px; font-variant-numeric: tabular-nums; }
+  .stat span { font-size:12px; color:var(--muted); }
+  .changed { background:#eef2ff; transition: background .0s; }
+  .bar { position:relative; height:18px; background:#f2f4f7; border-radius:9px; margin:14px 0 4px; overflow:hidden; }
+  .bar .m { position:absolute; left:0; top:0; bottom:0; background:var(--accent); }
+  .bar .e { position:absolute; top:0; bottom:0; background:repeating-linear-gradient(45deg,#91a7ff,#91a7ff 5px,#bac8ff 5px,#bac8ff 10px); }
+  .bar .tick { position:absolute; top:-2px; bottom:-2px; width:2px; background:var(--fg); }
+  .bar .truth { position:absolute; top:0; bottom:0; width:3px; background:var(--ok); }
+  .legend { font-size:12px; color:var(--muted); display:flex; gap:14px; flex-wrap:wrap; }
+  .legend i { display:inline-block; width:10px; height:10px; border-radius:2px; margin-right:4px; vertical-align:-1px; }
+  table { width:100%; border-collapse:collapse; font-size:13px; font-variant-numeric: tabular-nums; }
+  th, td { text-align:left; padding:5px 6px; border-bottom:1px solid var(--line); }
+  th { color:var(--muted); font-weight:600; font-size:12px; }
+  .log { font:12px/1.45 ui-monospace, Menlo, monospace; max-height:260px; overflow:auto; background:#f8f9fb; border:1px solid var(--line); border-radius:8px; padding:8px; }
+  .log div { white-space:pre-wrap; }
+  .log .WARNING { color:var(--warn); } .log .INFO { color:#344054; } .log .THRESH { color:var(--bad); font-weight:600; }
+  button { font:inherit; border:1px solid var(--line); background:#fff; border-radius:7px; padding:6px 11px; cursor:pointer; margin:3px 4px 3px 0; }
+  button:hover { border-color:var(--accent); }
+  button.primary { background:var(--accent); color:#fff; border-color:var(--accent); }
+  button:disabled { opacity:.45; cursor:default; }
+  .tabs { display:flex; flex-wrap:wrap; gap:4px; border-bottom:1px solid var(--line); margin-bottom:12px; }
+  .tabs button { border:none; border-bottom:2px solid transparent; border-radius:0; margin:0; }
+  .tabs button.on { border-bottom-color:var(--accent); color:var(--accent); font-weight:600; }
+  .params { display:grid; grid-template-columns: repeat(auto-fill, minmax(210px, 1fr)); gap:8px 14px; }
+  .params label { font-size:12px; color:var(--muted); display:block; }
+  .params input { width:100%; font:inherit; padding:4px 6px; border:1px solid var(--line); border-radius:6px; }
+  .next { margin:8px 0; padding:8px 10px; background:#f8f9fb; border-radius:8px; border:1px dashed var(--line); }
+  .muted { color:var(--muted); } .small { font-size:12px; }
+  svg text { font-size:11px; fill: var(--muted); }
+  .kv { font-variant-numeric: tabular-nums; }
+  .pos { color:var(--bad); } .neg { color:var(--warn); } .good { color:var(--ok); }
+</style>
+</head>
+<body>
+<main>
+  <h1>Local token estimator <span class="tag">PROTOTYPE — throwaway</span></h1>
+  <p class="intro">
+    <b>Question (ticket “Design the local token estimator”, map “Specify token-based attempt budgeting that works without live usage”):</b>
+    how does the agent count the tokens an implementation attempt has used <i>while it runs</i>, when the backend reports no usage for some or all of the model's
+    responses? The model: every model response is counted as soon as it is seen, first as a <b>local estimate</b> (the thread's current context plus its visible
+    output plus a thinking allowance), then replaced by the <b>measured</b> figure if the backend reports one. Threads that never report (Meta subagents) stay
+    estimated. When the attempt ends, the total is reconciled with the authoritative <code>ResultMessage.model_usage</code>.
+    The recorded scenarios replay real data: two #109 attempts (77 responses each, from CLI transcripts) and the #129 probe (main loop + one subagent).
+  </p>
+
+  <div class="card">
+    <h2>Estimator settings</h2>
+    <div class="params" id="params"></div>
+    <p class="small muted" style="margin:8px 0 0">Fitted on the #109 transcripts: tool results ≈ 4.0 chars/token (IQR 3.6–4.2), visible output ≈ 3.0 chars/token, ≈ 60 tokens of framing per message,
+      thinking ≈ 150–250 tokens per response (opaque on Meta). Main-thread base ≈ 19K tokens + prompt (the #109 agent); subagent base 1.4K is the probe's tool-light agent — unknown for Explore / general-purpose.
+      Changing a setting restarts the current walkthrough.</p>
+  </div>
+
+  <div class="grid">
+    <div class="card">
+      <h2>Attempt token budget — what the agent sees now</h2>
+      <div class="stats" id="stats"></div>
+      <div class="bar" id="bar"></div>
+      <div class="legend">
+        <span><i style="background:var(--accent)"></i>measured (reported by backend)</span>
+        <span><i style="background:#91a7ff"></i>estimated (no report, or not yet)</span>
+        <span><i style="background:var(--ok)"></i>truth from recording</span>
+        <span><i style="background:var(--fg)"></i>soft threshold / hard ceiling</span>
+      </div>
+      <div id="chart" style="margin-top:12px"></div>
+      <h2 style="margin-top:14px">Threads</h2>
+      <table id="threads"></table>
+      <div id="calib"></div>
+    </div>
+    <div class="card">
+      <h2>Guided walkthroughs</h2>
+      <div class="tabs" id="tabs"></div>
+      <div id="scenario"></div>
+      <h2 style="margin-top:16px">Free play</h2>
+      <div id="free"></div>
+      <h2 style="margin-top:16px">Event log</h2>
+      <div class="log" id="log"></div>
+    </div>
+  </div>
+</main>
+
+<script>
+/* ============================================================================
+ * Portable module: pure, no DOM. Lift into model_execution.py (replacing
+ * _CostEstimator) once the design is settled.
+ *
+ *   reduce(state, event) -> state          events are plain objects:
+ *     {type:'thread_started', thread, kind:'main'|'subagent', promptChars}
+ *     {type:'response',       thread, id, visibleChars}      AssistantMessage (one per response id)
+ *     {type:'usage',          thread, id, usage}             message_delta / non-zero AssistantMessage.usage
+ *     {type:'input',          thread, chars}                 tool result / user message fed back to that thread
+ *     {type:'result',         modelUsageTotal}               ResultMessage.model_usage, 4 categories summed
+ *   reading(state) -> {measured, inflight, estimated, total, threads[], crossed}
+ * ==========================================================================*/
+const TokenEstimator = (() => {
+  const DEFAULTS = {
+    inputCharsPerToken: 4.0, outputCharsPerToken: 3.0, framingTokens: 60,
+    thinkingAllowance: 150, mainSystemBase: 19000, subagentSystemBase: 1400,
+    softThreshold: 3200000, hardCeiling: 4000000,
+  };
+  const CATS = ['input_tokens', 'cache_read_input_tokens', 'cache_creation_input_tokens', 'output_tokens'];
+  const sum4 = u => CATS.reduce((a, k) => a + (u[k] || 0), 0);
+
+  function create(params) {
+    return { params: { ...DEFAULTS, ...params }, threads: {}, order: [], log: [],
+             degradedWarned: false, crossed: { soft: null, hard: null }, reconciled: null, events: 0 };
+  }
+
+  function emit(s, level, event, detail) { s.log.push({ n: s.events, level, event, detail }); }
+
+  function lastResponse(t) { return t.responses[t.responses.length - 1]; }
+
+  // A response is settled once anything else happens on its thread. If it
+  // settled without reported usage, its estimate is final: degraded mode.
+  function settle(s, t) {
+    const r = lastResponse(t);
+    if (!r || r.settled) return;
+    r.settled = true;
+    if (r.usage === null) {
+      t.estimatedResponses += 1;
+      if (!s.degradedWarned) {
+        s.degradedWarned = true;
+        emit(s, 'WARNING', 'token_estimate_degraded',
+          `thread=${t.id} (${t.kind}): response ${r.id} settled without reported usage; counting a local estimate from now on`);
+      }
+    }
+  }
+
+  function responseTokens(r) { return r.usage ? sum4(r.usage) : r.estimate; }
+
+  function reduce(prev, ev) {
+    const s = structuredClone(prev);
+    s.events += 1;
+    const p = s.params;
+    if (ev.type === 'thread_started') {
+      const base = (ev.kind === 'main' ? p.mainSystemBase : p.subagentSystemBase) + ev.promptChars / p.inputCharsPerToken;
+      s.threads[ev.thread] = { id: ev.thread, kind: ev.kind, ctx: base, responses: [], estimatedResponses: 0, everMeasured: false };
+      s.order.push(ev.thread);
+      emit(s, 'INFO', 'thread_started', `thread=${ev.thread} kind=${ev.kind} base_context≈${fmt(base)}`);
+    } else if (ev.type === 'response') {
+      const t = s.threads[ev.thread];
+      settle(s, t);
+      const out = ev.visibleChars / p.outputCharsPerToken + p.thinkingAllowance;
+      const estimate = t.ctx + out;
+      t.responses.push({ id: ev.id, estimate, usage: null, settled: false, estOut: out });
+      t.ctx += out;
+      emit(s, 'INFO', 'response_seen', `thread=${t.id} id=${ev.id} estimate≈${fmt(estimate)} (context ${fmt(estimate - out)} + output ${fmt(out)})`);
+    } else if (ev.type === 'usage') {
+      const t = s.threads[ev.thread];
+      const r = t.responses.find(x => x.id === ev.id) || lastResponse(t);
+      if (sum4(ev.usage) === 0) {
+        emit(s, 'INFO', 'usage_zero_ignored', `thread=${t.id} id=${r.id}: backend reported all-zero usage`);
+      } else {
+        // Merge per category by max: the same response may be reported more
+        // than once (per content block, then message_delta); never add twice.
+        const merged = { ...(r.usage || {}) };
+        for (const k of CATS) merged[k] = Math.max(merged[k] || 0, ev.usage[k] || 0);
+        const before = responseTokens(r);
+        r.usage = merged;
+        t.everMeasured = true;
+        // Re-anchor the thread's context on the measured figure.
+        const measuredCtx = merged.input_tokens + merged.cache_read_input_tokens + merged.cache_creation_input_tokens;
+        t.ctx = measuredCtx + merged.output_tokens;
+        emit(s, 'INFO', 'usage_measured', `thread=${t.id} id=${r.id} ${fmt(sum4(merged))} (estimate was ${fmt(r.estimate)}, Δ ${pct(r.estimate / sum4(merged) - 1)}); counted ${fmt(before)} → ${fmt(sum4(merged))}`);
+      }
+    } else if (ev.type === 'input') {
+      const t = s.threads[ev.thread];
+      settle(s, t);
+      t.ctx += ev.chars / p.inputCharsPerToken + p.framingTokens;
+    } else if (ev.type === 'result') {
+      for (const id of s.order) settle(s, s.threads[id]);
+      const rd = reading(s);
+      const measured = rd.measured;
+      const darkActual = ev.modelUsageTotal - measured;
+      const darkEstimate = rd.estimated + rd.inflight;
+      s.reconciled = {
+        mode: rd.estimated > 0 ? (measured > 0 ? 'mixed' : 'estimated') : 'measured',
+        estimate: rd.total, actual: ev.modelUsageTotal, error: rd.total / ev.modelUsageTotal - 1,
+        darkEstimate, darkActual, darkError: darkActual > 0 ? darkEstimate / darkActual - 1 : null,
+      };
+      emit(s, 'INFO', 'token_estimate_reconciled',
+        `mode=${s.reconciled.mode} estimate=${fmt(rd.total)} actual=${fmt(ev.modelUsageTotal)} error=${pct(s.reconciled.error)}` +
+        (darkEstimate > 0 ? `; unreported part: estimate=${fmt(darkEstimate)} actual=${fmt(darkActual)} error=${pct(s.reconciled.darkError)}` : ''));
+    }
+    const rd = reading(s);
+    for (const [key, limit] of [['soft', p.softThreshold], ['hard', p.hardCeiling]]) {
+      if (!s.crossed[key] && rd.total >= limit) {
+        s.crossed[key] = { atEvent: s.events, total: rd.total, responses: rd.responses };
+        emit(s, 'THRESH', key === 'soft' ? 'token_soft_threshold_crossed' : 'token_hard_ceiling_reached',
+          `tokens=${fmt(rd.total)} (measured ${fmt(rd.measured)} + estimated ${fmt(rd.estimated + rd.inflight)}) after ${rd.responses} responses`);
+      }
+    }
+    return s;
+  }
+
+  function reading(s) {
+    let measured = 0, inflight = 0, estimated = 0, responses = 0;
+    const threads = s.order.map(id => {
+      const t = s.threads[id];
+      let m = 0, e = 0, f = 0;
+      for (const r of t.responses) {
+        responses += 1;
+        if (r.usage) m += sum4(r.usage); else if (r.settled) e += r.estimate; else f += r.estimate;
+      }
+      measured += m; estimated += e; inflight += f;
+      const mode = t.estimatedResponses === 0 ? (t.everMeasured ? 'measured' : 'not yet known')
+                 : (t.everMeasured ? 'mixed' : 'estimated');
+      return { id, kind: t.kind, mode, responses: t.responses.length, context: t.ctx, measured: m, estimated: e + f };
+    });
+    return { measured, inflight, estimated, total: measured + inflight + estimated, threads, responses, crossed: s.crossed };
+  }
+
+  const fmt = n => n >= 1e6 ? (n / 1e6).toFixed(2) + 'M' : n >= 1e4 ? (n / 1e3).toFixed(1) + 'K' : Math.round(n).toString();
+  const pct = x => (x >= 0 ? '+' : '') + (x * 100).toFixed(1) + '%';
+  return { DEFAULTS, create, reduce, reading, sum4, fmt, pct };
+})();
+
+/* ============================ page (throwaway) ============================ */
+const DATA = {"a3":[["s","main","main",52265],["r","main","e42947b6",125,32319,0,0,119],["i","main",1048],["r","main","dddc41f6",53,32786,0,0,64],["i","main",6792],["r","main","a6974aa7",127,34748,0,0,148],["i","main",1046],["r","main","19064db1",117,35180,0,0,130],["i","main",307],["r","main","923c4f4e",190,35466,0,0,129],["i","main",1764],["r","main","3b7f4df0",154,36288,0,0,157],["i","main",1687],["r","main","bd6840eb",275,36873,0,0,204],["i","main",1690],["r","main","dc714b97",182,37509,0,0,262],["i","main",2829],["r","main","c7494bf3",203,38435,0,0,151],["i","main",2229],["r","main","9c3740ab",342,39104,0,0,234],["i","main",18658],["i","main",2245],["r","main","8ea445ad",95,44251,0,0,81],["i","main",10317],["r","main","a05e438f",161,46767,0,0,110],["i","main",3818],["r","main","f9764c8e",93,10865,36849,0,82],["i","main",14074],["r","main","ced645cb",93,50541,0,0,235],["i","main",10072],["r","main","ef504635",95,20450,32753,0,81],["i","main",8712],["r","main","e3174be1",251,55363,0,0,107],["i","main",7211],["r","main","d109434d",263,57139,0,0,613],["i","main",2603],["r","main","8b68444b",235,58455,0,0,1388],["i","main",3023],["r","main","a19845e0",247,25160,35441,0,1825],["i","main",6467],["i","main",1539],["r","main","5a214611",89,63980,0,0,1810],["i","main",5126],["r","main","4c3d4d3e",1844,67028,0,0,455],["i","main",151],["r","main","d60a4f98",6020,67587,0,0,1342],["i","main",151],["r","main","7e244c28",5579,69018,0,0,1291],["i","main",151],["r","main","2a3640f6",4666,9869,60529,0,1050],["i","main",151],["r","main","1877409e",1488,7681,63857,0,617],["i","main",151],["r","main","3c4c4e94",338,72247,0,0,139],["i","main",1046],["r","main","96bd4e54",592,19574,53105,0,249],["i","main",140],["r","main","5cd74455",418,73019,0,0,207],["i","main",2911],["r","main","bb894706",92,36519,37489,0,81],["i","main",4841],["r","main","16954bf7",90,40224,35057,0,228],["i","main",2867],["r","main","b41b4fa2",94,7268,68977,0,179],["i","main",5502],["r","main","130344c8",268,77598,0,0,194],["i","main",438],["r","main","6de049f3",455,77959,0,0,233],["i","main",143],["r","main","464d440a",735,78279,0,0,349],["i","main",893],["r","main","b0a7469e",94,8532,70385,0,220],["i","main",6717],["r","main","9db34493",92,80538,0,0,893],["i","main",8839],["r","main","a1a84de5",333,10593,72945,0,813],["i","main",35],["r","main","881d4ed9",177,84417,0,0,131],["i","main",666],["r","main","41ee4ee8",89,84759,0,0,833],["i","main",1284],["r","main","676c4f01",570,49738,36209,0,179],["i","main",148],["r","main","40604f80",2552,38612,47601,0,652],["i","main",2178],["r","main","25684c27",144,37032,50417,0,113],["i","main",442],["r","main","74b846d1",370,87732,0,0,216],["i","main",522],["r","main","8d034572",1196,88142,0,0,486],["i","main",526],["r","main","c1634eb9",180,10285,80497,0,222],["i","main",344],["r","main","fcb94c2d",352,91148,0,0,186],["i","main",122],["r","main","0e3e4cd9",374,47285,44145,0,210],["i","main",1258],["r","main","44544f6d",382,20455,71537,0,157],["i","main",6209],["r","main","a02841bd",93,15936,77553,0,453],["i","main",6112],["r","main","547347d0",93,9606,85873,0,83],["i","main",11848],["r","main","c757429d",316,98578,0,0,618],["i","main",4669],["r","main","8b794cb8",93,100436,0,0,2523],["i","main",7109],["r","main","7c434e44",151,37686,66929,0,267],["i","main",2850],["r","main","c5d84ccd",94,27746,77937,0,215],["i","main",4710],["r","main","f2224a81",392,19236,88049,0,1905],["i","main",149],["r","main","d9474cbf",4240,52142,57073,0,1074],["i","main",149],["r","main","9c134706",614,110385,0,0,210],["i","main",149],["r","main","2aa846c2",676,55410,55281,0,259],["i","main",149],["r","main","139649ee",92,111045,0,0,83],["i","main",2409],["r","main","118a4d8f",634,4523,107249,0,212],["i","main",149],["r","main","5aa747af",132,53726,58353,0,125],["i","main",860],["r","main","83164f15",409,27726,84721,0,173],["i","main",149],["r","main","1ae8413e",4072,2138,110577,0,1008],["i","main",149],["r","main","9630470c",161,41257,72561,0,127],["i","main",84],["r","main","2b5642bb",467,114026,0,0,166],["i","main",149],["r","main","4c4b4426",173,3327,110961,0,106],["i","main",99],["r","main","4e6b4ab9",567,1847,112625,0,202],["i","main",138],["r","main","f56c446c",331,5606,109169,0,180],["i","main",1655],["r","main","d0934667",100,36571,78833,0,83],["i","main",9791],["r","main","26424519",224,3449,114417,0,647],["i","main",2042],["r","main","caa04af9",255,40828,78193,0,108],["i","main",3111],["r","main","a2dc4184",348,47760,72177,0,1370],["i","main",2612],["r","main","f64c453e",224,121985,0,0,222],["i","main",4313],["r","main","bcb34aa5",283,35478,87665,0,823],["i","main",2442],["r","main","c15740d3",220,14251,110321,0,1409],["i","main",1517],["r","main","473a433c",100,126383,0,0,368],["i","main",2359],["r","main","c227443a",5368,15344,111985,0,1951],["i","main",212]],"a4":[["s","main","main",53949],["r","main","58954552",53,32835,0,0,98],["i","main",452],["r","main","72ff4b28",150,33142,0,0,112],["i","main",932],["r","main","5c3c4693",164,813,32753,0,96],["i","main",1618],["r","main","ec254f26",125,34143,0,0,96],["i","main",1181],["r","main","0caa4c59",158,34583,0,0,156],["i","main",2145],["r","main","e7fc432a",225,1760,33521,0,111],["i","main",2132],["r","main","458e426b",300,1888,34033,0,160],["i","main",175],["r","main","3e244572",145,36186,0,0,136],["i","main",18658],["i","main",10000],["r","main","34774986",220,43078,0,0,227],["i","main",2131],["r","main","13344dfa",261,43829,0,0,170],["i","main",4634],["i","main",2254],["r","main","a4004dab",261,45699,0,0,140],["i","main",4019],["r","main","c68146db",93,46742,0,0,82],["i","main",5736],["r","main","881c4540",93,48083,0,0,82],["i","main",15811],["r","main","473b4fa1",101,51177,0,0,395],["i","main",9460],["r","main","af104474",397,20615,33137,0,731],["i","main",1416],["r","main","7a934711",222,6912,47985,0,1355],["i","main",395],["r","main","4c414eaf",100,56370,0,0,144],["i","main",2637],["r","main","228d4d0b",195,57168,0,0,1133],["i","main",1980],["r","main","7b134f37",101,22929,35825,0,83],["i","main",4690],["r","main","0d4d4f62",154,23953,36081,0,782],["i","main",460],["r","main","17fc45ba",522,60978,0,0,231],["i","main",157],["r","main","3fe5467a",349,61313,0,0,137],["i","main",157],["r","main","65744142",407,7798,53745,0,151],["i","main",157],["r","main","ea8b4ac5",1194,61783,0,0,324],["i","main",157],["r","main","269941da",960,62199,0,0,281],["i","main",157],["r","main","a0174463",100,62572,0,0,143],["i","main",2391],["r","main","f63b4b88",1872,890,62449,0,467],["i","main",157],["r","main","3913470c",409,2218,61681,0,167],["i","main",157],["r","main","61be41cc",288,2730,61425,0,275],["i","main",188],["r","main","fbc748b7",224,9629,54897,0,117],["i","main",188],["r","main","90e74b46",348,64740,0,0,138],["i","main",188],["r","main","186942a0",293,18270,46705,0,246],["i","main",188],["r","main","32ad415a",225,65317,0,0,112],["i","main",188],["r","main","2a114c35",229,65527,0,0,116],["i","main",188],["r","main","ab42470e",1276,65743,0,0,356],["i","main",157],["r","main","ccc14296",493,66194,0,0,215],["i","main",157],["r","main","5d724f90",100,66504,0,0,159],["i","main",2860],["r","main","486d4704",855,67372,0,0,316],["i","main",157],["r","main","d3e54fb6",409,67783,0,0,163],["i","main",157],["r","main","dca449c7",417,68041,0,0,163],["i","main",157],["r","main","a558408d",304,68299,0,0,117],["i","main",81],["r","main","c416498e",168,2986,65521,0,100],["i","main",1473],["r","main","3c544d9d",284,69037,0,0,173],["i","main",2603],["r","main","fa7f4f34",267,69830,0,0,501],["i","main",4027],["r","main","c2d84a44",1516,71287,0,0,2085],["i","main",157],["r","main","1a1544c8",1112,73461,0,0,300],["i","main",157],["r","main","ef8545c0",101,17545,56305,0,106],["i","main",6314],["r","main","23dd40ed",1968,40928,34545,0,488],["i","main",157],["r","main","dde944f4",1344,2599,73457,0,344],["i","main",157],["r","main","29824f01",101,76495,0,0,186],["i","main",4994],["r","main","7de54c3b",164,77955,0,0,360],["i","main",2164],["r","main","b506446b",466,78824,0,0,375],["i","main",188],["r","main","e4944915",153,79295,0,0,98],["i","main",98],["r","main","489646f6",560,79468,0,0,253],["i","main",144],["r","main","eccb4af9",155,79824,0,0,104],["i","main",44],["r","main","067c4a99",870,80003,0,0,443],["i","main",1042],["r","main","4ea84702",677,80750,0,0,780],["i","main",3505],["r","main","92ba4f01",359,82451,0,0,270],["i","main",4062],["r","main","134f4443",402,15964,67697,0,682],["i","main",2060],["r","main","40234bec",95,84848,0,0,81],["i","main",5009],["r","main","5fce4fe1",305,86122,0,0,371],["i","main",245],["r","main","c0de488e",102,6884,79729,0,850],["i","main",10520],["r","main","50374d85",252,21600,68465,0,164],["i","main",3076],["r","main","51f74b63",95,10971,79985,0,81],["i","main",4139],["r","main","35c44742",94,25905,66161,0,81],["i","main",2477],["r","main","85dc4682",236,92778,0,0,1004],["i","main",674],["r","main","346b4955",196,93982,0,0,99],["i","main",1158],["r","main","3f55495c",1574,26190,68209,0,415],["i","main",98],["r","main","cd014835",363,94888,0,0,163],["i","main",104],["r","main","b4574fad",85,95144,0,0,80],["i","main",5110],["r","main","b9ca4650",267,14050,82417,0,330],["i","main",1617],["r","main","58074c0f",237,32066,65265,0,663],["i","main",2363],["r","main","43eb4301",133,39869,58737,0,297],["i","main",665],["r","main","bce94f39",84,35281,63857,0,80],["i","main",2892],["r","main","6ad9446d",163,64822,35185,0,330],["i","main",662],["r","main","24844ccc",187,100559,0,0,232],["i","main",141],["r","main","41d9455a",527,100882,0,0,182],["i","main",212]],"probe":[["s","main","main",362],["r","main","d2d44b25",118,16459,0,0,436],["i","main",37],["r","main","a5244db1",75,16933,0,0,103],["i","main",17],["r","main","f73945f5",163,17096,0,0,125],["i","main",1120],["s","sub1","subagent",65],["r","sub1","80e04838",117,1414,0,0,196],["i","sub1",48],["r","sub1","26644445",150,1686,0,0,215],["r","main","fbe844f5",75,17569,0,0,1089],["i","main",317],["r","main","f59043e3",70,19188,0,0,252]]};
+const { fmt, pct } = TokenEstimator;
+const usageOf = r => ({ input_tokens: r[4], cache_read_input_tokens: r[5], cache_creation_input_tokens: r[6], output_tokens: r[7] });
+
+// Turn a recording into steps: {label, ev, truthDelta}.
+function fromRecording(rec, opts) {
+  const steps = []; let total = 0;
+  for (const e of rec) {
+    if (e[0] === 's') steps.push({ label: `${e[2] === 'main' ? 'Attempt starts' : 'Subagent launched'} (prompt ${e[3]} chars)`, ev: { type: 'thread_started', thread: e[1], kind: e[2], promptChars: e[3] } });
+    else if (e[0] === 'r') {
+      const u = usageOf(e); const tokens = TokenEstimator.sum4(u); total += tokens;
+      steps.push({ label: `${e[1] === 'main' ? 'Model' : 'Subagent'} responds — ${e[3]} visible chars (guard runs here)`, ev: { type: 'response', thread: e[1], id: e[2], visibleChars: e[3] }, truthDelta: tokens });
+      const live = e[1] === 'main' ? opts.mainLive : opts.subLive;
+      if (live) steps.push({ label: `Backend reports usage for it: ${fmt(tokens)}`, ev: { type: 'usage', thread: e[1], id: e[2], usage: u } });
+    } else if (e[0] === 'i') steps.push({ label: `Tool result back to ${e[1] === 'main' ? 'model' : 'subagent'} — ${e[2]} chars`, ev: { type: 'input', thread: e[1], chars: e[2] } });
+  }
+  steps.push({ label: `Attempt ends — ResultMessage.model_usage = ${fmt(total)}`, ev: { type: 'result', modelUsageTotal: total } });
+  return steps;
+}
+
+// Synthetic generator using the estimator's own model with "true" constants.
+function synthetic({ subagents, perSub, trueSubBase, toolChars, outChars, think }) {
+  const rec = [['s', 'main', 'main', 26000]];
+  let ctx = 32000; const add = (th, vis, c) => { const out = vis / 3 + think; const u = [ 'r', th, 'x' + rec.length, vis, Math.round(c), 0, 0, Math.round(out)]; rec.push(u); return c + out; };
+  ctx = add('main', 400, ctx); rec.push(['i', 'main', 3000]); ctx += 3000 / 4 + 60;
+  for (let k = 1; k <= subagents; k++) {
+    ctx = add('main', 2400, ctx); rec.push(['i', 'main', 300]); ctx += 300 / 4 + 60;
+    const th = 'sub' + k; rec.push(['s', th, 'subagent', 2400]);
+    let sc = trueSubBase + 2400 / 4;
+    for (let j = 0; j < perSub; j++) { sc = add(th, outChars, sc); if (j < perSub - 1) { rec.push(['i', th, toolChars]); sc += toolChars / 4 + 60; } }
+    rec.push(['i', 'main', 1500]); ctx += 1500 / 4 + 60;
+  }
+  add('main', 300, ctx);
+  return rec;
+}
+
+function anthropicDuplicates() {
+  // Assumed Anthropic shape (from the research, unverified live): one AssistantMessage
+  // per content block, each carrying message_start usage (input side, output ≈ 1),
+  // then message_delta with the final output count.
+  const steps = [{ label: 'Attempt starts (prompt 26000 chars)', ev: { type: 'thread_started', thread: 'main', kind: 'main', promptChars: 26000 } }];
+  let truth = 0;
+  const resp = (id, input, cacheRead, output, blocks) => {
+    const start = { input_tokens: input, cache_read_input_tokens: cacheRead, cache_creation_input_tokens: 0, output_tokens: 1 };
+    const final = { ...start, output_tokens: output };
+    const tokens = TokenEstimator.sum4(final); truth += tokens;
+    steps.push({ label: `Model responds — ${blocks} content blocks, 900 visible chars`, ev: { type: 'response', thread: 'main', id, visibleChars: 900 }, truthDelta: tokens });
+    for (let b = 1; b <= blocks; b++) steps.push({ label: `AssistantMessage block ${b}/${blocks} carries start usage ${fmt(TokenEstimator.sum4(start))}`, ev: { type: 'usage', thread: 'main', id, usage: start } });
+    steps.push({ label: `message_delta: final output ${output}`, ev: { type: 'usage', thread: 'main', id, usage: final } });
+  };
+  resp('a1', 3000, 29000, 420, 3);
+  steps.push({ label: 'Tool result — 6000 chars', ev: { type: 'input', thread: 'main', chars: 6000 } });
+  resp('a2', 1600, 32000, 380, 3);
+  steps.push({ label: `Attempt ends — model_usage = ${fmt(truth)}`, ev: { type: 'result', modelUsageTotal: truth } });
+  return steps;
+}
+
+const SCENARIOS = [
+  { name: 'Meta, main loop reported', build: () => fromRecording(DATA.a3, { mainLive: true }),
+    text: `#109 attempt started 07:58 (77 responses, no subagents, 6.43M tokens). Every response's usage arrives in <code>message_delta</code>, but only <i>after</i> PreToolUse. Watch: at each “Model responds” step the guard already counts that response as an estimate (hatched), which the next step replaces with the measured figure — so the guard is never a response behind. Use “Run to soft threshold” and compare the crossing with the green truth marker.` },
+  { name: 'Meta, nothing reported', build: () => fromRecording(DATA.a3, { mainLive: false }),
+    text: `The same attempt, but assume the backend reported nothing (the worst case the map must survive). Watch: the WARNING on the first settled response, the estimate tracking the truth within about ±2% with the fitted settings, and the reconciliation at the end. Try the main-thread base at 16000 or 32000 to see how much the base matters.` },
+  { name: 'Second attempt, nothing reported', build: () => fromRecording(DATA.a4, { mainLive: false }),
+    text: `#109 attempt started 09:13 (77 responses, 5.35M tokens), fully estimated with the same settings — a check that the constants fitted on one attempt carry over to another.` },
+  { name: 'Subagent stays dark', build: () => fromRecording(DATA.probe, { mainLive: true, subLive: false }),
+    text: `The #129 probe (run 2): the main loop is reported, the one subagent never is (Meta forwards its AssistantMessages with zero usage and no stream events). Watch the thread table: main is “measured”, the subagent “estimated”. At the end the unreported part is reconciled: model_usage minus the measured main loop is exactly the subagent's real spend.` },
+  { name: 'Wrong subagent base', build: () => fromRecording(synthetic({ subagents: 6, perSub: 18, trueSubBase: 15000, toolChars: 4000, outChars: 500, think: 150 }), { mainLive: true, subLive: false }),
+    text: `<b>Synthetic</b>, shaped like #109 attempt 2 (8 general-purpose subagents, 10–24 tool calls each): 6 subagents × 18 responses whose real base context is 15K tokens, while the estimator assumes the probe's 1.4K. Watch the reconciliation: the per-response base error is multiplied by every subagent response. This is the open risk the estimator must answer (calibration or a better base).` },
+  { name: 'Anthropic: repeated usage', build: () => anthropicDuplicates(),
+    text: `<b>Synthetic, assumed shape.</b> On Anthropic every content block arrives as its own AssistantMessage carrying the same start usage, then message_delta adds the output. Watch: merging by response id and per-category max counts each response once. (Today's <code>_CostEstimator.observe</code> adds each AssistantMessage's usage, which would count it once per block.)` },
+];
+
+let params = { ...TokenEstimator.DEFAULTS };
+let current = 0, steps = [], pos = 0, state, truthSeries = [], estSeries = [], truth = 0, prevReading = null;
+
+function reset() {
+  steps = SCENARIOS[current].build(); pos = 0; truth = 0;
+  state = TokenEstimator.create(params); truthSeries = [0]; estSeries = [0]; prevReading = null;
+  render();
+}
+function apply(ev, truthDelta) {
+  prevReading = TokenEstimator.reading(state);
+  state = TokenEstimator.reduce(state, ev);
+  if (truthDelta) truth += truthDelta;
+  truthSeries.push(truth); estSeries.push(TokenEstimator.reading(state).total);
+}
+function step(n = 1) { for (let i = 0; i < n && pos < steps.length; i++, pos++) apply(steps[pos].ev, steps[pos].truthDelta); render(); }
+function runUntil(pred) { while (pos < steps.length && !pred()) { apply(steps[pos].ev, steps[pos].truthDelta); pos++; } render(); }
+
+function render() {
+  const rd = TokenEstimator.reading(state);
+  const changed = k => prevReading && Math.round(prevReading[k]) !== Math.round(rd[k]) ? 'changed' : '';
+  document.getElementById('stats').innerHTML = [
+    ['total', 'Tokens counted', rd.total], ['measured', 'Measured', rd.measured],
+    ['inflight', 'In flight (estimated)', rd.inflight], ['estimated', 'Settled estimates', rd.estimated],
+  ].map(([k, l, v]) => `<div class="stat ${changed(k)}"><b>${fmt(v)}</b><span>${l}</span></div>`).join('') +
+  `<div class="stat"><b>${truth ? fmt(truth) : '—'}</b><span>Truth so far (recording)</span></div>
+   <div class="stat"><b class="${truth ? (Math.abs(rd.total / truth - 1) < .05 ? 'good' : 'pos') : ''}">${truth ? pct(rd.total / truth - 1) : '—'}</b><span>Counted vs truth</span></div>
+   <div class="stat"><b>${rd.threads[0] ? fmt(rd.threads[0].context) : '—'}</b><span>Main context now</span></div>
+   <div class="stat"><b>${rd.responses}</b><span>Responses seen</span></div>`;
+  const max = Math.max(params.hardCeiling * 1.05, rd.total, truth);
+  const w = v => (100 * v / max) + '%';
+  document.getElementById('bar').innerHTML =
+    `<div class="m" style="width:${w(rd.measured)}"></div><div class="e" style="left:${w(rd.measured)};width:${w(rd.inflight + rd.estimated)}"></div>
+     <div class="tick" style="left:${w(params.softThreshold)}"></div><div class="tick" style="left:${w(params.hardCeiling)}"></div>` +
+    (truth ? `<div class="truth" style="left:${w(truth)}"></div>` : '');
+  renderChart(max);
+  document.getElementById('threads').innerHTML = '<tr><th>Thread</th><th>Counting</th><th>Responses</th><th>Context now</th><th>Measured</th><th>Estimated</th></tr>' +
+    rd.threads.map(t => `<tr><td>${t.id}</td><td>${t.mode}</td><td>${t.responses}</td><td>${fmt(t.context)}</td><td>${fmt(t.measured)}</td><td>${fmt(t.estimated)}</td></tr>`).join('');
+  const c = state.reconciled, x = state.crossed;
+  document.getElementById('calib').innerHTML =
+    `<p class="small kv" style="margin:10px 0 0">Soft threshold ${fmt(params.softThreshold)}: ${x.soft ? `<b>crossed</b> after ${x.soft.responses} responses` : 'not crossed'} ·
+       Hard ceiling ${fmt(params.hardCeiling)}: ${x.hard ? `<b>reached</b> after ${x.hard.responses} responses` : 'not reached'}
+       ${truthCross()}</p>` +
+    (c ? `<p class="small kv" style="margin:6px 0 0"><b>Reconciled with model_usage:</b> mode ${c.mode}; estimate ${fmt(c.estimate)} vs actual ${fmt(c.actual)} (${pct(c.error)})` +
+         (c.darkEstimate > 0 ? `; unreported part ${fmt(c.darkEstimate)} vs ${fmt(c.darkActual)} (<b class="${Math.abs(c.darkError) < .1 ? 'good' : 'pos'}">${pct(c.darkError)}</b>)` : '') + '</p>' : '');
+  const L = document.getElementById('log');
+  L.innerHTML = state.log.slice(-120).map(e => `<div class="${e.level}">#${e.n} ${e.level} ${e.event}: ${e.detail}</div>`).join('');
+  L.scrollTop = L.scrollHeight;
+  const sc = SCENARIOS[current];
+  document.getElementById('scenario').innerHTML = `<p>${sc.text}</p>
+    <div class="next">${pos < steps.length ? `<b>Step ${pos + 1} of ${steps.length}:</b> ${steps[pos].label}` : '<b>Walkthrough finished.</b>'}</div>
+    <button class="primary" onclick="step()" ${pos >= steps.length ? 'disabled' : ''}>Do this step</button>
+    <button onclick="step(10)" ${pos >= steps.length ? 'disabled' : ''}>Next 10 steps</button>
+    <button onclick="runUntil(()=>state.crossed.soft)" ${pos >= steps.length ? 'disabled' : ''}>Run to soft threshold</button>
+    <button onclick="runUntil(()=>false)" ${pos >= steps.length ? 'disabled' : ''}>Run to end</button>
+    <button onclick="reset()">Restart</button>`;
+  document.querySelectorAll('#tabs button').forEach((b, i) => b.classList.toggle('on', i === current));
+}
+
+function truthCross() {
+  if (!truthSeries.length) return '';
+  const i = truthSeries.findIndex(v => v >= params.softThreshold);
+  if (i < 0) return '';
+  const j = estSeries.findIndex(v => v >= params.softThreshold);
+  const respAt = k => steps.slice(0, k).filter(s => s.ev.type === 'response').length;
+  return `<br>Truth crosses the soft threshold at response ${respAt(i)}` + (j >= 0 ? `; the counter at response ${respAt(j)}` : '');
+}
+
+function renderChart(max) {
+  const W = 520, H = 150, n = Math.max(steps.length, 2);
+  const X = i => 30 + (W - 40) * i / n, Y = v => H - 18 - (H - 30) * v / max;
+  const line = (arr, col, dash) => `<polyline fill="none" stroke="${col}" stroke-width="2" ${dash ? 'stroke-dasharray="4 3"' : ''} points="${arr.map((v, i) => X(i) + ',' + Y(v)).join(' ')}"/>`;
+  const hl = (v, t) => `<line x1="30" x2="${W - 10}" y1="${Y(v)}" y2="${Y(v)}" stroke="#98a2b3" stroke-dasharray="2 3"/><text x="${W - 10}" y="${Y(v) - 3}" text-anchor="end">${t}</text>`;
+  document.getElementById('chart').innerHTML = `<svg viewBox="0 0 ${W} ${H}" width="100%" role="img" aria-label="counted vs truth">
+    ${hl(params.softThreshold, 'soft ' + fmt(params.softThreshold))}${hl(params.hardCeiling, 'hard ' + fmt(params.hardCeiling))}
+    <line x1="30" x2="${W - 10}" y1="${H - 18}" y2="${H - 18}" stroke="#d0d5dd"/>
+    ${truth ? line(truthSeries, 'var(--ok)', false) : ''}${line(estSeries, 'var(--accent)', true)}
+    <text x="30" y="${H - 4}">steps →</text><text x="${W - 10}" y="${H - 4}" text-anchor="end">green: truth · blue dashed: counted</text></svg>`;
+}
+
+// Free play: hand-driven events on the current state.
+let freeN = 0;
+function free(ev) { apply(ev, 0); render(); }
+function ensureThread(id, kind) { if (!state.threads[id]) free({ type: 'thread_started', thread: id, kind, promptChars: kind === 'main' ? 26000 : 2000 }); }
+function freeResp(th, kind) { ensureThread(th, kind); free({ type: 'response', thread: th, id: 'f' + (++freeN), visibleChars: 900 }); }
+function freeUsage(th) {
+  const t = state.threads[th]; if (!t || !t.responses.length) return;
+  const r = t.responses[t.responses.length - 1];
+  free({ type: 'usage', thread: th, id: r.id, usage: { input_tokens: Math.round(r.estimate - r.estOut), cache_read_input_tokens: 0, cache_creation_input_tokens: 0, output_tokens: Math.round(r.estOut * 1.5) } });
+}
+function freeZero(th) { const t = state.threads[th]; if (!t || !t.responses.length) return; free({ type: 'usage', thread: th, id: t.responses[t.responses.length - 1].id, usage: { input_tokens: 0, output_tokens: 0 } }); }
+function freeInput(th, kind) { ensureThread(th, kind); free({ type: 'input', thread: th, chars: 8000 }); }
+document.getElementById('free').innerHTML = `
+  <div class="small muted">Acts on the state shown; restart a walkthrough to get back to a known state.</div>
+  <button onclick="freeResp('main','main')">Model responds</button>
+  <button onclick="freeUsage('main')">Backend reports usage (output 1.5× the guess)</button>
+  <button onclick="freeZero('main')">Backend reports all-zero usage</button>
+  <button onclick="freeInput('main','main')">Tool result, 8000 chars</button><br>
+  <button onclick="freeResp('subX','subagent')">Subagent responds</button>
+  <button onclick="freeInput('subX','subagent')">Subagent tool result, 8000 chars</button>
+  <button onclick="free({type:'result', modelUsageTotal: Math.round(TokenEstimator.reading(state).total * 1.1)})">Attempt ends (actual = counted + 10%)</button>`;
+
+const P = [['mainSystemBase', 'Main-thread base context (tokens)'], ['subagentSystemBase', 'Subagent base context (tokens)'], ['thinkingAllowance', 'Thinking allowance per response'],
+  ['inputCharsPerToken', 'Tool-result chars per token'], ['outputCharsPerToken', 'Visible-output chars per token'], ['framingTokens', 'Framing tokens per message'],
+  ['softThreshold', 'Soft threshold (tokens)'], ['hardCeiling', 'Hard ceiling (tokens)']];
+document.getElementById('params').innerHTML = P.map(([k, l]) => `<div><label for="p_${k}">${l}</label><input id="p_${k}" type="number" step="any" value="${params[k]}"></div>`).join('');
+P.forEach(([k]) => document.getElementById('p_' + k).addEventListener('change', e => { params[k] = parseFloat(e.target.value); reset(); }));
+document.getElementById('tabs').innerHTML = SCENARIOS.map((s, i) => `<button onclick="current=${i};reset()">${s.name}</button>`).join('');
+reset();
+</script>
+</body>
+</html>
