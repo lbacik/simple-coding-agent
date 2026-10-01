@@ -15,5 +15,5 @@ def agent_version() -> str:
 
     try:
         return version(PACKAGE_NAME)
-    except (PackageNotFoundError, ValueError):
+    except (PackageNotFoundError, ValueError, OSError):
         return UNKNOWN_VERSION

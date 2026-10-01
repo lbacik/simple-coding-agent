@@ -35,6 +35,11 @@ class ProvenanceEvidence:
     cli_version: str
     agent_version: str = UNKNOWN_VERSION
 
+    def summary(self) -> str:
+        """One-line startup log detail naming the agent, SDK and CLI versions."""
+
+        return f"agent={self.agent_version}; sdk={self.sdk_version}; cli={self.cli_version}"
+
 
 class ProvenanceVerifier:
     """Reject model execution unless all pinned runtime inputs can be verified."""

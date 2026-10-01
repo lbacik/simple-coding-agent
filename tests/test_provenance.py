@@ -132,3 +132,44 @@ def test_parses_the_cli_version_from_its_trailing_label(tmp_path: Path) -> None:
     evidence = verifier.verify()
 
     assert evidence.cli_version == "2.1.278"
+
+
+def _verified_evidence(tmp_path: Path):
+    home = tmp_path / "home"
+    for skill in (*_UPSTREAM_SKILLS, "handoff"):
+        _link_skill(home, skill)
+    return ProvenanceVerifier(
+        home=home,
+        expected_sdk_version="0.2.156",
+        expected_cli_version="2.1.276",
+        run=lambda command: _upstream_listing()
+        if command[:2] == ("agent-installer", "list")
+        else "2.1.276",
+        sdk_version=lambda: "0.2.156",
+    ).verify()
+
+
+def test_startup_summary_names_the_agent_version_next_to_sdk_and_cli(tmp_path: Path) -> None:
+    from simple_coding_agent.agent_version import agent_version
+
+    summary = _verified_evidence(tmp_path).summary()
+
+    assert summary == f"agent={agent_version()}; sdk=0.2.156; cli=2.1.276"
+
+
+def test_startup_verification_survives_an_unreadable_agent_version(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import importlib.metadata
+
+    from simple_coding_agent import agent_version as agent_version_module
+
+    def missing(_name: str) -> str:
+        raise importlib.metadata.PackageNotFoundError
+
+    monkeypatch.setattr(agent_version_module, "version", missing)
+
+    evidence = _verified_evidence(tmp_path)
+
+    assert evidence.agent_version == "unknown"
+    assert evidence.summary().startswith("agent=unknown;")
