@@ -1812,3 +1812,253 @@ def test_zero_usage_subagent_responses_are_counted_on_their_own_thread(tmp_path:
     assert len(limits) == 1
     assert limits[0].startswith("thread=toolu_sub;")
     assert executor._ledger.estimated_tokens > 0
+
+
+def test_token_hard_ceiling_mid_response_interrupts_denies_everything_and_reports_model_limit(
+    tmp_path: Path,
+) -> None:
+    events: list[tuple[str, str, str]] = []
+    captured: list[FakeClient] = []
+
+    def client_factory(options: object) -> FakeClient:
+        client = FakeClient(
+            options,
+            [
+                AssistantMessage(
+                    content=[],
+                    model="muse-spark-1.3-contributor",
+                    message_id="r-big",
+                    usage={"input_tokens": 1_100_000},
+                ),
+                result(),
+            ],
+        )
+        captured.append(client)
+        return client
+
+    config = replace(runtime_config(tmp_path), max_budget_tokens=1_000_000)
+    executor = ModelExecutor(
+        config,
+        client_factory=client_factory,
+        event_log=lambda event, detail="", level="INFO", issue_number=None: events.append(
+            (event, detail, level)
+        ),
+    )
+    execution = asyncio.run(executor.execute(issue_body="Fix it.", working_directory=tmp_path))
+
+    ceiling = [(detail, level) for name, detail, level in events if name == "token_hard_ceiling_reached"]
+    assert len(ceiling) == 1
+    assert ceiling[0][1] == "WARNING"
+    assert "budget_tokens=" in ceiling[0][0]
+    assert "max_budget_tokens=1000000" in ceiling[0][0]
+    assert "thread=main" in ceiling[0][0]
+    assert "in_flight_estimated_tokens=" in ceiling[0][0]
+    assert captured[0].interrupted is True
+    assert captured[0].queried_prompts == []
+    assert execution.status is ModelExecutionStatus.MODEL_LIMIT_REACHED
+    assert execution.token_hard_ceiling_reached is True
+
+    pre_hook = captured[0].options.hooks["PreToolUse"][0].hooks[0]
+    for hook_input in (
+        {"tool_name": "Edit", "tool_input": {"file_path": "src/a.py"}},
+        {"tool_name": "Skill", "tool_input": {"skill": "handoff"}},
+        {"tool_name": "Bash", "tool_input": {"command": 'git commit -m "work"'}},
+        {"tool_name": "Edit", "tool_input": {"file_path": "src/a.py"}, "agent_id": "sub-1"},
+    ):
+        denied = asyncio.run(pre_hook(hook_input, None, {}))
+        assert denied["hookSpecificOutput"]["permissionDecision"] == "deny", hook_input
+
+
+def test_token_hard_ceiling_without_a_terminal_result_is_still_model_limit(
+    tmp_path: Path,
+) -> None:
+    captured: list[FakeClient] = []
+
+    def client_factory(options: object) -> FakeClient:
+        client = FakeClient(
+            options,
+            [
+                AssistantMessage(
+                    content=[],
+                    model="muse-spark-1.3-contributor",
+                    message_id="r-big",
+                    usage={"input_tokens": 1_100_000},
+                ),
+            ],
+        )
+        captured.append(client)
+        return client
+
+    executor = ModelExecutor(
+        replace(runtime_config(tmp_path), max_budget_tokens=1_000_000),
+        client_factory=client_factory,
+    )
+    execution = asyncio.run(executor.execute(issue_body="Fix it.", working_directory=tmp_path))
+
+    assert captured[0].interrupted is True
+    assert captured[0].queried_prompts == []
+    assert execution.status is ModelExecutionStatus.MODEL_LIMIT_REACHED
+    assert execution.token_hard_ceiling_reached is True
+
+
+def test_token_hard_ceiling_in_degraded_mode_follows_the_soft_threshold(
+    tmp_path: Path,
+) -> None:
+    events: list[tuple[str, str, str]] = []
+    captured: list[FakeClient] = []
+    big_result = "x" * 40_000
+
+    def zero_turn(index: int) -> list[object]:
+        return [
+            AssistantMessage(
+                content=[TextBlock(text="working")],
+                model="muse-spark-1.3-contributor",
+                message_id=f"r{index}",
+                usage={"input_tokens": 0, "output_tokens": 0},
+            ),
+            UserMessage(content=big_result),
+        ]
+
+    def client_factory(options: object) -> FakeClient:
+        messages: list[object] = []
+        for index in range(30):
+            messages.extend(zero_turn(index))
+        messages.append(result())
+        client = FakeClient(options, messages)
+        captured.append(client)
+        return client
+
+    config = replace(runtime_config(tmp_path), max_budget_tokens=1_400_000)
+    executor = ModelExecutor(
+        config,
+        client_factory=client_factory,
+        event_log=lambda event, detail="", level="INFO", issue_number=None: events.append(
+            (event, detail, level)
+        ),
+    )
+    execution = asyncio.run(executor.execute(issue_body="Fix it.", working_directory=tmp_path))
+
+    names = [name for name, _, _ in events]
+    assert "token_soft_threshold_crossed" in names
+    assert "token_hard_ceiling_reached" in names
+    assert names.index("token_soft_threshold_crossed") < names.index("token_hard_ceiling_reached")
+    assert execution.status is ModelExecutionStatus.MODEL_LIMIT_REACHED
+    assert execution.token_hard_ceiling_reached is True
+    assert captured[0].interrupted is True
+    assert captured[0].queried_prompts == []
+
+
+def test_token_hard_ceiling_applies_after_the_main_thread_invoked_handoff(
+    tmp_path: Path,
+) -> None:
+    captured: list[FakeClient] = []
+
+    def client_factory(options: object) -> FakeClient:
+        client = FakeClient(options, [result()])
+        captured.append(client)
+        return client
+
+    executor = ModelExecutor(
+        replace(runtime_config(tmp_path), max_budget_tokens=1_000_000),
+        client_factory=client_factory,
+    )
+    asyncio.run(executor.execute(issue_body="Fix it.", working_directory=tmp_path))
+    pre_hook = captured[0].options.hooks["PreToolUse"][0].hooks[0]
+
+    allowed = asyncio.run(
+        pre_hook({"tool_name": "Skill", "tool_input": {"skill": "handoff"}}, None, {})
+    )
+    assert allowed == {}
+    assert executor._main_thread_handoff_invoked() is True
+
+    executor._ledger.observe_response("main", "r-big", 0)
+    executor._ledger.observe_usage("main", "r-big", {"input_tokens": 1_100_000})
+    executor._check_limits("main")
+
+    assert executor._token_hard_ceiling_reached is True
+    denied = asyncio.run(
+        pre_hook({"tool_name": "Skill", "tool_input": {"skill": "handoff"}}, None, {})
+    )
+    assert denied["hookSpecificOutput"]["permissionDecision"] == "deny"
+    execution = executor._classify(result(), ())
+    assert execution.status is ModelExecutionStatus.MODEL_LIMIT_REACHED
+    assert execution.token_hard_ceiling_reached is True
+
+
+def test_sdk_budget_error_below_the_token_ceiling_gets_one_followup(
+    tmp_path: Path,
+) -> None:
+    from simple_coding_agent.lifecycle import _classify_handoff_reason
+
+    captured: list[FakeClient] = []
+
+    def client_factory(options: object) -> FakeClient:
+        client = FakeClient(
+            options,
+            [
+                SimpleNamespace(
+                    is_error=True,
+                    stop_reason="tool_use",
+                    terminal_reason="budget_exhausted",
+                    subtype="error_max_budget_usd",
+                    total_cost_usd=5.09,
+                    num_turns=116,
+                    model_usage={"muse-spark-1.3-contributor": {}},
+                )
+            ],
+            followup_messages=[result(stop_reason="end_turn")],
+        )
+        captured.append(client)
+        return client
+
+    executor = ModelExecutor(runtime_config(tmp_path), client_factory=client_factory)
+    execution = asyncio.run(executor.execute(issue_body="Fix it.", working_directory=tmp_path))
+
+    assert execution.status is ModelExecutionStatus.MODEL_LIMIT_REACHED
+    assert execution.token_hard_ceiling_reached is False
+    assert len(captured[0].queried_prompts) == 1
+    assert _classify_handoff_reason(execution) == "cost_hard_limit"
+
+
+def test_sdk_budget_error_at_the_token_ceiling_gets_no_followup(
+    tmp_path: Path,
+) -> None:
+    from simple_coding_agent.lifecycle import _classify_handoff_reason
+
+    captured: list[FakeClient] = []
+
+    def client_factory(options: object) -> FakeClient:
+        client = FakeClient(
+            options,
+            [
+                AssistantMessage(
+                    content=[],
+                    model="muse-spark-1.3-contributor",
+                    message_id="r-big",
+                    usage={"input_tokens": 1_100_000},
+                ),
+                SimpleNamespace(
+                    is_error=True,
+                    stop_reason="tool_use",
+                    terminal_reason="budget_exhausted",
+                    subtype="error_max_budget_usd",
+                    total_cost_usd=5.09,
+                    num_turns=116,
+                    model_usage={"muse-spark-1.3-contributor": {}},
+                ),
+            ],
+            followup_messages=[result(stop_reason="end_turn")],
+        )
+        captured.append(client)
+        return client
+
+    executor = ModelExecutor(
+        replace(runtime_config(tmp_path), max_budget_tokens=1_000_000),
+        client_factory=client_factory,
+    )
+    execution = asyncio.run(executor.execute(issue_body="Fix it.", working_directory=tmp_path))
+
+    assert execution.status is ModelExecutionStatus.MODEL_LIMIT_REACHED
+    assert execution.token_hard_ceiling_reached is True
+    assert captured[0].queried_prompts == []
+    assert _classify_handoff_reason(execution) == "token_hard_ceiling"

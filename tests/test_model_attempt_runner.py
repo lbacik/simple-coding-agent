@@ -875,3 +875,39 @@ def test_missing_transcript_source_logs_failure_and_leaves_outcome_unchanged(
     assert len(failures) == 1
     assert "no-such-session" in failures[0]
     assert any(level == "WARNING" for event, level, _ in events if event == "transcripts_copy_failed")
+
+
+def test_token_hard_ceiling_emergency_note_carries_the_token_hard_ceiling_reason(
+    tmp_path: Path,
+) -> None:
+    """The latched hard-ceiling flag must survive into the emergency note."""
+
+    from tests.fakes import InMemoryWorkspace
+
+    class CeilingExecutor(FakeModelExecutor):
+        async def execute(self, **kwargs: object) -> ModelExecution:
+            if self.after_execute is not None:
+                self.after_execute()
+            return ModelExecution(
+                status=ModelExecutionStatus.MODEL_LIMIT_REACHED,
+                explanation=(
+                    "Token budget reached the hard ceiling (budget_tokens=1100000; "
+                    "max_budget_tokens=1000000)."
+                ),
+                stop_reason="end_turn",
+                model_usage=None,
+                observed_models=(),
+                skill_events=(),
+                token_hard_ceiling_reached=True,
+            )
+
+    workspace = InMemoryWorkspace(tmp_path / "repo")
+    workspace.make_dirty("work.txt", "model edits")
+    runner = build_runner(tmp_path, model_executor=CeilingExecutor(), workspace=workspace)
+
+    runner(
+        claim(issue_number=24, issue_body="Fix the parser."), profile(), FakePrepared()
+    )
+
+    assert len(workspace.note_calls) == 1
+    assert "- reason: token_hard_ceiling" in workspace.note_calls[0][1]
