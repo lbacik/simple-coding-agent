@@ -100,7 +100,6 @@ class AttemptArchive:
             existing = {}
         evidence = existing if isinstance(existing, dict) else {}
         evidence.update(metadata)
-        evidence["token_estimate_authority"] = "non-authoritative"
         self._write_json("attempt.json", evidence)
 
     def read_attempt(self) -> dict[str, object]:

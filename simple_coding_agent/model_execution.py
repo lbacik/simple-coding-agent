@@ -124,6 +124,7 @@ class ModelExecution:
     skill_events: tuple[SkillEvent, ...]
     terminal_reason: str | None = None
     token_hard_ceiling_reached: bool = False
+    token_budget: Mapping[str, Any] | None = None
 
 
 class SDKClient(Protocol):
@@ -191,6 +192,8 @@ class ModelExecutor:
         self._event_sequence = 0
         self._started_at = self._clock()
         self._soft_threshold_crossed = False
+        self._soft_threshold_crossed_at_tokens: float | None = None
+        self._total_cost_usd: float | None = None
         self._handoff_context_delivered = False
         self._running_subagents: set[str] = set()
         self._stopped_subagent_ids: list[str] = []
@@ -256,6 +259,24 @@ class ModelExecutor:
         """The CLI session id latched during this execution, if any."""
 
         return self._cli_session_id
+
+    def _log_context_compacted(self, message: SystemMessage) -> None:
+        """Log a CLI context compaction; the ledger is deliberately left alone.
+
+        SDK 0.2.156 has no typed message for it and ``compact_metadata`` is
+        unverified, so ``trigger`` and ``pre_tokens`` are read best-effort.
+        """
+
+        data = getattr(message, "data", None)
+        data = data if isinstance(data, Mapping) else {}
+        metadata = data.get("compact_metadata")
+        metadata = metadata if isinstance(metadata, Mapping) else {}
+        thread = _thread_label_from(getattr(message, "parent_tool_use_id", None))
+        self._log(
+            "context_compacted",
+            f"thread={thread}; trigger={metadata.get('trigger')}; "
+            f"pre_tokens={metadata.get('pre_tokens')}",
+        )
 
     def _record_cli_session_id(self, message: object) -> None:
         """Latch the CLI session id from the init message or any sessioned message.
@@ -510,6 +531,8 @@ class ModelExecutor:
         self._event_sequence = 0
         self._started_at = self._clock()
         self._soft_threshold_crossed = False
+        self._soft_threshold_crossed_at_tokens = None
+        self._total_cost_usd = None
         self._token_hard_ceiling_reached = False
         self._handoff_context_delivered = False
         self._running_subagents = set()
@@ -740,6 +763,7 @@ class ModelExecutor:
         all_models = tuple(dict.fromkeys((*observed_models, *followup_models)))
         if not self._main_thread_handoff_invoked():
             return None
+        self._note_terminal(followup_terminal)
         return self._evidence(
             ModelExecutionStatus.HANDOFF_REQUESTED,
             success_explanation,
@@ -827,6 +851,8 @@ class ModelExecutor:
                     except StopAsyncIteration:
                         return None, tuple(observed_models)
                 self._record_cli_session_id(message)
+                if isinstance(message, SystemMessage) and message.subtype == "compact_boundary":
+                    self._log_context_compacted(message)
                 if isinstance(message, ResultMessage) or _looks_like_result(message):
                     return message, tuple(observed_models)
                 if isinstance(message, AssistantMessage):
@@ -1006,6 +1032,7 @@ class ModelExecutor:
         threshold = self._config.soft_threshold_tokens
         if not self._soft_threshold_crossed and budget >= threshold:
             self._soft_threshold_crossed = True
+            self._soft_threshold_crossed_at_tokens = budget
             self._log(
                 "token_soft_threshold_crossed",
                 f"budget_tokens={budget:.0f}; soft_threshold_tokens={threshold}; "
@@ -1048,6 +1075,7 @@ class ModelExecutor:
     def _classify(
         self, terminal: ResultMessage | None, observed_models: tuple[str, ...]
     ) -> ModelExecution:
+        self._note_terminal(terminal)
         if self._token_hard_ceiling_reached:
             return self._hard_ceiling_evidence(
                 getattr(terminal, "model_usage", None),
@@ -1217,6 +1245,7 @@ class ModelExecutor:
         observed_models: tuple[str, ...],
         terminal_reason: str | None = None,
     ) -> ModelExecution:
+        token_budget = self._reconcile_token_budget(model_usage)
         self._log("model_execution_finished", f"status={status}; {explanation}")
         return ModelExecution(
             status=status,
@@ -1227,7 +1256,45 @@ class ModelExecutor:
             skill_events=self.skill_events,
             terminal_reason=terminal_reason,
             token_hard_ceiling_reached=self._token_hard_ceiling_reached,
+            token_budget=token_budget,
         )
+
+    def _note_terminal(self, terminal: object) -> None:
+        cost = getattr(terminal, "total_cost_usd", None)
+        if cost is not None:
+            self._total_cost_usd = cost
+
+    def _reconcile_token_budget(
+        self, model_usage: Mapping[str, Any] | None
+    ) -> dict[str, Any]:
+        """Reconcile the ledger with ``model_usage`` and log ``token_budget_reconciled``."""
+
+        usage = model_usage if isinstance(model_usage, Mapping) else None
+        reconciliation = self._ledger.reconcile(usage)
+        summary: dict[str, Any] = {
+            "mode": reconciliation.mode,
+            "max_budget_tokens": self._config.max_budget_tokens,
+            "soft_threshold_tokens": self._config.soft_threshold_tokens,
+            "estimated_tokens": round(reconciliation.estimated_tokens),
+            "actual_tokens": reconciliation.actual_tokens,
+            "error_ratio": _round_ratio(reconciliation.error_ratio),
+            "unreported": {
+                "estimated_tokens": round(reconciliation.unreported_estimated_tokens),
+                "actual_tokens": reconciliation.unreported_actual_tokens,
+                "error_ratio": _round_ratio(reconciliation.unreported_error_ratio),
+            },
+            "soft_threshold_crossed": self._soft_threshold_crossed,
+            "soft_threshold_crossed_at_tokens": (
+                None
+                if self._soft_threshold_crossed_at_tokens is None
+                else round(self._soft_threshold_crossed_at_tokens)
+            ),
+            "hard_ceiling_reached": self._token_hard_ceiling_reached,
+            "peak_main_context_tokens": round(self._ledger.peak_main_context_tokens),
+            "total_cost_usd": self._total_cost_usd,
+        }
+        self._log("token_budget_reconciled", json.dumps(summary, sort_keys=True))
+        return summary
 
     async def _guard_and_record_pre_tool_use(
         self, hook_input: Any, tool_use_id: str | None, context: Any
@@ -1440,6 +1507,14 @@ async def publication_guard(hook_input: Any, tool_use_id: str | None, context: A
             "permissionDecisionReason": "Publication is owned by the driving process.",
         }
     }
+
+
+def _round_ratio(value: float | None) -> float | None:
+    return None if value is None else round(value, 4)
+
+
+def _thread_label_from(parent_tool_use_id: object) -> str:
+    return parent_tool_use_id if isinstance(parent_tool_use_id, str) and parent_tool_use_id else "main"
 
 
 def _deny(reason: str) -> dict[str, Any]:
