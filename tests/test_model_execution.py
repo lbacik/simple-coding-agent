@@ -9,7 +9,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from claude_agent_sdk import AssistantMessage, TextBlock
+from claude_agent_sdk import AssistantMessage, StreamEvent, TextBlock, UserMessage
 
 from simple_coding_agent.config import RuntimeConfig
 from simple_coding_agent.model_execution import (
@@ -296,7 +296,7 @@ def test_logs_skill_invocations_under_distinct_event_names(tmp_path: Path) -> No
     executor = ModelExecutor(
         runtime_config(tmp_path),
         client_factory=client_factory,
-        event_log=lambda event, detail="", issue_number=None: events.append((event, detail)),
+        event_log=lambda event, detail="", level="INFO", issue_number=None: events.append((event, detail)),
     )
     asyncio.run(executor.execute(issue_body="Fix it.", working_directory=tmp_path))
     pre_hook = captured[0].options.hooks["PreToolUse"][0].hooks[0]
@@ -360,7 +360,7 @@ def test_offloads_tool_and_model_response_evidence_to_the_attempt_archive(
     executor = ModelExecutor(
         runtime_config(tmp_path),
         client_factory=client_factory,
-        event_log=lambda event, detail="", issue_number=None: events.append((event, detail)),
+        event_log=lambda event, detail="", level="INFO", issue_number=None: events.append((event, detail)),
     )
     asyncio.run(
         executor.execute(
@@ -425,7 +425,7 @@ def test_logs_the_process_even_when_the_attempt_succeeds(tmp_path: Path) -> None
     executor = ModelExecutor(
         runtime_config(tmp_path),
         client_factory=client_factory,
-        event_log=lambda event, detail="", issue_number=None: events.append(
+        event_log=lambda event, detail="", level="INFO", issue_number=None: events.append(
             (event, detail, issue_number)
         ),
     )
@@ -958,7 +958,7 @@ def test_model_execution_logs_configured_limits_and_limits_checked_progress(tmp_
     executor = ModelExecutor(
         runtime_config(tmp_path),
         client_factory=client_factory,
-        event_log=lambda event, detail="", issue_number=None: events.append((event, detail, issue_number)),
+        event_log=lambda event, detail="", level="INFO", issue_number=None: events.append((event, detail, issue_number)),
     )
     execution = asyncio.run(
         executor.execute(issue_body="Fix the tests.", working_directory=tmp_path, issue_number=45)
@@ -1009,7 +1009,7 @@ def test_positive_token_usage_logs_limits_checked_progress(tmp_path: Path) -> No
     executor = ModelExecutor(
         runtime_config(tmp_path),
         client_factory=client_factory,
-        event_log=lambda event, detail="", issue_number=None: events.append((event, detail, issue_number)),
+        event_log=lambda event, detail="", level="INFO", issue_number=None: events.append((event, detail, issue_number)),
     )
     execution = asyncio.run(
         executor.execute(issue_body="Fix the tests.", working_directory=tmp_path, issue_number=45)
@@ -1041,7 +1041,7 @@ def test_cost_instruction_is_withheld_while_subagents_still_running(
     executor = ModelExecutor(
         runtime_config(tmp_path),
         client_factory=client_factory,
-        event_log=lambda event, detail="", issue_number=None: events.append((event, detail)),
+        event_log=lambda event, detail="", level="INFO", issue_number=None: events.append((event, detail)),
     )
     asyncio.run(executor.execute(issue_body="Fix it.", working_directory=tmp_path))
     pre_hook = captured[0].options.hooks["PreToolUse"][0].hooks[0]
@@ -1119,7 +1119,7 @@ def test_cost_crossing_stops_running_subagent_and_denies_later_subagent_calls(
     executor = ModelExecutor(
         config,
         client_factory=client_factory,
-        event_log=lambda event, detail="", issue_number=None: events.append((event, detail)),
+        event_log=lambda event, detail="", level="INFO", issue_number=None: events.append((event, detail)),
     )
     asyncio.run(executor.execute(issue_body="Fix it.", working_directory=tmp_path))
     pre_hook = captured[0].options.hooks["PreToolUse"][0].hooks[0]
@@ -1173,7 +1173,7 @@ def test_cost_handoff_instruction_reaches_main_thread_once_subagents_stopped(
     executor = ModelExecutor(
         config,
         client_factory=client_factory,
-        event_log=lambda event, detail="", issue_number=None: events.append((event, detail)),
+        event_log=lambda event, detail="", level="INFO", issue_number=None: events.append((event, detail)),
     )
     asyncio.run(executor.execute(issue_body="Fix it.", working_directory=tmp_path))
     pre_hook = captured[0].options.hooks["PreToolUse"][0].hooks[0]
@@ -1439,7 +1439,7 @@ def test_tool_events_record_the_calling_thread(tmp_path: Path) -> None:
     executor = ModelExecutor(
         runtime_config(tmp_path),
         client_factory=client_factory,
-        event_log=lambda event, detail="", issue_number=None: events.append((event, detail)),
+        event_log=lambda event, detail="", level="INFO", issue_number=None: events.append((event, detail)),
     )
     asyncio.run(executor.execute(issue_body="Fix it.", working_directory=tmp_path))
     pre_hook = captured[0].options.hooks["PreToolUse"][0].hooks[0]
@@ -1608,3 +1608,151 @@ def test_cli_session_id_resets_between_executions(tmp_path: Path) -> None:
 
     asyncio.run(executor.execute(issue_body="Fix it.", working_directory=tmp_path))
     assert executor.cli_session_id is None
+
+
+# --- Token ledger feeding (issue #119, part 2, step 1) ------------------------
+
+
+def stream_event(event: dict, *, parent_tool_use_id: str | None = None, uuid: str = "e-1") -> StreamEvent:
+    return StreamEvent(
+        uuid=uuid, session_id="sess-1", event=event, parent_tool_use_id=parent_tool_use_id
+    )
+
+
+def test_measured_usage_from_deltas_sums_once_per_response(tmp_path: Path) -> None:
+    events: list[tuple[str, str, str]] = []
+    captured: list[FakeClient] = []
+
+    def client_factory(options: object) -> FakeClient:
+        client = FakeClient(
+            options,
+            [
+                stream_event(
+                    {"type": "message_start", "message": {"id": "r1"}}, uuid="e-start-1"
+                ),
+                AssistantMessage(
+                    content=[TextBlock(text="hello")],
+                    model="muse-spark-1.3-contributor",
+                    message_id="r1",
+                    usage=None,
+                ),
+                stream_event(
+                    {"type": "message_delta", "usage": {"input_tokens": 1000, "output_tokens": 200}},
+                    uuid="e-delta-1",
+                ),
+                # The same response reported once per content block is merged, never added.
+                AssistantMessage(
+                    content=[TextBlock(text="hello")],
+                    model="muse-spark-1.3-contributor",
+                    message_id="r1",
+                    usage={"input_tokens": 1000, "output_tokens": 200},
+                ),
+                stream_event(
+                    {"type": "message_start", "message": {"id": "r2"}}, uuid="e-start-2"
+                ),
+                AssistantMessage(
+                    content=[TextBlock(text="world")],
+                    model="muse-spark-1.3-contributor",
+                    message_id="r2",
+                    usage=None,
+                ),
+                stream_event(
+                    {"type": "message_delta", "usage": {"input_tokens": 3000, "output_tokens": 400}},
+                    uuid="e-delta-2",
+                ),
+                result(),
+            ],
+        )
+        captured.append(client)
+        return client
+
+    executor = ModelExecutor(
+        runtime_config(tmp_path),
+        client_factory=client_factory,
+        event_log=lambda event, detail="", level="INFO", issue_number=None: events.append(
+            (event, detail, level)
+        ),
+    )
+    execution = asyncio.run(executor.execute(issue_body="Fix it.", working_directory=tmp_path))
+
+    assert execution.status is ModelExecutionStatus.SUCCEEDED
+    assert captured[0].options.include_partial_messages is True
+
+    assert executor._ledger.measured_tokens == 4600
+    assert executor._ledger.estimated_tokens == 0
+    assert executor._ledger.budget_tokens == 4600
+
+    assert not [name for name, _, _ in events if name == "token_estimate_degraded"]
+
+    limits_events = [
+        (detail, level)
+        for name, detail, level in events
+        if name == "limits_checked" and detail.startswith("thread=")
+    ]
+    # r1 settles when r2 arrives; r2 is still in flight at the terminal result.
+    assert len(limits_events) == 1
+    detail, level = limits_events[0]
+    assert level == "INFO"
+    assert "thread=main" in detail
+    assert "budget_tokens=4600" in detail
+    assert "measured_tokens=4600" in detail
+    assert "estimated_tokens=0" in detail
+    assert "soft_threshold_tokens=3200000" in detail
+    assert "max_budget_tokens=4000000" in detail
+    assert "main_context_tokens=" in detail
+    assert "turns=2" in detail
+    assert "max_turns=60" in detail
+    assert "elapsed_seconds=" in detail
+    assert "timeout_seconds=60" in detail
+    assert "usd" not in detail.lower()
+
+
+def test_subagent_responses_count_on_their_own_thread(tmp_path: Path) -> None:
+    events: list[tuple[str, str, str]] = []
+
+    def client_factory(options: object) -> FakeClient:
+        return FakeClient(
+            options,
+            [
+                AssistantMessage(
+                    content=[TextBlock(text="x" * 3000)],
+                    model="muse-spark-1.3-contributor",
+                    parent_tool_use_id="toolu-123",
+                    message_id="s1",
+                    usage={"input_tokens": 0, "output_tokens": 0},
+                ),
+                AssistantMessage(
+                    content=[],
+                    model="muse-spark-1.3-contributor",
+                    parent_tool_use_id="toolu-123",
+                    message_id="s2",
+                    usage=None,
+                ),
+                result(),
+            ],
+        )
+
+    executor = ModelExecutor(
+        runtime_config(tmp_path),
+        client_factory=client_factory,
+        event_log=lambda event, detail="", level="INFO", issue_number=None: events.append(
+            (event, detail, level)
+        ),
+    )
+    execution = asyncio.run(executor.execute(issue_body="Fix it.", working_directory=tmp_path))
+
+    assert execution.status is ModelExecutionStatus.SUCCEEDED
+    assert executor._ledger.has_thread("toolu-123")
+    assert executor._ledger.response_count("toolu-123") == 2
+    assert executor._ledger.response_count("main") == 0
+
+    degraded = [(detail, level) for name, detail, level in events if name == "token_estimate_degraded"]
+    assert len(degraded) == 1
+    assert degraded[0][1] == "WARNING"
+    assert "thread=toolu-123" in degraded[0][0]
+
+    limits_events = [
+        detail for name, detail, _ in events if name == "limits_checked" and detail.startswith("thread=")
+    ]
+    assert len(limits_events) == 1
+    assert "thread=toolu-123" in limits_events[0]

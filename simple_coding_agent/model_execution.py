@@ -20,20 +20,25 @@ from claude_agent_sdk import (
     HookMatcher,
     ResultMessage,
     SystemMessage,
+    StreamEvent,
     TextBlock,
+    UserMessage,
 )
 
 from simple_coding_agent.config import RuntimeConfig
+from simple_coding_agent.token_ledger import USAGE_CATEGORIES, TokenLedger
 
 
 _SKILLS = ["implement", "tdd", "code-review", "codebase-design", "handoff"]
 _META_BASE_URL = "https://api.meta.ai"
 
-# SDK 0.2.156 reports authoritative `total_cost_usd` only on the terminal
-# ResultMessage; there is no live cost feed mid-stream. This blended rate
-# converts tokens observed on each AssistantMessage into an estimate that is
-# precise enough to trigger a best-effort cooperative handoff near the
-# budget ceiling, but it is never an exact accounting guarantee.
+# The per-attempt token ledger (``token_ledger.TokenLedger``) is the live
+# budget reading: every streamed ``AssistantMessage`` counts its response as
+# an estimate on first sight, ``StreamEvent`` ``message_delta`` usage and
+# non-zero ``AssistantMessage.usage`` replace the estimate with the measured
+# categories, and tool results / user messages grow the thread context. The
+# soft threshold is evaluated against ``ledger.budget_tokens`` on every ledger
+# update; only ``limits_checked`` logging waits for a response to settle.
 _ESTIMATED_USD_PER_MILLION_TOKENS = 15.0
 _USAGE_TOKEN_FIELDS = (
     "input_tokens",
@@ -240,7 +245,7 @@ class ModelExecutor:
         *,
         client_factory: ClientFactory = ClaudeSDKClient,
         clock: Clock = lambda: datetime.now(UTC),
-        event_log: EventLog = lambda event, detail="", issue_number=None: None,
+        event_log: EventLog = lambda event, detail="", level="INFO", issue_number=None: None,
     ) -> None:
         self._config = config
         self._client_factory = client_factory
@@ -269,6 +274,19 @@ class ModelExecutor:
         self._operator_begun = False
         self._operator_deadline_expired = False
         self._cli_session_id: str | None = None
+        self._reset_ledger_state()
+
+    def _reset_ledger_state(self) -> None:
+        """Start a fresh per-attempt ledger (hooks may run without ``execute``)."""
+
+        self._ledger = TokenLedger()
+        self._ledger_threads: set[str] = set()
+        self._stream_response_ids: dict[str, str] = {}
+        self._pending_usage: dict[tuple[str, str], dict[str, int]] = {}
+        self._counted_response_ids: set[tuple[str, str]] = set()
+        self._limits_logged: set[tuple[str, str]] = set()
+        self._degraded_logged = False
+        self._auto_response_seq = 0
 
     def set_operator_handoff_provider(
         self, provider: OperatorHandoffProvider | None
@@ -470,8 +488,30 @@ class ModelExecutor:
 
         return tuple(self._skill_events)
 
-    def _log(self, event: str, detail: str = "") -> None:
-        self._event_log(event, detail, issue_number=self._issue_number)
+    def _log(self, event: str, detail: str = "", level: str = "INFO") -> None:
+        self._event_log(event, detail, level=level, issue_number=self._issue_number)
+
+    def _start_launch_thread(self, hook_input: Any, tool_use_id: str | None) -> None:
+        """Start a subagent ledger thread at launch, seeded with its prompt."""
+
+        if tool_use_id is None:
+            return
+        tool_name = _hook_field(hook_input, "tool_name")
+        if tool_name != "Agent" and not (
+            tool_name == "Task" and _is_subagent_launch(hook_input)
+        ):
+            return
+        tool_input = _hook_field(hook_input, "tool_input", {})
+        prompt = ""
+        subagent_type = None
+        if isinstance(tool_input, Mapping):
+            raw_prompt = tool_input.get("prompt", tool_input.get("description", ""))
+            prompt = raw_prompt if isinstance(raw_prompt, str) else ""
+            raw_type = tool_input.get("subagent_type")
+            subagent_type = raw_type if isinstance(raw_type, str) else None
+        self._ensure_ledger_thread(
+            tool_use_id, subagent_type=subagent_type, prompt_chars=len(prompt)
+        )
 
     def _track_subagent_seen(self, hook_input: Any) -> None:
         """Remember a subagent id seen before the soft-threshold crossing.
@@ -544,6 +584,8 @@ class ModelExecutor:
         self._stopped_subagent_ids = []
         self._usage_shape_logged = False
         self._cost_estimator_observed_on_assistant = False
+        self._reset_ledger_state()
+        self._ensure_ledger_thread("main", prompt_chars=len(issue_body))
         self._operator_handoff = None
         self._operator_context_delivered = False
         self._operator_fallback_used = False
@@ -783,6 +825,7 @@ class ModelExecutor:
             permission_mode="bypassPermissions",
             max_turns=self._config.max_turns,
             max_budget_usd=self._config.max_budget_usd,
+            include_partial_messages=True,
             cwd=working_directory,
             env=_meta_environment(self._config.meta_api_key, self._config.model),
             setting_sources=settings_sources,
@@ -857,7 +900,11 @@ class ModelExecutor:
                     for block in message.content:
                         if isinstance(block, TextBlock) and block.text.strip():
                             self._log("model_response", self._model_response_detail(block.text))
-                    self._observe_cost(message.usage)
+                    self._observe_assistant_message(message)
+                elif isinstance(message, StreamEvent):
+                    self._observe_stream_event(message)
+                elif isinstance(message, UserMessage):
+                    self._observe_user_message(message)
                 model = getattr(message, "model", None)
                 if isinstance(model, str):
                     observed_models.append(model)
@@ -876,6 +923,144 @@ class ModelExecutor:
         self._cost_estimator.observe(usage)
         if self._cost_estimator.has_positive_usage:
             self._check_limits()
+
+    def _ensure_ledger_thread(
+        self, thread_id: str, *, subagent_type: str | None = None, prompt_chars: int = 0
+    ) -> None:
+        """Start a ledger thread on first sight (``main`` or ``parent_tool_use_id``)."""
+
+        if thread_id in self._ledger_threads:
+            return
+        self._ledger.start_thread(
+            thread_id,
+            kind="main" if thread_id == "main" else "subagent",
+            prompt_chars=prompt_chars,
+            subagent_type=subagent_type,
+        )
+        self._ledger_threads.add(thread_id)
+
+    def _assistant_response_id(self, message: AssistantMessage, thread_id: str) -> str:
+        """Stable response id: the API message id, else one id per message."""
+
+        message_id = getattr(message, "message_id", None)
+        if isinstance(message_id, str) and message_id:
+            return message_id
+        uuid = getattr(message, "uuid", None)
+        if isinstance(uuid, str) and uuid:
+            return uuid
+        self._auto_response_seq += 1
+        return f"auto-{thread_id}-{self._auto_response_seq}"
+
+    def _observe_assistant_message(self, message: AssistantMessage) -> None:
+        """Feed one streamed assistant message into the token ledger.
+
+        The response is counted as an estimate on first sight; reported
+        usage (here or stashed from an earlier ``message_delta``) replaces
+        the estimate per category by max, keyed by response id.
+        """
+
+        thread_id = getattr(message, "parent_tool_use_id", None) or "main"
+        self._ensure_ledger_thread(thread_id)
+        response_id = self._assistant_response_id(message, thread_id)
+        content = getattr(message, "content", [])
+        usage = getattr(message, "usage", None)
+        self._ledger.observe_response(thread_id, response_id, _content_chars(content))
+        self._counted_response_ids.add((thread_id, response_id))
+        if isinstance(usage, Mapping):
+            self._ledger.observe_usage(thread_id, response_id, usage)
+        pending = self._pending_usage.pop((thread_id, response_id), None)
+        if pending:
+            self._ledger.observe_usage(thread_id, response_id, pending)
+        self._observe_cost(usage)
+        self._after_ledger_update(thread_id)
+
+    def _observe_stream_event(self, message: StreamEvent) -> None:
+        """Merge streamed ``message_delta`` usage into the ledger.
+
+        The response id comes from that stream's ``message_start``. A delta
+        for a response not yet counted (it arrives just after PreToolUse,
+        before the response's ``AssistantMessage``) is stashed until the
+        response is counted; a delta with no ``message_start`` is ignored.
+        """
+
+        event = getattr(message, "event", None)
+        if not isinstance(event, Mapping):
+            return
+        event_type = event.get("type")
+        thread_id = getattr(message, "parent_tool_use_id", None) or "main"
+        self._ensure_ledger_thread(thread_id)
+        if event_type == "message_start":
+            inner = event.get("message")
+            if isinstance(inner, Mapping):
+                response_id = inner.get("id")
+                if isinstance(response_id, str) and response_id:
+                    self._stream_response_ids[thread_id] = response_id
+        elif event_type == "message_delta":
+            usage = event.get("usage")
+            if not isinstance(usage, Mapping):
+                return
+            response_id = self._stream_response_ids.get(thread_id)
+            if response_id is None:
+                return
+            if (thread_id, response_id) in self._counted_response_ids:
+                self._ledger.observe_usage(thread_id, response_id, usage)
+            else:
+                pending = self._pending_usage.setdefault(
+                    (thread_id, response_id),
+                    {category: 0 for category in USAGE_CATEGORIES},
+                )
+                for category in USAGE_CATEGORIES:
+                    reported = usage.get(category, 0)
+                    pending[category] = max(
+                        pending[category], int(reported or 0)
+                    )
+            self._after_ledger_update(thread_id)
+
+    def _observe_user_message(self, message: UserMessage) -> None:
+        """Grow the thread context with a streamed tool result / user message."""
+
+        thread_id = getattr(message, "parent_tool_use_id", None) or "main"
+        self._ensure_ledger_thread(thread_id)
+        self._ledger.observe_input(thread_id, _content_chars(getattr(message, "content", "")))
+        self._after_ledger_update(thread_id)
+
+    def _after_ledger_update(self, thread_id: str) -> None:
+        """Log per-settled-response readings after any ledger mutation."""
+
+        notice = self._ledger.first_settled_without_usage
+        if notice is not None and not self._degraded_logged:
+            self._degraded_logged = True
+            self._log(
+                "token_estimate_degraded",
+                f"thread={notice.thread}; subagent_type={notice.subagent_type}; "
+                f"estimated_tokens={self._ledger.estimated_tokens:.0f}",
+                level="WARNING",
+            )
+        for response_id in self._ledger.settled_response_ids(thread_id):
+            if (thread_id, response_id) not in self._limits_logged:
+                self._limits_logged.add((thread_id, response_id))
+                self._log("limits_checked", self._token_limits_detail(thread_id))
+
+    def _token_limits_detail(self, thread_id: str) -> str:
+        if self._ledger.has_thread("main"):
+            main_context = self._ledger.context_tokens("main")
+            turns = self._ledger.response_count("main")
+        else:
+            main_context = 0.0
+            turns = 0
+        return (
+            f"thread={thread_id}; "
+            f"budget_tokens={self._ledger.budget_tokens:.0f}; "
+            f"measured_tokens={self._ledger.measured_tokens:.0f}; "
+            f"estimated_tokens={self._ledger.estimated_tokens:.0f}; "
+            f"soft_threshold_tokens={self._config.soft_threshold_tokens}; "
+            f"max_budget_tokens={self._config.max_budget_tokens}; "
+            f"main_context_tokens={main_context:.0f}; "
+            f"turns={turns}; "
+            f"max_turns={self._config.max_turns}; "
+            f"elapsed_seconds={self._elapsed_seconds()}; "
+            f"timeout_seconds={self._config.model_timeout}"
+        )
 
     def _elapsed_seconds(self) -> int:
         delta = (self._clock() - self._started_at).total_seconds()
@@ -1068,6 +1253,7 @@ class ModelExecutor:
     ) -> dict[str, Any]:
         self._log_tool_use("tool_call", hook_input)
         await self._record_skill_event("PreToolUse", hook_input, tool_use_id, context)
+        self._start_launch_thread(hook_input, tool_use_id)
         if _skill_name(hook_input) == "code-review":
             self._review_count += 1
             if self._review_count > 3:
@@ -1338,6 +1524,38 @@ def _skill_name(hook_input: object) -> str | None:
     tool_input = _hook_field(hook_input, "tool_input", {})
     name = tool_input.get("skill") if isinstance(tool_input, Mapping) else None
     return name if isinstance(name, str) else None
+
+
+def _content_chars(value: object) -> int:
+    """Approximate character count of streamed content or a tool payload.
+
+    Visible assistant output (text blocks, tool-use input) sizes the
+    response estimate; tool results and user messages grow the thread
+    context. Anything unrecognised falls back to its ``repr`` length.
+    """
+
+    if value is None:
+        return 0
+    if isinstance(value, str):
+        return len(value)
+    if isinstance(value, Mapping):
+        return sum(_content_chars(key) + _content_chars(item) for key, item in value.items())
+    if isinstance(value, (list, tuple)):
+        return sum(_content_chars(item) for item in value)
+    text = getattr(value, "text", None)
+    if isinstance(text, str):
+        return len(text)
+    total = 0
+    for attribute in ("content", "input"):
+        inner = getattr(value, attribute, None)
+        if inner is not None:
+            total += _content_chars(inner)
+    if total:
+        return total
+    name = getattr(value, "name", None)
+    if isinstance(name, str):
+        return len(name)
+    return len(repr(value))
 
 
 def _hook_field(hook_input: object, name: str, default: Any = None) -> Any:
