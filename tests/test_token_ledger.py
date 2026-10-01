@@ -140,6 +140,14 @@ def test_subagent_base_is_conservative_by_default_for_known_and_unknown_types() 
     assert ledger.context_tokens("toolu_1") == 15_000
 
 
+def test_ledger_accepts_per_type_subagent_base_overrides() -> None:
+    ledger = TokenLedger(subagent_bases_by_type={"custom": 1_400})
+    ledger.start_thread("toolu_1", kind="subagent", prompt_chars=0, subagent_type="custom")
+    ledger.start_thread("toolu_2", kind="subagent", prompt_chars=0, subagent_type="other")
+
+    assert ledger.context_tokens("toolu_1") == 1_400
+    assert ledger.context_tokens("toolu_2") == 15_000
+
 def test_first_response_that_settles_without_usage_is_reported_once() -> None:
     ledger = TokenLedger()
     ledger.start_thread("main", kind="main", prompt_chars=0)

@@ -165,7 +165,10 @@ class TokenLedger:
     ) -> None:
         self._main_system_base = main_system_base
         self._subagent_system_base = subagent_system_base_tokens
-        self._subagent_bases_by_type = dict(subagent_bases_by_type or {})
+        if subagent_bases_by_type is None:
+            self._subagent_bases_by_type = dict(SUBAGENT_SYSTEM_BASE_TOKENS_BY_TYPE)
+        else:
+            self._subagent_bases_by_type = dict(subagent_bases_by_type)
         self._threads: dict[str, _Thread] = {}
         self._first_settled_without_usage: DegradedNotice | None = None
         self._peak_main_context_tokens = 0.0
