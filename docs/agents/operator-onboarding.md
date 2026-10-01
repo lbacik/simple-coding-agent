@@ -88,7 +88,7 @@ The agent does not delete log directories.
 ## Provider spending caps
 
 Configure spending limits in Meta's dashboard.  The agent sets
-`max_budget_usd=5` as a client-side SDK circuit breaker; this is not
+`max_budget_usd=20` as a client-side SDK circuit breaker; this is not
 authoritative billing.  Override it with `MAX_BUDGET_USD` (a positive
 integer number of dollars) and the turn cap with `MAX_TURNS` (default 60).
 The only model used is `muse-spark-1.3-contributor`; no fallback is
@@ -101,13 +101,17 @@ USD figures for the Meta backend come from the container's managed-settings
 default-model rates.  They are still estimates for observability, not a
 measured bill: rely on Meta's billing dashboard for accurate cost data.
 
-Before the hard ceiling, the agent tries a cooperative `handoff`: once
-estimated spend crosses `soft = max_budget_usd - max_budget_usd *
-SOFT_THRESHOLD_PERCENTAGE` (default `SOFT_THRESHOLD_PERCENTAGE=0.2`, i.e. 80%
-of budget), it asks the model to commit its progress and stop. This estimate
-is derived from streamed token counts, not the SDK's authoritative
-`total_cost_usd` (only available once the attempt ends), so treat the
-threshold as approximate. Once the soft threshold is crossed, tool enforcement
+Before the hard ceiling, the agent tries a cooperative `handoff`: once the
+token budget crosses `soft = MAX_BUDGET_TOKENS * (1 -
+SOFT_THRESHOLD_PERCENTAGE)` tokens (default `MAX_BUDGET_TOKENS=4000000` and
+`SOFT_THRESHOLD_PERCENTAGE=0.2`, i.e. 3,200,000 tokens), it asks the model to
+commit its progress and stop. The token budget comes from a per-attempt
+ledger: each streamed response is first counted as a local estimate and is
+replaced by the usage the backend reports (`message_delta` events) when that
+arrives, so the threshold still works when the backend reports no usage; the
+`token_estimate_degraded` warning marks that case. `max_budget_usd` (default
+`20`) is only the SDK's client-side USD backstop and does not drive the soft
+threshold. Once the soft threshold is crossed, tool enforcement
 blocks general file modifications and arbitrary execution, only allowing the
 model to write the handoff note (`.agent/handoff/<issue-number>.md`) and execute
 read/inspection or git wrap-up commands (e.g. `git status`, `git add`, `git commit`).

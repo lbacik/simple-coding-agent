@@ -39,20 +39,6 @@ _META_BASE_URL = "https://api.meta.ai"
 # categories, and tool results / user messages grow the thread context. The
 # soft threshold is evaluated against ``ledger.budget_tokens`` on every ledger
 # update; only ``limits_checked`` logging waits for a response to settle.
-_ESTIMATED_USD_PER_MILLION_TOKENS = 15.0
-_USAGE_TOKEN_FIELDS = (
-    "input_tokens",
-    "output_tokens",
-    "cache_creation_input_tokens",
-    "cache_read_input_tokens",
-)
-_CATEGORY_USD_PER_MILLION_TOKENS: Mapping[str, float] = {
-    "cache_read_input_tokens": 0.30,
-    "cache_creation_input_tokens": 3.75,
-    "input_tokens": 3.00,
-    "output_tokens": 15.00,
-}
-
 _HANDOFF_FOLLOWUP_TIMEOUT = 300
 
 _OPERATOR_HANDOFF_DELIVERY_WINDOW_SECONDS = 60
@@ -63,7 +49,7 @@ _COST_HANDOFF_INSTRUCTION = (
     "to preserve your progress cooperatively instead of continuing further work."
 )
 _COST_HANDOFF_FOLLOWUP_PROMPT = (
-    "This attempt crossed its cost soft threshold and must now end by handing off. "
+    "This attempt crossed its token soft threshold and must now end by handing off. "
     "Invoke the `handoff` skill now to preserve your progress: commit any outstanding "
     "work, then write and commit the handoff note. Do not attempt further implementation work."
 )
@@ -88,60 +74,6 @@ _OPERATOR_HANDOFF_FOLLOWUP_PROMPT = (
     " commit it separately as the final commit. Do not attempt further"
     " implementation work."
 )
-
-
-class _CostEstimator:
-    """Accumulate an approximate USD spend from streamed token usage or turn count."""
-
-    def __init__(
-        self,
-        rate_per_million_tokens: float = _ESTIMATED_USD_PER_MILLION_TOKENS,
-        category_rates: Mapping[str, float] | None = None,
-        fallback_turn_cost: float = 0.05,
-    ) -> None:
-        self._rate = rate_per_million_tokens
-        self._category_rates = dict(category_rates or _CATEGORY_USD_PER_MILLION_TOKENS)
-        self._fallback_turn_cost = fallback_turn_cost
-        self._tokens = 0
-        self._estimated_cost = 0.0
-        self._has_positive_usage = False
-        self._turns = 0
-
-    @property
-    def has_positive_usage(self) -> bool:
-        return self._has_positive_usage
-
-    @property
-    def turns(self) -> int:
-        return self._turns
-
-    def observe(self, usage: Any) -> float:
-        has_tokens = False
-        if isinstance(usage, Mapping):
-            has_cache = any(
-                isinstance(usage.get(f), int) and usage.get(f) > 0
-                for f in ("cache_read_input_tokens", "cache_creation_input_tokens")
-            )
-            for field in _USAGE_TOKEN_FIELDS:
-                value = usage.get(field)
-                if isinstance(value, int) and value > 0:
-                    has_tokens = True
-                    self._tokens += value
-                    rate = self._category_rates.get(field, self._rate) if has_cache else self._rate
-                    self._estimated_cost += (value / 1_000_000) * rate
-        if has_tokens:
-            self._has_positive_usage = True
-            self._turns += 1
-        return self.estimated_cost_usd
-
-    def observe_turn(self, estimated_turn_cost_usd: float) -> float:
-        self._turns += 1
-        self._estimated_cost += estimated_turn_cost_usd
-        return self.estimated_cost_usd
-
-    @property
-    def estimated_cost_usd(self) -> float:
-        return self._estimated_cost
 
 
 class ModelExecutionStatus(StrEnum):
@@ -225,10 +157,10 @@ _MAX_LOG_DETAIL = 2000
 class ModelExecutor:
     """Run the approved upstream skills and retain terminal stream evidence.
 
-    Cost soft-threshold policy: once the estimated cost crosses the soft
+    Token soft-threshold policy: once the ledger budget crosses the soft
     threshold, every running subagent (including background ones) is
     stopped: subsequent subagent tool calls are denied and the cancelled
-    ids are recorded in a ``cost_soft_threshold_subagents_stopped`` event.
+    ids are recorded in a ``token_soft_threshold_subagents_stopped`` event.
     Only the main thread is steered toward the ``handoff`` skill after the
     crossing; new subagent launches from the main thread are denied. The
     handoff instruction is delivered on the next tool boundary once no
@@ -256,16 +188,12 @@ class ModelExecutor:
         self._issue_number: int | None = None
         self._archive: EvidenceWriter | None = None
         self._event_sequence = 0
-        self._cost_estimator = _CostEstimator(
-            fallback_turn_cost=self._config.max_budget_usd / max(self._config.max_turns, 1)
-        )
         self._started_at = self._clock()
         self._soft_threshold_crossed = False
         self._handoff_context_delivered = False
         self._running_subagents: set[str] = set()
         self._stopped_subagent_ids: list[str] = []
         self._usage_shape_logged = False
-        self._cost_estimator_observed_on_assistant = False
         self._operator_handoff_provider: OperatorHandoffProvider | None = None
         self._operator_handoff_reporter: OperatorHandoffReporter | None = None
         self._operator_handoff: OperatorHandoff | None = None
@@ -439,9 +367,7 @@ class ModelExecutor:
     def _operator_fallback_blocked(self) -> bool:
         """Whether the single fallback query would bypass the hard cost limit."""
 
-        return (
-            self._cost_estimator.estimated_cost_usd >= self._config.max_budget_usd
-        )
+        return self._ledger.budget_tokens >= self._config.max_budget_tokens
 
     async def _run_operator_fallback(
         self, client: SDKClient, observed_models: list[str]
@@ -538,7 +464,7 @@ class ModelExecutor:
         self._running_subagents.clear()
         ids_detail = ",".join(stopped)
         self._log(
-            "cost_soft_threshold_subagents_stopped",
+            "token_soft_threshold_subagents_stopped",
             f"stopped_agent_ids={ids_detail}; count={len(stopped)}; "
             "in-flight subagent tools are denied after the cost crossing "
             "and only handoff-related main-thread commands stay allowed.",
@@ -575,15 +501,11 @@ class ModelExecutor:
         self._archive = archive
         self._event_sequence = 0
         self._started_at = self._clock()
-        self._cost_estimator = _CostEstimator(
-            fallback_turn_cost=self._config.max_budget_usd / max(self._config.max_turns, 1)
-        )
         self._soft_threshold_crossed = False
         self._handoff_context_delivered = False
         self._running_subagents = set()
         self._stopped_subagent_ids = []
         self._usage_shape_logged = False
-        self._cost_estimator_observed_on_assistant = False
         self._reset_ledger_state()
         self._ensure_ledger_thread("main", prompt_chars=len(issue_body))
         self._operator_handoff = None
@@ -592,12 +514,12 @@ class ModelExecutor:
         self._operator_begun = False
         self._operator_deadline_expired = False
         self._cli_session_id = None
-        soft_threshold = self._config.max_budget_usd * (1 - self._config.soft_threshold_percentage)
         self._log(
             "model_execution_started",
             f"issue_body_length={len(issue_body)}; limits: "
             f"max_budget_usd={self._config.max_budget_usd:.4f}; "
-            f"soft_threshold_usd={soft_threshold:.4f}; "
+            f"max_budget_tokens={self._config.max_budget_tokens}; "
+            f"soft_threshold_tokens={self._config.soft_threshold_tokens}; "
             f"max_turns={self._config.max_turns}; "
             f"timeout_seconds={self._config.model_timeout}",
         )
@@ -629,8 +551,8 @@ class ModelExecutor:
                     terminal, observed_models
                 ):
                     self._log(
-                        "cost_soft_threshold_handoff_followup",
-                        "Terminal result arrived after the cost soft-threshold"
+                        "token_soft_threshold_handoff_followup",
+                        "Terminal result arrived after the token soft-threshold"
                         " crossing without a main-thread handoff; issuing the"
                         " single cost follow-up handoff prompt.",
                     )
@@ -731,9 +653,7 @@ class ModelExecutor:
     def _cost_followup_blocked(self) -> bool:
         """Whether the cost follow-up would bypass the hard cost limit."""
 
-        return (
-            self._cost_estimator.estimated_cost_usd >= self._config.max_budget_usd
-        )
+        return self._ledger.budget_tokens >= self._config.max_budget_tokens
 
     def _needs_cost_handoff_followup(
         self, terminal: ResultMessage, observed_models: tuple[str, ...]
@@ -750,7 +670,7 @@ class ModelExecutor:
             return False
         if self._cost_followup_blocked():
             self._log(
-                "cost_soft_threshold_handoff_followup_blocked",
+                "token_soft_threshold_handoff_followup_blocked",
                 "estimated cost reached the hard cost limit, so no cost"
                 " follow-up query is issued and the terminal result decides"
                 " the outcome",
@@ -913,16 +833,10 @@ class ModelExecutor:
             # while a ``__anext__()`` is still pending; never leave it dangling.
             await _cancel_stream_wait(pending)
 
-    def _observe_cost(self, usage: Any) -> None:
-        """Latch a one-time soft-threshold crossing from estimated cumulative cost."""
-
-        self._cost_estimator_observed_on_assistant = True
+    def _log_usage_shape(self, usage: Any) -> None:
         if not self._usage_shape_logged:
             self._usage_shape_logged = True
             self._log("model_usage_shape", f"usage={usage!r}")
-        self._cost_estimator.observe(usage)
-        if self._cost_estimator.has_positive_usage:
-            self._check_limits()
 
     def _ensure_ledger_thread(
         self, thread_id: str, *, subagent_type: str | None = None, prompt_chars: int = 0
@@ -971,7 +885,7 @@ class ModelExecutor:
         pending = self._pending_usage.pop((thread_id, response_id), None)
         if pending:
             self._ledger.observe_usage(thread_id, response_id, pending)
-        self._observe_cost(usage)
+        self._log_usage_shape(usage)
         self._after_ledger_update(thread_id)
 
     def _observe_stream_event(self, message: StreamEvent) -> None:
@@ -1025,7 +939,9 @@ class ModelExecutor:
         self._after_ledger_update(thread_id)
 
     def _after_ledger_update(self, thread_id: str) -> None:
-        """Log per-settled-response readings after any ledger mutation."""
+        """Check the soft threshold and log settled responses after any ledger mutation."""
+
+        self._check_limits(thread_id)
 
         notice = self._ledger.first_settled_without_usage
         if notice is not None and not self._degraded_logged:
@@ -1066,27 +982,17 @@ class ModelExecutor:
         delta = (self._clock() - self._started_at).total_seconds()
         return max(0, int(delta))
 
-    def _limits_detail(self) -> str:
-        soft_threshold = self._config.max_budget_usd * (1 - self._config.soft_threshold_percentage)
-        return (
-            f"estimated_cost_usd={self._cost_estimator.estimated_cost_usd:.4f}; "
-            f"soft_threshold_usd={soft_threshold:.4f}; "
-            f"max_budget_usd={self._config.max_budget_usd:.4f}; "
-            f"turns={self._cost_estimator.turns}; "
-            f"max_turns={self._config.max_turns}; "
-            f"elapsed_seconds={self._elapsed_seconds()}; "
-            f"timeout_seconds={self._config.model_timeout}"
-        )
+    def _check_limits(self, thread_id: str = "main") -> None:
+        """Latch a one-time soft-threshold crossing from the token ledger."""
 
-    def _check_limits(self) -> None:
-        self._log("limits_checked", self._limits_detail())
-        soft_threshold = self._config.max_budget_usd * (1 - self._config.soft_threshold_percentage)
-        if not self._soft_threshold_crossed and self._cost_estimator.estimated_cost_usd >= soft_threshold:
+        budget = self._ledger.budget_tokens
+        threshold = self._config.soft_threshold_tokens
+        if not self._soft_threshold_crossed and budget >= threshold:
             self._soft_threshold_crossed = True
             self._log(
-                "cost_soft_threshold_crossed",
-                f"estimated_cost_usd={self._cost_estimator.estimated_cost_usd:.4f}; "
-                f"soft_threshold_usd={soft_threshold:.4f}",
+                "token_soft_threshold_crossed",
+                f"budget_tokens={budget:.0f}; soft_threshold_tokens={threshold}; "
+                f"thread={thread_id}",
             )
             self._stop_running_subagents()
 
@@ -1129,7 +1035,7 @@ class ModelExecutor:
         if self._soft_threshold_crossed and self._main_thread_handoff_invoked():
             return self._evidence(
                 ModelExecutionStatus.HANDOFF_REQUESTED,
-                "Model invoked the handoff skill after a cost soft-threshold instruction.",
+                "Model invoked the handoff skill after a token soft-threshold instruction.",
                 stop_reason,
                 model_usage,
                 all_models,
@@ -1265,7 +1171,7 @@ class ModelExecutor:
                 agent_id = _hook_agent_id(hook_input)
                 if agent_id is not None and agent_id not in self._stopped_subagent_ids:
                     self._stopped_subagent_ids.append(agent_id)
-                return _cost_deny("Subagent work is stopped after the cost soft threshold.")
+                return _cost_deny("Subagent work is stopped after the token soft threshold.")
             else:
                 tool_name = _hook_field(hook_input, "tool_name")
                 if tool_name == "Skill" and _skill_name(hook_input) == "handoff":
@@ -1318,10 +1224,6 @@ class ModelExecutor:
         await self._record_skill_event("PostToolUse", hook_input, tool_use_id, context)
         if not self._soft_threshold_crossed:
             self._track_subagent_seen(hook_input)
-        if not self._cost_estimator.has_positive_usage:
-            per_turn_cost = self._config.max_budget_usd / max(self._config.max_turns, 1)
-            self._cost_estimator.observe_turn(per_turn_cost)
-        self._check_limits()
         self._poll_operator_handoff()
         contexts: list[str] = []
         if self._soft_threshold_crossed and not self._handoff_context_delivered:
@@ -1332,7 +1234,7 @@ class ModelExecutor:
                 # boundary; stopping the subagents at the crossing is what
                 # frees the remaining budget for the handoff.
                 self._handoff_context_delivered = True
-                self._log("cost_soft_threshold_handoff_context_injected")
+                self._log("token_soft_threshold_handoff_context_injected")
                 contexts.append(_COST_HANDOFF_INSTRUCTION)
             else:
                 # Subagents are still recorded as running (for example the

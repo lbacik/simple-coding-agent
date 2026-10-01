@@ -326,13 +326,12 @@ def test_fallback_never_bypasses_the_hard_cost_limit(tmp_path: Path) -> None:
     heavy_usage = AssistantMessage(
         content=[],
         model="muse-spark-1.3-contributor",
-        usage={"input_tokens": 400_000},
+        usage={"input_tokens": 1_100_000},
     )
     client = FakeClient(object(), [heavy_usage, result()])
     current: list[OperatorHandoff | None] = [None]
-    # Pinned to the pre-token-budget USD regime: this test exercises the USD hard ceiling.
     executor = ModelExecutor(
-        replace(runtime_config(tmp_path), max_budget_usd=5),
+        replace(runtime_config(tmp_path), max_budget_tokens=1_000_000),
         client_factory=lambda options: client,
         clock=lambda: now,
     )
@@ -344,7 +343,7 @@ def test_fallback_never_bypasses_the_hard_cost_limit(tmp_path: Path) -> None:
         )
         for _ in range(1000):
             await asyncio.sleep(0)
-            if executor._cost_estimator.estimated_cost_usd >= 5:
+            if executor._ledger.budget_tokens >= 1_000_000:
                 break
         current[0] = OperatorHandoff("req-1", now - timedelta(seconds=61))
         return await task

@@ -424,6 +424,34 @@ def test_served_handoff_with_a_wrong_reason_still_publishes_but_fails_the_reques
     assert "operator_request" in operator.failed[0][1]
 
 
+def test_served_handoff_with_a_token_soft_threshold_reason_still_publishes_but_fails_the_request(
+    tmp_path: Path,
+) -> None:
+    working_directory = tmp_path / "work"
+    working_directory.mkdir()
+    workspace = seeded_workspace(
+        working_directory, note=True, work_subject="Half-finish the parser"
+    )
+    write_operator_note(working_directory, reason="token_soft_threshold", last_work_commit=work_revision(workspace))
+    executor = ScriptedOperatorExecutor(
+        status=ModelExecutionStatus.HANDOFF_REQUESTED, deliver=True, begun=True
+    )
+    operator = FakeOperatorControl(accepted_snapshot("req-1"))
+    runner = build_runner(
+        tmp_path,
+        executor=executor,
+        workspace=workspace,
+        operator=operator,
+    )
+
+    evidence = runner(claim(), profile(), prepared())
+
+    assert evidence.decision.outcome is AttemptOutcome.HANDOFF
+    assert len(operator.failed) == 1
+    assert operator.failed[0][0] == "req-1"
+    assert "operator_request" in operator.failed[0][1]
+
+
 def test_served_handoff_without_handoff_outcome_fails_with_the_ordinary_outcome(
     tmp_path: Path,
 ) -> None:

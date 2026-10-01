@@ -1117,7 +1117,7 @@ def write_handoff_note(
     issue_number: int,
     body: str,
     *,
-    reason: str = "cost_soft_threshold",
+    reason: str = "token_soft_threshold",
     last_work_commit: str | None = None,
 ) -> None:
     """Stand in for the handoff skill's own final, separate note commit.
