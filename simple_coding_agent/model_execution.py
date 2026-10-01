@@ -26,7 +26,12 @@ from claude_agent_sdk import (
 )
 
 from simple_coding_agent.config import RuntimeConfig
-from simple_coding_agent.token_ledger import USAGE_CATEGORIES, TokenLedger
+from simple_coding_agent.token_ledger import (
+    USAGE_CATEGORIES,
+    TokenLedger,
+    hit_rate_of,
+    usage_by_category,
+)
 
 
 _SKILLS = ["implement", "tdd", "code-review", "codebase-design", "handoff"]
@@ -40,6 +45,10 @@ _META_BASE_URL = "https://api.meta.ai"
 # soft threshold is evaluated against ``ledger.budget_tokens`` on every ledger
 # update; only ``limits_checked`` logging waits for a response to settle.
 _HANDOFF_FOLLOWUP_TIMEOUT = 300
+# One-time ``prompt_cache_ineffective`` diagnostic: evaluated when the main
+# thread's K-th measured response settles. Observational only.
+PROMPT_CACHE_MIN_MEASURED_RESPONSES = 20
+PROMPT_CACHE_HIT_RATE_THRESHOLD = 0.5
 
 _OPERATOR_HANDOFF_DELIVERY_WINDOW_SECONDS = 60
 _OPERATOR_HANDOFF_MODEL_DEADLINE_SECONDS = 240
@@ -219,6 +228,7 @@ class ModelExecutor:
         self._counted_response_ids: set[tuple[str, str]] = set()
         self._limits_logged: set[tuple[str, str]] = set()
         self._degraded_logged = False
+        self._cache_warning_evaluated = False
         self._auto_response_seq = 0
 
     def set_operator_handoff_provider(
@@ -261,10 +271,12 @@ class ModelExecutor:
         return self._cli_session_id
 
     def _log_context_compacted(self, message: SystemMessage) -> None:
-        """Log a CLI context compaction; the ledger is deliberately left alone.
+        """Log a CLI context compaction.
 
-        SDK 0.2.156 has no typed message for it and ``compact_metadata`` is
-        unverified, so ``trigger`` and ``pre_tokens`` are read best-effort.
+        The budget is left alone; the ledger only learns of the compaction so
+        the next response is excluded from cache-miss accounting. SDK 0.2.156
+        has no typed message for it and ``compact_metadata`` is unverified,
+        so ``trigger`` and ``pre_tokens`` are read best-effort.
         """
 
         data = getattr(message, "data", None)
@@ -272,6 +284,7 @@ class ModelExecutor:
         metadata = data.get("compact_metadata")
         metadata = metadata if isinstance(metadata, Mapping) else {}
         thread = _thread_label_from(getattr(message, "parent_tool_use_id", None))
+        self._ledger.notify_compaction(thread)
         self._log(
             "context_compacted",
             f"thread={thread}; trigger={metadata.get('trigger')}; "
@@ -998,16 +1011,17 @@ class ModelExecutor:
         for response_id in self._ledger.settled_response_ids(thread_id):
             if (thread_id, response_id) not in self._limits_logged:
                 self._limits_logged.add((thread_id, response_id))
-                self._log("limits_checked", self._token_limits_detail(thread_id))
+                self._log("limits_checked", self._token_limits_detail(thread_id, response_id))
+        self._check_prompt_cache()
 
-    def _token_limits_detail(self, thread_id: str) -> str:
+    def _token_limits_detail(self, thread_id: str, response_id: str) -> str:
         if self._ledger.has_thread("main"):
             main_context = self._ledger.context_tokens("main")
             turns = self._ledger.response_count("main")
         else:
             main_context = 0.0
             turns = 0
-        return (
+        detail = (
             f"thread={thread_id}; "
             f"budget_tokens={self._ledger.budget_tokens:.0f}; "
             f"measured_tokens={self._ledger.measured_tokens:.0f}; "
@@ -1019,6 +1033,38 @@ class ModelExecutor:
             f"max_turns={self._config.max_turns}; "
             f"elapsed_seconds={self._elapsed_seconds()}; "
             f"timeout_seconds={self._config.model_timeout}"
+        )
+        metrics = self._ledger.response_cache_metrics(thread_id, response_id)
+        if metrics is None:
+            return detail
+        miss = "excluded" if metrics.miss_tokens is None else metrics.miss_tokens
+        return (
+            f"{detail}; input_tokens={metrics.input_tokens}; "
+            f"cache_read_tokens={metrics.cache_read_tokens}; "
+            f"cache_creation_tokens={metrics.cache_creation_tokens}; "
+            f"cache_hit_rate={_round_ratio(metrics.hit_rate)}; "
+            f"cache_miss_tokens={miss}"
+        )
+
+    def _check_prompt_cache(self) -> None:
+        """Warn once if the cache is ineffective over the first K measured main responses."""
+
+        k = PROMPT_CACHE_MIN_MEASURED_RESPONSES
+        if self._cache_warning_evaluated or self._ledger.main_measured_settled_count < k:
+            return
+        self._cache_warning_evaluated = True
+        hit_rate = self._ledger.main_hit_rate(k)
+        if hit_rate is None or hit_rate >= PROMPT_CACHE_HIT_RATE_THRESHOLD:
+            return
+        totals = self._ledger.main_measured_by_category(k)
+        self._log(
+            "prompt_cache_ineffective",
+            f"measured_responses={k}; main_hit_rate={_round_ratio(hit_rate)}; "
+            f"hit_rate_threshold={PROMPT_CACHE_HIT_RATE_THRESHOLD}; "
+            f"input_tokens={totals['input_tokens']}; "
+            f"cache_read_tokens={totals['cache_read_input_tokens']}; "
+            f"cache_creation_tokens={totals['cache_creation_input_tokens']}",
+            level="WARNING",
         )
 
     def _elapsed_seconds(self) -> int:
@@ -1271,6 +1317,9 @@ class ModelExecutor:
 
         usage = model_usage if isinstance(model_usage, Mapping) else None
         reconciliation = self._ledger.reconcile(usage)
+        actual_totals = _sum_usage_by_category(usage) if usage is not None else None
+        main_stats = self._ledger.main_cache_stats()
+        all_threads_hit_rate = None if actual_totals is None else hit_rate_of(actual_totals)
         summary: dict[str, Any] = {
             "mode": reconciliation.mode,
             "max_budget_tokens": self._config.max_budget_tokens,
@@ -1282,6 +1331,17 @@ class ModelExecutor:
                 "estimated_tokens": round(reconciliation.unreported_estimated_tokens),
                 "actual_tokens": reconciliation.unreported_actual_tokens,
                 "error_ratio": _round_ratio(reconciliation.unreported_error_ratio),
+            },
+            "measured_by_category": _short_categories(self._ledger.measured_by_category),
+            "actual_by_category": (
+                None if actual_totals is None else _short_categories(actual_totals)
+            ),
+            "prompt_cache": {
+                "main_hit_rate": _round_ratio(main_stats.hit_rate),
+                "all_threads_hit_rate": _round_ratio(all_threads_hit_rate),
+                "main_cache_miss_tokens": main_stats.miss_tokens,
+                "main_miss_responses_counted": main_stats.counted,
+                "main_miss_responses_excluded": main_stats.excluded,
             },
             "soft_threshold_crossed": self._soft_threshold_crossed,
             "soft_threshold_crossed_at_tokens": (
@@ -1511,6 +1571,28 @@ async def publication_guard(hook_input: Any, tool_use_id: str | None, context: A
 
 def _round_ratio(value: float | None) -> float | None:
     return None if value is None else round(value, 4)
+
+
+def _short_categories(totals: Mapping[str, int]) -> dict[str, int]:
+    """Map usage category names to the short ``token_budget`` keys."""
+
+    return {
+        "input": totals["input_tokens"],
+        "cache_read": totals["cache_read_input_tokens"],
+        "cache_creation": totals["cache_creation_input_tokens"],
+        "output": totals["output_tokens"],
+    }
+
+
+def _sum_usage_by_category(model_usage: Mapping[str, Any]) -> dict[str, int]:
+    """Sum ``model_usage`` across models, per category."""
+
+    totals = {category: 0 for category in USAGE_CATEGORIES}
+    for usage in model_usage.values():
+        if isinstance(usage, Mapping):
+            for category, value in usage_by_category(usage).items():
+                totals[category] += value
+    return totals
 
 
 def _thread_label_from(parent_tool_use_id: object) -> str:

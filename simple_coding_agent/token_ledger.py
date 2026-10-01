@@ -82,6 +82,19 @@ _CAMEL_CASE_ALIASES = {
 }
 
 
+def _category_value(usage: Mapping[str, Any], category: str) -> int:
+    value = usage.get(category, None)
+    if value is None:
+        value = usage.get(_CAMEL_CASE_ALIASES[category], 0)
+    return int(value or 0)
+
+
+def usage_by_category(usage: Mapping[str, Any]) -> dict[str, int]:
+    """Per-category token values of one usage report (either naming shape)."""
+
+    return {category: _category_value(usage, category) for category in USAGE_CATEGORIES}
+
+
 def subagent_system_base(subagent_type: str | None) -> int:
     """Return the system base for a subagent type (default: conservative)."""
 
@@ -93,13 +106,26 @@ def subagent_system_base(subagent_type: str | None) -> int:
 def usage_total(usage: Mapping[str, Any]) -> int:
     """Sum the four budget categories of a usage mapping, unweighted."""
 
-    total = 0
-    for category in USAGE_CATEGORIES:
-        value = usage.get(category, None)
-        if value is None:
-            value = usage.get(_CAMEL_CASE_ALIASES[category], 0)
-        total += int(value or 0)
-    return total
+    return sum(usage_by_category(usage).values())
+
+
+def _total_input_of(usage: Mapping[str, int]) -> int:
+    """One measured response's total input (output excluded)."""
+
+    return usage["input_tokens"] + usage["cache_read_input_tokens"] + usage["cache_creation_input_tokens"]
+
+
+def hit_rate_of(totals: Mapping[str, int]) -> float | None:
+    """Cache-read share of summed input; ``None`` when the denominator is 0."""
+
+    denominator = (
+        totals["input_tokens"]
+        + totals["cache_read_input_tokens"]
+        + totals["cache_creation_input_tokens"]
+    )
+    if denominator == 0:
+        return None
+    return totals["cache_read_input_tokens"] / denominator
 
 
 @dataclass(frozen=True)
@@ -109,6 +135,27 @@ class DegradedNotice:
     thread: str
     subagent_type: str | None
     response_id: str
+
+
+@dataclass(frozen=True)
+class MainCacheStats:
+    """Prompt-cache effectiveness over an attempt's measured main-thread responses."""
+
+    hit_rate: float | None
+    miss_tokens: int
+    counted: int
+    excluded: int
+
+
+@dataclass(frozen=True)
+class ResponseCacheMetrics:
+    """One measured response's own cache figures (``miss_tokens`` is ``None`` when excluded)."""
+
+    input_tokens: int
+    cache_read_tokens: int
+    cache_creation_tokens: int
+    hit_rate: float | None
+    miss_tokens: int | None
 
 
 @dataclass(frozen=True)
@@ -133,6 +180,7 @@ class _Response:
     output_estimate: float
     usage: dict[str, int] | None = None
     settled: bool = False
+    compacted_before: bool = False
 
     def counted(self) -> float:
         """Tokens this response contributes to the budget reading."""
@@ -172,6 +220,7 @@ class TokenLedger:
         self._threads: dict[str, _Thread] = {}
         self._first_settled_without_usage: DegradedNotice | None = None
         self._peak_main_context_tokens = 0.0
+        self._compaction_pending: set[str] = set()
 
     # -- events ----------------------------------------------------------
 
@@ -200,6 +249,7 @@ class TokenLedger:
             context=base + prompt_chars / INPUT_CHARS_PER_TOKEN,
         )
         self._threads[thread_id] = thread
+        self._compaction_pending.discard(thread_id)
         self._track_peak(thread)
 
     def observe_response(self, thread_id: str, response_id: str, visible_chars: int) -> float:
@@ -217,8 +267,14 @@ class TokenLedger:
         output_estimate = visible_chars / OUTPUT_CHARS_PER_TOKEN + THINKING_ALLOWANCE_TOKENS
         estimate = thread.context + output_estimate
         thread.responses.append(
-            _Response(id=response_id, estimate=estimate, output_estimate=output_estimate)
+            _Response(
+                id=response_id,
+                estimate=estimate,
+                output_estimate=output_estimate,
+                compacted_before=thread_id in self._compaction_pending,
+            )
         )
+        self._compaction_pending.discard(thread_id)
         thread.context += output_estimate
         self._track_peak(thread)
         return estimate
@@ -235,7 +291,7 @@ class TokenLedger:
 
         if usage is None:
             return
-        merged = {category: self._category_value(usage, category) for category in USAGE_CATEGORIES}
+        merged = {category: _category_value(usage, category) for category in USAGE_CATEGORIES}
         if sum(merged.values()) == 0:
             return
         thread = self._threads[thread_id]
@@ -262,6 +318,16 @@ class TokenLedger:
         self._settle(thread)
         thread.context += chars / INPUT_CHARS_PER_TOKEN + FRAMING_TOKENS_PER_MESSAGE
         self._track_peak(thread)
+
+    def notify_compaction(self, thread_id: str) -> None:
+        """Record a context compaction on a thread (pure: state only, no I/O).
+
+        The next response counted on that thread is excluded from
+        cache-miss accounting: its prefix was rewritten, so the previous
+        response's input is no longer the expected cache read.
+        """
+
+        self._compaction_pending.add(thread_id)
 
     def reconcile(
         self, model_usage: Mapping[str, Mapping[str, Any]] | None
@@ -338,6 +404,105 @@ class TokenLedger:
             if response.usage is None
         )
 
+    @property
+    def measured_by_category(self) -> dict[str, int]:
+        """Measured totals per category over all threads (estimates excluded)."""
+
+        totals = {category: 0 for category in USAGE_CATEGORIES}
+        for thread in self._threads.values():
+            for response in thread.responses:
+                if response.usage is not None:
+                    for category in USAGE_CATEGORIES:
+                        totals[category] += response.usage[category]
+        return totals
+
+    def main_measured_by_category(self, limit: int | None = None) -> dict[str, int]:
+        """Measured main-thread totals per category over the first ``limit`` responses."""
+
+        totals = {category: 0 for category in USAGE_CATEGORIES}
+        for response in self._measured_main_responses(limit):
+            assert response.usage is not None
+            for category in USAGE_CATEGORIES:
+                totals[category] += response.usage[category]
+        return totals
+
+    def main_hit_rate(self, limit: int | None = None) -> float | None:
+        """Share of main-thread input served from the prompt cache.
+
+        ``cache_read / (input + cache_read + cache_creation)`` summed over
+        the first ``limit`` measured main-thread responses (all of them when
+        ``limit`` is None). ``None`` when the denominator is 0.
+        """
+
+        return hit_rate_of(self.main_measured_by_category(limit))
+
+    def main_cache_stats(self, limit: int | None = None) -> MainCacheStats:
+        """Hit rate and miss accounting over the first ``limit`` measured main responses."""
+
+        hit_rate = self.main_hit_rate(limit)
+        miss_tokens = 0
+        counted = 0
+        excluded = 0
+        thread = self._threads.get("main")
+        if thread is not None:
+            measured_ids = {
+                id(response) for response in self._measured_main_responses(limit)
+            }
+            for index, response in enumerate(thread.responses):
+                if id(response) not in measured_ids:
+                    continue
+                miss = self._main_miss_at(thread.responses, index)
+                if miss is None:
+                    excluded += 1
+                else:
+                    counted += 1
+                    miss_tokens += miss
+        return MainCacheStats(
+            hit_rate=hit_rate, miss_tokens=miss_tokens, counted=counted, excluded=excluded
+        )
+
+    def response_cache_metrics(
+        self, thread_id: str, response_id: str
+    ) -> ResponseCacheMetrics | None:
+        """One response's own cache figures, or ``None`` when it is unmeasured.
+
+        ``miss_tokens`` is ``None`` (excluded) for non-main threads and for
+        main-thread responses whose predecessor is missing, estimated, or
+        separated by a compaction. Exclusion never affects the hit rate.
+        """
+
+        thread = self._threads.get(thread_id)
+        if thread is None:
+            return None
+        index = next(
+            (i for i, response in enumerate(thread.responses) if response.id == response_id),
+            None,
+        )
+        if index is None:
+            return None
+        response = thread.responses[index]
+        if response.usage is None:
+            return None
+        miss = self._main_miss_at(thread.responses, index) if thread_id == "main" else None
+        return ResponseCacheMetrics(
+            input_tokens=response.usage["input_tokens"],
+            cache_read_tokens=response.usage["cache_read_input_tokens"],
+            cache_creation_tokens=response.usage["cache_creation_input_tokens"],
+            hit_rate=hit_rate_of(response.usage),
+            miss_tokens=miss,
+        )
+
+    @property
+    def main_measured_settled_count(self) -> int:
+        """Settled measured responses on the main thread (warning trigger)."""
+
+        thread = self._threads.get("main")
+        if thread is None:
+            return 0
+        return sum(
+            1 for response in thread.responses if response.settled and response.usage is not None
+        )
+
     def context_tokens(self, thread_id: str) -> float:
         """Current context of one thread (measured where reported)."""
 
@@ -403,12 +568,32 @@ class TokenLedger:
             return thread.responses[-1]
         return None
 
+    def _measured_main_responses(self, limit: int | None) -> list[_Response]:
+        """Measured main-thread responses in counting order (first ``limit``)."""
+
+        thread = self._threads.get("main")
+        if thread is None:
+            return []
+        measured = [response for response in thread.responses if response.usage is not None]
+        return measured if limit is None else measured[:limit]
+
     @staticmethod
-    def _category_value(usage: Mapping[str, Any], category: str) -> int:
-        value = usage.get(category, None)
-        if value is None:
-            value = usage.get(_CAMEL_CASE_ALIASES[category], 0)
-        return int(value or 0)
+    def _main_miss_at(responses: list[_Response], index: int) -> int | None:
+        """Cache-miss tokens of ``responses[index]``; ``None`` means excluded.
+
+        The expected prefix is the previous main-thread response's total
+        input (its output excluded: Meta's thinking is opaque and may not be
+        cached). The first response, a response after a compaction, and a
+        response after an estimated predecessor are excluded.
+        """
+
+        response = responses[index]
+        if response.usage is None or index == 0 or response.compacted_before:
+            return None
+        previous = responses[index - 1]
+        if previous.usage is None:
+            return None
+        return max(0, _total_input_of(previous.usage) - response.usage["cache_read_input_tokens"])
 
     def _track_peak(self, thread: _Thread) -> None:
         if thread.kind == "main" and thread.context > self._peak_main_context_tokens:
