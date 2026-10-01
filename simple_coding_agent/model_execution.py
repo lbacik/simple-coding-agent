@@ -45,7 +45,7 @@ _OPERATOR_HANDOFF_DELIVERY_WINDOW_SECONDS = 60
 _OPERATOR_HANDOFF_MODEL_DEADLINE_SECONDS = 240
 
 _COST_HANDOFF_INSTRUCTION = (
-    "This attempt is approaching its cost budget. Invoke the `handoff` skill now "
+    "This attempt is approaching its token budget. Invoke the `handoff` skill now "
     "to preserve your progress cooperatively instead of continuing further work."
 )
 _COST_HANDOFF_FOLLOWUP_PROMPT = (
@@ -364,10 +364,13 @@ class ModelExecutor:
             targets.append(_OPERATOR_HANDOFF_DELIVERY_WINDOW_SECONDS - elapsed)
         return max(min(targets), 0.0)
 
-    def _operator_fallback_blocked(self) -> bool:
-        """Whether the single fallback query would bypass the hard cost limit."""
-
+    def _hard_token_limit_reached(self) -> bool:
         return self._ledger.budget_tokens >= self._config.max_budget_tokens
+
+    def _operator_fallback_blocked(self) -> bool:
+        """Whether the single fallback query would bypass the hard token limit."""
+
+        return self._hard_token_limit_reached()
 
     async def _run_operator_fallback(
         self, client: SDKClient, observed_models: list[str]
@@ -376,7 +379,7 @@ class ModelExecutor:
 
         Returns the follow-up terminal result (and merged models) to
         propagate, or ``None`` to keep reading the original stream. A blocked
-        fallback (hard cost limit) consumes the single attempt without
+        fallback (hard token limit) consumes the single attempt without
         querying: the stream's own terminal result then decides the outcome.
         """
 
@@ -387,8 +390,8 @@ class ModelExecutor:
         if self._operator_fallback_blocked():
             self._log(
                 "operator_handoff_fallback_blocked",
-                f"request={latched.request_id}; estimated cost reached the hard"
-                " cost limit, so no follow-up query is issued and the stream's"
+                f"request={latched.request_id}; token budget reached the hard"
+                " token limit, so no follow-up query is issued and the stream's"
                 " own terminal result decides the outcome",
             )
             return None
@@ -466,7 +469,7 @@ class ModelExecutor:
         self._log(
             "token_soft_threshold_subagents_stopped",
             f"stopped_agent_ids={ids_detail}; count={len(stopped)}; "
-            "in-flight subagent tools are denied after the cost crossing "
+            "in-flight subagent tools are denied after the token soft-threshold crossing "
             "and only handoff-related main-thread commands stay allowed.",
         )
 
@@ -554,14 +557,14 @@ class ModelExecutor:
                         "token_soft_threshold_handoff_followup",
                         "Terminal result arrived after the token soft-threshold"
                         " crossing without a main-thread handoff; issuing the"
-                        " single cost follow-up handoff prompt.",
+                        " single token follow-up handoff prompt.",
                     )
                     followup = await self._attempt_handoff_followup(
                         client,
                         observed_models,
                         prompt=_COST_HANDOFF_FOLLOWUP_PROMPT,
                         success_explanation=(
-                            "Model invoked the handoff skill after a cost"
+                            "Model invoked the handoff skill after a token"
                             " soft-threshold instruction."
                         ),
                     )
@@ -651,9 +654,9 @@ class ModelExecutor:
         )
 
     def _cost_followup_blocked(self) -> bool:
-        """Whether the cost follow-up would bypass the hard cost limit."""
+        """Whether the cost follow-up would bypass the hard token limit."""
 
-        return self._ledger.budget_tokens >= self._config.max_budget_tokens
+        return self._hard_token_limit_reached()
 
     def _needs_cost_handoff_followup(
         self, terminal: ResultMessage, observed_models: tuple[str, ...]
@@ -663,7 +666,7 @@ class ModelExecutor:
         Only ordinary successful-looking results qualify: limits already got
         their follow-up above (``elif``), errors/timeouts/aborts and model
         mismatches are not handoff-able successes, and a follow-up past the
-        hard cost ceiling would itself bypass the budget.
+        hard token limit would itself bypass the budget.
         """
 
         if not self._soft_threshold_crossed or self._main_thread_handoff_invoked():
@@ -671,7 +674,7 @@ class ModelExecutor:
         if self._cost_followup_blocked():
             self._log(
                 "token_soft_threshold_handoff_followup_blocked",
-                "estimated cost reached the hard cost limit, so no cost"
+                "token budget reached the hard token limit, so no token"
                 " follow-up query is issued and the terminal result decides"
                 " the outcome",
             )
@@ -707,7 +710,7 @@ class ModelExecutor:
             "Model invoked the handoff skill after reaching a turns/timeout limit."
         ),
     ) -> ModelExecution | None:
-        """Best-effort same-client follow-up after a turns/timeout/cost limit.
+        """Best-effort same-client follow-up after a turns/timeout/token limit.
 
         Returns a HANDOFF_REQUESTED evidence only when the model actually
         invoked the handoff skill in the main thread during the follow-up;
@@ -1118,7 +1121,7 @@ class ModelExecutor:
             # read as an ordinary success: the attempt ends incomplete.
             return self._evidence(
                 ModelExecutionStatus.MODEL_LIMIT_REACHED,
-                "Cost soft threshold was crossed without a main-thread handoff, "
+                "Token soft threshold was crossed without a main-thread handoff, "
                 "so the attempt ends incomplete instead of succeeding.",
                 stop_reason,
                 model_usage,
@@ -1374,7 +1377,7 @@ def _cost_deny(restriction: str) -> dict[str, Any]:
     """Deny with the shared cost-guard wording for the given restriction."""
 
     return _deny(
-        "Cost soft threshold reached. "
+        "Token soft threshold reached. "
         f"{restriction} "
         "You must invoke the `handoff` skill now to preserve your progress."
     )

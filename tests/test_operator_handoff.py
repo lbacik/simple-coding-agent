@@ -141,7 +141,7 @@ def test_operator_instruction_is_delivered_once_at_a_post_tool_boundary(
     assert second == {}
 
 
-def test_operator_delivery_merges_with_cost_soft_threshold_instruction(
+def test_operator_delivery_merges_with_token_soft_threshold_instruction(
     tmp_path: Path,
 ) -> None:
     client = FakeClient(object(), [result()])
@@ -158,7 +158,7 @@ def test_operator_delivery_merges_with_cost_soft_threshold_instruction(
 
     context = reply["hookSpecificOutput"]["additionalContext"]
     assert "operator_request" in context
-    assert "cost budget" in context
+    assert "token budget" in context
 
 
 def test_begun_is_reported_only_when_the_handoff_skill_is_observed(
