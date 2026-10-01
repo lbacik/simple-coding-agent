@@ -136,6 +136,107 @@ def test_dockerfile_copies_the_project_owned_skills_directory() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Managed settings: Meta model pricing (issue #139)
+# ---------------------------------------------------------------------------
+
+MANAGED_SETTINGS_SRC = "docker/managed-settings.json"
+MANAGED_SETTINGS_DEST = "/etc/claude-code/managed-settings.json"
+META_MODEL = "muse-spark-1.3-contributor"
+
+
+def test_dockerfile_installs_managed_settings_to_the_linux_system_path() -> None:
+    content = _dockerfile()
+    assert MANAGED_SETTINGS_SRC in content, (
+        "Dockerfile must copy docker/managed-settings.json into the image"
+    )
+    assert MANAGED_SETTINGS_DEST in content, (
+        "Dockerfile must install managed settings at /etc/claude-code/managed-settings.json, "
+        "the path the pinned CLI reads on Linux"
+    )
+
+
+def test_dockerfile_managed_settings_copy_runs_as_root() -> None:
+    lines = _dockerfile().splitlines()
+    copy_at = next(
+        (i for i, line in enumerate(lines) if MANAGED_SETTINGS_DEST in line),
+        None,
+    )
+    assert copy_at is not None, "Dockerfile must reference the managed-settings destination"
+    user_lines = [
+        (i, line.split()[1])
+        for i, line in enumerate(lines)
+        if line.strip().startswith("USER ")
+    ]
+    assert user_lines, "Dockerfile must contain USER directives"
+    prior_users = [user for i, user in user_lines if i < copy_at]
+    # Docker builds run as root until the first USER directive.
+    current_user = prior_users[-1] if prior_users else "root"
+    assert current_user == "root", (
+        "Dockerfile must copy managed-settings.json while USER is root, "
+        "so the file is root-owned and not writable by the agent user"
+    )
+
+
+def test_dockerfile_managed_settings_is_not_writable_by_the_agent_user() -> None:
+    lines = _dockerfile().splitlines()
+    copy_lines = [line for line in lines if MANAGED_SETTINGS_DEST in line]
+    assert copy_lines, "Dockerfile must reference the managed-settings destination"
+    assert any("--chmod=" in line for line in copy_lines), (
+        "Dockerfile must set an explicit read-only-for-agent mode on managed-settings.json"
+    )
+    for line in copy_lines:
+        match = re.search(r"--chmod=([0-7]{3,4})", line)
+        assert match, f"Cannot parse --chmod mode in: {line!r}"
+        mode = int(match.group(1), 8)
+        assert not mode & 0o022, (
+            f"managed-settings.json mode {match.group(1)} must not be writable "
+            "by group or others (the agent user)"
+        )
+
+
+def _managed_settings() -> dict:
+    import json
+
+    path = ROOT / MANAGED_SETTINGS_SRC
+    assert path.is_file(), f"{MANAGED_SETTINGS_SRC} must exist in the repository"
+    return json.loads(path.read_text())
+
+
+def test_managed_settings_prices_the_meta_model_at_meta_rates() -> None:
+    data = _managed_settings()
+    overrides = data.get("modelPricing", {}).get("overrides", {})
+    assert META_MODEL in overrides, (
+        f"managed-settings.json must hold a modelPricing override for {META_MODEL}"
+    )
+    rates = overrides[META_MODEL]
+    assert rates["input"] == 1.25, "Meta input rate must be $1.25 per million tokens"
+    assert rates["cacheRead"] == 0.15, "Meta cached-input rate must be $0.15 per million tokens"
+    assert rates["output"] == 4.25, "Meta output rate must be $4.25 per million tokens"
+
+
+def test_managed_settings_pricing_row_has_all_cli_required_keys() -> None:
+    data = _managed_settings()
+    rates = data["modelPricing"]["overrides"][META_MODEL]
+    for key in ("input", "output", "cacheRead", "cacheWrite"):
+        assert key in rates, (
+            f"Pricing row must include '{key}': the pinned CLI reads all four keys "
+            "as USD-per-million-token rates"
+        )
+        assert isinstance(rates[key], (int, float)) and rates[key] >= 0, (
+            f"Pricing row key '{key}' must be a non-negative number"
+        )
+
+
+def test_managed_settings_keeps_anthropic_models_on_the_cli_price_table() -> None:
+    data = _managed_settings()
+    overrides = data.get("modelPricing", {}).get("overrides", {})
+    assert list(overrides) == [META_MODEL], (
+        "managed-settings.json must not override Anthropic models; "
+        "they keep the CLI price table"
+    )
+
+
+# ---------------------------------------------------------------------------
 # docker-compose.yml
 # ---------------------------------------------------------------------------
 
@@ -340,6 +441,17 @@ def test_onboarding_documents_required_tracker_context() -> None:
     content = _onboarding()
     assert "CONTEXT.md" in content and "issue-tracker.md" in content, (
         "Onboarding docs must list required tracker context files"
+    )
+
+
+def test_onboarding_notes_meta_usd_figures_come_from_managed_pricing() -> None:
+    content = _onboarding()
+    assert "modelPricing" in content or "managed-settings" in content, (
+        "Onboarding docs must note that Meta USD figures come from the "
+        "managed-settings modelPricing entry"
+    )
+    assert "bill" in content, (
+        "Onboarding docs must note that Meta USD figures are still not a measured bill"
     )
 
 

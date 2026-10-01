@@ -1,0 +1,12 @@
+{
+  "modelPricing": {
+    "overrides": {
+      "muse-spark-1.3-contributor": {
+        "input": 1.25,
+        "output": 4.25,
+        "cacheRead": 0.15,
+        "cacheWrite": 1.25
+      }
+    }
+  }
+}
