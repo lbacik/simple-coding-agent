@@ -3763,8 +3763,17 @@ def _continuation_expected(
     return False
 
 
+# ``cost_soft_threshold`` is the legacy name of ``token_soft_threshold``: it is
+# still accepted when reading old notes, but new notes never use it.
 _ALLOWED_HANDOFF_REASONS = frozenset(
-    {"cost_soft_threshold", "cost_hard_limit", "turn_limit", "time_limit", "operator_request"}
+    {
+        "token_soft_threshold",
+        "cost_soft_threshold",
+        "cost_hard_limit",
+        "turn_limit",
+        "time_limit",
+        "operator_request",
+    }
 )
 
 

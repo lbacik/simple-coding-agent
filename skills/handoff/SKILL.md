@@ -3,7 +3,7 @@ name: handoff
 description: "Pause an implementation attempt cooperatively near a resource limit, preserving progress for human-approved continuation."
 ---
 
-Invoke this skill only when instructed to do so (a cost soft-threshold
+Invoke this skill only when instructed to do so (a token soft-threshold
 notice, a turn/time limit follow-up prompt, or an operator `handoff now`
 request delivered by the driving process). It is the only supported way
 to end an attempt early while keeping the work usable by a continuation.
@@ -29,7 +29,7 @@ other publishing command.
 
    - issue: <issue-number>
    - started_at: <UTC ISO-8601 timestamp, e.g. from `date -u +%Y-%m-%dT%H:%M:%SZ`>
-   - reason: <cost_soft_threshold | cost_hard_limit | turn_limit | time_limit | operator_request>
+   - reason: <token_soft_threshold | cost_hard_limit | turn_limit | time_limit | operator_request>
    - last_work_commit: <SHA of the last commit from step 1, or the branch's
      existing HEAD if step 1 committed nothing>
 

@@ -20,45 +20,36 @@ from claude_agent_sdk import (
     HookMatcher,
     ResultMessage,
     SystemMessage,
+    StreamEvent,
     TextBlock,
+    UserMessage,
 )
 
 from simple_coding_agent.config import RuntimeConfig
+from simple_coding_agent.token_ledger import USAGE_CATEGORIES, TokenLedger
 
 
 _SKILLS = ["implement", "tdd", "code-review", "codebase-design", "handoff"]
 _META_BASE_URL = "https://api.meta.ai"
 
-# SDK 0.2.156 reports authoritative `total_cost_usd` only on the terminal
-# ResultMessage; there is no live cost feed mid-stream. This blended rate
-# converts tokens observed on each AssistantMessage into an estimate that is
-# precise enough to trigger a best-effort cooperative handoff near the
-# budget ceiling, but it is never an exact accounting guarantee.
-_ESTIMATED_USD_PER_MILLION_TOKENS = 15.0
-_USAGE_TOKEN_FIELDS = (
-    "input_tokens",
-    "output_tokens",
-    "cache_creation_input_tokens",
-    "cache_read_input_tokens",
-)
-_CATEGORY_USD_PER_MILLION_TOKENS: Mapping[str, float] = {
-    "cache_read_input_tokens": 0.30,
-    "cache_creation_input_tokens": 3.75,
-    "input_tokens": 3.00,
-    "output_tokens": 15.00,
-}
-
+# The per-attempt token ledger (``token_ledger.TokenLedger``) is the live
+# budget reading: every streamed ``AssistantMessage`` counts its response as
+# an estimate on first sight, ``StreamEvent`` ``message_delta`` usage and
+# non-zero ``AssistantMessage.usage`` replace the estimate with the measured
+# categories, and tool results / user messages grow the thread context. The
+# soft threshold is evaluated against ``ledger.budget_tokens`` on every ledger
+# update; only ``limits_checked`` logging waits for a response to settle.
 _HANDOFF_FOLLOWUP_TIMEOUT = 300
 
 _OPERATOR_HANDOFF_DELIVERY_WINDOW_SECONDS = 60
 _OPERATOR_HANDOFF_MODEL_DEADLINE_SECONDS = 240
 
 _COST_HANDOFF_INSTRUCTION = (
-    "This attempt is approaching its cost budget. Invoke the `handoff` skill now "
+    "This attempt is approaching its token budget. Invoke the `handoff` skill now "
     "to preserve your progress cooperatively instead of continuing further work."
 )
 _COST_HANDOFF_FOLLOWUP_PROMPT = (
-    "This attempt crossed its cost soft threshold and must now end by handing off. "
+    "This attempt crossed its token soft threshold and must now end by handing off. "
     "Invoke the `handoff` skill now to preserve your progress: commit any outstanding "
     "work, then write and commit the handoff note. Do not attempt further implementation work."
 )
@@ -83,60 +74,6 @@ _OPERATOR_HANDOFF_FOLLOWUP_PROMPT = (
     " commit it separately as the final commit. Do not attempt further"
     " implementation work."
 )
-
-
-class _CostEstimator:
-    """Accumulate an approximate USD spend from streamed token usage or turn count."""
-
-    def __init__(
-        self,
-        rate_per_million_tokens: float = _ESTIMATED_USD_PER_MILLION_TOKENS,
-        category_rates: Mapping[str, float] | None = None,
-        fallback_turn_cost: float = 0.05,
-    ) -> None:
-        self._rate = rate_per_million_tokens
-        self._category_rates = dict(category_rates or _CATEGORY_USD_PER_MILLION_TOKENS)
-        self._fallback_turn_cost = fallback_turn_cost
-        self._tokens = 0
-        self._estimated_cost = 0.0
-        self._has_positive_usage = False
-        self._turns = 0
-
-    @property
-    def has_positive_usage(self) -> bool:
-        return self._has_positive_usage
-
-    @property
-    def turns(self) -> int:
-        return self._turns
-
-    def observe(self, usage: Any) -> float:
-        has_tokens = False
-        if isinstance(usage, Mapping):
-            has_cache = any(
-                isinstance(usage.get(f), int) and usage.get(f) > 0
-                for f in ("cache_read_input_tokens", "cache_creation_input_tokens")
-            )
-            for field in _USAGE_TOKEN_FIELDS:
-                value = usage.get(field)
-                if isinstance(value, int) and value > 0:
-                    has_tokens = True
-                    self._tokens += value
-                    rate = self._category_rates.get(field, self._rate) if has_cache else self._rate
-                    self._estimated_cost += (value / 1_000_000) * rate
-        if has_tokens:
-            self._has_positive_usage = True
-            self._turns += 1
-        return self.estimated_cost_usd
-
-    def observe_turn(self, estimated_turn_cost_usd: float) -> float:
-        self._turns += 1
-        self._estimated_cost += estimated_turn_cost_usd
-        return self.estimated_cost_usd
-
-    @property
-    def estimated_cost_usd(self) -> float:
-        return self._estimated_cost
 
 
 class ModelExecutionStatus(StrEnum):
@@ -220,10 +157,10 @@ _MAX_LOG_DETAIL = 2000
 class ModelExecutor:
     """Run the approved upstream skills and retain terminal stream evidence.
 
-    Cost soft-threshold policy: once the estimated cost crosses the soft
+    Token soft-threshold policy: once the ledger budget crosses the soft
     threshold, every running subagent (including background ones) is
     stopped: subsequent subagent tool calls are denied and the cancelled
-    ids are recorded in a ``cost_soft_threshold_subagents_stopped`` event.
+    ids are recorded in a ``token_soft_threshold_subagents_stopped`` event.
     Only the main thread is steered toward the ``handoff`` skill after the
     crossing; new subagent launches from the main thread are denied. The
     handoff instruction is delivered on the next tool boundary once no
@@ -240,7 +177,7 @@ class ModelExecutor:
         *,
         client_factory: ClientFactory = ClaudeSDKClient,
         clock: Clock = lambda: datetime.now(UTC),
-        event_log: EventLog = lambda event, detail="", issue_number=None: None,
+        event_log: EventLog = lambda event, detail="", level="INFO", issue_number=None: None,
     ) -> None:
         self._config = config
         self._client_factory = client_factory
@@ -251,16 +188,12 @@ class ModelExecutor:
         self._issue_number: int | None = None
         self._archive: EvidenceWriter | None = None
         self._event_sequence = 0
-        self._cost_estimator = _CostEstimator(
-            fallback_turn_cost=self._config.max_budget_usd / max(self._config.max_turns, 1)
-        )
         self._started_at = self._clock()
         self._soft_threshold_crossed = False
         self._handoff_context_delivered = False
         self._running_subagents: set[str] = set()
         self._stopped_subagent_ids: list[str] = []
         self._usage_shape_logged = False
-        self._cost_estimator_observed_on_assistant = False
         self._operator_handoff_provider: OperatorHandoffProvider | None = None
         self._operator_handoff_reporter: OperatorHandoffReporter | None = None
         self._operator_handoff: OperatorHandoff | None = None
@@ -269,6 +202,19 @@ class ModelExecutor:
         self._operator_begun = False
         self._operator_deadline_expired = False
         self._cli_session_id: str | None = None
+        self._reset_ledger_state()
+
+    def _reset_ledger_state(self) -> None:
+        """Start a fresh per-attempt ledger (hooks may run without ``execute``)."""
+
+        self._ledger = TokenLedger()
+        self._ledger_threads: set[str] = set()
+        self._stream_response_ids: dict[str, str] = {}
+        self._pending_usage: dict[tuple[str, str], dict[str, int]] = {}
+        self._counted_response_ids: set[tuple[str, str]] = set()
+        self._limits_logged: set[tuple[str, str]] = set()
+        self._degraded_logged = False
+        self._auto_response_seq = 0
 
     def set_operator_handoff_provider(
         self, provider: OperatorHandoffProvider | None
@@ -418,12 +364,13 @@ class ModelExecutor:
             targets.append(_OPERATOR_HANDOFF_DELIVERY_WINDOW_SECONDS - elapsed)
         return max(min(targets), 0.0)
 
-    def _operator_fallback_blocked(self) -> bool:
-        """Whether the single fallback query would bypass the hard cost limit."""
+    def _hard_token_limit_reached(self) -> bool:
+        return self._ledger.budget_tokens >= self._config.max_budget_tokens
 
-        return (
-            self._cost_estimator.estimated_cost_usd >= self._config.max_budget_usd
-        )
+    def _operator_fallback_blocked(self) -> bool:
+        """Whether the single fallback query would bypass the hard token limit."""
+
+        return self._hard_token_limit_reached()
 
     async def _run_operator_fallback(
         self, client: SDKClient, observed_models: list[str]
@@ -432,7 +379,7 @@ class ModelExecutor:
 
         Returns the follow-up terminal result (and merged models) to
         propagate, or ``None`` to keep reading the original stream. A blocked
-        fallback (hard cost limit) consumes the single attempt without
+        fallback (hard token limit) consumes the single attempt without
         querying: the stream's own terminal result then decides the outcome.
         """
 
@@ -443,8 +390,8 @@ class ModelExecutor:
         if self._operator_fallback_blocked():
             self._log(
                 "operator_handoff_fallback_blocked",
-                f"request={latched.request_id}; estimated cost reached the hard"
-                " cost limit, so no follow-up query is issued and the stream's"
+                f"request={latched.request_id}; token budget reached the hard"
+                " token limit, so no follow-up query is issued and the stream's"
                 " own terminal result decides the outcome",
             )
             return None
@@ -470,8 +417,30 @@ class ModelExecutor:
 
         return tuple(self._skill_events)
 
-    def _log(self, event: str, detail: str = "") -> None:
-        self._event_log(event, detail, issue_number=self._issue_number)
+    def _log(self, event: str, detail: str = "", level: str = "INFO") -> None:
+        self._event_log(event, detail, level=level, issue_number=self._issue_number)
+
+    def _start_launch_thread(self, hook_input: Any, tool_use_id: str | None) -> None:
+        """Start a subagent ledger thread at launch, seeded with its prompt."""
+
+        if tool_use_id is None:
+            return
+        tool_name = _hook_field(hook_input, "tool_name")
+        if tool_name != "Agent" and not (
+            tool_name == "Task" and _is_subagent_launch(hook_input)
+        ):
+            return
+        tool_input = _hook_field(hook_input, "tool_input", {})
+        prompt = ""
+        subagent_type = None
+        if isinstance(tool_input, Mapping):
+            raw_prompt = tool_input.get("prompt", tool_input.get("description", ""))
+            prompt = raw_prompt if isinstance(raw_prompt, str) else ""
+            raw_type = tool_input.get("subagent_type")
+            subagent_type = raw_type if isinstance(raw_type, str) else None
+        self._ensure_ledger_thread(
+            tool_use_id, subagent_type=subagent_type, prompt_chars=len(prompt)
+        )
 
     def _track_subagent_seen(self, hook_input: Any) -> None:
         """Remember a subagent id seen before the soft-threshold crossing.
@@ -498,9 +467,9 @@ class ModelExecutor:
         self._running_subagents.clear()
         ids_detail = ",".join(stopped)
         self._log(
-            "cost_soft_threshold_subagents_stopped",
+            "token_soft_threshold_subagents_stopped",
             f"stopped_agent_ids={ids_detail}; count={len(stopped)}; "
-            "in-flight subagent tools are denied after the cost crossing "
+            "in-flight subagent tools are denied after the token soft-threshold crossing "
             "and only handoff-related main-thread commands stay allowed.",
         )
 
@@ -535,27 +504,25 @@ class ModelExecutor:
         self._archive = archive
         self._event_sequence = 0
         self._started_at = self._clock()
-        self._cost_estimator = _CostEstimator(
-            fallback_turn_cost=self._config.max_budget_usd / max(self._config.max_turns, 1)
-        )
         self._soft_threshold_crossed = False
         self._handoff_context_delivered = False
         self._running_subagents = set()
         self._stopped_subagent_ids = []
         self._usage_shape_logged = False
-        self._cost_estimator_observed_on_assistant = False
+        self._reset_ledger_state()
+        self._ensure_ledger_thread("main", prompt_chars=len(issue_body))
         self._operator_handoff = None
         self._operator_context_delivered = False
         self._operator_fallback_used = False
         self._operator_begun = False
         self._operator_deadline_expired = False
         self._cli_session_id = None
-        soft_threshold = self._config.max_budget_usd * (1 - self._config.soft_threshold_percentage)
         self._log(
             "model_execution_started",
             f"issue_body_length={len(issue_body)}; limits: "
             f"max_budget_usd={self._config.max_budget_usd:.4f}; "
-            f"soft_threshold_usd={soft_threshold:.4f}; "
+            f"max_budget_tokens={self._config.max_budget_tokens}; "
+            f"soft_threshold_tokens={self._config.soft_threshold_tokens}; "
             f"max_turns={self._config.max_turns}; "
             f"timeout_seconds={self._config.model_timeout}",
         )
@@ -587,17 +554,17 @@ class ModelExecutor:
                     terminal, observed_models
                 ):
                     self._log(
-                        "cost_soft_threshold_handoff_followup",
-                        "Terminal result arrived after the cost soft-threshold"
+                        "token_soft_threshold_handoff_followup",
+                        "Terminal result arrived after the token soft-threshold"
                         " crossing without a main-thread handoff; issuing the"
-                        " single cost follow-up handoff prompt.",
+                        " single token follow-up handoff prompt.",
                     )
                     followup = await self._attempt_handoff_followup(
                         client,
                         observed_models,
                         prompt=_COST_HANDOFF_FOLLOWUP_PROMPT,
                         success_explanation=(
-                            "Model invoked the handoff skill after a cost"
+                            "Model invoked the handoff skill after a token"
                             " soft-threshold instruction."
                         ),
                     )
@@ -687,11 +654,9 @@ class ModelExecutor:
         )
 
     def _cost_followup_blocked(self) -> bool:
-        """Whether the cost follow-up would bypass the hard cost limit."""
+        """Whether the cost follow-up would bypass the hard token limit."""
 
-        return (
-            self._cost_estimator.estimated_cost_usd >= self._config.max_budget_usd
-        )
+        return self._hard_token_limit_reached()
 
     def _needs_cost_handoff_followup(
         self, terminal: ResultMessage, observed_models: tuple[str, ...]
@@ -701,15 +666,15 @@ class ModelExecutor:
         Only ordinary successful-looking results qualify: limits already got
         their follow-up above (``elif``), errors/timeouts/aborts and model
         mismatches are not handoff-able successes, and a follow-up past the
-        hard cost ceiling would itself bypass the budget.
+        hard token limit would itself bypass the budget.
         """
 
         if not self._soft_threshold_crossed or self._main_thread_handoff_invoked():
             return False
         if self._cost_followup_blocked():
             self._log(
-                "cost_soft_threshold_handoff_followup_blocked",
-                "estimated cost reached the hard cost limit, so no cost"
+                "token_soft_threshold_handoff_followup_blocked",
+                "token budget reached the hard token limit, so no token"
                 " follow-up query is issued and the terminal result decides"
                 " the outcome",
             )
@@ -745,7 +710,7 @@ class ModelExecutor:
             "Model invoked the handoff skill after reaching a turns/timeout limit."
         ),
     ) -> ModelExecution | None:
-        """Best-effort same-client follow-up after a turns/timeout/cost limit.
+        """Best-effort same-client follow-up after a turns/timeout/token limit.
 
         Returns a HANDOFF_REQUESTED evidence only when the model actually
         invoked the handoff skill in the main thread during the follow-up;
@@ -783,6 +748,7 @@ class ModelExecutor:
             permission_mode="bypassPermissions",
             max_turns=self._config.max_turns,
             max_budget_usd=self._config.max_budget_usd,
+            include_partial_messages=True,
             cwd=working_directory,
             env=_meta_environment(self._config.meta_api_key, self._config.model),
             setting_sources=settings_sources,
@@ -857,7 +823,11 @@ class ModelExecutor:
                     for block in message.content:
                         if isinstance(block, TextBlock) and block.text.strip():
                             self._log("model_response", self._model_response_detail(block.text))
-                    self._observe_cost(message.usage)
+                    self._observe_assistant_message(message)
+                elif isinstance(message, StreamEvent):
+                    self._observe_stream_event(message)
+                elif isinstance(message, UserMessage):
+                    self._observe_user_message(message)
                 model = getattr(message, "model", None)
                 if isinstance(model, str):
                     observed_models.append(model)
@@ -866,42 +836,166 @@ class ModelExecutor:
             # while a ``__anext__()`` is still pending; never leave it dangling.
             await _cancel_stream_wait(pending)
 
-    def _observe_cost(self, usage: Any) -> None:
-        """Latch a one-time soft-threshold crossing from estimated cumulative cost."""
-
-        self._cost_estimator_observed_on_assistant = True
+    def _log_usage_shape(self, usage: Any) -> None:
         if not self._usage_shape_logged:
             self._usage_shape_logged = True
             self._log("model_usage_shape", f"usage={usage!r}")
-        self._cost_estimator.observe(usage)
-        if self._cost_estimator.has_positive_usage:
-            self._check_limits()
 
-    def _elapsed_seconds(self) -> int:
-        delta = (self._clock() - self._started_at).total_seconds()
-        return max(0, int(delta))
+    def _ensure_ledger_thread(
+        self, thread_id: str, *, subagent_type: str | None = None, prompt_chars: int = 0
+    ) -> None:
+        """Start a ledger thread on first sight (``main`` or ``parent_tool_use_id``)."""
 
-    def _limits_detail(self) -> str:
-        soft_threshold = self._config.max_budget_usd * (1 - self._config.soft_threshold_percentage)
+        if thread_id in self._ledger_threads:
+            return
+        self._ledger.start_thread(
+            thread_id,
+            kind="main" if thread_id == "main" else "subagent",
+            prompt_chars=prompt_chars,
+            subagent_type=subagent_type,
+        )
+        self._ledger_threads.add(thread_id)
+
+    def _assistant_response_id(self, message: AssistantMessage, thread_id: str) -> str:
+        """Stable response id: the API message id, else one id per message."""
+
+        message_id = getattr(message, "message_id", None)
+        if isinstance(message_id, str) and message_id:
+            return message_id
+        uuid = getattr(message, "uuid", None)
+        if isinstance(uuid, str) and uuid:
+            return uuid
+        self._auto_response_seq += 1
+        return f"auto-{thread_id}-{self._auto_response_seq}"
+
+    def _observe_assistant_message(self, message: AssistantMessage) -> None:
+        """Feed one streamed assistant message into the token ledger.
+
+        The response is counted as an estimate on first sight; reported
+        usage (here or stashed from an earlier ``message_delta``) replaces
+        the estimate per category by max, keyed by response id.
+        """
+
+        thread_id = getattr(message, "parent_tool_use_id", None) or "main"
+        self._ensure_ledger_thread(thread_id)
+        response_id = self._assistant_response_id(message, thread_id)
+        content = getattr(message, "content", [])
+        usage = getattr(message, "usage", None)
+        self._ledger.observe_response(thread_id, response_id, _content_chars(content))
+        self._counted_response_ids.add((thread_id, response_id))
+        if isinstance(usage, Mapping):
+            self._ledger.observe_usage(thread_id, response_id, usage)
+        pending = self._pending_usage.pop((thread_id, response_id), None)
+        if pending:
+            self._ledger.observe_usage(thread_id, response_id, pending)
+        self._log_usage_shape(usage)
+        self._after_ledger_update(thread_id)
+
+    def _observe_stream_event(self, message: StreamEvent) -> None:
+        """Merge streamed ``message_delta`` usage into the ledger.
+
+        The response id comes from that stream's ``message_start``. A delta
+        for a response not yet counted (it arrives just after PreToolUse,
+        before the response's ``AssistantMessage``) is stashed until the
+        response is counted; a delta with no ``message_start`` is ignored.
+        """
+
+        event = getattr(message, "event", None)
+        if not isinstance(event, Mapping):
+            return
+        event_type = event.get("type")
+        thread_id = getattr(message, "parent_tool_use_id", None) or "main"
+        self._ensure_ledger_thread(thread_id)
+        if event_type == "message_start":
+            inner = event.get("message")
+            if isinstance(inner, Mapping):
+                response_id = inner.get("id")
+                if isinstance(response_id, str) and response_id:
+                    self._stream_response_ids[thread_id] = response_id
+        elif event_type == "message_delta":
+            usage = event.get("usage")
+            if not isinstance(usage, Mapping):
+                return
+            response_id = self._stream_response_ids.get(thread_id)
+            if response_id is None:
+                return
+            if (thread_id, response_id) in self._counted_response_ids:
+                self._ledger.observe_usage(thread_id, response_id, usage)
+            else:
+                pending = self._pending_usage.setdefault(
+                    (thread_id, response_id),
+                    {category: 0 for category in USAGE_CATEGORIES},
+                )
+                for category in USAGE_CATEGORIES:
+                    reported = usage.get(category, 0)
+                    pending[category] = max(
+                        pending[category], int(reported or 0)
+                    )
+            self._after_ledger_update(thread_id)
+
+    def _observe_user_message(self, message: UserMessage) -> None:
+        """Grow the thread context with a streamed tool result / user message."""
+
+        thread_id = getattr(message, "parent_tool_use_id", None) or "main"
+        self._ensure_ledger_thread(thread_id)
+        self._ledger.observe_input(thread_id, _content_chars(getattr(message, "content", "")))
+        self._after_ledger_update(thread_id)
+
+    def _after_ledger_update(self, thread_id: str) -> None:
+        """Check the soft threshold and log settled responses after any ledger mutation."""
+
+        self._check_limits(thread_id)
+
+        notice = self._ledger.first_settled_without_usage
+        if notice is not None and not self._degraded_logged:
+            self._degraded_logged = True
+            self._log(
+                "token_estimate_degraded",
+                f"thread={notice.thread}; subagent_type={notice.subagent_type}; "
+                f"estimated_tokens={self._ledger.estimated_tokens:.0f}",
+                level="WARNING",
+            )
+        for response_id in self._ledger.settled_response_ids(thread_id):
+            if (thread_id, response_id) not in self._limits_logged:
+                self._limits_logged.add((thread_id, response_id))
+                self._log("limits_checked", self._token_limits_detail(thread_id))
+
+    def _token_limits_detail(self, thread_id: str) -> str:
+        if self._ledger.has_thread("main"):
+            main_context = self._ledger.context_tokens("main")
+            turns = self._ledger.response_count("main")
+        else:
+            main_context = 0.0
+            turns = 0
         return (
-            f"estimated_cost_usd={self._cost_estimator.estimated_cost_usd:.4f}; "
-            f"soft_threshold_usd={soft_threshold:.4f}; "
-            f"max_budget_usd={self._config.max_budget_usd:.4f}; "
-            f"turns={self._cost_estimator.turns}; "
+            f"thread={thread_id}; "
+            f"budget_tokens={self._ledger.budget_tokens:.0f}; "
+            f"measured_tokens={self._ledger.measured_tokens:.0f}; "
+            f"estimated_tokens={self._ledger.estimated_tokens:.0f}; "
+            f"soft_threshold_tokens={self._config.soft_threshold_tokens}; "
+            f"max_budget_tokens={self._config.max_budget_tokens}; "
+            f"main_context_tokens={main_context:.0f}; "
+            f"turns={turns}; "
             f"max_turns={self._config.max_turns}; "
             f"elapsed_seconds={self._elapsed_seconds()}; "
             f"timeout_seconds={self._config.model_timeout}"
         )
 
-    def _check_limits(self) -> None:
-        self._log("limits_checked", self._limits_detail())
-        soft_threshold = self._config.max_budget_usd * (1 - self._config.soft_threshold_percentage)
-        if not self._soft_threshold_crossed and self._cost_estimator.estimated_cost_usd >= soft_threshold:
+    def _elapsed_seconds(self) -> int:
+        delta = (self._clock() - self._started_at).total_seconds()
+        return max(0, int(delta))
+
+    def _check_limits(self, thread_id: str = "main") -> None:
+        """Latch a one-time soft-threshold crossing from the token ledger."""
+
+        budget = self._ledger.budget_tokens
+        threshold = self._config.soft_threshold_tokens
+        if not self._soft_threshold_crossed and budget >= threshold:
             self._soft_threshold_crossed = True
             self._log(
-                "cost_soft_threshold_crossed",
-                f"estimated_cost_usd={self._cost_estimator.estimated_cost_usd:.4f}; "
-                f"soft_threshold_usd={soft_threshold:.4f}",
+                "token_soft_threshold_crossed",
+                f"budget_tokens={budget:.0f}; soft_threshold_tokens={threshold}; "
+                f"thread={thread_id}",
             )
             self._stop_running_subagents()
 
@@ -944,7 +1038,7 @@ class ModelExecutor:
         if self._soft_threshold_crossed and self._main_thread_handoff_invoked():
             return self._evidence(
                 ModelExecutionStatus.HANDOFF_REQUESTED,
-                "Model invoked the handoff skill after a cost soft-threshold instruction.",
+                "Model invoked the handoff skill after a token soft-threshold instruction.",
                 stop_reason,
                 model_usage,
                 all_models,
@@ -1027,7 +1121,7 @@ class ModelExecutor:
             # read as an ordinary success: the attempt ends incomplete.
             return self._evidence(
                 ModelExecutionStatus.MODEL_LIMIT_REACHED,
-                "Cost soft threshold was crossed without a main-thread handoff, "
+                "Token soft threshold was crossed without a main-thread handoff, "
                 "so the attempt ends incomplete instead of succeeding.",
                 stop_reason,
                 model_usage,
@@ -1068,6 +1162,7 @@ class ModelExecutor:
     ) -> dict[str, Any]:
         self._log_tool_use("tool_call", hook_input)
         await self._record_skill_event("PreToolUse", hook_input, tool_use_id, context)
+        self._start_launch_thread(hook_input, tool_use_id)
         if _skill_name(hook_input) == "code-review":
             self._review_count += 1
             if self._review_count > 3:
@@ -1079,7 +1174,7 @@ class ModelExecutor:
                 agent_id = _hook_agent_id(hook_input)
                 if agent_id is not None and agent_id not in self._stopped_subagent_ids:
                     self._stopped_subagent_ids.append(agent_id)
-                return _cost_deny("Subagent work is stopped after the cost soft threshold.")
+                return _cost_deny("Subagent work is stopped after the token soft threshold.")
             else:
                 tool_name = _hook_field(hook_input, "tool_name")
                 if tool_name == "Skill" and _skill_name(hook_input) == "handoff":
@@ -1132,10 +1227,6 @@ class ModelExecutor:
         await self._record_skill_event("PostToolUse", hook_input, tool_use_id, context)
         if not self._soft_threshold_crossed:
             self._track_subagent_seen(hook_input)
-        if not self._cost_estimator.has_positive_usage:
-            per_turn_cost = self._config.max_budget_usd / max(self._config.max_turns, 1)
-            self._cost_estimator.observe_turn(per_turn_cost)
-        self._check_limits()
         self._poll_operator_handoff()
         contexts: list[str] = []
         if self._soft_threshold_crossed and not self._handoff_context_delivered:
@@ -1146,7 +1237,7 @@ class ModelExecutor:
                 # boundary; stopping the subagents at the crossing is what
                 # frees the remaining budget for the handoff.
                 self._handoff_context_delivered = True
-                self._log("cost_soft_threshold_handoff_context_injected")
+                self._log("token_soft_threshold_handoff_context_injected")
                 contexts.append(_COST_HANDOFF_INSTRUCTION)
             else:
                 # Subagents are still recorded as running (for example the
@@ -1286,7 +1377,7 @@ def _cost_deny(restriction: str) -> dict[str, Any]:
     """Deny with the shared cost-guard wording for the given restriction."""
 
     return _deny(
-        "Cost soft threshold reached. "
+        "Token soft threshold reached. "
         f"{restriction} "
         "You must invoke the `handoff` skill now to preserve your progress."
     )
@@ -1338,6 +1429,38 @@ def _skill_name(hook_input: object) -> str | None:
     tool_input = _hook_field(hook_input, "tool_input", {})
     name = tool_input.get("skill") if isinstance(tool_input, Mapping) else None
     return name if isinstance(name, str) else None
+
+
+def _content_chars(value: object) -> int:
+    """Approximate character count of streamed content or a tool payload.
+
+    Visible assistant output (text blocks, tool-use input) sizes the
+    response estimate; tool results and user messages grow the thread
+    context. Anything unrecognised falls back to its ``repr`` length.
+    """
+
+    if value is None:
+        return 0
+    if isinstance(value, str):
+        return len(value)
+    if isinstance(value, Mapping):
+        return sum(_content_chars(key) + _content_chars(item) for key, item in value.items())
+    if isinstance(value, (list, tuple)):
+        return sum(_content_chars(item) for item in value)
+    text = getattr(value, "text", None)
+    if isinstance(text, str):
+        return len(text)
+    total = 0
+    for attribute in ("content", "input"):
+        inner = getattr(value, attribute, None)
+        if inner is not None:
+            total += _content_chars(inner)
+    if total:
+        return total
+    name = getattr(value, "name", None)
+    if isinstance(name, str):
+        return len(name)
+    return len(repr(value))
 
 
 def _hook_field(hook_input: object, name: str, default: Any = None) -> Any:

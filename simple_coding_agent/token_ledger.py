@@ -360,6 +360,23 @@ class TokenLedger:
 
         return self._first_settled_without_usage
 
+    def has_thread(self, thread_id: str) -> bool:
+        """Whether a thread was started (the executor starts them lazily)."""
+
+        return thread_id in self._threads
+
+    def response_count(self, thread_id: str) -> int:
+        """Number of responses counted on a thread, in-flight included."""
+
+        return len(self._threads[thread_id].responses)
+
+    def settled_response_ids(self, thread_id: str) -> tuple[str, ...]:
+        """Ids of a thread's settled responses, in counting order."""
+
+        return tuple(
+            response.id for response in self._threads[thread_id].responses if response.settled
+        )
+
     # -- internals --------------------------------------------------------
 
     def _settle(self, thread: _Thread) -> None:

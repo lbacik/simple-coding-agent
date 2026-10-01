@@ -81,8 +81,8 @@ def main() -> None:
         issue_comments=tracker.trusted_comments,
         model_executor=ModelExecutor(
             config,
-            event_log=lambda event, detail="", issue_number=None: logger.emit(
-                event, phase="model_execution", detail=detail, issue_number=issue_number
+            event_log=lambda event, detail="", level="INFO", issue_number=None: logger.emit(
+                event, phase="model_execution", detail=detail, level=level, issue_number=issue_number
             ),
         ),
         attempt_archive_factory=archive_factory,

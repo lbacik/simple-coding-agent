@@ -285,3 +285,25 @@ def test_reconcile_accepts_camel_case_model_usage_without_thinking() -> None:
     assert result.error_ratio == 0
 
 
+
+
+def test_executor_readings_cover_thread_presence_counts_and_settled_ids() -> None:
+    ledger = TokenLedger()
+
+    assert ledger.has_thread("main") is False
+
+    ledger.start_thread("main", kind="main", prompt_chars=0)
+    ledger.observe_response("main", "r1", visible_chars=0)
+    ledger.observe_response("main", "r1", visible_chars=999)
+
+    assert ledger.has_thread("main") is True
+    assert ledger.has_thread("toolu-1") is False
+    # The repeat for the same id is not counted twice.
+    assert ledger.response_count("main") == 1
+    # Nothing settled yet: only the next event on the thread settles r1.
+    assert ledger.settled_response_ids("main") == ()
+
+    ledger.observe_response("main", "r2", visible_chars=0)
+
+    assert ledger.response_count("main") == 2
+    assert ledger.settled_response_ids("main") == ("r1",)

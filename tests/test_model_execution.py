@@ -9,7 +9,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from claude_agent_sdk import AssistantMessage, TextBlock
+from claude_agent_sdk import AssistantMessage, StreamEvent, TextBlock, UserMessage
 
 from simple_coding_agent.config import RuntimeConfig
 from simple_coding_agent.model_execution import (
@@ -296,7 +296,7 @@ def test_logs_skill_invocations_under_distinct_event_names(tmp_path: Path) -> No
     executor = ModelExecutor(
         runtime_config(tmp_path),
         client_factory=client_factory,
-        event_log=lambda event, detail="", issue_number=None: events.append((event, detail)),
+        event_log=lambda event, detail="", level="INFO", issue_number=None: events.append((event, detail)),
     )
     asyncio.run(executor.execute(issue_body="Fix it.", working_directory=tmp_path))
     pre_hook = captured[0].options.hooks["PreToolUse"][0].hooks[0]
@@ -360,7 +360,7 @@ def test_offloads_tool_and_model_response_evidence_to_the_attempt_archive(
     executor = ModelExecutor(
         runtime_config(tmp_path),
         client_factory=client_factory,
-        event_log=lambda event, detail="", issue_number=None: events.append((event, detail)),
+        event_log=lambda event, detail="", level="INFO", issue_number=None: events.append((event, detail)),
     )
     asyncio.run(
         executor.execute(
@@ -425,7 +425,7 @@ def test_logs_the_process_even_when_the_attempt_succeeds(tmp_path: Path) -> None
     executor = ModelExecutor(
         runtime_config(tmp_path),
         client_factory=client_factory,
-        event_log=lambda event, detail="", issue_number=None: events.append(
+        event_log=lambda event, detail="", level="INFO", issue_number=None: events.append(
             (event, detail, issue_number)
         ),
     )
@@ -491,7 +491,7 @@ def test_crossing_the_soft_cost_threshold_injects_additional_context_once(
             options,
             [
                 AssistantMessage(
-                    content=[], model="muse-spark-1.3-contributor", usage={"input_tokens": 300_000}
+                    content=[], model="muse-spark-1.3-contributor", usage={"input_tokens": 900_000}
                 ),
                 result(),
             ],
@@ -499,8 +499,7 @@ def test_crossing_the_soft_cost_threshold_injects_additional_context_once(
         captured.append(client)
         return client
 
-    # Pinned to the pre-token-budget USD regime: this test exercises USD threshold behavior.
-    config = replace(runtime_config(tmp_path), max_budget_usd=5)
+    config = replace(runtime_config(tmp_path), max_budget_tokens=1_000_000)
     executor = ModelExecutor(config, client_factory=client_factory)
     execution = asyncio.run(executor.execute(issue_body="Fix it.", working_directory=tmp_path))
 
@@ -871,40 +870,55 @@ def test_max_turns_identified_from_sdk_terminal_reason_and_subtype(tmp_path: Pat
     assert len(captured[0].queried_prompts) == 1
 
 
-def test_zero_usage_live_sdk_stream_accumulates_turn_cost_and_crosses_soft_threshold(
-    tmp_path: Path,
-) -> None:
+def test_zero_usage_stream_crosses_soft_threshold_from_estimates(tmp_path: Path) -> None:
+    events: list[tuple[str, str, str]] = []
     captured: list[FakeClient] = []
+    big_result = "x" * 40_000  # ~10K estimated tokens per tool result
+
+    def zero_turn(index: int) -> list[object]:
+        return [
+            AssistantMessage(
+                content=[TextBlock(text="working")],
+                model="muse-spark-1.3-contributor",
+                message_id=f"r{index}",
+                usage={"input_tokens": 0, "output_tokens": 0},
+            ),
+            UserMessage(content=big_result),
+        ]
 
     def client_factory(options: object) -> FakeClient:
+        messages: list[object] = []
+        for index in range(14):
+            messages.extend(zero_turn(index))
+        messages.append(result())
         client = FakeClient(
-            options,
-            [
-                AssistantMessage(
-                    content=[],
-                    model="muse-spark-1.3-contributor",
-                    usage={"input_tokens": 0, "output_tokens": 0},
-                ),
-                result(),
-            ],
+            options, messages, followup_messages=[result(stop_reason="end_turn")]
         )
         captured.append(client)
         return client
 
-    executor = ModelExecutor(runtime_config(tmp_path), client_factory=client_factory)
+    config = replace(runtime_config(tmp_path), max_budget_tokens=1_400_000)
+    executor = ModelExecutor(
+        config,
+        client_factory=client_factory,
+        event_log=lambda event, detail="", level="INFO", issue_number=None: events.append(
+            (event, detail, level)
+        ),
+    )
     execution = asyncio.run(executor.execute(issue_body="Fix it.", working_directory=tmp_path))
 
-    assert execution.status is ModelExecutionStatus.SUCCEEDED
-    post_hook = captured[0].options.hooks["PostToolUse"][0].hooks[0]
-    tool_event = {"tool_name": "Bash", "tool_input": {"command": "pytest"}, "tool_response": "ok"}
-
-    outcomes = []
-    for _ in range(50):
-        outcomes.append(asyncio.run(post_hook(tool_event, None, {})))
-
-    injected = [o for o in outcomes if "additionalContext" in o.get("hookSpecificOutput", {})]
-    assert len(injected) == 1
-    assert "approaching its cost budget" in injected[0]["hookSpecificOutput"]["additionalContext"]
+    degraded = [(d, lvl) for name, d, lvl in events if name == "token_estimate_degraded"]
+    assert len(degraded) == 1
+    assert degraded[0][1] == "WARNING"
+    crossed = [d for name, d, _ in events if name == "token_soft_threshold_crossed"]
+    assert len(crossed) == 1
+    crossed_budget = int(crossed[0].split("budget_tokens=")[1].split(";")[0])
+    assert 1_120_000 <= crossed_budget < config.max_budget_tokens
+    assert "thread=main" in crossed[0]
+    assert executor._ledger.measured_tokens == 0
+    assert any(name == "token_soft_threshold_handoff_followup" for name, _, _ in events)
+    assert len(captured[0].queried_prompts) == 1
+    assert execution.status is ModelExecutionStatus.MODEL_LIMIT_REACHED
 
 
 def test_per_category_token_pricing_discounts_cache_read_tokens(tmp_path: Path) -> None:
@@ -949,6 +963,7 @@ def test_model_execution_logs_configured_limits_and_limits_checked_progress(tmp_
                     model="muse-spark-1.3-contributor",
                     usage={"input_tokens": 0, "output_tokens": 0},
                 ),
+                UserMessage(content="ok"),
                 result(),
             ],
         )
@@ -958,7 +973,7 @@ def test_model_execution_logs_configured_limits_and_limits_checked_progress(tmp_
     executor = ModelExecutor(
         runtime_config(tmp_path),
         client_factory=client_factory,
-        event_log=lambda event, detail="", issue_number=None: events.append((event, detail, issue_number)),
+        event_log=lambda event, detail="", level="INFO", issue_number=None: events.append((event, detail, issue_number)),
     )
     execution = asyncio.run(
         executor.execute(issue_body="Fix the tests.", working_directory=tmp_path, issue_number=45)
@@ -970,7 +985,8 @@ def test_model_execution_logs_configured_limits_and_limits_checked_progress(tmp_
     started_event = next(detail for name, detail, _ in events if name == "model_execution_started")
     assert "limits:" in started_event
     assert "max_budget_usd=20.0000" in started_event
-    assert "soft_threshold_usd=16.0000" in started_event
+    assert "max_budget_tokens=4000000" in started_event
+    assert "soft_threshold_tokens=3200000" in started_event
     assert "max_turns=60" in started_event
     assert "timeout_seconds=60" in started_event
 
@@ -981,9 +997,10 @@ def test_model_execution_logs_configured_limits_and_limits_checked_progress(tmp_
 
     limits_events = [detail for name, detail, num in events if name == "limits_checked"]
     assert len(limits_events) == 1
-    assert "estimated_cost_usd=0.3333" in limits_events[0]
-    assert "soft_threshold_usd=16.0000" in limits_events[0]
-    assert "max_budget_usd=20.0000" in limits_events[0]
+    assert "thread=main" in limits_events[0]
+    assert "soft_threshold_tokens=3200000" in limits_events[0]
+    assert "max_budget_tokens=4000000" in limits_events[0]
+    assert "usd" not in limits_events[0].lower()
     assert "turns=1" in limits_events[0]
     assert "max_turns=60" in limits_events[0]
     assert "elapsed_seconds=" in limits_events[0]
@@ -1002,6 +1019,7 @@ def test_positive_token_usage_logs_limits_checked_progress(tmp_path: Path) -> No
                     model="muse-spark-1.3-contributor",
                     usage={"input_tokens": 100_000, "output_tokens": 5_000},
                 ),
+                UserMessage(content="ok"),
                 result(),
             ],
         )
@@ -1009,7 +1027,7 @@ def test_positive_token_usage_logs_limits_checked_progress(tmp_path: Path) -> No
     executor = ModelExecutor(
         runtime_config(tmp_path),
         client_factory=client_factory,
-        event_log=lambda event, detail="", issue_number=None: events.append((event, detail, issue_number)),
+        event_log=lambda event, detail="", level="INFO", issue_number=None: events.append((event, detail, issue_number)),
     )
     execution = asyncio.run(
         executor.execute(issue_body="Fix the tests.", working_directory=tmp_path, issue_number=45)
@@ -1019,9 +1037,9 @@ def test_positive_token_usage_logs_limits_checked_progress(tmp_path: Path) -> No
     limits_events = [detail for name, detail, _ in events if name == "limits_checked"]
     assert len(limits_events) == 1
     assert "turns=1" in limits_events[0]
-    assert "estimated_cost_usd=" in limits_events[0]
-    assert "soft_threshold_usd=16.0000" in limits_events[0]
-    assert "max_budget_usd=20.0000" in limits_events[0]
+    assert "measured_tokens=105000" in limits_events[0]
+    assert "soft_threshold_tokens=3200000" in limits_events[0]
+    assert "max_budget_tokens=4000000" in limits_events[0]
 
 
 # --- Cost soft-threshold handoff guarantee (issue #85) -----------------------
@@ -1041,7 +1059,7 @@ def test_cost_instruction_is_withheld_while_subagents_still_running(
     executor = ModelExecutor(
         runtime_config(tmp_path),
         client_factory=client_factory,
-        event_log=lambda event, detail="", issue_number=None: events.append((event, detail)),
+        event_log=lambda event, detail="", level="INFO", issue_number=None: events.append((event, detail)),
     )
     asyncio.run(executor.execute(issue_body="Fix it.", working_directory=tmp_path))
     pre_hook = captured[0].options.hooks["PreToolUse"][0].hooks[0]
@@ -1099,8 +1117,8 @@ def test_cost_instruction_is_withheld_while_subagents_still_running(
 
     assert "handoff" in stopped_reply["hookSpecificOutput"]["additionalContext"]
     assert executor._handoff_context_delivered is True
-    assert any(name == "cost_soft_threshold_subagents_stopped" for name, _ in events)
-    assert any(name == "cost_soft_threshold_handoff_context_injected" for name, _ in events)
+    assert any(name == "token_soft_threshold_subagents_stopped" for name, _ in events)
+    assert any(name == "token_soft_threshold_handoff_context_injected" for name, _ in events)
 
 
 def test_cost_crossing_stops_running_subagent_and_denies_later_subagent_calls(
@@ -1114,12 +1132,11 @@ def test_cost_crossing_stops_running_subagent_and_denies_later_subagent_calls(
         return client
 
     events: list[tuple[str, str]] = []
-    # Pinned to the pre-token-budget USD regime: this test exercises USD threshold behavior.
-    config = replace(runtime_config(tmp_path), max_budget_usd=5)
+    config = replace(runtime_config(tmp_path), max_budget_tokens=1_000_000)
     executor = ModelExecutor(
         config,
         client_factory=client_factory,
-        event_log=lambda event, detail="", issue_number=None: events.append((event, detail)),
+        event_log=lambda event, detail="", level="INFO", issue_number=None: events.append((event, detail)),
     )
     asyncio.run(executor.execute(issue_body="Fix it.", working_directory=tmp_path))
     pre_hook = captured[0].options.hooks["PreToolUse"][0].hooks[0]
@@ -1138,13 +1155,16 @@ def test_cost_crossing_stops_running_subagent_and_denies_later_subagent_calls(
 
     # Crossing the soft threshold via observed cost stops the running
     # subagent and records the cancelled id.
-    executor._cost_estimator.observe({"input_tokens": 300_000})
-    executor._check_limits()
+    executor._ledger.start_thread("sub-1", kind="subagent", prompt_chars=0)
+    executor._ledger_threads.add("sub-1")
+    executor._ledger.observe_response("sub-1", "r-big", 0)
+    executor._ledger.observe_usage("sub-1", "r-big", {"input_tokens": 900_000})
+    executor._check_limits("sub-1")
 
     assert executor._soft_threshold_crossed is True
     assert executor._running_subagents == set()
     assert "sub-1" in executor._stopped_subagent_ids
-    stopped_events = [detail for name, detail in events if name == "cost_soft_threshold_subagents_stopped"]
+    stopped_events = [detail for name, detail in events if name == "token_soft_threshold_subagents_stopped"]
     assert stopped_events and "sub-1" in stopped_events[0]
 
     # No subagent tool call is allowed afterwards.
@@ -1168,12 +1188,11 @@ def test_cost_handoff_instruction_reaches_main_thread_once_subagents_stopped(
         return client
 
     events: list[tuple[str, str]] = []
-    # Pinned to the pre-token-budget USD regime: this test exercises USD threshold behavior.
-    config = replace(runtime_config(tmp_path), max_budget_usd=5)
+    config = replace(runtime_config(tmp_path), max_budget_tokens=1_000_000)
     executor = ModelExecutor(
         config,
         client_factory=client_factory,
-        event_log=lambda event, detail="", issue_number=None: events.append((event, detail)),
+        event_log=lambda event, detail="", level="INFO", issue_number=None: events.append((event, detail)),
     )
     asyncio.run(executor.execute(issue_body="Fix it.", working_directory=tmp_path))
     pre_hook = captured[0].options.hooks["PreToolUse"][0].hooks[0]
@@ -1186,8 +1205,11 @@ def test_cost_handoff_instruction_reaches_main_thread_once_subagents_stopped(
             {},
         )
     )
-    executor._cost_estimator.observe({"input_tokens": 300_000})
-    executor._check_limits()
+    executor._ledger.start_thread("sub-1", kind="subagent", prompt_chars=0)
+    executor._ledger_threads.add("sub-1")
+    executor._ledger.observe_response("sub-1", "r-big", 0)
+    executor._ledger.observe_usage("sub-1", "r-big", {"input_tokens": 900_000})
+    executor._check_limits("sub-1")
     assert executor._running_subagents == set()
 
     reply = asyncio.run(
@@ -1205,7 +1227,7 @@ def test_cost_handoff_instruction_reaches_main_thread_once_subagents_stopped(
 
     assert "handoff" in reply["hookSpecificOutput"]["additionalContext"]
     assert executor._handoff_context_delivered is True
-    assert any(name == "cost_soft_threshold_handoff_context_injected" for name, _ in events)
+    assert any(name == "token_soft_threshold_handoff_context_injected" for name, _ in events)
 
 
 def test_cost_guard_stops_in_flight_subagents_and_denies_new_launches(
@@ -1278,7 +1300,7 @@ def test_soft_threshold_without_handoff_gets_one_followup_then_model_limit(
             options,
             [
                 AssistantMessage(
-                    content=[], model="muse-spark-1.3-contributor", usage={"input_tokens": 300_000}
+                    content=[], model="muse-spark-1.3-contributor", usage={"input_tokens": 900_000}
                 ),
                 result(),
             ],
@@ -1288,13 +1310,13 @@ def test_soft_threshold_without_handoff_gets_one_followup_then_model_limit(
         return client
 
     executor = ModelExecutor(
-        replace(runtime_config(tmp_path), max_budget_usd=5), client_factory=client_factory
+        replace(runtime_config(tmp_path), max_budget_tokens=1_000_000), client_factory=client_factory
     )
     execution = asyncio.run(executor.execute(issue_body="Fix it.", working_directory=tmp_path))
 
     assert execution.status is ModelExecutionStatus.MODEL_LIMIT_REACHED
     assert len(captured[0].queried_prompts) == 1
-    assert "cost" in captured[0].queried_prompts[0]
+    assert "token" in captured[0].queried_prompts[0]
     assert "handoff" in captured[0].queried_prompts[0]
 
 
@@ -1313,7 +1335,7 @@ def test_soft_threshold_followup_that_hands_off_reports_handoff_requested(
             options,
             [
                 AssistantMessage(
-                    content=[], model="muse-spark-1.3-contributor", usage={"input_tokens": 300_000}
+                    content=[], model="muse-spark-1.3-contributor", usage={"input_tokens": 900_000}
                 ),
                 result(),
             ],
@@ -1321,9 +1343,8 @@ def test_soft_threshold_followup_that_hands_off_reports_handoff_requested(
             on_query=invoke_handoff_skill,
         )
 
-    # Pinned to the pre-token-budget USD regime: this test exercises USD threshold behavior.
     executor = ModelExecutor(
-        replace(runtime_config(tmp_path), max_budget_usd=5), client_factory=client_factory
+        replace(runtime_config(tmp_path), max_budget_tokens=1_000_000), client_factory=client_factory
     )
     holder["executor"] = executor
 
@@ -1342,7 +1363,7 @@ def test_soft_threshold_followup_is_skipped_past_the_hard_cost_ceiling(
             options,
             [
                 AssistantMessage(
-                    content=[], model="muse-spark-1.3-contributor", usage={"input_tokens": 400_000}
+                    content=[], model="muse-spark-1.3-contributor", usage={"input_tokens": 1_100_000}
                 ),
                 result(),
             ],
@@ -1352,7 +1373,7 @@ def test_soft_threshold_followup_is_skipped_past_the_hard_cost_ceiling(
         return client
 
     executor = ModelExecutor(
-        replace(runtime_config(tmp_path), max_budget_usd=5), client_factory=client_factory
+        replace(runtime_config(tmp_path), max_budget_tokens=1_000_000), client_factory=client_factory
     )
     execution = asyncio.run(executor.execute(issue_body="Fix it.", working_directory=tmp_path))
 
@@ -1370,7 +1391,7 @@ def test_model_mismatch_with_crossed_threshold_gets_no_cost_followup(
             options,
             [
                 AssistantMessage(
-                    content=[], model="other-model", usage={"input_tokens": 300_000}
+                    content=[], model="other-model", usage={"input_tokens": 900_000}
                 ),
                 SimpleNamespace(
                     is_error=True,
@@ -1439,7 +1460,7 @@ def test_tool_events_record_the_calling_thread(tmp_path: Path) -> None:
     executor = ModelExecutor(
         runtime_config(tmp_path),
         client_factory=client_factory,
-        event_log=lambda event, detail="", issue_number=None: events.append((event, detail)),
+        event_log=lambda event, detail="", level="INFO", issue_number=None: events.append((event, detail)),
     )
     asyncio.run(executor.execute(issue_body="Fix it.", working_directory=tmp_path))
     pre_hook = captured[0].options.hooks["PreToolUse"][0].hooks[0]
@@ -1608,3 +1629,186 @@ def test_cli_session_id_resets_between_executions(tmp_path: Path) -> None:
 
     asyncio.run(executor.execute(issue_body="Fix it.", working_directory=tmp_path))
     assert executor.cli_session_id is None
+
+
+# --- Token ledger feeding (issue #119, part 2, step 1) ------------------------
+
+
+def stream_event(event: dict, *, parent_tool_use_id: str | None = None, uuid: str = "e-1") -> StreamEvent:
+    return StreamEvent(
+        uuid=uuid, session_id="sess-1", event=event, parent_tool_use_id=parent_tool_use_id
+    )
+
+
+def test_measured_usage_from_deltas_sums_once_per_response(tmp_path: Path) -> None:
+    events: list[tuple[str, str, str]] = []
+    captured: list[FakeClient] = []
+
+    def client_factory(options: object) -> FakeClient:
+        client = FakeClient(
+            options,
+            [
+                stream_event(
+                    {"type": "message_start", "message": {"id": "r1"}}, uuid="e-start-1"
+                ),
+                AssistantMessage(
+                    content=[TextBlock(text="hello")],
+                    model="muse-spark-1.3-contributor",
+                    message_id="r1",
+                    usage=None,
+                ),
+                stream_event(
+                    {"type": "message_delta", "usage": {"input_tokens": 1000, "output_tokens": 200}},
+                    uuid="e-delta-1",
+                ),
+                # The same response reported once per content block is merged, never added.
+                AssistantMessage(
+                    content=[TextBlock(text="hello")],
+                    model="muse-spark-1.3-contributor",
+                    message_id="r1",
+                    usage={"input_tokens": 1000, "output_tokens": 200},
+                ),
+                stream_event(
+                    {"type": "message_start", "message": {"id": "r2"}}, uuid="e-start-2"
+                ),
+                AssistantMessage(
+                    content=[TextBlock(text="world")],
+                    model="muse-spark-1.3-contributor",
+                    message_id="r2",
+                    usage=None,
+                ),
+                stream_event(
+                    {"type": "message_delta", "usage": {"input_tokens": 3000, "output_tokens": 400}},
+                    uuid="e-delta-2",
+                ),
+                result(),
+            ],
+        )
+        captured.append(client)
+        return client
+
+    executor = ModelExecutor(
+        runtime_config(tmp_path),
+        client_factory=client_factory,
+        event_log=lambda event, detail="", level="INFO", issue_number=None: events.append(
+            (event, detail, level)
+        ),
+    )
+    execution = asyncio.run(executor.execute(issue_body="Fix it.", working_directory=tmp_path))
+
+    assert execution.status is ModelExecutionStatus.SUCCEEDED
+    assert captured[0].options.include_partial_messages is True
+
+    assert executor._ledger.measured_tokens == 4600
+    assert executor._ledger.estimated_tokens == 0
+    assert executor._ledger.budget_tokens == 4600
+
+    assert not [name for name, _, _ in events if name == "token_estimate_degraded"]
+
+    limits_events = [
+        (detail, level)
+        for name, detail, level in events
+        if name == "limits_checked" and detail.startswith("thread=")
+    ]
+    # r1 settles when r2 arrives; r2 is still in flight at the terminal result.
+    assert len(limits_events) == 1
+    detail, level = limits_events[0]
+    assert level == "INFO"
+    assert "thread=main" in detail
+    # Logged as r1 settles: r1 measured, r2 only counted as an estimate so far.
+    assert "measured_tokens=1200" in detail
+    assert "estimated_tokens=1352" in detail
+    assert "budget_tokens=2552" in detail
+    assert "soft_threshold_tokens=3200000" in detail
+    assert "max_budget_tokens=4000000" in detail
+    assert "main_context_tokens=" in detail
+    assert "turns=2" in detail
+    assert "max_turns=60" in detail
+    assert "elapsed_seconds=" in detail
+    assert "timeout_seconds=60" in detail
+    assert "usd" not in detail.lower()
+
+
+def test_subagent_responses_count_on_their_own_thread(tmp_path: Path) -> None:
+    events: list[tuple[str, str, str]] = []
+
+    def client_factory(options: object) -> FakeClient:
+        return FakeClient(
+            options,
+            [
+                AssistantMessage(
+                    content=[TextBlock(text="x" * 3000)],
+                    model="muse-spark-1.3-contributor",
+                    parent_tool_use_id="toolu-123",
+                    message_id="s1",
+                    usage={"input_tokens": 0, "output_tokens": 0},
+                ),
+                AssistantMessage(
+                    content=[],
+                    model="muse-spark-1.3-contributor",
+                    parent_tool_use_id="toolu-123",
+                    message_id="s2",
+                    usage=None,
+                ),
+                result(),
+            ],
+        )
+
+    executor = ModelExecutor(
+        runtime_config(tmp_path),
+        client_factory=client_factory,
+        event_log=lambda event, detail="", level="INFO", issue_number=None: events.append(
+            (event, detail, level)
+        ),
+    )
+    execution = asyncio.run(executor.execute(issue_body="Fix it.", working_directory=tmp_path))
+
+    assert execution.status is ModelExecutionStatus.SUCCEEDED
+    assert executor._ledger.has_thread("toolu-123")
+    assert executor._ledger.response_count("toolu-123") == 2
+    assert executor._ledger.response_count("main") == 0
+
+    degraded = [(detail, level) for name, detail, level in events if name == "token_estimate_degraded"]
+    assert len(degraded) == 1
+    assert degraded[0][1] == "WARNING"
+    assert "thread=toolu-123" in degraded[0][0]
+
+    limits_events = [
+        detail for name, detail, _ in events if name == "limits_checked" and detail.startswith("thread=")
+    ]
+    assert len(limits_events) == 1
+    assert "thread=toolu-123" in limits_events[0]
+
+
+def test_zero_usage_subagent_responses_are_counted_on_their_own_thread(tmp_path: Path) -> None:
+    events: list[tuple[str, str, str]] = []
+
+    def client_factory(options: object) -> FakeClient:
+        return FakeClient(
+            options,
+            [
+                AssistantMessage(
+                    content=[TextBlock(text="sub work")],
+                    model="muse-spark-1.3-contributor",
+                    message_id="s1",
+                    usage={"input_tokens": 0, "output_tokens": 0},
+                    parent_tool_use_id="toolu_sub",
+                ),
+                UserMessage(content="tool output", parent_tool_use_id="toolu_sub"),
+                result(),
+            ],
+        )
+
+    executor = ModelExecutor(
+        runtime_config(tmp_path),
+        client_factory=client_factory,
+        event_log=lambda event, detail="", level="INFO", issue_number=None: events.append(
+            (event, detail, level)
+        ),
+    )
+    asyncio.run(executor.execute(issue_body="Fix it.", working_directory=tmp_path))
+
+    limits = [d for name, d, _ in events if name == "limits_checked" and d.startswith("thread=")]
+    assert len(limits) == 1
+    assert limits[0].startswith("thread=toolu_sub;")
+    assert executor._ledger.estimated_tokens > 0
