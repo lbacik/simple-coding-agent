@@ -297,6 +297,47 @@ def test_fallback_runs_once_when_the_safe_boundary_is_missed(tmp_path: Path) -> 
     assert reported == [("delivered", "req-1")]
 
 
+def test_fallback_prompt_names_the_issue_note_path_and_skill_tool(tmp_path: Path) -> None:
+    now = datetime.now(UTC)
+    client = FakeClient(object(), [result()], followup_messages=[result()])
+    executor, _ = make_executor(
+        tmp_path,
+        client,
+        handoff=OperatorHandoff("req-1", now - timedelta(seconds=61)),
+        now=now,
+    )
+
+    asyncio.run(
+        executor.execute(issue_body="Fix it.", working_directory=tmp_path, issue_number=77)
+    )
+
+    prompt = client.queried_prompts[0]
+    assert "#77" in prompt
+    assert ".agent/handoff/77.md" in prompt
+    assert "`Skill` tool" in prompt
+
+
+def test_operator_instruction_names_the_issue_note_path_and_skill_tool(
+    tmp_path: Path,
+) -> None:
+    client = FakeClient(object(), [result()])
+    executor, _ = make_executor(
+        tmp_path, client, handoff=OperatorHandoff("req-1", datetime.now(UTC))
+    )
+    executor._issue_number = 77
+
+    output = asyncio.run(
+        executor._record_post_tool_use(
+            {"tool_name": "Edit", "tool_input": {"file_path": "src/a.py"}}, None, {}
+        )
+    )
+
+    context = output["hookSpecificOutput"]["additionalContext"]
+    assert "#77" in context
+    assert ".agent/handoff/77.md" in context
+    assert "`Skill` tool" in context
+
+
 def test_no_fallback_inside_the_delivery_window(tmp_path: Path) -> None:
     now = datetime.now(UTC)
     client = FakeClient(object(), [result()])
