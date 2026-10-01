@@ -121,7 +121,7 @@ def test_dispatches_the_issue_body_to_the_pinned_sdk_and_returns_execution_evide
     assert options.fallback_model is None
     assert options.permission_mode == "bypassPermissions"
     assert options.max_turns == 60
-    assert options.max_budget_usd == 5
+    assert options.max_budget_usd == 20
     assert options.setting_sources == ["user"]
     assert options.skills == ["implement", "tdd", "code-review", "codebase-design", "handoff"]
     assert options.env == {
@@ -499,7 +499,9 @@ def test_crossing_the_soft_cost_threshold_injects_additional_context_once(
         captured.append(client)
         return client
 
-    executor = ModelExecutor(runtime_config(tmp_path), client_factory=client_factory)
+    # Pinned to the pre-token-budget USD regime: this test exercises USD threshold behavior.
+    config = replace(runtime_config(tmp_path), max_budget_usd=5)
+    executor = ModelExecutor(config, client_factory=client_factory)
     execution = asyncio.run(executor.execute(issue_body="Fix it.", working_directory=tmp_path))
 
     # The crossing during the stream earns exactly one cost follow-up; with no
@@ -967,8 +969,8 @@ def test_model_execution_logs_configured_limits_and_limits_checked_progress(tmp_
     # Verify model_execution_started includes limits
     started_event = next(detail for name, detail, _ in events if name == "model_execution_started")
     assert "limits:" in started_event
-    assert "max_budget_usd=5.0000" in started_event
-    assert "soft_threshold_usd=4.0000" in started_event
+    assert "max_budget_usd=20.0000" in started_event
+    assert "soft_threshold_usd=16.0000" in started_event
     assert "max_turns=60" in started_event
     assert "timeout_seconds=60" in started_event
 
@@ -979,9 +981,9 @@ def test_model_execution_logs_configured_limits_and_limits_checked_progress(tmp_
 
     limits_events = [detail for name, detail, num in events if name == "limits_checked"]
     assert len(limits_events) == 1
-    assert "estimated_cost_usd=0.0833" in limits_events[0]
-    assert "soft_threshold_usd=4.0000" in limits_events[0]
-    assert "max_budget_usd=5.0000" in limits_events[0]
+    assert "estimated_cost_usd=0.3333" in limits_events[0]
+    assert "soft_threshold_usd=16.0000" in limits_events[0]
+    assert "max_budget_usd=20.0000" in limits_events[0]
     assert "turns=1" in limits_events[0]
     assert "max_turns=60" in limits_events[0]
     assert "elapsed_seconds=" in limits_events[0]
@@ -1018,8 +1020,8 @@ def test_positive_token_usage_logs_limits_checked_progress(tmp_path: Path) -> No
     assert len(limits_events) == 1
     assert "turns=1" in limits_events[0]
     assert "estimated_cost_usd=" in limits_events[0]
-    assert "soft_threshold_usd=4.0000" in limits_events[0]
-    assert "max_budget_usd=5.0000" in limits_events[0]
+    assert "soft_threshold_usd=16.0000" in limits_events[0]
+    assert "max_budget_usd=20.0000" in limits_events[0]
 
 
 # --- Cost soft-threshold handoff guarantee (issue #85) -----------------------
@@ -1112,8 +1114,10 @@ def test_cost_crossing_stops_running_subagent_and_denies_later_subagent_calls(
         return client
 
     events: list[tuple[str, str]] = []
+    # Pinned to the pre-token-budget USD regime: this test exercises USD threshold behavior.
+    config = replace(runtime_config(tmp_path), max_budget_usd=5)
     executor = ModelExecutor(
-        runtime_config(tmp_path),
+        config,
         client_factory=client_factory,
         event_log=lambda event, detail="", issue_number=None: events.append((event, detail)),
     )

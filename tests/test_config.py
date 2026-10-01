@@ -32,8 +32,10 @@ def test_loads_required_operator_settings_and_defaults(tmp_path: Path) -> None:
     assert config.agent_trust_project_settings is False
     assert config.model == "muse-spark-1.3-contributor"
     assert config.max_turns == 60
-    assert config.max_budget_usd == 5
+    assert config.max_budget_usd == 20
+    assert config.max_budget_tokens == 4_000_000
     assert config.soft_threshold_percentage == 0.2
+    assert config.soft_threshold_tokens == 3_200_000
     assert config.claude_agent_sdk_version == "0.2.156"
     assert config.claude_code_version == "2.1.278"
 
@@ -53,6 +55,9 @@ def test_loads_required_operator_settings_and_defaults(tmp_path: Path) -> None:
         ("MAX_TURNS", "0"),
         ("MAX_TURNS", "many"),
         ("MAX_BUDGET_USD", "-1"),
+        ("MAX_BUDGET_TOKENS", "0"),
+        ("MAX_BUDGET_TOKENS", "-1"),
+        ("MAX_BUDGET_TOKENS", "many"),
         ("SOFT_THRESHOLD_PERCENTAGE", "1"),
         ("SOFT_THRESHOLD_PERCENTAGE", "-0.1"),
         ("SOFT_THRESHOLD_PERCENTAGE", "not-a-number"),
@@ -99,6 +104,7 @@ def test_applies_operator_overrides_including_the_test_only_review_gate(
             "CLAUDE_CODE_VERSION": "3.0.0",
             "MAX_TURNS": "90",
             "MAX_BUDGET_USD": "10",
+            "MAX_BUDGET_TOKENS": "1000000",
             "SOFT_THRESHOLD_PERCENTAGE": "0.3",
         }
     )
@@ -106,7 +112,9 @@ def test_applies_operator_overrides_including_the_test_only_review_gate(
     assert config.clone_dir == tmp_path / "clone"
     assert config.max_turns == 90
     assert config.max_budget_usd == 10
+    assert config.max_budget_tokens == 1_000_000
     assert config.soft_threshold_percentage == 0.3
+    assert config.soft_threshold_tokens == 700_000
     assert config.poll_interval == 15
     assert config.log_level == "DEBUG"
     assert config.model_timeout == 120
@@ -118,6 +126,35 @@ def test_applies_operator_overrides_including_the_test_only_review_gate(
     assert config.model == "muse-spark-2.0"
     assert config.claude_agent_sdk_version == "0.3.0"
     assert config.claude_code_version == "3.0.0"
+
+
+def _operator_env(tmp_path: Path, **overrides: str) -> dict[str, str]:
+    return {
+        "GITHUB_TOKEN": "github-secret",
+        "META_API_KEY": "meta-secret",
+        "TARGET_REPO": "octo/example",
+        "DATA_DIR": str(tmp_path),
+        **overrides,
+    }
+
+
+def test_warns_when_usd_backstop_is_tighter_than_token_budget(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    with caplog.at_level("WARNING", logger="simple_coding_agent.config"):
+        load_runtime_config(_operator_env(tmp_path, MAX_BUDGET_USD="19"))
+
+    warnings = [record for record in caplog.records if record.levelname == "WARNING"]
+    assert any("MAX_BUDGET_USD=19" in record.message for record in warnings)
+
+
+def test_no_warning_when_usd_backstop_covers_token_budget(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    with caplog.at_level("WARNING", logger="simple_coding_agent.config"):
+        load_runtime_config(_operator_env(tmp_path))
+
+    assert [record for record in caplog.records if record.levelname == "WARNING"] == []
 
 
 def test_profile_path_defaults_to_empty_string(tmp_path: Path) -> None:
