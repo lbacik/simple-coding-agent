@@ -33,6 +33,16 @@ The agent uses only `muse-spark-1.3-contributor`; no fallback model is set.
 The runtime pair is pinned to `claude-agent-sdk==0.2.163` and
 `@anthropic-ai/claude-code@2.1.286`.
 
+The model backend is configured through operator settings that default to
+Meta, so an existing `.env` with only `META_API_KEY` keeps working with no
+edits: `MODEL_BASE_URL` (default `https://api.meta.ai`, passed as
+`ANTHROPIC_BASE_URL`; an explicitly empty value leaves it unset),
+`MODEL_API_KEY` (falls back to `META_API_KEY`; when both are set,
+`MODEL_API_KEY` wins — one of the two must be set), `MODEL_AUTH_MODE`
+(`auth_token` sends the credential as `ANTHROPIC_AUTH_TOKEN`, the Meta
+behaviour; `api_key` sends it as `ANTHROPIC_API_KEY` for the Anthropic API),
+and `MODEL_STREAM_IDLE_TIMEOUT_MS` (default `60000`).
+
 The image ships a managed-settings file (`docker/managed-settings.json`,
 installed at `/etc/claude-code/managed-settings.json`) with a `modelPricing`
 override for `muse-spark-1.3-contributor` at Meta's published rates ($1.25
@@ -165,7 +175,8 @@ specification through `ClaudeSDKClient`. It uses the pinned upstream
 `implement`, `tdd`, `code-review`, and `codebase-design` skills, with
 `max_turns=60`, `max_budget_usd=5`, and `MODEL_TIMEOUT`. The dollar limit is a
 non-authoritative circuit breaker for Meta. A timeout interrupts the client and
-drains the stream before teardown; `CLAUDE_STREAM_IDLE_TIMEOUT_MS=60000` is a
+drains the stream before teardown; `MODEL_STREAM_IDLE_TIMEOUT_MS` (default
+`60000`, passed as `CLAUDE_STREAM_IDLE_TIMEOUT_MS`) is a
 separate stalled-stream control.
 
 The model runs with `bypassPermissions`, but an SDK `PreToolUse` guard denies
@@ -176,6 +187,28 @@ infrastructure errors; `max_turns_exceeded` is reported to the completion
 evaluator as a model-limit status, which maps to an incomplete attempt. The pinned SDK's
 observed `ResultMessage` fields are `is_error`, `model_usage`, and
 `stop_reason`; this differs from the current SDK reference field names.
+
+### Alternative backend for testing
+
+To run the agent against the Anthropic API directly instead of Meta:
+
+```env
+MODEL_BASE_URL=
+MODEL_AUTH_MODE=api_key
+MODEL_API_KEY=sk-ant-...
+MODEL_NAME=claude-sonnet-5-5
+```
+
+`MODEL_NAME` must be the full model ID (for example `claude-sonnet-5-5`),
+not an alias like `sonnet`: the strict observed-model check compares the
+model reported by the API with `MODEL_NAME` and treats any mismatch as an
+infrastructure error. `docker/managed-settings.json` only overrides pricing
+for the Meta model; Anthropic models use the CLI's built-in price table on
+purpose, so `total_cost_usd` and `MAX_BUDGET_USD` reflect Anthropic rates,
+which are several times higher than Meta's. The token estimator constants
+(`token_ledger.py`, e.g. `THINKING_ALLOWANCE_TOKENS`) are tuned for Meta, so
+estimates may be less accurate on other backends — but measured usage still
+replaces the estimates once the backend reports it.
 
 `tests/test_model_execution_smoke.py` is opt-in and makes a paid request only
 when `RUN_MODEL_SMOKE=1` is set. It requires `MODEL_SMOKE_REPOSITORY` (the

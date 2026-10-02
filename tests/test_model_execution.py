@@ -141,6 +141,7 @@ def test_dispatches_the_issue_body_to_the_pinned_sdk_and_returns_execution_evide
     assert options.env == {
         "ANTHROPIC_BASE_URL": "https://api.meta.ai",
         "ANTHROPIC_AUTH_TOKEN": "meta-secret",
+        "ANTHROPIC_API_KEY": "",
         "ANTHROPIC_MODEL": "muse-spark-1.3-contributor",
         "ANTHROPIC_DEFAULT_OPUS_MODEL": "muse-spark-1.3-contributor",
         "ANTHROPIC_DEFAULT_SONNET_MODEL": "muse-spark-1.3-contributor",
@@ -148,6 +149,116 @@ def test_dispatches_the_issue_body_to_the_pinned_sdk_and_returns_execution_evide
         "CLAUDE_CODE_SUBAGENT_MODEL": "muse-spark-1.3-contributor",
         "CLAUDE_STREAM_IDLE_TIMEOUT_MS": "60000",
     }
+
+
+def test_default_meta_config_matches_the_legacy_meta_environment_mapping(
+    tmp_path: Path,
+) -> None:
+    from simple_coding_agent.config import load_runtime_config
+
+    config = load_runtime_config(
+        {
+            "GITHUB_TOKEN": "github-secret",
+            "META_API_KEY": "meta-secret",
+            "TARGET_REPO": "octo/example",
+            "DATA_DIR": str(tmp_path),
+        }
+    )
+
+    captured: list[FakeClient] = []
+
+    def client_factory(options: object) -> FakeClient:
+        client = FakeClient(options, [result()])
+        captured.append(client)
+        return client
+
+    asyncio.run(
+        ModelExecutor(config, client_factory=client_factory).execute(
+            issue_body="Fix it.", working_directory=tmp_path
+        )
+    )
+
+    # Historical output of ``_meta_environment()`` at HEAD, pinned literally so
+    # the test does not depend on the helper it replaces.
+    legacy = {
+        "ANTHROPIC_BASE_URL": "https://api.meta.ai",
+        "ANTHROPIC_AUTH_TOKEN": "meta-secret",
+        "ANTHROPIC_MODEL": "muse-spark-1.3-contributor",
+        "ANTHROPIC_DEFAULT_OPUS_MODEL": "muse-spark-1.3-contributor",
+        "ANTHROPIC_DEFAULT_SONNET_MODEL": "muse-spark-1.3-contributor",
+        "ANTHROPIC_DEFAULT_HAIKU_MODEL": "muse-spark-1.3-contributor",
+        "CLAUDE_CODE_SUBAGENT_MODEL": "muse-spark-1.3-contributor",
+        "CLAUDE_STREAM_IDLE_TIMEOUT_MS": "60000",
+    }
+    assert all(captured[0].options.env[name] == value for name, value in legacy.items())
+    # Leak guard: the unused credential variable is pinned to empty so a value
+    # inherited from the parent environment cannot reach the CLI.
+    assert captured[0].options.env["ANTHROPIC_API_KEY"] == ""
+
+
+def test_api_key_mode_with_empty_base_url_uses_direct_anthropic_api(
+    tmp_path: Path,
+) -> None:
+    config = replace(
+        runtime_config(tmp_path),
+        model_base_url="",
+        model_api_key="sk-ant-secret",
+        model_auth_mode="api_key",
+        model="claude-sonnet-5-5",
+    )
+    captured: list[FakeClient] = []
+
+    def client_factory(options: object) -> FakeClient:
+        client = FakeClient(
+            options,
+            [
+                SimpleNamespace(model="claude-sonnet-5-5"),
+                SimpleNamespace(
+                    is_error=False,
+                    stop_reason="end_turn",
+                    model_usage={"claude-sonnet-5-5": {"input_tokens": 12}},
+                ),
+            ],
+        )
+        captured.append(client)
+        return client
+
+    execution = asyncio.run(
+        ModelExecutor(config, client_factory=client_factory).execute(
+            issue_body="Fix it.", working_directory=tmp_path
+        )
+    )
+
+    assert execution.status is ModelExecutionStatus.SUCCEEDED
+    assert captured[0].options.env == {
+        "ANTHROPIC_AUTH_TOKEN": "",
+        "ANTHROPIC_API_KEY": "sk-ant-secret",
+        "ANTHROPIC_MODEL": "claude-sonnet-5-5",
+        "ANTHROPIC_DEFAULT_OPUS_MODEL": "claude-sonnet-5-5",
+        "ANTHROPIC_DEFAULT_SONNET_MODEL": "claude-sonnet-5-5",
+        "ANTHROPIC_DEFAULT_HAIKU_MODEL": "claude-sonnet-5-5",
+        "CLAUDE_CODE_SUBAGENT_MODEL": "claude-sonnet-5-5",
+        "CLAUDE_STREAM_IDLE_TIMEOUT_MS": "60000",
+    }
+    assert "ANTHROPIC_BASE_URL" not in captured[0].options.env
+
+
+def test_model_stream_idle_timeout_is_configurable(tmp_path: Path) -> None:
+    captured: list[FakeClient] = []
+
+    def client_factory(options: object) -> FakeClient:
+        client = FakeClient(options, [result()])
+        captured.append(client)
+        return client
+
+    asyncio.run(
+        ModelExecutor(
+            replace(runtime_config(tmp_path), model_stream_idle_timeout_ms=120000),
+            client_factory=client_factory,
+        ).execute(issue_body="Fix it.", working_directory=tmp_path)
+    )
+
+    assert captured[0].options.env["CLAUDE_STREAM_IDLE_TIMEOUT_MS"] == "120000"
 
 
 def test_enables_project_settings_only_when_the_operator_explicitly_trusts_them(

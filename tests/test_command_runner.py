@@ -58,6 +58,46 @@ def test_subprocess_environment_is_limited_to_profile_and_path(tmp_path: Path) -
     assert result.commands[0].stdout.split("|")[-1] == os.defpath
 
 
+def test_subprocess_environment_strips_all_backend_credential_variables(
+    tmp_path: Path,
+) -> None:
+    result = CommandRunner().run(
+        (
+            "printf '%s|%s|%s|%s|%s' "
+            "\"${GITHUB_TOKEN-unset}\" \"${META_API_KEY-unset}\" "
+            "\"${MODEL_API_KEY-unset}\" \"${ANTHROPIC_API_KEY-unset}\" "
+            "\"${ANTHROPIC_AUTH_TOKEN-unset}\"",
+        ),
+        timeout=5,
+        cwd=tmp_path,
+        environment={
+            "GITHUB_TOKEN": "github-secret",
+            "META_API_KEY": "meta-secret",
+            "MODEL_API_KEY": "model-secret",
+            "ANTHROPIC_API_KEY": "api-key-secret",
+            "ANTHROPIC_AUTH_TOKEN": "auth-token-secret",
+        },
+    )
+
+    assert result.commands[0].stdout == "unset|unset|unset|unset|unset"
+
+
+def test_scrubs_all_backend_credentials_from_captured_output(tmp_path: Path) -> None:
+    result = CommandRunner(
+        redactions=("meta-secret", "model-secret", "api-key-secret", "auth-token-secret")
+    ).run(
+        (
+            "printf 'meta-secret model-secret api-key-secret auth-token-secret'; "
+            "printf 'meta-secret model-secret api-key-secret auth-token-secret' >&2",
+        ),
+        timeout=5,
+        cwd=tmp_path,
+    )
+
+    assert result.commands[0].stdout == "[REDACTED] [REDACTED] [REDACTED] [REDACTED]"
+    assert result.commands[0].stderr == "[REDACTED] [REDACTED] [REDACTED] [REDACTED]"
+
+
 def test_extra_path_is_prepended_to_the_subprocess_path(tmp_path: Path) -> None:
     result = CommandRunner(extra_path="/opt/homebrew/bin").run(
         ("printf '%s' \"$PATH\"",), timeout=5, cwd=tmp_path

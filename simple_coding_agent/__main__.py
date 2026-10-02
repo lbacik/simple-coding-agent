@@ -33,7 +33,7 @@ def main() -> None:
         config.data_dir,
         issue_number=issue_number,
         started_at=started_at,
-        redactions=(config.github_token, config.meta_api_key),
+        redactions=config.credential_redactions,
     )
 
     def _attempt_sink(issue_number: int) -> AttemptArchive | None:
@@ -44,7 +44,7 @@ def main() -> None:
 
     logger = JsonEventLogger(
         sys.stdout,
-        redactions=(config.github_token, config.meta_api_key),
+        redactions=config.credential_redactions,
         attempt_sink=_attempt_sink,
     )
     try:
@@ -73,7 +73,7 @@ def main() -> None:
         workspace=workspace,
         verifier=VerificationRunner(
             CommandRunner(
-                redactions=(config.github_token, config.meta_api_key),
+                redactions=config.credential_redactions,
                 extra_path=config.profile_extra_path,
             )
         ),

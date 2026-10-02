@@ -128,4 +128,7 @@ def _environment(profile_environment: Mapping[str, str], extra_path: str = "") -
     # Credentials belong exclusively to the driving process and model boundary.
     environment.pop("GITHUB_TOKEN", None)
     environment.pop("META_API_KEY", None)
+    environment.pop("MODEL_API_KEY", None)
+    environment.pop("ANTHROPIC_API_KEY", None)
+    environment.pop("ANTHROPIC_AUTH_TOKEN", None)
     return environment

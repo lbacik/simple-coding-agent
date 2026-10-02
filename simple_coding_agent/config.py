@@ -28,6 +28,10 @@ class ProfileError(ValueError):
 _TARGET_REPOSITORY = re.compile(r"^[^/\s]+/[^/\s]+$")
 _LOG_LEVELS = frozenset({"CRITICAL", "ERROR", "WARNING", "INFO", "DEBUG"})
 _DEFAULT_MODEL_NAME = "muse-spark-1.3-contributor"
+_DEFAULT_MODEL_BASE_URL = "https://api.meta.ai"
+_DEFAULT_MODEL_AUTH_MODE = "auth_token"
+_MODEL_AUTH_MODES = frozenset({"auth_token", "api_key"})
+_DEFAULT_MODEL_STREAM_IDLE_TIMEOUT_MS = 60000
 _DEFAULT_CLAUDE_AGENT_SDK_VERSION = "0.2.163"
 _DEFAULT_CLAUDE_CODE_VERSION = "2.1.286"
 
@@ -58,12 +62,26 @@ class RuntimeConfig:
     max_budget_usd: int = 20
     max_budget_tokens: int = 4_000_000
     soft_threshold_percentage: float = 0.2
+    model_base_url: str = _DEFAULT_MODEL_BASE_URL
+    model_api_key: str = ""
+    model_auth_mode: str = _DEFAULT_MODEL_AUTH_MODE
+    model_stream_idle_timeout_ms: int = _DEFAULT_MODEL_STREAM_IDLE_TIMEOUT_MS
 
     @property
     def soft_threshold_tokens(self) -> int:
         """Token budget reading past which the attempt must hand off."""
 
         return int(self.max_budget_tokens * (1 - self.soft_threshold_percentage))
+
+    @property
+    def credential_redactions(self) -> tuple[str, ...]:
+        """Secrets that must never appear in logs or profile-command output."""
+
+        return tuple(
+            secret
+            for secret in (self.github_token, self.meta_api_key, self.model_api_key)
+            if secret
+        )
 
 
 @dataclass(frozen=True)
@@ -83,7 +101,21 @@ def load_runtime_config(environ: Mapping[str, str] | None = None) -> RuntimeConf
 
     values = os.environ if environ is None else environ
     github_token = _required(values, "GITHUB_TOKEN")
-    meta_api_key = _required(values, "META_API_KEY")
+    meta_api_key = values.get("META_API_KEY", "")
+    model_api_key = values.get("MODEL_API_KEY", "")
+    resolved_api_key = (
+        model_api_key if model_api_key.strip() else (meta_api_key if meta_api_key.strip() else "")
+    )
+    if not resolved_api_key.strip():
+        raise ConfigurationError("MODEL_API_KEY or META_API_KEY must be set")
+    model_auth_mode = values.get("MODEL_AUTH_MODE", _DEFAULT_MODEL_AUTH_MODE).strip()
+    if model_auth_mode not in _MODEL_AUTH_MODES:
+        raise ConfigurationError("MODEL_AUTH_MODE must be auth_token or api_key")
+    if "MODEL_BASE_URL" in values:
+        raw_base_url = values["MODEL_BASE_URL"]
+        model_base_url = "" if not raw_base_url.strip() else raw_base_url.strip()
+    else:
+        model_base_url = _DEFAULT_MODEL_BASE_URL
     target_repo = _required(values, "TARGET_REPO")
     if not _TARGET_REPOSITORY.fullmatch(target_repo):
         raise ConfigurationError("TARGET_REPO must use the owner/repo format")
@@ -97,6 +129,12 @@ def load_runtime_config(environ: Mapping[str, str] | None = None) -> RuntimeConf
     config = RuntimeConfig(
         github_token=github_token,
         meta_api_key=meta_api_key,
+        model_base_url=model_base_url,
+        model_api_key=resolved_api_key,
+        model_auth_mode=model_auth_mode,
+        model_stream_idle_timeout_ms=_positive_integer(
+            values, "MODEL_STREAM_IDLE_TIMEOUT_MS", _DEFAULT_MODEL_STREAM_IDLE_TIMEOUT_MS
+        ),
         target_repo=target_repo,
         data_dir=data_dir,
         clone_dir=clone_dir,
