@@ -47,14 +47,7 @@ def test_default_runtime_versions_match_dockerfile_pins(tmp_path: Path) -> None:
     cli_pin = re.search(r"npm install --global @anthropic-ai/claude-code@(\S+)", dockerfile)
     assert sdk_pin and cli_pin, "Dockerfile must pin both the SDK and the CLI"
 
-    config = load_runtime_config(
-        {
-            "GITHUB_TOKEN": "github-secret",
-            "META_API_KEY": "meta-secret",
-            "TARGET_REPO": "octo/example",
-            "DATA_DIR": str(tmp_path),
-        }
-    )
+    config = load_runtime_config(_operator_env(tmp_path))
 
     assert config.claude_agent_sdk_version == sdk_pin.group(1)
     assert config.claude_code_version == cli_pin.group(1)
