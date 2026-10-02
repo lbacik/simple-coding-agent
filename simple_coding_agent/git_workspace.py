@@ -157,6 +157,22 @@ class GitWorkspace:
         """Return porcelain status of dirty or untracked changes."""
         return self._git("status", "--porcelain")
 
+    def dirty_paths(self) -> tuple[str, ...]:
+        """Return repository-relative paths of dirty or untracked changes.
+
+        Parsed from ``git status --porcelain`` (v1): the path follows the
+        two-column status and separator, so ``XY path`` yields ``path`` and
+        a rename ``R  old -> new`` yields ``new``. Unreadable state
+        propagates, so callers fail closed instead of treating the tree as
+        clean.
+        """
+
+        return tuple(
+            _porcelain_path(line)
+            for line in self.dirty_status().splitlines()
+            if line.strip()
+        )
+
     def has_unresolved_conflicts(self) -> bool:
         """Return True when the working tree holds an unfinished rebase/merge.
 
@@ -712,6 +728,18 @@ class GitWorkspace:
                 return self._run(("git", *arguments), working_directory, environment)
             except (OSError, subprocess.CalledProcessError) as error:
                 raise GitWorkspaceError("Git command failed") from error
+
+
+def _porcelain_path(line: str) -> str:
+    """Return the repository-relative path of one ``status --porcelain`` line.
+
+    Porcelain v1 lines are ``XY path`` (or ``XY origin -> destination`` for
+    renames); the destination is what blocks a clean tree.
+    """
+
+    path = line[3:] if len(line) > 3 else line.strip()
+    _, separator, destination = path.rpartition(" -> ")
+    return destination.strip() if separator else path.strip()
 
 
 def _attempt_branch(issue_number: int) -> str:
