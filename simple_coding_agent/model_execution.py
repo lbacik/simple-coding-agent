@@ -320,7 +320,7 @@ class ModelExecutor:
         """Log a CLI context compaction.
 
         The budget is left alone; the ledger only learns of the compaction so
-        the next response is excluded from cache-miss accounting. SDK 0.2.156
+        the next response is excluded from cache-miss accounting. SDK 0.2.163
         has no typed message for it and ``compact_metadata`` is unverified,
         so ``trigger`` and ``pre_tokens`` are read best-effort.
         """
@@ -1251,7 +1251,7 @@ class ModelExecutor:
                 stop_reason=getattr(terminal, "stop_reason", None),
                 terminal_reason=getattr(terminal, "terminal_reason", None),
             )
-        # SDK 0.2.156 exposes these runtime fields, unlike the current reference
+        # SDK 0.2.163 exposes these runtime fields, unlike the current reference
         # documentation's terminal_reason/total_cost_usd/input_tokens examples.
         model_usage = getattr(terminal, "model_usage", None)
         result_models = tuple(model_usage.keys()) if isinstance(model_usage, Mapping) else ()

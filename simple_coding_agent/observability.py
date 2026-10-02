@@ -142,7 +142,7 @@ class AttemptArchive:
     ) -> tuple[int, int]:
         """Copy this attempt's CLI session transcripts into ``transcripts/``, redacted.
 
-        On-disk layout under the pinned CLI (``@anthropic-ai/claude-code@2.1.276``,
+        On-disk layout under the pinned CLI (``@anthropic-ai/claude-code@2.1.286``,
         verified against ``$HOME/.claude/projects`` in the container and the
         SDK's ``session_store.file_path_to_session_key`` documentation):
 

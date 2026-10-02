@@ -28,8 +28,8 @@ class ProfileError(ValueError):
 _TARGET_REPOSITORY = re.compile(r"^[^/\s]+/[^/\s]+$")
 _LOG_LEVELS = frozenset({"CRITICAL", "ERROR", "WARNING", "INFO", "DEBUG"})
 _DEFAULT_MODEL_NAME = "muse-spark-1.3-contributor"
-_DEFAULT_CLAUDE_AGENT_SDK_VERSION = "0.2.156"
-_DEFAULT_CLAUDE_CODE_VERSION = "2.1.278"
+_DEFAULT_CLAUDE_AGENT_SDK_VERSION = "0.2.163"
+_DEFAULT_CLAUDE_CODE_VERSION = "2.1.286"
 
 
 @dataclass(frozen=True)
