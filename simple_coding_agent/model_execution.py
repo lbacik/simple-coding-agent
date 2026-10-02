@@ -35,7 +35,7 @@ from simple_coding_agent.token_ledger import (
 
 
 _SKILLS = ["implement", "tdd", "code-review", "codebase-design", "handoff"]
-_META_BASE_URL = "https://api.meta.ai"
+_DEFAULT_MODEL_BASE_URL = "https://api.meta.ai"
 
 # The per-attempt token ledger (``token_ledger.TokenLedger``) is the live
 # budget reading: every streamed ``AssistantMessage`` counts its response as
@@ -870,7 +870,7 @@ class ModelExecutor:
             max_budget_usd=self._config.max_budget_usd,
             include_partial_messages=True,
             cwd=working_directory,
-            env=_meta_environment(self._config.meta_api_key, self._config.model),
+            env=_model_environment(self._config),
             setting_sources=settings_sources,
             strict_mcp_config=self._config.agent_trust_project_settings,
             extra_args={"disable-all-hooks": None}
@@ -1774,17 +1774,42 @@ def _cost_deny(restriction: str) -> dict[str, Any]:
     )
 
 
-def _meta_environment(api_key: str, model: str) -> dict[str, str]:
-    return {
-        "ANTHROPIC_BASE_URL": _META_BASE_URL,
-        "ANTHROPIC_AUTH_TOKEN": api_key,
-        "ANTHROPIC_MODEL": model,
-        "ANTHROPIC_DEFAULT_OPUS_MODEL": model,
-        "ANTHROPIC_DEFAULT_SONNET_MODEL": model,
-        "ANTHROPIC_DEFAULT_HAIKU_MODEL": model,
-        "CLAUDE_CODE_SUBAGENT_MODEL": model,
-        "CLAUDE_STREAM_IDLE_TIMEOUT_MS": "60000",
-    }
+def _model_environment(config: RuntimeConfig) -> dict[str, str]:
+    """Build the model-backend environment for the CLI from operator config.
+
+    ``auth_token`` mode sends the credential as ``ANTHROPIC_AUTH_TOKEN``
+    (Bearer, the Meta behaviour); ``api_key`` mode sends it as
+    ``ANTHROPIC_API_KEY`` (x-api-key, the Anthropic API). The unused
+    credential variable is set to an empty string so a value inherited from
+    the parent environment cannot leak into the CLI. An empty base URL
+    means ``ANTHROPIC_BASE_URL`` is left unset (direct Anthropic API).
+    """
+
+    api_key = (
+        config.model_api_key
+        if config.model_api_key.strip()
+        # ``load_runtime_config`` always resolves ``model_api_key``; the
+        # fallback covers directly-constructed configs that only set the
+        # legacy ``meta_api_key`` field.
+        else config.meta_api_key
+    )
+    model = config.model
+    environment: dict[str, str] = {}
+    if config.model_base_url:
+        environment["ANTHROPIC_BASE_URL"] = config.model_base_url
+    if config.model_auth_mode == "api_key":
+        environment["ANTHROPIC_AUTH_TOKEN"] = ""
+        environment["ANTHROPIC_API_KEY"] = api_key
+    else:
+        environment["ANTHROPIC_AUTH_TOKEN"] = api_key
+        environment["ANTHROPIC_API_KEY"] = ""
+    environment["ANTHROPIC_MODEL"] = model
+    environment["ANTHROPIC_DEFAULT_OPUS_MODEL"] = model
+    environment["ANTHROPIC_DEFAULT_SONNET_MODEL"] = model
+    environment["ANTHROPIC_DEFAULT_HAIKU_MODEL"] = model
+    environment["CLAUDE_CODE_SUBAGENT_MODEL"] = model
+    environment["CLAUDE_STREAM_IDLE_TIMEOUT_MS"] = str(config.model_stream_idle_timeout_ms)
+    return environment
 
 
 async def _cancel_stream_wait(pending: asyncio.Task | None) -> None:

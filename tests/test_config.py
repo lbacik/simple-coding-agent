@@ -141,6 +141,111 @@ def test_applies_operator_overrides_including_the_test_only_review_gate(
     assert config.claude_code_version == "3.0.0"
 
 
+def test_model_backend_defaults_to_meta(tmp_path: Path) -> None:
+    config = load_runtime_config(
+        {
+            "GITHUB_TOKEN": "github-secret",
+            "META_API_KEY": "meta-secret",
+            "TARGET_REPO": "octo/example",
+            "DATA_DIR": str(tmp_path),
+        }
+    )
+
+    assert config.model_base_url == "https://api.meta.ai"
+    assert config.model_api_key == "meta-secret"
+    assert config.model_auth_mode == "auth_token"
+    assert config.model_stream_idle_timeout_ms == 60000
+
+
+def test_meta_api_key_only_keeps_working_without_new_variables(tmp_path: Path) -> None:
+    config = load_runtime_config(_operator_env(tmp_path))
+
+    assert config.meta_api_key == "meta-secret"
+    assert config.model_api_key == "meta-secret"
+
+
+def test_model_api_key_takes_precedence_over_meta_api_key(tmp_path: Path) -> None:
+    config = load_runtime_config(
+        _operator_env(tmp_path, MODEL_API_KEY="model-secret", META_API_KEY="meta-secret")
+    )
+
+    assert config.model_api_key == "model-secret"
+    assert config.meta_api_key == "meta-secret"
+
+
+def test_model_api_key_alone_satisfies_the_credential_requirement(tmp_path: Path) -> None:
+    environment = _operator_env(tmp_path, MODEL_API_KEY="model-secret")
+    del environment["META_API_KEY"]
+
+    config = load_runtime_config(environment)
+
+    assert config.model_api_key == "model-secret"
+
+
+def test_empty_model_base_url_means_direct_anthropic_api(tmp_path: Path) -> None:
+    config = load_runtime_config(_operator_env(tmp_path, MODEL_BASE_URL=""))
+
+    assert config.model_base_url == ""
+
+
+def test_rejects_unknown_model_auth_mode_without_leaking_secrets(tmp_path: Path) -> None:
+    with pytest.raises(ConfigurationError) as error:
+        load_runtime_config(_operator_env(tmp_path, MODEL_AUTH_MODE="bearer"))
+
+    assert "github-secret" not in str(error.value)
+    assert "meta-secret" not in str(error.value)
+
+
+def test_rejects_missing_credential_without_leaking_secrets(tmp_path: Path) -> None:
+    environment = _operator_env(tmp_path, MODEL_API_KEY="")
+    del environment["META_API_KEY"]
+
+    with pytest.raises(ConfigurationError) as error:
+        load_runtime_config(environment)
+
+    assert "github-secret" not in str(error.value)
+
+
+def test_rejects_blank_credentials_without_leaking_secrets(tmp_path: Path) -> None:
+    with pytest.raises(ConfigurationError) as error:
+        load_runtime_config(
+            _operator_env(tmp_path, MODEL_API_KEY="  ", META_API_KEY="  ")
+        )
+
+    assert "github-secret" not in str(error.value)
+
+
+def test_credential_redactions_cover_both_api_key_settings(tmp_path: Path) -> None:
+    config = load_runtime_config(
+        _operator_env(tmp_path, MODEL_API_KEY="model-secret", META_API_KEY="meta-secret")
+    )
+
+    assert config.credential_redactions == (
+        "github-secret",
+        "meta-secret",
+        "model-secret",
+    )
+
+
+def test_applies_model_backend_overrides(tmp_path: Path) -> None:
+    config = load_runtime_config(
+        _operator_env(
+            tmp_path,
+            MODEL_BASE_URL="",
+            MODEL_AUTH_MODE="api_key",
+            MODEL_API_KEY="model-secret",
+            MODEL_NAME="claude-sonnet-5-5",
+            MODEL_STREAM_IDLE_TIMEOUT_MS="120000",
+        )
+    )
+
+    assert config.model_base_url == ""
+    assert config.model_auth_mode == "api_key"
+    assert config.model_api_key == "model-secret"
+    assert config.model == "claude-sonnet-5-5"
+    assert config.model_stream_idle_timeout_ms == 120000
+
+
 def _operator_env(tmp_path: Path, **overrides: str) -> dict[str, str]:
     return {
         "GITHUB_TOKEN": "github-secret",

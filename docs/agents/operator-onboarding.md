@@ -150,6 +150,52 @@ before actually running `git commit` would have those edits silently left
 out of the pushed branch and the pull request, even though the final check
 observed them on disk and the attempt still gets recorded as `complete`.
 
+## Model backend settings
+
+The model backend is configured through operator environment settings that
+default to Meta, so an existing `.env` with only `META_API_KEY` keeps working
+with no edits:
+
+- `MODEL_BASE_URL` (default `https://api.meta.ai`) is passed as
+  `ANTHROPIC_BASE_URL`. An explicitly empty value leaves it unset, which
+  selects the Anthropic API directly.
+- `MODEL_API_KEY` holds the backend credential and falls back to
+  `META_API_KEY` when unset. When both are set, `MODEL_API_KEY` wins. One of
+  the two must be set.
+- `MODEL_AUTH_MODE` selects how the credential is sent: `auth_token` sends it
+  as `ANTHROPIC_AUTH_TOKEN` (Bearer, the Meta behaviour); `api_key` sends it
+  as `ANTHROPIC_API_KEY` (x-api-key, the Anthropic API).
+- `MODEL_STREAM_IDLE_TIMEOUT_MS` (default `60000`) is passed as
+  `CLAUDE_STREAM_IDLE_TIMEOUT_MS`, the stalled-stream control.
+
+The resolved credential is redacted from logs everywhere `META_API_KEY` was,
+and profile commands never see `META_API_KEY`, `MODEL_API_KEY`,
+`ANTHROPIC_API_KEY`, or `ANTHROPIC_AUTH_TOKEN`.
+
+## Alternative backend for testing
+
+To run the agent against the Anthropic API directly instead of Meta:
+
+```env
+MODEL_BASE_URL=
+MODEL_AUTH_MODE=api_key
+MODEL_API_KEY=sk-ant-...
+MODEL_NAME=claude-sonnet-5-5
+```
+
+- `MODEL_NAME` must be the full model ID (for example
+  `claude-sonnet-5-5`), not an alias like `sonnet`. The strict
+  observed-model check compares the model reported by the API with
+  `MODEL_NAME` and treats any mismatch as an infrastructure error.
+- `docker/managed-settings.json` only overrides pricing for the Meta model.
+  Anthropic models use the CLI's built-in price table on purpose, so
+  `total_cost_usd` and `MAX_BUDGET_USD` reflect Anthropic rates. Those rates
+  are several times higher than Meta's.
+- The token estimator constants (`token_ledger.py`, e.g.
+  `THINKING_ALLOWANCE_TOKENS`) are tuned for Meta. Estimates may be less
+  accurate on other backends, but measured usage still replaces them once the
+  backend reports it.
+
 ## Non-destructive workspace management
 
 The agent adheres strictly to non-destructive cleanup:
