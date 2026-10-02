@@ -622,6 +622,7 @@ class ModelExecutor:
                     async with asyncio.timeout(self._config.model_timeout):
                         terminal, observed_models = await self._receive_terminal(client)
                 except TimeoutError:
+                    self._ledger.mark_interrupted()
                     await client.interrupt()
                     await self._drain(client)
                     if self._token_hard_ceiling_reached:
@@ -907,6 +908,7 @@ class ModelExecutor:
                 if action == "expire":
                     await _cancel_stream_wait(pending)
                     pending = None
+                    self._ledger.mark_interrupted()
                     await client.interrupt()
                     await self._drain(client)
                     self._operator_deadline_expired = True
@@ -950,6 +952,7 @@ class ModelExecutor:
                 elif isinstance(message, UserMessage):
                     self._observe_user_message(message)
                 if self._token_hard_ceiling_reached:
+                    self._ledger.mark_interrupted()
                     await client.interrupt()
                     drained = await self._drain(client)
                     return drained, tuple(observed_models)
@@ -1087,17 +1090,31 @@ class ModelExecutor:
         self._check_prompt_cache()
 
     def _token_limits_detail(self, thread_id: str, response_id: str) -> str:
-        if self._ledger.has_thread("main"):
-            main_context = self._ledger.context_tokens("main")
-            turns = self._ledger.response_count("main")
+        # Report the settled response's own figures, captured before the
+        # event that settled it was applied. The live ledger already carries
+        # the next response's estimate (or tool-input growth) at log time.
+        reading = self._ledger.settled_reading(thread_id, response_id)
+        if reading is not None:
+            budget = reading.budget_tokens
+            measured = reading.measured_tokens
+            estimated = reading.estimated_tokens
+            main_context = reading.main_context_tokens
+            turns = reading.main_response_count
         else:
-            main_context = 0.0
-            turns = 0
+            budget = self._ledger.budget_tokens
+            measured = self._ledger.measured_tokens
+            estimated = self._ledger.estimated_tokens
+            if self._ledger.has_thread("main"):
+                main_context = self._ledger.context_tokens("main")
+                turns = self._ledger.response_count("main")
+            else:
+                main_context = 0.0
+                turns = 0
         detail = (
             f"thread={thread_id}; "
-            f"budget_tokens={self._ledger.budget_tokens:.0f}; "
-            f"measured_tokens={self._ledger.measured_tokens:.0f}; "
-            f"estimated_tokens={self._ledger.estimated_tokens:.0f}; "
+            f"budget_tokens={budget:.0f}; "
+            f"measured_tokens={measured:.0f}; "
+            f"estimated_tokens={estimated:.0f}; "
             f"soft_threshold_tokens={self._config.soft_threshold_tokens}; "
             f"max_budget_tokens={self._config.max_budget_tokens}; "
             f"main_context_tokens={main_context:.0f}; "
@@ -1403,6 +1420,9 @@ class ModelExecutor:
                 "estimated_tokens": round(reconciliation.unreported_estimated_tokens),
                 "actual_tokens": reconciliation.unreported_actual_tokens,
                 "error_ratio": _round_ratio(reconciliation.unreported_error_ratio),
+            },
+            "interrupted": {
+                "estimated_tokens": round(reconciliation.interrupted_estimated_tokens),
             },
             "measured_by_category": _short_categories(self._ledger.measured_by_category),
             "actual_by_category": (
