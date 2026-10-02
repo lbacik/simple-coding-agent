@@ -165,6 +165,9 @@ class InMemoryWorkspace:
     def is_clean(self) -> bool:
         return not self.dirty
 
+    def dirty_paths(self) -> tuple[str, ...]:
+        return tuple(sorted(self.dirty))
+
     def commits_added(self, prepared: PreparedAttempt) -> tuple[AttemptCommit, ...]:
         return tuple(
             AttemptCommit(revision=record.revision, subject=record.subject)

@@ -238,6 +238,12 @@ def test_malformed_checkpoint_holds_intake_without_claiming(
 def test_dirty_tree_without_checkpoint_holds_intake(
     tmp_path: Path, workspace: InMemoryWorkspace, publisher: FakePublisher
 ) -> None:
+    """A dirty tree with no checkpoint holds the claim without exiting.
+
+    The process stays up (no ``SystemExit``), sleeps the poll interval,
+    and keeps serving the control socket, so the operator retains a live
+    view while the tree awaits manual repair.
+    """
     workspace.make_dirty("work.txt", "uncommitted work")
     tracker = FakeTracker(next_claim=Claim(_issue(25), Assignment("issue-25", "agent-id")))
     lifecycle = AgentLifecycle(
@@ -247,11 +253,12 @@ def test_dirty_tree_without_checkpoint_holds_intake(
         profile_loader=lambda _: _profile(),
         publisher=publisher,
         completion_store=AttemptCompletionStore(tmp_path),
+        sleeper=lambda seconds: None,
     )
 
-    with pytest.raises(SystemExit):
-        lifecycle.run_once()
+    result = lifecycle.run_once()
 
+    assert result.status is LifecycleStatus.IDLE
     assert tracker.claimed == []
     assert AttemptStateStore(tmp_path).read() is None
 
