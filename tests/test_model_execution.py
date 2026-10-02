@@ -1872,14 +1872,15 @@ def test_measured_usage_from_deltas_sums_once_per_response(tmp_path: Path) -> No
     detail, level = limits_events[0]
     assert level == "INFO"
     assert "thread=main" in detail
-    # Logged as r1 settles: r1 measured, r2 only counted as an estimate so far.
+    # Logged for r1 as it settles: r1's own figures, before r2's estimate
+    # was counted (r2 settles nothing and stays in flight at the terminal).
     assert "measured_tokens=1200" in detail
-    assert "estimated_tokens=1352" in detail
-    assert "budget_tokens=2552" in detail
+    assert "estimated_tokens=0" in detail
+    assert "budget_tokens=1200" in detail
     assert "soft_threshold_tokens=3200000" in detail
     assert "max_budget_tokens=4000000" in detail
-    assert "main_context_tokens=" in detail
-    assert "turns=2" in detail
+    assert "main_context_tokens=1200" in detail
+    assert "turns=1" in detail
     assert "max_turns=60" in detail
     assert "elapsed_seconds=" in detail
     assert "timeout_seconds=60" in detail
@@ -2347,6 +2348,83 @@ def test_hard_ceiling_without_a_terminal_has_null_actuals(tmp_path: Path) -> Non
     assert budget["error_ratio"] is None
     assert budget["unreported"]["actual_tokens"] is None
     assert budget["unreported"]["error_ratio"] is None
+
+
+def _limits_value(detail: str, name: str) -> int:
+    for part in detail.split("; "):
+        key, _, value = part.partition("=")
+        if key == name:
+            return int(value)
+    raise AssertionError(f"{name!r} missing from {detail!r}")
+
+
+def test_limits_checked_reports_the_settled_responses_own_values(tmp_path: Path) -> None:
+    _, events, _ = _execute_with(
+        tmp_path,
+        [
+            AssistantMessage(
+                content=[],
+                model="muse-spark-1.3-contributor",
+                message_id="r1",
+                usage={"input_tokens": 1000, "output_tokens": 100},
+            ),
+            AssistantMessage(
+                content=[],
+                model="muse-spark-1.3-contributor",
+                message_id="r2",
+            ),
+            _result_with_usage(
+                {"muse-spark-1.3-contributor": {"input_tokens": 1000, "output_tokens": 100}}
+            ),
+        ],
+    )
+
+    details = [detail for name, detail, _ in events if name == "limits_checked"]
+    assert len(details) == 1
+    # r1 settled when r2's first AssistantMessage arrived; the entry must
+    # carry r1's own figures, not the live ledger with r2's estimate.
+    assert _limits_value(details[0], "budget_tokens") == 1100
+    assert _limits_value(details[0], "measured_tokens") == 1100
+    assert _limits_value(details[0], "estimated_tokens") == 0
+    assert _limits_value(details[0], "turns") == 1
+
+
+def test_hard_ceiling_interrupted_response_is_measured_with_own_field(
+    tmp_path: Path,
+) -> None:
+    execution, _, _ = _execute_with(
+        tmp_path,
+        [
+            AssistantMessage(
+                content=[],
+                model="muse-spark-1.3-contributor",
+                message_id="r1",
+                usage={"input_tokens": 1000, "output_tokens": 100},
+            ),
+            AssistantMessage(
+                content=[TextBlock(text="x" * 300_000)],
+                model="muse-spark-1.3-contributor",
+                message_id="r2",
+            ),
+            _result_with_usage(
+                {"muse-spark-1.3-contributor": {"input_tokens": 1000, "output_tokens": 100}}
+            ),
+        ],
+        max_budget_tokens=50_000,
+    )
+
+    budget = execution.token_budget
+    assert budget["hard_ceiling_reached"] is True
+    # r2 was cut off by the interrupt before usage arrived; every completed
+    # response was measured, so the summary is measured over covered responses.
+    assert budget["mode"] == "measured"
+    assert budget["actual_tokens"] == 1100
+    assert budget["error_ratio"] == pytest.approx(0, abs=0.01)
+    assert budget["unreported"]["estimated_tokens"] == 0
+    assert budget["unreported"]["actual_tokens"] == 0
+    assert budget["interrupted"]["estimated_tokens"] > 0
+    # Enforcement totals still carry the interrupted estimate.
+    assert budget["estimated_tokens"] == 1100 + budget["interrupted"]["estimated_tokens"]
 
 
 def test_compact_boundary_is_logged_without_touching_the_ledger(tmp_path: Path) -> None:

@@ -22,7 +22,18 @@ The model (decided in #127 from the ``prototype/token-estimator`` replay):
 * A response settles when the next event on its thread arrives. The first
   response per attempt that settles without reported usage is reported via
   :attr:`TokenLedger.first_settled_without_usage` so the executor can log
-  ``token_estimate_degraded``.
+  ``token_estimate_degraded``. The ledger captures a
+  :class:`SettledReading` for each settled response at settle time, before
+  the event that settled it is applied, so ``limits_checked`` can report
+  the settled response's own figures instead of the live ledger state
+  (which already carries the next response's estimate).
+* A response cut off by an interrupt (for example the hard ceiling firing
+  right after its first ``AssistantMessage``, before usage arrives) is
+  flagged via :meth:`TokenLedger.mark_interrupted`. Interrupted estimates
+  stay in ``budget_tokens``/``estimated_tokens`` (enforcement is
+  unchanged) but are reported separately and excluded from the
+  reconciliation ``mode``/``error_ratio``, which cover completed
+  responses only.
 
 Compaction needs no handling here: the main thread re-anchors to the
 measured context at its next reported response, and estimated threads are
@@ -160,7 +171,14 @@ class ResponseCacheMetrics:
 
 @dataclass(frozen=True)
 class Reconciliation:
-    """Budget count checked against the authoritative ``model_usage`` total."""
+    """Budget count checked against the authoritative ``model_usage`` total.
+
+    ``estimated_tokens`` is the full ledger total, including interrupted
+    in-flight estimates (enforcement is unchanged). ``mode``,
+    ``error_ratio`` and the ``unreported_*`` fields cover completed
+    responses only: interrupted estimates are excluded and reported via
+    ``interrupted_estimated_tokens``.
+    """
 
     mode: Literal["measured", "mixed", "estimated"]
     estimated_tokens: float
@@ -169,6 +187,24 @@ class Reconciliation:
     unreported_estimated_tokens: float
     unreported_actual_tokens: int | None
     unreported_error_ratio: float | None
+    interrupted_estimated_tokens: float
+
+
+@dataclass(frozen=True)
+class SettledReading:
+    """Ledger aggregates captured when one response settled.
+
+    Taken before the event that settled it is applied, so the figures are
+    the settled response's own: they exclude the next response's estimate
+    (when the settler is the next response's first ``AssistantMessage``)
+    and any tool-input growth (when the settler is a tool result).
+    """
+
+    budget_tokens: float
+    measured_tokens: float
+    estimated_tokens: float
+    main_context_tokens: float
+    main_response_count: int
 
 
 @dataclass
@@ -181,6 +217,7 @@ class _Response:
     usage: dict[str, int] | None = None
     settled: bool = False
     compacted_before: bool = False
+    interrupted: bool = False
 
     def counted(self) -> float:
         """Tokens this response contributes to the budget reading."""
@@ -219,6 +256,7 @@ class TokenLedger:
             self._subagent_bases_by_type = dict(subagent_bases_by_type)
         self._threads: dict[str, _Thread] = {}
         self._first_settled_without_usage: DegradedNotice | None = None
+        self._settled_readings: dict[tuple[str, str], SettledReading] = {}
         self._peak_main_context_tokens = 0.0
         self._compaction_pending: set[str] = set()
 
@@ -335,28 +373,36 @@ class TokenLedger:
         """Check the count against the full ``model_usage`` (all models).
 
         With no ``model_usage`` every actual and error is ``None``.
+        Interrupted in-flight estimates stay in ``estimated_tokens`` but
+        are excluded from ``mode`` and the error ratios, which cover
+        completed responses only.
         """
 
         for thread in self._threads.values():
             self._settle(thread)
         estimated_total = self.budget_tokens
         measured = self.measured_tokens
-        unreported_estimated = self.estimated_tokens
-        if unreported_estimated > 0:
+        interrupted = self.interrupted_estimated_tokens
+        covered_estimated = estimated_total - interrupted
+        covered_unreported = self.estimated_tokens - interrupted
+        if covered_unreported > 0:
             mode: Literal["measured", "mixed", "estimated"] = (
                 "mixed" if measured > 0 else "estimated"
             )
-        else:
+        elif measured > 0 or interrupted == 0:
             mode = "measured"
+        else:
+            mode = "estimated"
         if model_usage is None:
             return Reconciliation(
                 mode=mode,
                 estimated_tokens=estimated_total,
                 actual_tokens=None,
                 error_ratio=None,
-                unreported_estimated_tokens=unreported_estimated,
+                unreported_estimated_tokens=covered_unreported,
                 unreported_actual_tokens=None,
                 unreported_error_ratio=None,
+                interrupted_estimated_tokens=interrupted,
             )
         actual = sum(usage_total(usage) for usage in model_usage.values())
         unreported_actual = actual - int(measured)
@@ -364,14 +410,15 @@ class TokenLedger:
             mode=mode,
             estimated_tokens=estimated_total,
             actual_tokens=actual,
-            error_ratio=(estimated_total - actual) / actual if actual > 0 else None,
-            unreported_estimated_tokens=unreported_estimated,
+            error_ratio=(covered_estimated - actual) / actual if actual > 0 else None,
+            unreported_estimated_tokens=covered_unreported,
             unreported_actual_tokens=unreported_actual,
             unreported_error_ratio=(
-                (unreported_estimated - unreported_actual) / unreported_actual
+                (covered_unreported - unreported_actual) / unreported_actual
                 if unreported_actual > 0
                 else None
             ),
+            interrupted_estimated_tokens=interrupted,
         )
 
     # -- readings ---------------------------------------------------------
@@ -403,6 +450,38 @@ class TokenLedger:
             for response in thread.responses
             if response.usage is None
         )
+
+    @property
+    def interrupted_estimated_tokens(self) -> float:
+        """Tokens of in-flight responses cut off by an interrupt.
+
+        A subset of :attr:`estimated_tokens`: responses flagged via
+        :meth:`mark_interrupted` that still have no reported usage. Once
+        usage arrives for such a response it counts as measured again.
+        """
+
+        return sum(
+            response.counted()
+            for thread in self._threads.values()
+            for response in thread.responses
+            if response.usage is None and response.interrupted
+        )
+
+    def mark_interrupted(self) -> int:
+        """Flag in-flight responses without usage as cut off by an interrupt.
+
+        Only unsettled responses qualify: settled-but-unmeasured responses
+        completed normally (their usage report is merely missing) and stay
+        in the ordinary unreported bucket. Returns the number flagged.
+        """
+
+        flagged = 0
+        for thread in self._threads.values():
+            for response in thread.responses:
+                if response.usage is None and not response.settled and not response.interrupted:
+                    response.interrupted = True
+                    flagged += 1
+        return flagged
 
     @property
     def measured_by_category(self) -> dict[str, int]:
@@ -542,16 +621,27 @@ class TokenLedger:
             response.id for response in self._threads[thread_id].responses if response.settled
         )
 
+    def settled_reading(self, thread_id: str, response_id: str) -> SettledReading | None:
+        """Aggregates captured when one response settled, if it has settled."""
+
+        return self._settled_readings.get((thread_id, response_id))
+
     # -- internals --------------------------------------------------------
 
     def _settle(self, thread: _Thread) -> None:
-        """Settle a thread's in-flight response as the next event arrives."""
+        """Settle a thread's in-flight response as the next event arrives.
+
+        The reading is captured before the settling event is applied: at
+        this point the ledger still holds the settled response's own
+        state, without the next response's estimate or tool-input growth.
+        """
 
         if not thread.responses:
             return
         response = thread.responses[-1]
         if response.settled:
             return
+        self._settled_readings[(thread.id, response.id)] = self._current_reading()
         response.settled = True
         if response.usage is None and self._first_settled_without_usage is None:
             self._first_settled_without_usage = DegradedNotice(
@@ -559,6 +649,18 @@ class TokenLedger:
                 subagent_type=thread.subagent_type,
                 response_id=response.id,
             )
+
+    def _current_reading(self) -> SettledReading:
+        """Snapshot the current aggregates (the settled response's own state)."""
+
+        main_thread = self._threads.get("main")
+        return SettledReading(
+            budget_tokens=self.budget_tokens,
+            measured_tokens=self.measured_tokens,
+            estimated_tokens=self.estimated_tokens,
+            main_context_tokens=main_thread.context if main_thread is not None else 0.0,
+            main_response_count=len(main_thread.responses) if main_thread is not None else 0,
+        )
 
     def _response_for_usage(self, thread: _Thread, response_id: str) -> _Response | None:
         for response in thread.responses:

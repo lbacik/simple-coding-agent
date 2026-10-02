@@ -307,3 +307,86 @@ def test_executor_readings_cover_thread_presence_counts_and_settled_ids() -> Non
 
     assert ledger.response_count("main") == 2
     assert ledger.settled_response_ids("main") == ("r1",)
+
+
+def test_settled_reading_excludes_the_next_response_estimate() -> None:
+    ledger = TokenLedger()
+    ledger.start_thread("main", kind="main", prompt_chars=0)
+    ledger.observe_response("main", "r1", visible_chars=0)
+    ledger.observe_usage(
+        "main",
+        "r1",
+        {"input_tokens": 1_000, "cache_read_input_tokens": 2_000, "output_tokens": 100},
+    )
+    measured = 3_100.0
+
+    ledger.observe_response("main", "r2", visible_chars=0)
+
+    reading = ledger.settled_reading("main", "r1")
+    assert reading is not None
+    assert reading.measured_tokens == measured
+    assert reading.estimated_tokens == 0
+    assert reading.budget_tokens == measured
+    assert reading.main_response_count == 1
+    # The live ledger already carries r2's estimate; the reading must not.
+    assert ledger.budget_tokens > measured
+    assert ledger.response_count("main") == 2
+
+
+def test_settled_reading_is_captured_before_tool_input_growth() -> None:
+    ledger = TokenLedger()
+    ledger.start_thread("main", kind="main", prompt_chars=0)
+    ledger.observe_response("main", "r1", visible_chars=0)
+    context_before_input = ledger.context_tokens("main")
+
+    ledger.observe_input("main", chars=4_000)
+
+    reading = ledger.settled_reading("main", "r1")
+    assert reading is not None
+    assert reading.main_context_tokens == context_before_input
+    assert ledger.context_tokens("main") > context_before_input
+
+
+def test_interrupted_inflight_is_excluded_from_mode_and_error() -> None:
+    ledger = TokenLedger()
+    ledger.start_thread("main", kind="main", prompt_chars=0)
+    ledger.observe_response("main", "r1", visible_chars=0)
+    ledger.observe_usage(
+        "main",
+        "r1",
+        {"input_tokens": 1_000, "output_tokens": 100},
+    )
+    estimate_r2 = ledger.observe_response("main", "r2", visible_chars=0)
+    ledger.mark_interrupted()
+
+    result = ledger.reconcile({"m": {"input_tokens": 1_000, "output_tokens": 100}})
+
+    assert result.mode == "measured"
+    assert result.interrupted_estimated_tokens == estimate_r2
+    # Enforcement totals still carry the interrupted estimate.
+    assert result.estimated_tokens == 1_100 + estimate_r2
+    assert result.error_ratio == 0
+    assert result.unreported_estimated_tokens == 0
+    assert result.unreported_actual_tokens == 0
+
+
+def test_mark_interrupted_only_flags_inflight_responses() -> None:
+    ledger = TokenLedger()
+    ledger.start_thread("main", kind="main", prompt_chars=0)
+    ledger.observe_response("main", "r0", visible_chars=0)
+    ledger.observe_usage(
+        "main",
+        "r0",
+        {"input_tokens": 1_000, "output_tokens": 100},
+    )
+    estimate_r1 = ledger.observe_response("main", "r1", visible_chars=0)
+    estimate_r2 = ledger.observe_response("main", "r2", visible_chars=0)
+    # r1 settled without usage when r2 arrived; r2 is still in flight.
+    ledger.mark_interrupted()
+
+    assert ledger.interrupted_estimated_tokens == estimate_r2
+
+    result = ledger.reconcile({"m": {"input_tokens": 1_000, "output_tokens": 100 + 500}})
+    assert result.mode == "mixed"
+    assert result.unreported_estimated_tokens == estimate_r1
+    assert result.interrupted_estimated_tokens == estimate_r2
