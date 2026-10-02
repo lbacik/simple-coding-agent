@@ -44,27 +44,27 @@ def test_accepts_the_pinned_skill_closure_versions_and_home_links(tmp_path: Path
     _link_skill(home, "handoff")
     verifier = ProvenanceVerifier(
         home=home,
-        expected_sdk_version="0.2.156",
-        expected_cli_version="2.1.276",
+        expected_sdk_version="0.2.163",
+        expected_cli_version="2.1.286",
         run=lambda command: _upstream_listing()
         if command[:2] == ("agent-installer", "list")
-        else "2.1.276",
-        sdk_version=lambda: "0.2.156",
+        else "2.1.286",
+        sdk_version=lambda: "0.2.163",
     )
 
     evidence = verifier.verify()
 
-    assert evidence.cli_version == "2.1.276"
+    assert evidence.cli_version == "2.1.286"
     assert set(evidence.skill_hashes) == {*_UPSTREAM_SKILLS, "handoff"}
 
 
 def test_blocks_model_execution_when_skill_provenance_is_tampered(tmp_path: Path) -> None:
     verifier = ProvenanceVerifier(
         home=tmp_path,
-        expected_sdk_version="0.2.156",
-        expected_cli_version="2.1.276",
+        expected_sdk_version="0.2.163",
+        expected_cli_version="2.1.286",
         run=lambda _: '{"artifacts": []}',
-        sdk_version=lambda: "0.2.156",
+        sdk_version=lambda: "0.2.163",
     )
 
     with pytest.raises(ProvenanceError, match="required skill"):
@@ -79,12 +79,12 @@ def test_blocks_model_execution_when_the_project_owned_skill_link_is_missing(
         _link_skill(home, skill)
     verifier = ProvenanceVerifier(
         home=home,
-        expected_sdk_version="0.2.156",
-        expected_cli_version="2.1.276",
+        expected_sdk_version="0.2.163",
+        expected_cli_version="2.1.286",
         run=lambda command: _upstream_listing()
         if command[:2] == ("agent-installer", "list")
-        else "2.1.276",
-        sdk_version=lambda: "0.2.156",
+        else "2.1.286",
+        sdk_version=lambda: "0.2.163",
     )
 
     with pytest.raises(ProvenanceError, match="handoff"):
@@ -98,12 +98,12 @@ def test_project_owned_skill_hash_reflects_its_installed_content(tmp_path: Path)
     _link_skill(home, "handoff", content="# handoff\n\nOne body.\n")
     verifier = ProvenanceVerifier(
         home=home,
-        expected_sdk_version="0.2.156",
-        expected_cli_version="2.1.276",
+        expected_sdk_version="0.2.163",
+        expected_cli_version="2.1.286",
         run=lambda command: _upstream_listing()
         if command[:2] == ("agent-installer", "list")
-        else "2.1.276",
-        sdk_version=lambda: "0.2.156",
+        else "2.1.286",
+        sdk_version=lambda: "0.2.163",
     )
     first_hash = verifier.verify().skill_hashes["handoff"]
 
@@ -121,17 +121,17 @@ def test_parses_the_cli_version_from_its_trailing_label(tmp_path: Path) -> None:
     listing = _upstream_listing()
     verifier = ProvenanceVerifier(
         home=home,
-        expected_sdk_version="0.2.156",
-        expected_cli_version="2.1.278",
+        expected_sdk_version="0.2.163",
+        expected_cli_version="2.1.286",
         run=lambda command: listing
         if command[:2] == ("agent-installer", "list")
-        else "2.1.278 (Claude Code)",
-        sdk_version=lambda: "0.2.156",
+        else "2.1.286 (Claude Code)",
+        sdk_version=lambda: "0.2.163",
     )
 
     evidence = verifier.verify()
 
-    assert evidence.cli_version == "2.1.278"
+    assert evidence.cli_version == "2.1.286"
 
 
 def _verified_evidence(tmp_path: Path):
@@ -140,12 +140,12 @@ def _verified_evidence(tmp_path: Path):
         _link_skill(home, skill)
     return ProvenanceVerifier(
         home=home,
-        expected_sdk_version="0.2.156",
-        expected_cli_version="2.1.276",
+        expected_sdk_version="0.2.163",
+        expected_cli_version="2.1.286",
         run=lambda command: _upstream_listing()
         if command[:2] == ("agent-installer", "list")
-        else "2.1.276",
-        sdk_version=lambda: "0.2.156",
+        else "2.1.286",
+        sdk_version=lambda: "0.2.163",
     ).verify()
 
 
@@ -154,7 +154,7 @@ def test_startup_summary_names_the_agent_version_next_to_sdk_and_cli(tmp_path: P
 
     summary = _verified_evidence(tmp_path).summary()
 
-    assert summary == f"agent={agent_version()}; sdk=0.2.156; cli=2.1.276"
+    assert summary == f"agent={agent_version()}; sdk=0.2.163; cli=2.1.286"
 
 
 def test_startup_verification_survives_an_unreadable_agent_version(

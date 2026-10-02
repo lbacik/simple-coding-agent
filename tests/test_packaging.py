@@ -63,15 +63,15 @@ def test_dockerfile_does_not_mount_docker_socket() -> None:
 
 def test_dockerfile_installs_pinned_python_sdk() -> None:
     content = _dockerfile()
-    assert "claude-agent-sdk==0.2.156" in content, (
-        "Dockerfile must install claude-agent-sdk==0.2.156"
+    assert "claude-agent-sdk==0.2.163" in content, (
+        "Dockerfile must install claude-agent-sdk==0.2.163"
     )
 
 
 def test_dockerfile_installs_pinned_claude_code_cli() -> None:
     content = _dockerfile()
-    assert "@anthropic-ai/claude-code@2.1.276" in content, (
-        "Dockerfile must install @anthropic-ai/claude-code@2.1.276"
+    assert "@anthropic-ai/claude-code@2.1.286" in content, (
+        "Dockerfile must install @anthropic-ai/claude-code@2.1.286"
     )
 
 
@@ -563,7 +563,7 @@ class TestDockerSmoke:
             text=True,
         )
         assert result.returncode == 0
-        assert result.stdout.strip() == "0.2.156", (
+        assert result.stdout.strip() == "0.2.163", (
             f"SDK version mismatch: {result.stdout.strip()}"
         )
 
@@ -579,7 +579,7 @@ class TestDockerSmoke:
         )
         assert result.returncode == 0
         version = result.stdout.strip().split()[-1].lstrip("v")
-        assert version == "2.1.276", f"CLI version mismatch: {version}"
+        assert version == "2.1.286", f"CLI version mismatch: {version}"
 
     def test_skills_are_visible_in_agent_home(self) -> None:
         result = subprocess.run(

@@ -1,3 +1,4 @@
+import re
 from pathlib import Path
 
 import pytest
@@ -36,8 +37,20 @@ def test_loads_required_operator_settings_and_defaults(tmp_path: Path) -> None:
     assert config.max_budget_tokens == 4_000_000
     assert config.soft_threshold_percentage == 0.2
     assert config.soft_threshold_tokens == 3_200_000
-    assert config.claude_agent_sdk_version == "0.2.156"
-    assert config.claude_code_version == "2.1.278"
+
+
+def test_default_runtime_versions_match_dockerfile_pins(tmp_path: Path) -> None:
+    # The provenance check compares these defaults with the installed pair, so
+    # a container built without overrides only starts if they match the image.
+    dockerfile = (Path(__file__).parent.parent / "Dockerfile").read_text()
+    sdk_pin = re.search(r'"claude-agent-sdk==([^"]+)"', dockerfile)
+    cli_pin = re.search(r"npm install --global @anthropic-ai/claude-code@(\S+)", dockerfile)
+    assert sdk_pin and cli_pin, "Dockerfile must pin both the SDK and the CLI"
+
+    config = load_runtime_config(_operator_env(tmp_path))
+
+    assert config.claude_agent_sdk_version == sdk_pin.group(1)
+    assert config.claude_code_version == cli_pin.group(1)
 
 
 @pytest.mark.parametrize(
