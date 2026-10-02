@@ -18,6 +18,11 @@ services:
     # No Docker socket is mounted. No control port is published: the only
     # control channel is the container-local Unix socket above.
     restart: unless-stopped
+    # A core dump landing in the clone's working directory makes the tree
+    # dirty (`git status --porcelain` sees it as untracked), which blocks
+    # intake until an operator removes it — so disable core dumps.
+    ulimits:
+      core: 0
 
 volumes:
   agent_data:

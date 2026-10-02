@@ -156,14 +156,20 @@ The agent adheres strictly to non-destructive cleanup:
 - The agent **never** deletes uncommitted files or removes branches after an attempt
   ends (`git reset --hard`, `git clean -fd`, and `git branch -D` are not run on attempt cleanup).
 - Attempt branches and untracked artifacts remain intact for human review and debugging.
-- **Clean workspace precondition**: Before starting or claiming an attempt, the agent
-  inspects the repository working tree (`git status --porcelain`). If the workspace
-  contains uncommitted or untracked changes, the agent:
-  1. Emits a warning log (`working_tree_dirty`).
-  2. Releases the claim, removes the `ready-for-agent` label from the issue, and posts
-     a comment indicating that uncommitted changes exist in the workspace.
-  3. Halts execution with exit code 1.
+- **Clean workspace precondition**: When intake is running and a claim could
+  happen, the agent inspects the repository working tree
+  (`git status --porcelain`). If the workspace contains uncommitted or
+  untracked changes, the agent blocks the claim but keeps running:
+  1. Emits a warning log (`working_tree_dirty`) once per dirty episode,
+     naming the first offending paths (a follow-up `working_tree_clean`
+     is logged when the tree reads clean again).
+  2. Sleeps the normal poll interval and keeps serving `agentctl status`,
+     whose `recovery` block reports the hold with the offending paths and
+     the repair instruction — no exit, no restart loop, no label changes.
+  A stopped instance never inspects the tree and stays quiet.
   Cleaning the working tree is strictly the responsibility of human operators.
+  Keep stray files (notably core dumps — the compose file disables them via
+  `ulimits: core: 0`) out of the clone: any untracked file blocks intake.
 
 ## Per-instance operator control (`agentctl`)
 

@@ -142,7 +142,9 @@ def test_git_dirty_paths_names_untracked_files_first(tmp_path: Path) -> None:
     (clone / "notes" / "scratch.txt").write_text("wip")
 
     assert workspace.is_clean() is False
-    assert workspace.dirty_paths() == ("core.6458", "notes/scratch.txt")
+    # Porcelain collapses an untracked directory to ``notes/``; the hold
+    # detail quotes whatever git reports, which is what the operator sees.
+    assert workspace.dirty_paths() == ("core.6458", "notes/")
 
 
 def claim(number: int) -> Claim:

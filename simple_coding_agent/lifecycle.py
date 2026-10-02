@@ -1373,11 +1373,7 @@ class AgentLifecycle:
                 attempt_id=None,
                 branch=None,
                 phase=None,
-                reason=(
-                    "the working tree holds unexplained dirty or untracked"
-                    " work with no active attempt; manual repair is required"
-                    " before intake"
-                ),
+                reason=self._dirty_tree_detail(),
             )
         return None
 
@@ -1392,6 +1388,74 @@ class AgentLifecycle:
             return not self._workspace.is_clean()
         except Exception:
             return True
+
+    def _dirty_tree_hold_locked(self) -> bool:
+        """Block the claim while the tree holds unexplained work (no exit).
+
+        The caller holds the control lock with intake already permitted.
+        Returns True when the claim must wait: the branch, checkpoint
+        (none here), and working tree are left untouched for the
+        operator, and the caller sleeps the normal poll interval with
+        the control socket still serving. Logs ``working_tree_dirty``
+        once per dirty episode (naming the first offending paths) and
+        ``working_tree_clean`` on recovery, so a stopped instance stays
+        quiet and a dirty poll loop stays quiet after the first report.
+        An unreadable tree fails closed as a hold.
+        """
+
+        try:
+            clean = self._workspace.is_clean()
+        except Exception:
+            clean = False
+        if clean:
+            if self._dirty_tree_reported:
+                self._dirty_tree_reported = False
+                self._event_log(
+                    "working_tree_clean",
+                    "repository working tree is clean again; intake hold cleared",
+                    level="INFO",
+                )
+            return False
+        if not self._dirty_tree_reported:
+            self._dirty_tree_reported = True
+            self._event_log(
+                "working_tree_dirty",
+                self._dirty_tree_detail(),
+                level="WARNING",
+            )
+        return True
+
+    def _dirty_tree_paths_locked(self) -> tuple[str, ...]:
+        """Best-effort offending paths for the dirty-tree hold detail.
+
+        Never raises: an unreadable tree (or a workspace without the
+        ``dirty_paths`` seam) yields no paths, and the hold still blocks
+        with the base message so the tree fails closed.
+        """
+
+        describe = getattr(self._workspace, "dirty_paths", None)
+        if not callable(describe):
+            return ()
+        try:
+            return tuple(describe())
+        except Exception:
+            return ()
+
+    def _dirty_tree_detail(self) -> str:
+        """Operator-facing dirty-tree hold detail naming offending paths."""
+
+        base = (
+            "repository working tree holds unexplained dirty or untracked"
+            " work with no active attempt; manual repair is required before"
+            " intake"
+        )
+        paths = self._dirty_tree_paths_locked()
+        if not paths:
+            return base + "."
+        shown = ", ".join(paths[:_DIRTY_PATH_DISPLAY_LIMIT])
+        extra = len(paths) - _DIRTY_PATH_DISPLAY_LIMIT
+        suffix = shown + (f" (and {extra} more)" if extra > 0 else "")
+        return base + f"; offending paths: {suffix}."
 
     # -- recovery execution -------------------------------------------------
 
@@ -1973,10 +2037,7 @@ class AgentLifecycle:
         if checkpoint is None:
             if not self._workspace_is_dirty():
                 return None
-            reason = (
-                "the working tree holds unexplained dirty or untracked work"
-                " with no active attempt; manual repair is required before intake"
-            )
+            reason = self._dirty_tree_detail()
             return {
                 "attempt_id": None,
                 "issue_number": None,
