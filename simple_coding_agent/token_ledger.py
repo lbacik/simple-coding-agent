@@ -19,7 +19,13 @@ The model (decided in #127 from the ``prototype/token-estimator`` replay):
   plus framing tokens to the thread's context.
 * A new thread starts at a system base plus ``prompt chars /
   INPUT_CHARS_PER_TOKEN``. The subagent base is per subagent type.
-* A response settles when the next event on its thread arrives. The first
+* A response settles when the next event on its thread arrives. Threads
+  whose last response never sees another event on their thread (the main
+  thread's terminal response, a subagent's final response before its Task
+  tool result) are settled explicitly via :meth:`TokenLedger.settle_thread`
+  / :meth:`TokenLedger.settle_all_threads`. Responses cut off by an
+  interrupt stay unsettled (see ``mark_interrupted`` below) and produce no
+  entry, so entries stay "once per settled response". The first
   response per attempt that settles without reported usage is reported via
   :attr:`TokenLedger.first_settled_without_usage` so the executor can log
   ``token_estimate_degraded``. The ledger captures a
@@ -625,6 +631,40 @@ class TokenLedger:
         """Aggregates captured when one response settled, if it has settled."""
 
         return self._settled_readings.get((thread_id, response_id))
+
+    def settle_thread(self, thread_id: str) -> tuple[str, ...]:
+        """Settle one thread's in-flight response, unless it was interrupted.
+
+        Returns the newly settled response ids (at most one). Responses
+        flagged via :meth:`mark_interrupted` stay unsettled: they keep their
+        interrupted accounting and produce no ``limits_checked`` entry, so
+        entries stay "once per settled response".
+        """
+
+        thread = self._threads.get(thread_id)
+        if thread is None or not thread.responses:
+            return ()
+        response = thread.responses[-1]
+        if response.settled or response.interrupted:
+            return ()
+        self._settle(thread)
+        return (response.id,)
+
+    def settle_all_threads(self) -> dict[str, tuple[str, ...]]:
+        """Settle every thread's in-flight response, skipping interrupted ones.
+
+        Used when the terminal ``ResultMessage`` arrives: each thread's last
+        response would otherwise never see another event on its thread.
+        Returns the newly settled response ids per thread (threads with
+        nothing new to settle are omitted).
+        """
+
+        newly: dict[str, tuple[str, ...]] = {}
+        for thread_id in self._threads:
+            settled = self.settle_thread(thread_id)
+            if settled:
+                newly[thread_id] = settled
+        return newly
 
     # -- internals --------------------------------------------------------
 

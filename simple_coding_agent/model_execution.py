@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -941,6 +941,7 @@ class ModelExecutor:
                 if isinstance(message, SystemMessage) and message.subtype == "compact_boundary":
                     self._log_context_compacted(message)
                 if isinstance(message, ResultMessage) or _looks_like_result(message):
+                    self._settle_all_threads_and_log()
                     return message, tuple(observed_models)
                 if isinstance(message, AssistantMessage):
                     for block in message.content:
@@ -955,6 +956,7 @@ class ModelExecutor:
                     self._ledger.mark_interrupted()
                     await client.interrupt()
                     drained = await self._drain(client)
+                    self._settle_all_threads_and_log()
                     return drained, tuple(observed_models)
                 model = getattr(message, "model", None)
                 if isinstance(model, str):
@@ -1066,6 +1068,13 @@ class ModelExecutor:
 
         thread_id = getattr(message, "parent_tool_use_id", None) or "main"
         self._ensure_ledger_thread(thread_id)
+        for tool_use_id in _tool_result_ids(getattr(message, "content", "")):
+            # A Task tool result ends its subagent thread: settle the
+            # subagent's final response before the main-thread event is
+            # applied, so its entry carries the subagent thread (not main)
+            # with its own reading.
+            if tool_use_id != thread_id and self._ledger.has_thread(tool_use_id):
+                self._settle_thread_and_log(tool_use_id)
         self._ledger.observe_input(thread_id, _content_chars(getattr(message, "content", "")))
         self._after_ledger_update(thread_id)
 
@@ -1083,11 +1092,35 @@ class ModelExecutor:
                 f"estimated_tokens={self._ledger.estimated_tokens:.0f}",
                 level="WARNING",
             )
-        for response_id in self._ledger.settled_response_ids(thread_id):
+        self._log_newly_settled(thread_id, self._ledger.settled_response_ids(thread_id))
+        self._check_prompt_cache()
+
+    def _settle_thread_and_log(self, thread_id: str) -> None:
+        """Settle one thread's in-flight response and log its entry."""
+
+        self._log_newly_settled(thread_id, self._ledger.settle_thread(thread_id))
+
+    def _settle_all_threads_and_log(self) -> None:
+        """Settle every thread's in-flight response at the terminal result.
+
+        Each thread's last response would otherwise never see another event
+        on its thread (main's terminal response; each subagent's final
+        response). Interrupted in-flight responses stay unsettled and get no
+        entry. Only ``limits_checked`` logging runs here: settling changes no
+        budget figure, so thresholds, degradation and reconciliation are
+        untouched.
+        """
+
+        for settled_thread_id, response_ids in self._ledger.settle_all_threads().items():
+            self._log_newly_settled(settled_thread_id, response_ids)
+
+    def _log_newly_settled(self, thread_id: str, response_ids: Iterable[str]) -> None:
+        """Log one ``limits_checked`` entry per newly settled response, once."""
+
+        for response_id in response_ids:
             if (thread_id, response_id) not in self._limits_logged:
                 self._limits_logged.add((thread_id, response_id))
                 self._log("limits_checked", self._token_limits_detail(thread_id, response_id))
-        self._check_prompt_cache()
 
     def _token_limits_detail(self, thread_id: str, response_id: str) -> str:
         # Report the settled response's own figures, captured before the
@@ -1689,6 +1722,35 @@ def _sum_usage_by_category(model_usage: Mapping[str, Any]) -> dict[str, int]:
 
 def _thread_label_from(parent_tool_use_id: object) -> str:
     return parent_tool_use_id if isinstance(parent_tool_use_id, str) and parent_tool_use_id else "main"
+
+
+def _tool_result_ids(content: object) -> tuple[str, ...]:
+    """Tool-use ids completed by a streamed tool-result message.
+
+    A Task tool result carries the launched subagent's thread id as its
+    ``tool_use_id``; settling that thread before the main-thread event is
+    applied attributes the subagent's final response to its own thread.
+    Both ``ToolResultBlock`` objects and plain mappings are read; anything
+    else (plain user text, unknown blocks) completes no thread.
+    """
+
+    ids: list[str] = []
+    stack: list[object] = [content]
+    while stack:
+        item = stack.pop()
+        if isinstance(item, Mapping):
+            candidate = item.get("tool_use_id", item.get("toolUseId"))
+            if isinstance(candidate, str) and candidate:
+                ids.append(candidate)
+        elif isinstance(item, (list, tuple)):
+            stack.extend(item)
+        elif isinstance(item, str):
+            continue
+        else:
+            candidate = getattr(item, "tool_use_id", None)
+            if isinstance(candidate, str) and candidate:
+                ids.append(candidate)
+    return tuple(ids)
 
 
 def _deny(reason: str) -> dict[str, Any]:

@@ -413,13 +413,18 @@ def test_limits_checked_appends_cache_fields_for_a_measured_response(tmp_path: P
     )
 
     details = _limits_details(events)
-    assert len(details) == 1
+    assert len(details) == 2
     assert "; input_tokens=1000" in details[0]
     assert "; cache_read_tokens=3000" in details[0]
     assert "; cache_creation_tokens=0" in details[0]
     assert "; cache_hit_rate=0.75" in details[0]
     # The first measured main-thread response is always excluded from miss accounting.
     assert "; cache_miss_tokens=excluded" in details[0]
+    # r2 is still unmeasured when the terminal result settles it: no cache fields.
+    assert details[1].startswith("thread=main;")
+    assert "cache_" not in details[1]
+    assert "input_tokens=" not in details[1]
+    assert "miss" not in details[1]
 
 
 def test_limits_checked_reports_miss_for_a_second_measured_response(tmp_path: Path) -> None:
@@ -448,11 +453,13 @@ def test_limits_checked_reports_miss_for_a_second_measured_response(tmp_path: Pa
     )
 
     details = _limits_details(events)
-    assert len(details) == 2
+    assert len(details) == 3
     assert "; cache_miss_tokens=excluded" in details[0]
     # Expected prefix 4000, read 100.
     assert "; cache_miss_tokens=3900" in details[1]
     assert "; cache_hit_rate=0.025" in details[1]
+    # r3 is still unmeasured when the terminal result settles it: no cache fields.
+    assert "cache_" not in details[2]
 
 
 def test_limits_checked_is_unchanged_without_reported_usage(tmp_path: Path) -> None:
@@ -507,9 +514,11 @@ def test_limits_checked_after_compaction_logs_miss_excluded(tmp_path: Path) -> N
     )
 
     details = _limits_details(events)
-    assert len(details) == 2
+    assert len(details) == 3
     assert "; cache_miss_tokens=excluded" in details[0]
     assert "; cache_miss_tokens=excluded" in details[1]
+    # r3 is still unmeasured when the terminal result settles it: no cache fields.
+    assert "cache_" not in details[2]
     assert [name for name, _, _ in events if name == "context_compacted"] != []
 
 

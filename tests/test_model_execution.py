@@ -9,7 +9,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from claude_agent_sdk import AssistantMessage, StreamEvent, TextBlock, UserMessage
+from claude_agent_sdk import AssistantMessage, StreamEvent, TextBlock, ToolResultBlock, UserMessage
 
 from simple_coding_agent.config import RuntimeConfig
 from simple_coding_agent.model_execution import (
@@ -1867,8 +1867,8 @@ def test_measured_usage_from_deltas_sums_once_per_response(tmp_path: Path) -> No
         for name, detail, level in events
         if name == "limits_checked" and detail.startswith("thread=")
     ]
-    # r1 settles when r2 arrives; r2 is still in flight at the terminal result.
-    assert len(limits_events) == 1
+    # r1 settles when r2 arrives; r2 settles when the terminal result arrives.
+    assert len(limits_events) == 2
     detail, level = limits_events[0]
     assert level == "INFO"
     assert "thread=main" in detail
@@ -1885,6 +1885,15 @@ def test_measured_usage_from_deltas_sums_once_per_response(tmp_path: Path) -> No
     assert "elapsed_seconds=" in detail
     assert "timeout_seconds=60" in detail
     assert "usd" not in detail.lower()
+    # r2 settles when the terminal result arrives, with its own figures.
+    terminal_detail, terminal_level = limits_events[1]
+    assert terminal_level == "INFO"
+    assert "thread=main" in terminal_detail
+    assert "measured_tokens=4600" in terminal_detail
+    assert "estimated_tokens=0" in terminal_detail
+    assert "budget_tokens=4600" in terminal_detail
+    assert "main_context_tokens=3400" in terminal_detail
+    assert "turns=2" in terminal_detail
 
 
 def test_subagent_responses_count_on_their_own_thread(tmp_path: Path) -> None:
@@ -1934,8 +1943,10 @@ def test_subagent_responses_count_on_their_own_thread(tmp_path: Path) -> None:
     limits_events = [
         detail for name, detail, _ in events if name == "limits_checked" and detail.startswith("thread=")
     ]
-    assert len(limits_events) == 1
+    # Both subagent responses settle: s1 when s2 arrives, s2 at the terminal result.
+    assert len(limits_events) == 2
     assert "thread=toolu-123" in limits_events[0]
+    assert "thread=toolu-123" in limits_events[1]
 
 
 def test_zero_usage_subagent_responses_are_counted_on_their_own_thread(tmp_path: Path) -> None:
@@ -2380,19 +2391,111 @@ def test_limits_checked_reports_the_settled_responses_own_values(tmp_path: Path)
     )
 
     details = [detail for name, detail, _ in events if name == "limits_checked"]
-    assert len(details) == 1
+    assert len(details) == 2
     # r1 settled when r2's first AssistantMessage arrived; the entry must
     # carry r1's own figures, not the live ledger with r2's estimate.
     assert _limits_value(details[0], "budget_tokens") == 1100
     assert _limits_value(details[0], "measured_tokens") == 1100
     assert _limits_value(details[0], "estimated_tokens") == 0
     assert _limits_value(details[0], "turns") == 1
+    # r2 settled when the terminal result arrived; its entry carries its own
+    # figures, including r2's still-unmeasured estimate.
+    assert _limits_value(details[1], "budget_tokens") == 2350
+    assert _limits_value(details[1], "measured_tokens") == 1100
+    assert _limits_value(details[1], "estimated_tokens") == 1250
+    assert _limits_value(details[1], "turns") == 2
+
+
+def test_terminal_response_is_logged_with_its_own_reading(tmp_path: Path) -> None:
+    execution, events, executor = _execute_with(
+        tmp_path,
+        [
+            AssistantMessage(
+                content=[],
+                model="muse-spark-1.3-contributor",
+                message_id="m1",
+                usage={"input_tokens": 1000, "output_tokens": 100},
+            ),
+            AssistantMessage(
+                content=[],
+                model="muse-spark-1.3-contributor",
+                message_id="m2",
+                usage={"input_tokens": 2000, "output_tokens": 200},
+            ),
+            _result_with_usage(
+                {"muse-spark-1.3-contributor": {"input_tokens": 3000, "output_tokens": 300}}
+            ),
+        ],
+    )
+
+    assert execution.status is ModelExecutionStatus.SUCCEEDED
+    details = [detail for name, detail, _ in events if name == "limits_checked"]
+    assert len(details) == executor._ledger.response_count("main") == 2
+    assert all(detail.startswith("thread=main;") for detail in details)
+    assert _limits_value(details[0], "turns") == 1
+    assert _limits_value(details[0], "budget_tokens") == 1100
+    # The terminal response settles when the ResultMessage arrives.
+    assert _limits_value(details[1], "turns") == 2
+    assert _limits_value(details[1], "budget_tokens") == 3300
+    assert _limits_value(details[1], "measured_tokens") == 3300
+    assert _limits_value(details[1], "estimated_tokens") == 0
+
+
+def test_subagent_final_response_is_logged_on_its_own_thread(tmp_path: Path) -> None:
+    subagent_thread = "toolu-sub-final"
+    _, events, executor = _execute_with(
+        tmp_path,
+        [
+            AssistantMessage(
+                content=[],
+                model="muse-spark-1.3-contributor",
+                message_id="m1",
+                usage={"input_tokens": 1000, "output_tokens": 100},
+            ),
+            AssistantMessage(
+                content=[TextBlock(text="sub work")],
+                model="muse-spark-1.3-contributor",
+                message_id="s1",
+                parent_tool_use_id=subagent_thread,
+                usage={"input_tokens": 500, "output_tokens": 50},
+            ),
+            AssistantMessage(
+                content=[TextBlock(text="sub done")],
+                model="muse-spark-1.3-contributor",
+                message_id="s2",
+                parent_tool_use_id=subagent_thread,
+            ),
+            UserMessage(content=[ToolResultBlock(tool_use_id=subagent_thread, content="done")]),
+            AssistantMessage(
+                content=[],
+                model="muse-spark-1.3-contributor",
+                message_id="m2",
+                usage={"input_tokens": 2000, "output_tokens": 200},
+            ),
+            _result_with_usage(
+                {"muse-spark-1.3-contributor": {"input_tokens": 3500, "output_tokens": 350}}
+            ),
+        ],
+    )
+
+    details = [detail for name, detail, _ in events if name == "limits_checked"]
+    main_entries = [detail for detail in details if detail.startswith("thread=main;")]
+    sub_entries = [
+        detail for detail in details if detail.startswith(f"thread={subagent_thread};")
+    ]
+    assert len(main_entries) == executor._ledger.response_count("main") == 2
+    assert len(sub_entries) == executor._ledger.response_count(subagent_thread) == 2
+    # s2 settles when its Task tool result arrives on main: the subagent entry
+    # is logged before the main-thread entry for the tool result itself, so the
+    # subagent estimate never first appears inside a thread=main entry.
+    assert details.index(sub_entries[1]) < details.index(main_entries[0])
+    assert _limits_value(sub_entries[1], "estimated_tokens") > 0
 
 
 def test_hard_ceiling_interrupted_response_is_measured_with_own_field(
     tmp_path: Path,
 ) -> None:
-    execution, _, _ = _execute_with(
+    execution, events, _ = _execute_with(
         tmp_path,
         [
             AssistantMessage(
@@ -2425,6 +2528,10 @@ def test_hard_ceiling_interrupted_response_is_measured_with_own_field(
     assert budget["interrupted"]["estimated_tokens"] > 0
     # Enforcement totals still carry the interrupted estimate.
     assert budget["estimated_tokens"] == 1100 + budget["interrupted"]["estimated_tokens"]
+    # The interrupted response stays unsettled: only r1 gets an entry.
+    details = [detail for name, detail, _ in events if name == "limits_checked"]
+    assert len(details) == 1
+    assert _limits_value(details[0], "turns") == 1
 
 
 def test_compact_boundary_is_logged_without_touching_the_ledger(tmp_path: Path) -> None:
