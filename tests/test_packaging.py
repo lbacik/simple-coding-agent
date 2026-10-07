@@ -278,6 +278,21 @@ def test_compose_does_not_mount_docker_socket() -> None:
     )
 
 
+def test_compose_default_deployment_uses_project_network_only() -> None:
+    # The LiteLLM gateway network is opt-in through the overlay (#171).
+    assert "external" not in _compose()
+
+
+def test_compose_litellm_overlay_attaches_external_network() -> None:
+    import yaml
+
+    overlay = yaml.safe_load((ROOT / "docker-compose.litellm.yml").read_text())
+    assert overlay["services"]["agent"]["networks"] == ["default", "litellm"]
+    network = overlay["networks"]["litellm"]
+    assert network["external"] is True
+    assert network["name"] == "${LITELLM_NETWORK:-main}"
+
+
 def test_compose_service_notes_single_instance_scope() -> None:
     content = _compose()
     # Either explicit scale:1 or a comment noting sequential-worker scope

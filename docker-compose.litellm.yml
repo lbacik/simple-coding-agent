@@ -1,0 +1,21 @@
+# Optional overlay: attach the agent to the external network shared with the
+# LiteLLM gateway (deployed separately, see ADR 0003), so MODEL_BASE_URL can
+# point at http://litellm:4000. Use it together with the base file:
+#
+#   docker compose -f docker-compose.yml -f docker-compose.litellm.yml up -d
+#
+# The plain `docker compose up` ignores this file and keeps the default,
+# direct-to-Meta deployment unchanged.
+services:
+  agent:
+    networks:
+      # Keep the project's default network next to the shared one.
+      - default
+      - litellm
+
+networks:
+  litellm:
+    external: true
+    # Name of the network the gateway's compose project joins. Override with
+    # LITELLM_NETWORK in the compose-level .env when it differs.
+    name: ${LITELLM_NETWORK:-main}
