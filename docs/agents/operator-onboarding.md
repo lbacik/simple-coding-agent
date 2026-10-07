@@ -172,6 +172,56 @@ The resolved credential is redacted from logs everywhere `META_API_KEY` was,
 and profile commands never see `META_API_KEY`, `MODEL_API_KEY`,
 `ANTHROPIC_API_KEY`, or `ANTHROPIC_AUTH_TOKEN`.
 
+## Meta through the LiteLLM gateway
+
+Meta's prompt cache lives on each backend replica and is reused reliably only
+when requests carry an affinity key, `prompt_cache_key`. Meta's
+Anthropic-compatible `/v1/messages` endpoint is the only protocol the CLI
+speaks, and it rejects that parameter, so direct traffic gets close to 0%
+cache reuse (#169). A LiteLLM gateway accepts the CLI's Messages requests,
+translates them to Meta's Responses API, and derives `prompt_cache_key` from
+the session ID the CLI already sends. Measured hit rates were 89–99% in the
+probes and 86% across all threads of a real attempt (#171). The decision is
+recorded in
+[ADR 0003](../adr/0003-litellm-gateway-for-meta-prompt-caching.md).
+
+The gateway is separate infrastructure (its own compose project). The agent
+needs no extra dependency, only the backend settings above:
+
+```env
+MODEL_BASE_URL=http://litellm:4000
+MODEL_API_KEY=<LITELLM_MASTER_KEY>
+# MODEL_AUTH_MODE=auth_token (default, Bearer)
+# MODEL_NAME=muse-spark-1.3-contributor (unchanged)
+```
+
+- `META_API_KEY` then lives only in the gateway's configuration. Remove it
+  from the agent's `.env`.
+- `MODEL_NAME` must match the gateway's `model_name` entry. Keeping it
+  unchanged keeps the observed-model check and the pricing in
+  `docker/managed-settings.json` working.
+- The default `docker-compose.yml` uses the project's own network, where
+  `litellm` does not resolve. Attach the agent to the network it shares with
+  the gateway with the overlay file:
+
+  ```shell
+  docker compose -f docker-compose.yml -f docker-compose.litellm.yml up -d
+  ```
+
+  The overlay joins the external network named by `LITELLM_NETWORK`
+  (default `main`). Set it in `.env` if the gateway uses another network.
+  Plain `docker compose up` ignores the overlay and connects to Meta
+  directly, as before.
+- Check the cache hit rate in `token_budget_reconciled.prompt_cache` after
+  the first attempt through the gateway.
+- **Re-run the prompt-cache probe after every LiteLLM version bump.** The
+  `prompt_cache_key` derivation is LiteLLM behaviour, not a contract, and a
+  regression would silently drop the hit rate back to zero. The probe is
+  `scripts/probe_prompt_cache.py` on the `codex/muse-cache-investigation-169`
+  branch.
+- Meta's `request-id` is not propagated through LiteLLM. Support requests to
+  Meta need the upstream request IDs from the gateway's own logs.
+
 ## Alternative backend for testing
 
 To run the agent against the Anthropic API directly instead of Meta:

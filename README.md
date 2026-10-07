@@ -118,6 +118,14 @@ For a one-shot run (useful for testing or manual invocation):
 docker compose run --rm agent
 ```
 
+To route Meta traffic through the LiteLLM gateway (restores prompt caching),
+add the network overlay and set the gateway backend in `.env`; see
+[Meta through the LiteLLM gateway](docs/agents/operator-onboarding.md#meta-through-the-litellm-gateway):
+
+```shell
+docker compose -f docker-compose.yml -f docker-compose.litellm.yml up -d
+```
+
 Lifecycle and persistence semantics are the same for both launch paths.
 `restart: unless-stopped` in `docker-compose.yml` ensures the service
 recovers from transient failures, but the persisted `consecutive_errors.json`

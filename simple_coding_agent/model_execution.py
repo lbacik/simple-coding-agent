@@ -35,7 +35,6 @@ from simple_coding_agent.token_ledger import (
 
 
 _SKILLS = ["implement", "tdd", "code-review", "codebase-design", "handoff"]
-_DEFAULT_MODEL_BASE_URL = "https://api.meta.ai"
 
 # The per-attempt token ledger (``token_ledger.TokenLedger``) is the live
 # budget reading: every streamed ``AssistantMessage`` counts its response as
