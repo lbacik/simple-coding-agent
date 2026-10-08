@@ -34,6 +34,38 @@ _MODEL_AUTH_MODES = frozenset({"auth_token", "api_key"})
 _DEFAULT_MODEL_STREAM_IDLE_TIMEOUT_MS = 60000
 _DEFAULT_CLAUDE_AGENT_SDK_VERSION = "0.2.163"
 _DEFAULT_CLAUDE_CODE_VERSION = "2.1.286"
+_DEFAULT_HANDOFF_RESERVE_TURNS = 6
+_MAX_HANDOFF_RESERVE_TURNS = 20
+
+
+def effective_soft_threshold_tokens(
+    max_budget_tokens: int,
+    soft_threshold_percentage: float,
+    handoff_reserve_turns: int,
+    main_context_tokens: float,
+) -> tuple[int, str, int]:
+    """Effective soft threshold, the rule that set it, and the reserve size.
+
+    The threshold is the earlier of two rules, computed from the main
+    thread's latest context size (not its peak): a fixed share of the
+    budget (``percentage`` rule) and a handoff reserve of
+    ``handoff_reserve_turns`` turns after the crossing turn at the current
+    context size (``reserve`` rule)::
+
+        soft = min(max_budget_tokens * (1 - pct),
+                   max_budget_tokens - (reserve_turns + 1) * main_context_tokens)
+
+    When the reserve exceeds the remaining budget (a huge context) the
+    reserve rule yields a threshold at or below zero, so the next limit
+    check fires immediately. That is correct behaviour, not an error.
+    """
+
+    percentage_threshold = int(max_budget_tokens * (1 - soft_threshold_percentage))
+    reserve_tokens = int((handoff_reserve_turns + 1) * main_context_tokens)
+    reserve_threshold = max_budget_tokens - reserve_tokens
+    if reserve_threshold <= percentage_threshold:
+        return reserve_threshold, "reserve", reserve_tokens
+    return percentage_threshold, "percentage", reserve_tokens
 
 
 @dataclass(frozen=True)
@@ -62,6 +94,7 @@ class RuntimeConfig:
     max_budget_usd: int = 20
     max_budget_tokens: int = 4_000_000
     soft_threshold_percentage: float = 0.2
+    handoff_reserve_turns: int = _DEFAULT_HANDOFF_RESERVE_TURNS
     model_base_url: str = _DEFAULT_MODEL_BASE_URL
     model_api_key: str = ""
     model_auth_mode: str = _DEFAULT_MODEL_AUTH_MODE
@@ -69,9 +102,26 @@ class RuntimeConfig:
 
     @property
     def soft_threshold_tokens(self) -> int:
-        """Token budget reading past which the attempt must hand off."""
+        """Percentage-rule token reading past which the attempt must hand off.
+
+        This is the fixed-share rule only
+        (``max_budget_tokens * (1 - soft_threshold_percentage)``). The
+        effective threshold is the earlier of this rule and the handoff
+        reserve; use :meth:`effective_soft_threshold` with the main thread's
+        latest context size for that.
+        """
 
         return int(self.max_budget_tokens * (1 - self.soft_threshold_percentage))
+
+    def effective_soft_threshold(self, main_context_tokens: float) -> tuple[int, str, int]:
+        """Effective threshold, rule, and reserve size for a context size."""
+
+        return effective_soft_threshold_tokens(
+            self.max_budget_tokens,
+            self.soft_threshold_percentage,
+            self.handoff_reserve_turns,
+            main_context_tokens,
+        )
 
     @property
     def credential_redactions(self) -> tuple[str, ...]:
@@ -159,6 +209,9 @@ def load_runtime_config(environ: Mapping[str, str] | None = None) -> RuntimeConf
         max_budget_usd=_positive_integer(values, "MAX_BUDGET_USD", 20),
         max_budget_tokens=_positive_integer(values, "MAX_BUDGET_TOKENS", 4_000_000),
         soft_threshold_percentage=_fraction(values, "SOFT_THRESHOLD_PERCENTAGE", 0.2),
+        handoff_reserve_turns=_reserve_turns(
+            values, "HANDOFF_RESERVE_TURNS", _DEFAULT_HANDOFF_RESERVE_TURNS
+        ),
     )
     _warn_when_usd_backstop_is_tighter(config)
     return config
@@ -261,6 +314,21 @@ def _fraction(values: Mapping[str, str], name: str, default: float) -> float:
         raise ConfigurationError(f"{name} must be a number between 0 and 1") from error
     if not 0.0 <= number < 1.0:
         raise ConfigurationError(f"{name} must be a number between 0 and 1")
+    return number
+
+
+def _reserve_turns(values: Mapping[str, str], name: str, default: int) -> int:
+    value = values.get(name, str(default))
+    try:
+        number = int(value)
+    except ValueError as error:
+        raise ConfigurationError(
+            f"{name} must be an integer between 1 and {_MAX_HANDOFF_RESERVE_TURNS}"
+        ) from error
+    if not 1 <= number <= _MAX_HANDOFF_RESERVE_TURNS:
+        raise ConfigurationError(
+            f"{name} must be an integer between 1 and {_MAX_HANDOFF_RESERVE_TURNS}"
+        )
     return number
 
 

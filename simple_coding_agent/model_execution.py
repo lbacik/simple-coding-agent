@@ -41,8 +41,10 @@ _SKILLS = ["implement", "tdd", "code-review", "codebase-design", "handoff"]
 # an estimate on first sight, ``StreamEvent`` ``message_delta`` usage and
 # non-zero ``AssistantMessage.usage`` replace the estimate with the measured
 # categories, and tool results / user messages grow the thread context. The
-# soft threshold is evaluated against ``ledger.budget_tokens`` on every ledger
-# update; only ``limits_checked`` logging waits for a response to settle.
+# effective soft threshold (the percentage rule vs the handoff reserve at
+# the main thread's latest context size) is evaluated against
+# ``ledger.budget_tokens`` on every ledger update and in the PreToolUse
+# hook; only ``limits_checked`` logging waits for a response to settle.
 _HANDOFF_FOLLOWUP_TIMEOUT = 300
 # One-time ``prompt_cache_ineffective`` diagnostic: evaluated when the main
 # thread's K-th measured response settles. Observational only.
@@ -247,6 +249,8 @@ class ModelExecutor:
         self._started_at = self._clock()
         self._soft_threshold_crossed = False
         self._soft_threshold_crossed_at_tokens: float | None = None
+        self._soft_threshold_rule: str | None = None
+        self._soft_threshold_effective_tokens: int | None = None
         self._total_cost_usd: float | None = None
         self._handoff_context_delivered = False
         self._running_subagents: set[str] = set()
@@ -590,6 +594,8 @@ class ModelExecutor:
         self._started_at = self._clock()
         self._soft_threshold_crossed = False
         self._soft_threshold_crossed_at_tokens = None
+        self._soft_threshold_rule = None
+        self._soft_threshold_effective_tokens = None
         self._total_cost_usd = None
         self._token_hard_ceiling_reached = False
         self._handoff_context_delivered = False
@@ -604,12 +610,18 @@ class ModelExecutor:
         self._operator_begun = False
         self._operator_deadline_expired = False
         self._cli_session_id = None
+        threshold, rule, reserve_tokens = self._effective_threshold()
         self._log(
             "model_execution_started",
             f"issue_body_length={len(issue_body)}; limits: "
             f"max_budget_usd={self._config.max_budget_usd:.4f}; "
             f"max_budget_tokens={self._config.max_budget_tokens}; "
-            f"soft_threshold_tokens={self._config.soft_threshold_tokens}; "
+            f"soft_threshold_tokens={threshold}; "
+            f"soft_threshold_percentage={self._config.soft_threshold_percentage}; "
+            f"reserve_turns={self._config.handoff_reserve_turns}; "
+            f"rule={rule}; "
+            f"main_context_tokens={self._latest_main_context_tokens():.0f}; "
+            f"reserve_tokens={reserve_tokens}; "
             f"max_turns={self._config.max_turns}; "
             f"timeout_seconds={self._config.model_timeout}",
         )
@@ -1142,12 +1154,16 @@ class ModelExecutor:
             else:
                 main_context = 0.0
                 turns = 0
+        effective, rule, reserve_tokens = self._config.effective_soft_threshold(main_context)
         detail = (
             f"thread={thread_id}; "
             f"budget_tokens={budget:.0f}; "
             f"measured_tokens={measured:.0f}; "
             f"estimated_tokens={estimated:.0f}; "
-            f"soft_threshold_tokens={self._config.soft_threshold_tokens}; "
+            f"soft_threshold_tokens={effective}; "
+            f"rule={rule}; "
+            f"reserve_turns={self._config.handoff_reserve_turns}; "
+            f"reserve_tokens={reserve_tokens}; "
             f"max_budget_tokens={self._config.max_budget_tokens}; "
             f"main_context_tokens={main_context:.0f}; "
             f"turns={turns}; "
@@ -1192,17 +1208,49 @@ class ModelExecutor:
         delta = (self._clock() - self._started_at).total_seconds()
         return max(0, int(delta))
 
+    def _latest_main_context_tokens(self) -> float:
+        """The main thread's latest context size (0 before it starts).
+
+        The effective soft threshold is computed from this latest reading,
+        not the peak: a compaction that shrinks the context moves the
+        reserve rule later again, but a latched crossing stays crossed.
+        """
+
+        if self._ledger.has_thread("main"):
+            return self._ledger.context_tokens("main")
+        return 0.0
+
+    def _effective_threshold(self) -> tuple[int, str, int]:
+        """Effective threshold, rule, and reserve size at the live context."""
+
+        return self._config.effective_soft_threshold(self._latest_main_context_tokens())
+
     def _check_limits(self, thread_id: str = "main") -> None:
-        """Latch one-time soft-threshold and hard-ceiling crossings from the ledger."""
+        """Latch one-time soft-threshold and hard-ceiling crossings from the ledger.
+
+        The soft threshold is the effective one: the earlier of the
+        percentage rule and the handoff reserve at the main thread's
+        latest context size. It is evaluated on every counted response
+        (via ``_after_ledger_update``) and in the PreToolUse hook; once
+        crossed it stays crossed, even if a compaction later shrinks the
+        context.
+        """
 
         budget = self._ledger.budget_tokens
-        threshold = self._config.soft_threshold_tokens
+        main_context = self._latest_main_context_tokens()
+        threshold, rule, reserve_tokens = self._config.effective_soft_threshold(main_context)
         if not self._soft_threshold_crossed and budget >= threshold:
             self._soft_threshold_crossed = True
             self._soft_threshold_crossed_at_tokens = budget
+            self._soft_threshold_rule = rule
+            self._soft_threshold_effective_tokens = threshold
             self._log(
                 "token_soft_threshold_crossed",
                 f"budget_tokens={budget:.0f}; soft_threshold_tokens={threshold}; "
+                f"rule={rule}; "
+                f"reserve_turns={self._config.handoff_reserve_turns}; "
+                f"main_context_tokens={main_context:.0f}; "
+                f"reserve_tokens={reserve_tokens}; "
                 f"thread={thread_id}",
             )
             self._stop_running_subagents()
@@ -1445,6 +1493,10 @@ class ModelExecutor:
             "mode": reconciliation.mode,
             "max_budget_tokens": self._config.max_budget_tokens,
             "soft_threshold_tokens": self._config.soft_threshold_tokens,
+            "soft_threshold_percentage": self._config.soft_threshold_percentage,
+            "handoff_reserve_turns": self._config.handoff_reserve_turns,
+            "soft_threshold_rule": self._soft_threshold_rule,
+            "effective_soft_threshold_tokens": self._soft_threshold_effective_tokens,
             "estimated_tokens": round(reconciliation.estimated_tokens),
             "actual_tokens": reconciliation.actual_tokens,
             "error_ratio": _round_ratio(reconciliation.error_ratio),
@@ -1483,6 +1535,11 @@ class ModelExecutor:
     async def _guard_and_record_pre_tool_use(
         self, hook_input: Any, tool_use_id: str | None, context: Any
     ) -> dict[str, Any]:
+        # The soft threshold is evaluated here as well as on every counted
+        # response: the ledger reading is unchanged since the last update,
+        # but the effective threshold moves with the main context, and a
+        # crossing here latches exactly like a response-time crossing.
+        self._check_limits(_hook_agent_id(hook_input) or "main")
         if self._token_hard_ceiling_reached:
             return _deny(
                 "Token budget reached the hard ceiling "

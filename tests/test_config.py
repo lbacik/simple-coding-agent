@@ -6,6 +6,7 @@ import pytest
 from simple_coding_agent.config import (
     ConfigurationError,
     ProfileError,
+    effective_soft_threshold_tokens,
     load_repository_profile,
     load_runtime_config,
 )
@@ -37,6 +38,7 @@ def test_loads_required_operator_settings_and_defaults(tmp_path: Path) -> None:
     assert config.max_budget_tokens == 4_000_000
     assert config.soft_threshold_percentage == 0.2
     assert config.soft_threshold_tokens == 3_200_000
+    assert config.handoff_reserve_turns == 6
 
 
 def test_default_runtime_versions_match_dockerfile_pins(tmp_path: Path) -> None:
@@ -408,3 +410,58 @@ def test_empty_override_path_falls_back_to_the_default_in_repo_location(tmp_path
     profile = load_repository_profile(tmp_path, "")
 
     assert profile.setup == ("pytest",)
+
+
+def test_handoff_reserve_turns_accepts_the_full_range(tmp_path: Path) -> None:
+    for value in ("1", "6", "20"):
+        config = load_runtime_config(_operator_env(tmp_path, HANDOFF_RESERVE_TURNS=value))
+
+        assert config.handoff_reserve_turns == int(value)
+
+
+@pytest.mark.parametrize("value", ["0", "21", "-1", "many", "6.5", ""])
+def test_handoff_reserve_turns_rejects_out_of_range_or_non_integer(
+    tmp_path: Path, value: str
+) -> None:
+    with pytest.raises(ConfigurationError) as error:
+        load_runtime_config(_operator_env(tmp_path, HANDOFF_RESERVE_TURNS=value))
+
+    assert "HANDOFF_RESERVE_TURNS" in str(error.value)
+    assert "github-secret" not in str(error.value)
+    assert "meta-secret" not in str(error.value)
+
+
+def test_effective_soft_threshold_uses_the_reserve_rule_for_a_large_context() -> None:
+    threshold, rule, reserve_tokens = effective_soft_threshold_tokens(
+        4_000_000, 0.2, 6, 150_000
+    )
+
+    assert threshold == 2_950_000
+    assert rule == "reserve"
+    assert reserve_tokens == 7 * 150_000
+
+
+def test_effective_soft_threshold_uses_the_percentage_rule_for_a_small_context() -> None:
+    threshold, rule, reserve_tokens = effective_soft_threshold_tokens(
+        4_000_000, 0.2, 6, 50_000
+    )
+
+    assert threshold == 3_200_000
+    assert rule == "percentage"
+    assert reserve_tokens == 7 * 50_000
+
+
+def test_effective_soft_threshold_fires_immediately_when_the_reserve_exceeds_the_budget() -> (
+    None
+):
+    threshold, rule, _ = effective_soft_threshold_tokens(4_000_000, 0.2, 6, 600_000)
+
+    assert rule == "reserve"
+    assert threshold <= 0
+
+
+def test_runtime_config_effective_soft_threshold_matches_the_helper(tmp_path: Path) -> None:
+    config = load_runtime_config(_operator_env(tmp_path))
+
+    assert config.effective_soft_threshold(150_000) == (2_950_000, "reserve", 1_050_000)
+    assert config.effective_soft_threshold(50_000) == (3_200_000, "percentage", 350_000)

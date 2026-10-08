@@ -102,10 +102,24 @@ default-model rates.  They are still estimates for observability, not a
 measured bill: rely on Meta's billing dashboard for accurate cost data.
 
 Before the hard ceiling, the agent tries a cooperative `handoff`: once the
-token budget crosses `soft = MAX_BUDGET_TOKENS * (1 -
-SOFT_THRESHOLD_PERCENTAGE)` tokens (default `MAX_BUDGET_TOKENS=4000000` and
-`SOFT_THRESHOLD_PERCENTAGE=0.2`, i.e. 3,200,000 tokens), it asks the model to
-commit its progress and stop. The token budget comes from a per-attempt
+token budget crosses the effective soft threshold, it asks the model to
+commit its progress and stop. The threshold is the earlier of two rules,
+computed from the main thread's latest context size (defaults
+`MAX_BUDGET_TOKENS=4000000`, `SOFT_THRESHOLD_PERCENTAGE=0.2`,
+`HANDOFF_RESERVE_TURNS=6`):
+
+`soft = min(MAX_BUDGET_TOKENS * (1 - SOFT_THRESHOLD_PERCENTAGE), MAX_BUDGET_TOKENS - (HANDOFF_RESERVE_TURNS + 1) * main_context_tokens)`
+
+`SOFT_THRESHOLD_PERCENTAGE` (0-1, exclusive) sets the fixed share of the
+budget (3,200,000 tokens by default); `HANDOFF_RESERVE_TURNS` (integer 1-20)
+guarantees that many turns after the crossing turn at the current context
+size (with a 150K context the reserve rule sets the threshold to 2,950,000
+tokens, leaving at least six turns before the hard ceiling). The threshold
+is evaluated on every counted response and in the `PreToolUse` hook, and
+once crossed it stays crossed for the attempt, even if a compaction later
+shrinks the context. A huge context whose reserve exceeds the remaining
+budget trips the threshold on the next check. The token budget comes from
+a per-attempt
 ledger: each streamed response is first counted as a local estimate and is
 replaced by the usage the backend reports (`message_delta` events) when that
 arrives, so the threshold still works when the backend reports no usage; the

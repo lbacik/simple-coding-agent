@@ -52,6 +52,10 @@ _Avoid_: Cost budget, spend limit
 The point in the token budget past which the model must end the attempt with a handoff, leaving the rest of the budget for writing the Handoff note.
 _Avoid_: Cost threshold, warning limit
 
+**Handoff reserve**:
+The number of turns guaranteed after the turn that crosses the soft threshold, sized at the main thread's latest context size (`HANDOFF_RESERVE_TURNS`, default 6). It pulls the effective soft threshold earlier when the context is large.
+_Avoid_: Turn cap, handoff note
+
 **Hard ceiling**:
 The point at which the attempt is stopped regardless of the model, whether or not it has handed off.
 _Avoid_: Budget cap, kill limit

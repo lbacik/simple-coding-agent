@@ -1033,7 +1033,14 @@ def test_zero_usage_stream_crosses_soft_threshold_from_estimates(tmp_path: Path)
     crossed = [d for name, d, _ in events if name == "token_soft_threshold_crossed"]
     assert len(crossed) == 1
     crossed_budget = int(crossed[0].split("budget_tokens=")[1].split(";")[0])
-    assert 1_120_000 <= crossed_budget < config.max_budget_tokens
+    # The ~10K context per turn pulls the reserve rule below the 1,120,000
+    # percentage rule, so the crossing lands earlier with room to spare.
+    assert crossed_budget < config.soft_threshold_tokens
+    assert crossed_budget < config.max_budget_tokens
+    assert "rule=reserve" in crossed[0]
+    assert "reserve_turns=6" in crossed[0]
+    assert "main_context_tokens=" in crossed[0]
+    assert "reserve_tokens=" in crossed[0]
     assert "thread=main" in crossed[0]
     assert executor._ledger.measured_tokens == 0
     assert any(name == "token_soft_threshold_handoff_followup" for name, _, _ in events)
@@ -1051,7 +1058,7 @@ def test_per_category_token_pricing_discounts_cache_read_tokens(tmp_path: Path) 
                 AssistantMessage(
                     content=[],
                     model="muse-spark-1.3-contributor",
-                    usage={"cache_read_input_tokens": 2_500_000, "input_tokens": 10_000},
+                    usage={"cache_read_input_tokens": 250_000, "input_tokens": 10_000},
                 ),
                 result(),
             ],
@@ -2678,3 +2685,205 @@ def test_compact_boundary_is_logged_without_touching_the_ledger(tmp_path: Path) 
     assert logged_a == ["thread=main; trigger=auto; pre_tokens=150000"]
     assert logged_b == ["thread=main; trigger=None; pre_tokens=None"]
     assert with_meta.token_budget == baseline.token_budget == without_meta.token_budget
+
+
+# --- Handoff reserve in turns (soft = earlier of percentage vs reserve) -------
+
+
+def _crossed_value(detail: str, name: str) -> str:
+    for part in detail.split("; "):
+        key, _, value = part.partition("=")
+        if key == name:
+            return value
+    raise AssertionError(f"{name!r} missing from {detail!r}")
+
+
+def test_reserve_rule_leaves_handoff_turns_before_the_hard_ceiling(
+    tmp_path: Path,
+) -> None:
+    events: list[tuple[str, str, str]] = []
+    captured: list[FakeClient] = []
+
+    def client_factory(options: object) -> FakeClient:
+        messages: list[object] = [
+            AssistantMessage(
+                content=[],
+                model="muse-spark-1.3-contributor",
+                message_id=f"r{index}",
+                usage={"input_tokens": 150_000, "output_tokens": 1_000},
+            )
+            for index in range(25)
+        ]
+        messages.append(result())
+        client = FakeClient(
+            options, messages, followup_messages=[result(stop_reason="end_turn")]
+        )
+        captured.append(client)
+        return client
+
+    executor = ModelExecutor(
+        runtime_config(tmp_path),
+        client_factory=client_factory,
+        event_log=lambda event, detail="", level="INFO", issue_number=None: events.append(
+            (event, detail, level)
+        ),
+    )
+    execution = asyncio.run(executor.execute(issue_body="Fix it.", working_directory=tmp_path))
+
+    # No handoff was invoked, so the crossing ends the attempt incomplete
+    # after the single follow-up.
+    assert execution.status is ModelExecutionStatus.MODEL_LIMIT_REACHED
+    assert len(captured[0].queried_prompts) == 1
+    crossed = [d for name, d, _ in events if name == "token_soft_threshold_crossed"]
+    assert len(crossed) == 1
+    assert _crossed_value(crossed[0], "rule") == "reserve"
+    assert _crossed_value(crossed[0], "reserve_turns") == "6"
+    assert _crossed_value(crossed[0], "soft_threshold_tokens") == "2943000"
+    assert _crossed_value(crossed[0], "main_context_tokens") == "151000"
+    assert _crossed_value(crossed[0], "reserve_tokens") == "1057000"
+    # At least reserve_turns turns of budget remain after the crossing
+    # turn, counting that turn's overshoot.
+    crossed_budget = int(_crossed_value(crossed[0], "budget_tokens"))
+    main_context = int(_crossed_value(crossed[0], "main_context_tokens"))
+    assert 4_000_000 - crossed_budget >= 6 * main_context
+    budget = execution.token_budget
+    assert budget["soft_threshold_crossed"] is True
+    assert budget["soft_threshold_rule"] == "reserve"
+    assert budget["effective_soft_threshold_tokens"] == 2_943_000
+
+
+def test_pre_tool_use_check_latches_the_soft_threshold(tmp_path: Path) -> None:
+    events: list[tuple[str, str]] = []
+    captured: list[FakeClient] = []
+
+    def client_factory(options: object) -> FakeClient:
+        client = FakeClient(options, [result()])
+        captured.append(client)
+        return client
+
+    config = replace(runtime_config(tmp_path), max_budget_tokens=1_000_000)
+    executor = ModelExecutor(
+        config,
+        client_factory=client_factory,
+        event_log=lambda event, detail="", level="INFO", issue_number=None: events.append((event, detail)),
+    )
+    asyncio.run(executor.execute(issue_body="Fix it.", working_directory=tmp_path))
+    pre_hook = captured[0].options.hooks["PreToolUse"][0].hooks[0]
+
+    # Grow the ledger past the effective threshold without a limit check:
+    # a 900K main context leaves no room for the 7-turn reserve.
+    executor._ledger.observe_response("main", "r-big", 0)
+    executor._ledger.observe_usage("main", "r-big", {"input_tokens": 900_000})
+    assert executor._soft_threshold_crossed is False
+
+    decision = asyncio.run(
+        pre_hook({"tool_name": "Bash", "tool_input": {"command": "pytest"}}, None, {})
+    )
+
+    # The PreToolUse crossing latches and logs like a response-time one,
+    # and the same call already enforces the post-crossing guard.
+    assert executor._soft_threshold_crossed is True
+    assert executor._soft_threshold_rule == "reserve"
+    crossed = [detail for name, detail in events if name == "token_soft_threshold_crossed"]
+    assert len(crossed) == 1
+    assert _crossed_value(crossed[0], "rule") == "reserve"
+    assert _crossed_value(crossed[0], "reserve_turns") == "6"
+    assert _crossed_value(crossed[0], "main_context_tokens") == "900000"
+    assert _crossed_value(crossed[0], "reserve_tokens") == "6300000"
+    assert "thread=main" in crossed[0]
+    assert decision["hookSpecificOutput"]["permissionDecision"] == "deny"
+    denied = asyncio.run(
+        pre_hook(
+            {"tool_name": "Edit", "tool_input": {"file_path": "src/a.py"}, "agent_id": "sub-1"},
+            None,
+            {},
+        )
+    )
+    assert denied["hookSpecificOutput"]["permissionDecision"] == "deny"
+    assert (
+        asyncio.run(
+            pre_hook({"tool_name": "Skill", "tool_input": {"skill": "handoff"}}, None, {})
+        )
+        == {}
+    )
+
+
+def test_huge_context_trips_the_threshold_on_the_next_check(tmp_path: Path) -> None:
+    events: list[tuple[str, str]] = []
+    captured: list[FakeClient] = []
+
+    def client_factory(options: object) -> FakeClient:
+        client = FakeClient(options, [result()])
+        captured.append(client)
+        return client
+
+    executor = ModelExecutor(
+        runtime_config(tmp_path),
+        client_factory=client_factory,
+        event_log=lambda event, detail="", level="INFO", issue_number=None: events.append((event, detail)),
+    )
+    asyncio.run(executor.execute(issue_body="Fix it.", working_directory=tmp_path))
+
+    # A 600K context needs a 4.2M reserve against a 4M budget, so the
+    # reserve rule sits below zero and the next check fires immediately.
+    executor._ledger.observe_response("main", "r-huge", 0)
+    executor._ledger.observe_usage("main", "r-huge", {"input_tokens": 600_000})
+    assert executor._soft_threshold_crossed is False
+    executor._check_limits()
+
+    assert executor._soft_threshold_crossed is True
+    assert executor._soft_threshold_rule == "reserve"
+    assert executor._soft_threshold_effective_tokens == -200_000
+    crossed = [detail for name, detail in events if name == "token_soft_threshold_crossed"]
+    assert len(crossed) == 1
+    assert _crossed_value(crossed[0], "soft_threshold_tokens") == "-200000"
+    assert _crossed_value(crossed[0], "rule") == "reserve"
+
+
+def test_threshold_events_carry_the_reserve_fields(tmp_path: Path) -> None:
+    events: list[tuple[str, str, int | None]] = []
+
+    def client_factory(options: object) -> FakeClient:
+        return FakeClient(
+            options,
+            [
+                AssistantMessage(
+                    content=[],
+                    model="muse-spark-1.3-contributor",
+                    message_id="r1",
+                    usage={"input_tokens": 1000, "output_tokens": 100},
+                ),
+                result(),
+            ],
+        )
+
+    executor = ModelExecutor(
+        runtime_config(tmp_path),
+        client_factory=client_factory,
+        event_log=lambda event, detail="", level="INFO", issue_number=None: events.append((event, detail, issue_number)),
+    )
+    execution = asyncio.run(
+        executor.execute(issue_body="Fix it.", working_directory=tmp_path, issue_number=7)
+    )
+
+    assert execution.status is ModelExecutionStatus.SUCCEEDED
+    started = next(detail for name, detail, _ in events if name == "model_execution_started")
+    assert "max_budget_tokens=4000000" in started
+    assert "soft_threshold_percentage=0.2" in started
+    assert "reserve_turns=6" in started
+    assert "soft_threshold_tokens=3200000" in started
+    assert "rule=percentage" in started
+    limits = [detail for name, detail, _ in events if name == "limits_checked"]
+    assert len(limits) == 1
+    assert "soft_threshold_tokens=3200000" in limits[0]
+    assert "rule=percentage" in limits[0]
+    assert "reserve_turns=6" in limits[0]
+    assert "reserve_tokens=" in limits[0]
+    assert "max_budget_tokens=4000000" in limits[0]
+    budget = execution.token_budget
+    assert budget["max_budget_tokens"] == 4_000_000
+    assert budget["soft_threshold_tokens"] == 3_200_000
+    assert budget["soft_threshold_percentage"] == 0.2
+    assert budget["handoff_reserve_turns"] == 6
+    assert budget["soft_threshold_rule"] is None
+    assert budget["effective_soft_threshold_tokens"] is None
