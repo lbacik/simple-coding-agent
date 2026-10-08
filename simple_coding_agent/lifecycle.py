@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -11,9 +11,10 @@ import os
 from pathlib import Path
 import re
 import signal
+import subprocess
 import threading
 import time
-from typing import NoReturn, Protocol
+from typing import Any, NoReturn, Protocol
 
 from simple_coding_agent.attempt_state import (
     AttemptCheckpoint,
@@ -63,7 +64,7 @@ from simple_coding_agent.github_tracker import (
     TrackerIssue,
     ineligibility_reason,
 )
-from simple_coding_agent.model_execution import ModelExecutionStatus, ModelExecutor, OperatorHandoff
+from simple_coding_agent.model_execution import ModelExecutionStatus, ModelExecutor, OperatorHandoff, ToolCallRecord
 from simple_coding_agent.observability import AttemptArchive
 from simple_coding_agent.operating import ConsecutiveErrorStore
 from simple_coding_agent.publication import PublicationRequest
@@ -485,7 +486,11 @@ class ModelAttemptRunner:
         # path above aborts and restores instead of committing conflict
         # markers; the exception path seals before propagating.
         try:
-            self._workspace.seal(
+            try:
+                pre_seal_dirty: tuple[str, ...] | None = self._workspace.dirty_paths()
+            except Exception:
+                pre_seal_dirty = None
+            seal_commit = self._workspace.seal(
                 issue_number=claim.issue.number,
                 attempt_id=attempt_id,
                 status=execution.status,
@@ -519,12 +524,45 @@ class ModelAttemptRunner:
                 prepared, claim.issue.number, attempt_id=attempt_id
             )
             if note_commit is None:
+                reason = _classify_handoff_reason(execution)
                 note_content = _build_emergency_handoff_note(
                     issue_number=claim.issue.number,
                     started_at=attempt_id,
-                    reason=_classify_handoff_reason(execution),
+                    reason=reason,
                     last_work_commit=commits[0].revision if commits else prepared.base_revision,
                     explanation=execution.explanation,
+                    diff_stat=_git_diff_stat(
+                        self._workspace.working_directory,
+                        prepared.base_revision,
+                        seal_commit.revision if seal_commit is not None else prepared.branch,
+                    ),
+                    attempt_commits=tuple(
+                        f"{commit.revision[:7]} {commit.subject}" for commit in commits
+                    ),
+                    sealed_files=(
+                        tuple(pre_seal_dirty)
+                        if seal_commit is not None and pre_seal_dirty is not None
+                        else None
+                    ),
+                    edited_files=tuple(execution.edited_files),
+                    last_assistant_text=execution.last_assistant_text,
+                    handoff_skill_invoked=_main_thread_handoff_invoked(
+                        execution.skill_events
+                    ),
+                    tool_calls=tuple(execution.tool_calls),
+                    last_check_call=_last_check_call(
+                        tuple(execution.bash_calls), profile.check
+                    ),
+                    baseline_result=(
+                        preparation.baseline if preparation is not None else None
+                    ),
+                    token_budget=execution.token_budget,
+                    archive_dir=(
+                        str(archive.directory) if archive is not None else None
+                    ),
+                    session_id=getattr(
+                        self._model_executor, "cli_session_id", None
+                    ),
                 )
                 self._workspace.commit_handoff_note(claim.issue.number, note_content)
                 commits = self._workspace.commits_added(prepared)
@@ -3899,6 +3937,14 @@ def _classify_handoff_reason(execution: object) -> str:
     return "cost_hard_limit"
 
 
+# Bounds for the emergency handoff note: the tool-call trail shows the last
+# 15 calls, file lists show the first 50 entries plus a `+N more` line, and
+# the last assistant text is truncated to about 1,500 characters.
+_EMERGENCY_TOOL_TRAIL_LIMIT = 15
+_EMERGENCY_FILE_LIST_LIMIT = 50
+_EMERGENCY_ASSISTANT_TEXT_LIMIT = 1500
+
+
 def _build_emergency_handoff_note(
     *,
     issue_number: int,
@@ -3906,18 +3952,340 @@ def _build_emergency_handoff_note(
     reason: str,
     last_work_commit: str,
     explanation: str,
+    diff_stat: str | None = None,
+    attempt_commits: Sequence[str] = (),
+    sealed_files: Sequence[str] | None = None,
+    edited_files: Sequence[str] = (),
+    last_assistant_text: str | None = None,
+    handoff_skill_invoked: bool = False,
+    tool_calls: Sequence[ToolCallRecord] = (),
+    last_check_call: ToolCallRecord | None = None,
+    baseline_result: object | None = None,
+    token_budget: Mapping[str, Any] | None = None,
+    archive_dir: str | None = None,
+    session_id: str | None = None,
 ) -> str:
-    return (
+    """Render the runtime-written handoff note for a limit stop without a model note.
+
+    The title and four header fields are exactly as before so
+    ``_validate_handoff_note`` still passes; every section below them
+    degrades to ``"not available"`` / ``"none recorded"`` / ``"none"``
+    instead of failing when a fact is missing.
+    """
+
+    header = (
         f"# Handoff note: issue #{issue_number}\n\n"
         f"- issue: {issue_number}\n"
         f"- started_at: {started_at}\n"
         f"- reason: {reason}\n"
-        f"- last_work_commit: {last_work_commit}\n\n"
-        "## Summary\n\n"
-        f"{explanation}\n\n"
-        "## Remaining work\n\n"
-        "Review progress preserved on this branch and continue implementation.\n"
+        f"- last_work_commit: {last_work_commit}\n"
     )
+    sections = [
+        ("Provenance", _emergency_provenance(reason, explanation)),
+        (
+            "Changes",
+            _emergency_changes(
+                diff_stat=diff_stat,
+                attempt_commits=attempt_commits,
+                sealed_files=sealed_files,
+                edited_files=edited_files,
+            ),
+        ),
+        (
+            "Last model intent",
+            _emergency_last_intent(
+                last_assistant_text=last_assistant_text,
+                handoff_skill_invoked=handoff_skill_invoked,
+            ),
+        ),
+        (
+            "Activity trail",
+            _emergency_activity(
+                edited_files=edited_files,
+                tool_calls=tool_calls,
+                last_check_call=last_check_call,
+            ),
+        ),
+        ("Check state", _emergency_check_state(baseline_result=baseline_result)),
+        ("Budget facts", _emergency_budget(token_budget=token_budget)),
+        (
+            "Pointers",
+            _emergency_pointers(archive_dir=archive_dir, session_id=session_id),
+        ),
+        ("Remaining work", _emergency_remaining_work()),
+    ]
+    body = "".join(f"\n## {title}\n\n{content}\n" for title, content in sections)
+    return f"{header}{body}"
+
+
+def _emergency_provenance(reason: str, explanation: str) -> str:
+    """Who wrote the note and which limit fired."""
+
+    detail = (explanation or "").strip() or "not available"
+    return (
+        "This note was written by the runtime because the model did not write "
+        "a handoff note before the attempt ended.\n"
+        f"The limit that fired was `{reason}`.\n\n"
+        "Model's terminal explanation:\n\n"
+        f"{_blockquote(detail)}"
+    )
+
+
+def _emergency_changes(
+    *,
+    diff_stat: str | None,
+    attempt_commits: Sequence[str],
+    sealed_files: Sequence[str] | None,
+    edited_files: Sequence[str],
+) -> str:
+    """Preserved work: diff stat, attempt commits, sealed and edited files."""
+
+    stat_block = (diff_stat or "").strip() or "not available"
+    commits = [line for line in (str(line).strip() for line in attempt_commits) if line]
+    commits_block = (
+        "\n".join(f"- {line}" for line in commits) if commits else "none"
+    )
+    if sealed_files is None:
+        sealed_block = "none"
+    else:
+        sealed_block = _format_capped_files(sealed_files, empty="none")
+    return (
+        "Changes since the verified base "
+        "(`git diff --stat <base>..<seal or HEAD>`):\n\n"
+        "```diff\n"
+        f"{stat_block}\n"
+        "```\n\n"
+        "Attempt commits (`git log --oneline <base>..HEAD`):\n\n"
+        f"{commits_block}\n\n"
+        "Files that were uncommitted when sealing happened "
+        "(committed by the seal commit):\n\n"
+        f"{sealed_block}\n\n"
+        "Files the model edited or created (Edit/Write calls):\n\n"
+        f"{_format_capped_files(edited_files, empty='none recorded')}"
+    )
+
+
+def _emergency_last_intent(
+    *,
+    last_assistant_text: str | None,
+    handoff_skill_invoked: bool,
+) -> str:
+    """The model's last words and whether it invoked the handoff skill."""
+
+    detail = (last_assistant_text or "").strip()
+    if not detail:
+        text_block = "not available"
+    elif len(detail) > _EMERGENCY_ASSISTANT_TEXT_LIMIT:
+        text_block = _blockquote(
+            detail[:_EMERGENCY_ASSISTANT_TEXT_LIMIT] + "...[truncated]"
+        )
+    else:
+        text_block = _blockquote(detail)
+    invoked = "invoked" if handoff_skill_invoked else "not invoked"
+    return (
+        "Last assistant text (truncated to about 1,500 characters):\n\n"
+        f"{text_block}\n\n"
+        f"Handoff skill on the main thread: {invoked}."
+    )
+
+
+def _emergency_activity(
+    *,
+    edited_files: Sequence[str],
+    tool_calls: Sequence[ToolCallRecord],
+    last_check_call: ToolCallRecord | None,
+) -> str:
+    """Edited files, the recent tool trail, and the last check-command call."""
+
+    trail = list(tool_calls)[-_EMERGENCY_TOOL_TRAIL_LIMIT:]
+    if trail:
+        calls_block = "\n".join(_format_tool_call(record) for record in trail)
+    else:
+        calls_block = "none recorded"
+    if last_check_call is None:
+        check_block = "none recorded"
+    else:
+        command = " ".join((last_check_call.command or "").split())
+        check_block = f"`{command}` ({last_check_call.outcome})"
+    return (
+        "Files the model edited or created (Edit/Write calls):\n\n"
+        f"{_format_capped_files(edited_files, empty='none recorded')}\n\n"
+        "Recent tool calls (last 15: tool, short target, ok/error flag):\n\n"
+        f"{calls_block}\n\n"
+        "Last Bash call running a profile `check` command:\n\n"
+        f"{check_block}"
+    )
+
+
+def _emergency_check_state(baseline_result: object | None) -> str:
+    """The final check never runs on this path; report the baseline if one ran."""
+
+    if baseline_result is None:
+        baseline_block = "not available (no baseline check ran)"
+    else:
+        succeeded = getattr(baseline_result, "succeeded", None)
+        if succeeded is True:
+            baseline_block = (
+                f"passed (exit {getattr(baseline_result, 'exit_code', None)})"
+            )
+        elif succeeded is False:
+            baseline_block = f"failed: {_command_failure_detail(baseline_result)}"
+        else:
+            baseline_block = "not available"
+    return (
+        "final check: not run (the runtime does not run the final check "
+        "before writing an emergency note).\n\n"
+        f"Baseline check (pre-model): {baseline_block}."
+    )
+
+
+def _emergency_budget(token_budget: Mapping[str, Any] | None) -> str:
+    """Token-budget facts, each degrading to ``not available`` when missing."""
+
+    budget = token_budget if isinstance(token_budget, Mapping) else {}
+    soft_crossed = budget.get("soft_threshold_crossed")
+    soft_at = budget.get("soft_threshold_crossed_at_tokens")
+    if soft_crossed and soft_at is not None:
+        soft_block = f"crossed at {soft_at} tokens"
+    elif soft_crossed:
+        soft_block = "crossed"
+    else:
+        soft_block = "not crossed"
+    prompt_cache = budget.get("prompt_cache")
+    hit_rate = (
+        prompt_cache.get("main_hit_rate")
+        if isinstance(prompt_cache, Mapping)
+        else None
+    )
+    lines = [
+        f"- budget_tokens: {_budget_value(budget.get('budget_tokens'))}",
+        f"- max_budget_tokens: {_budget_value(budget.get('max_budget_tokens'))}",
+        f"- soft threshold: {soft_block}",
+        f"- peak_main_context_tokens: "
+        f"{_budget_value(budget.get('peak_main_context_tokens'))}",
+        f"- main prompt-cache hit rate: "
+        f"{hit_rate if hit_rate is not None else 'not available'}",
+        f"- turns: {_budget_value(budget.get('turns'))}",
+        f"- elapsed: {_elapsed_value(budget.get('elapsed_seconds'))}",
+    ]
+    return "\n".join(lines)
+
+
+def _emergency_pointers(
+    *, archive_dir: str | None, session_id: str | None
+) -> str:
+    """Where to look next: the attempt log directory and the CLI session id."""
+
+    directory = (archive_dir or "").strip() or "not available"
+    session = (session_id or "").strip() or "not available"
+    return (
+        f"- attempt log directory: {directory}\n"
+        f"- CLI transcript session id: {session}"
+    )
+
+
+def _emergency_remaining_work() -> str:
+    """What is left: unknown to the runtime; the issue decides; nothing verified."""
+
+    return (
+        "The runtime could not determine what work remains: the attempt "
+        "stopped at a limit without a model-written assessment of what is "
+        "left.\n\n"
+        "The issue's acceptance criteria are the reference for what \"done\" "
+        "means. None were verified by the runtime on this path.\n\n"
+        "Review the sections above and continue implementation from the "
+        "preserved work on this branch."
+    )
+
+
+def _blockquote(text: str) -> str:
+    """Quote free model text so it can never be misread as a note header field."""
+
+    lines = text.strip().splitlines() or [text]
+    return "\n".join(f"> {line}" if line.strip() else ">" for line in lines)
+
+
+def _format_capped_files(files: Sequence[str], *, empty: str) -> str:
+    """Render a file list capped at 50 entries with a ``+N more`` line."""
+
+    paths = [str(path).strip() for path in files]
+    paths = [path for path in paths if path]
+    if not paths:
+        return empty
+    shown = paths[:_EMERGENCY_FILE_LIST_LIMIT]
+    lines = [f"- `{path}`" for path in shown]
+    remaining = len(paths) - len(shown)
+    if remaining:
+        lines.append(f"- +{remaining} more")
+    return "\n".join(lines)
+
+
+def _format_tool_call(record: ToolCallRecord) -> str:
+    """Render one trail entry as tool name, short target, and ok/error flag."""
+
+    target = f" {record.target}" if record.target else ""
+    return f"- `{record.tool}`{target} ({record.outcome})"
+
+
+def _budget_value(value: object) -> str:
+    return "not available" if value is None else str(value)
+
+
+def _elapsed_value(value: object) -> str:
+    if value is None:
+        return "not available"
+    return f"{value}s"
+
+
+def _main_thread_handoff_invoked(skill_events: object) -> bool:
+    """Whether the ``handoff`` skill was invoked in the main thread."""
+
+    events = skill_events if isinstance(skill_events, (list, tuple)) else ()
+    return any(
+        getattr(event, "name", None) == "handoff"
+        and getattr(event, "agent_id", None) is None
+        for event in events
+    )
+
+
+def _last_check_call(
+    bash_calls: Sequence[ToolCallRecord], check_commands: Sequence[str]
+) -> ToolCallRecord | None:
+    """The last Bash call whose command contains a profile ``check`` command."""
+
+    checks = tuple(
+        command
+        for command in check_commands
+        if isinstance(command, str) and command
+    )
+    if not checks:
+        return None
+    for record in reversed(list(bash_calls)):
+        command = record.command if isinstance(record, ToolCallRecord) else ""
+        if any(check in command for check in checks):
+            return record
+    return None
+
+
+def _git_diff_stat(
+    working_directory: Path, base_revision: str, endpoint: str
+) -> str | None:
+    """Best-effort ``git diff --stat`` for the emergency note; ``None`` when unavailable."""
+
+    try:
+        completed = subprocess.run(
+            ("git", "diff", "--stat", f"{base_revision}..{endpoint}"),
+            cwd=working_directory,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except Exception:
+        return None
+    if completed.returncode != 0:
+        return None
+    output = (completed.stdout or "").strip()
+    return output if output else "(no differences)"
 
 _HANDOFF_NOTE_TITLE_PATTERN = re.compile(r"^#\s*Handoff note:\s*issue #(\d+)")
 _HANDOFF_NOTE_FIELD_PATTERN = re.compile(r"^-\s*(issue|started_at|reason|last_work_commit):\s*(.+?)\s*$")

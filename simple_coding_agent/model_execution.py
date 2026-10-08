@@ -167,6 +167,23 @@ class SkillEvent:
 
 
 @dataclass(frozen=True)
+class ToolCallRecord:
+    """One model tool invocation with its short target and ok/error outcome.
+
+    ``target`` is a short human-readable target (a file path, a command
+    snippet, a skill name); ``command`` carries the full Bash command for
+    check-command matching (empty for non-Bash tools). ``outcome`` is one of
+    ``"ok"``, ``"error"``, or ``"unknown"`` (no tool result was observed,
+    e.g. the attempt was stopped mid-call).
+    """
+
+    tool: str
+    target: str
+    outcome: str
+    command: str = ""
+
+
+@dataclass(frozen=True)
 class ModelExecution:
     """Structured execution evidence; publication remains outside this boundary."""
 
@@ -179,6 +196,10 @@ class ModelExecution:
     terminal_reason: str | None = None
     token_hard_ceiling_reached: bool = False
     token_budget: Mapping[str, Any] | None = None
+    last_assistant_text: str | None = None
+    edited_files: tuple[str, ...] = ()
+    tool_calls: tuple[ToolCallRecord, ...] = ()
+    bash_calls: tuple[ToolCallRecord, ...] = ()
 
 
 class SDKClient(Protocol):
@@ -208,6 +229,14 @@ Clock = Callable[[], datetime]
 EventLog = Callable[..., None]
 
 _MAX_LOG_DETAIL = 2000
+# Bounded in-memory activity record for the emergency handoff note: the
+# recent tool trail keeps the last 15 calls, Bash history keeps the last 50
+# (so a check command stays findable even when it falls off the short
+# trail), and the last assistant text is truncated to ~1,500 chars at
+# render time.
+_MAX_TOOL_TRAIL = 15
+_MAX_BASH_HISTORY = 50
+_MAX_SHORT_TARGET = 100
 
 
 class ModelExecutor:
@@ -261,6 +290,12 @@ class ModelExecutor:
         self._operator_deadline_expired = False
         self._cli_session_id: str | None = None
         self._token_hard_ceiling_reached = False
+        self._last_assistant_text: str | None = None
+        self._edited_files: list[str] = []
+        self._tool_trail: list[dict[str, Any]] = []
+        self._tool_pending: dict[str, dict[str, Any]] = {}
+        self._bash_history: list[dict[str, Any]] = []
+        self._bash_pending: dict[str, dict[str, Any]] = {}
         self._reset_ledger_state()
 
     def _reset_ledger_state(self) -> None:
@@ -604,6 +639,12 @@ class ModelExecutor:
         self._operator_begun = False
         self._operator_deadline_expired = False
         self._cli_session_id = None
+        self._last_assistant_text = None
+        self._edited_files = []
+        self._tool_trail = []
+        self._tool_pending = {}
+        self._bash_history = []
+        self._bash_pending = {}
         self._log(
             "model_execution_started",
             f"issue_body_length={len(issue_body)}; limits: "
@@ -1010,6 +1051,8 @@ class ModelExecutor:
         response_id = self._assistant_response_id(message, thread_id)
         content = getattr(message, "content", [])
         usage = getattr(message, "usage", None)
+        if thread_id == "main":
+            self._record_last_assistant_text(content)
         self._ledger.observe_response(thread_id, response_id, _content_chars(content))
         self._counted_response_ids.add((thread_id, response_id))
         if isinstance(usage, Mapping):
@@ -1424,6 +1467,10 @@ class ModelExecutor:
             terminal_reason=terminal_reason,
             token_hard_ceiling_reached=self._token_hard_ceiling_reached,
             token_budget=token_budget,
+            last_assistant_text=self._last_assistant_text,
+            edited_files=tuple(self._edited_files),
+            tool_calls=tuple(_freeze_trail(self._tool_trail)),
+            bash_calls=tuple(_freeze_trail(self._bash_history)),
         )
 
     def _note_terminal(self, terminal: object) -> None:
@@ -1476,6 +1523,13 @@ class ModelExecutor:
             "hard_ceiling_reached": self._token_hard_ceiling_reached,
             "peak_main_context_tokens": round(self._ledger.peak_main_context_tokens),
             "total_cost_usd": self._total_cost_usd,
+            "budget_tokens": round(self._ledger.budget_tokens),
+            "turns": (
+                self._ledger.response_count("main")
+                if self._ledger.has_thread("main")
+                else 0
+            ),
+            "elapsed_seconds": self._elapsed_seconds(),
         }
         self._log("token_budget_reconciled", json.dumps(summary, sort_keys=True))
         return summary
@@ -1491,6 +1545,7 @@ class ModelExecutor:
                 " use is allowed, including the handoff skill and git commands."
             )
         self._log_tool_use("tool_call", hook_input)
+        self._record_tool_call(hook_input, tool_use_id)
         await self._record_skill_event("PreToolUse", hook_input, tool_use_id, context)
         self._start_launch_thread(hook_input, tool_use_id)
         if _skill_name(hook_input) == "code-review":
@@ -1554,6 +1609,7 @@ class ModelExecutor:
         self._log_tool_use(
             "tool_result", hook_input, response=_hook_field(hook_input, "tool_response")
         )
+        self._record_tool_result(hook_input, tool_use_id)
         await self._record_skill_event("PostToolUse", hook_input, tool_use_id, context)
         if not self._soft_threshold_crossed:
             self._track_subagent_seen(hook_input)
@@ -1673,6 +1729,107 @@ class ModelExecutor:
                 f"request={self._operator_handoff.request_id}",
             )
         return {}
+
+
+    def _record_last_assistant_text(self, content: object) -> None:
+        """Remember the latest main-thread assistant text for the handoff note.
+
+        Only the main thread counts: subagent prose describes delegated work,
+        not what the model itself last intended. Empty messages leave the
+        previous text in place.
+        """
+
+        blocks = content if isinstance(content, (list, tuple)) else [content]
+        texts = [
+            block.text
+            for block in blocks
+            if isinstance(block, TextBlock)
+            and isinstance(block.text, str)
+            and block.text.strip()
+        ]
+        if texts:
+            self._last_assistant_text = "\n".join(texts)
+
+    def _record_tool_call(self, hook_input: Any, tool_use_id: str | None) -> None:
+        """Append one in-memory trail entry; its outcome lands in PostToolUse.
+
+        Recorded in memory by the hooks, never parsed back from the archive:
+        the archive holds full payloads while the trail keeps just the tool
+        name, a short target, and the ok/error flag. Edit/Write paths also
+        extend the edited-files list in first-seen order.
+        """
+
+        tool_name = _hook_field(hook_input, "tool_name")
+        if not isinstance(tool_name, str) or not tool_name:
+            return
+        tool_input = _hook_field(hook_input, "tool_input", {})
+        if not isinstance(tool_input, Mapping):
+            tool_input = {}
+        if tool_name == "Skill":
+            target = _skill_name(hook_input) or ""
+        else:
+            target = _short_tool_target(tool_name, tool_input)
+        command = ""
+        if tool_name == "Bash":
+            raw_command = tool_input.get("command")
+            if isinstance(raw_command, str):
+                command = raw_command
+        if tool_name in ("Edit", "Write"):
+            raw_path = tool_input.get("file_path")
+            if (
+                isinstance(raw_path, str)
+                and raw_path
+                and raw_path not in self._edited_files
+            ):
+                self._edited_files.append(raw_path)
+        record: dict[str, Any] = {
+            "tool": tool_name,
+            "target": target,
+            "outcome": "unknown",
+            "command": command,
+        }
+        self._tool_trail.append(record)
+        if len(self._tool_trail) > _MAX_TOOL_TRAIL:
+            del self._tool_trail[: len(self._tool_trail) - _MAX_TOOL_TRAIL]
+        if isinstance(tool_use_id, str) and tool_use_id:
+            self._tool_pending[tool_use_id] = record
+            self._prune_tool_pending()
+        if tool_name == "Bash":
+            bash_record: dict[str, Any] = {
+                "tool": tool_name,
+                "target": target,
+                "outcome": "unknown",
+                "command": command,
+            }
+            self._bash_history.append(bash_record)
+            if len(self._bash_history) > _MAX_BASH_HISTORY:
+                del self._bash_history[
+                    : len(self._bash_history) - _MAX_BASH_HISTORY
+                ]
+            if isinstance(tool_use_id, str) and tool_use_id:
+                self._bash_pending[tool_use_id] = bash_record
+                self._prune_tool_pending()
+
+    def _record_tool_result(self, hook_input: Any, tool_use_id: str | None) -> None:
+        """Settle the pending trail entry's ok/error flag from the tool result."""
+
+        if not isinstance(tool_use_id, str) or not tool_use_id:
+            return
+        outcome = _tool_result_outcome(_hook_field(hook_input, "tool_response"))
+        record = self._tool_pending.pop(tool_use_id, None)
+        if record is not None:
+            record["outcome"] = outcome
+        bash_record = self._bash_pending.pop(tool_use_id, None)
+        if bash_record is not None:
+            bash_record["outcome"] = outcome
+
+    def _prune_tool_pending(self) -> None:
+        """Drop the oldest unsettled entries so a missing PostToolUse cannot leak."""
+
+        while len(self._tool_pending) > 4 * _MAX_TOOL_TRAIL:
+            self._tool_pending.pop(next(iter(self._tool_pending)))
+        while len(self._bash_pending) > 4 * _MAX_BASH_HISTORY:
+            self._bash_pending.pop(next(iter(self._bash_pending)))
 
 
 async def publication_guard(hook_input: Any, tool_use_id: str | None, context: Any) -> dict[str, Any]:
@@ -2054,6 +2211,66 @@ def _gh_subcommand(arguments: list[str]) -> tuple[str, str] | None:
 
 def _timestamp(value: datetime) -> str:
     return value.astimezone(UTC).isoformat().replace("+00:00", "Z")
+
+
+def _freeze_trail(records: Iterable[dict[str, Any]]) -> tuple[ToolCallRecord, ...]:
+    """Freeze mutable hook records into the evidence carried by ``ModelExecution``."""
+
+    return tuple(
+        ToolCallRecord(
+            tool=str(record.get("tool", "")),
+            target=str(record.get("target", "")),
+            outcome=str(record.get("outcome", "unknown")),
+            command=str(record.get("command", "")),
+        )
+        for record in records
+    )
+
+
+def _shorten(value: str, limit: int = _MAX_SHORT_TARGET) -> str:
+    collapsed = " ".join(value.split())
+    if len(collapsed) <= limit:
+        return collapsed
+    return collapsed[:limit] + "..."
+
+
+def _short_tool_target(tool_name: str, tool_input: Mapping[str, Any]) -> str:
+    """One short human-readable target for the tool-call trail."""
+
+    if tool_name in ("Edit", "Write", "Read"):
+        candidate = tool_input.get("file_path")
+        return _shorten(candidate) if isinstance(candidate, str) else ""
+    if tool_name == "Bash":
+        candidate = tool_input.get("command")
+        return _shorten(candidate) if isinstance(candidate, str) else ""
+    if tool_name in ("Agent", "Task"):
+        for key in ("description", "subagent_type", "prompt"):
+            candidate = tool_input.get(key)
+            if isinstance(candidate, str) and candidate:
+                return _shorten(candidate)
+        return ""
+    for key in ("path", "file", "command", "pattern", "skill"):
+        candidate = tool_input.get(key)
+        if isinstance(candidate, str) and candidate:
+            return _shorten(candidate)
+    return ""
+
+
+def _tool_result_outcome(response: Any) -> str:
+    """Map a PostToolUse response to the trail's ok/error flag.
+
+    Only an explicit error reads as ``"error"``; a finished call without an
+    error signal reads as ``"ok"``. Calls still in flight (no PostToolUse
+    yet) keep ``"unknown"`` from the PreToolUse entry.
+    """
+
+    if isinstance(response, Mapping):
+        if response.get("interrupted") is True:
+            return "error"
+        if response.get("is_error") is True:
+            return "error"
+        return "ok"
+    return "ok"
 
 
 def _truncate(text: str) -> str:
