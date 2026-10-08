@@ -36,6 +36,10 @@ _Avoid_: Status, result code, exit status
 The durable record of a `handoff` outcome: a committed file at a fixed per-issue path (`.agent/handoff/<issue-number>.md`) describing remaining work, plus a verbatim copy posted as an issue comment. The comment copy is what a continuation's starting prompt is enriched with; the file itself is only pointed at, never digested, since it is already reachable on the resumed branch.
 _Avoid_: Progress note, status update, summary
 
+**Emergency handoff note**:
+A Handoff note written by the runtime, not the model, when the model reaches a limit without having written one. It states its own provenance and carries only what the runtime can reconstruct (changes, activity, budget facts); it never claims to know what work remains.
+_Avoid_: Fallback note, synthetic note
+
 **Attempt workspace**:
 The working tree in which one implementation attempt makes its changes, prepared from the verified base and holding the attempt's branch. It belongs to a single attempt at a time; after the attempt it returns to the base without carrying any of the attempt's changes with it.
 _Avoid_: Repo, checkout, sandbox
@@ -49,8 +53,12 @@ The limit on the total tokens one implementation attempt may process and generat
 _Avoid_: Cost budget, spend limit
 
 **Soft threshold**:
-The point in the token budget past which the model must end the attempt with a handoff, leaving the rest of the budget for writing the Handoff note.
+The point in the token budget past which the model must end the attempt with a handoff, placed early enough to leave a Handoff reserve before the Hard ceiling.
 _Avoid_: Cost threshold, warning limit
+
+**Handoff reserve**:
+The part of the token budget kept back for the handoff itself, sized as a number of turns at the main thread's current context size, since every turn re-counts that whole context.
+_Avoid_: Buffer, headroom, safety margin
 
 **Hard ceiling**:
 The point at which the attempt is stopped regardless of the model, whether or not it has handed off.
