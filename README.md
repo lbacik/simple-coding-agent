@@ -12,6 +12,10 @@ The tracker selects only OPEN issues in `TARGET_REPO` that are labelled
 GitHub blockers. It orders eligible issues FIFO by creation date and rechecks
 eligibility immediately before assigning the authenticated GitHub identity.
 That check-then-set claim assumes one process; it is not a distributed lock.
+A handoff releases its issue labelled `round-finished`: with the operator
+setting `MAX_AUTO_CONTINUATIONS=N` (default `0`), a `round-finished` issue
+within budget is claimed automatically ahead of new work, up to N
+continuations in a row before a human requeue is needed again.
 
 Applying `ready-for-agent` is the human trust boundary: only repository
 collaborators with write access may apply it. The issue body is passed to the
@@ -24,7 +28,9 @@ Copy `.env.example` and set `GITHUB_TOKEN`, `META_API_KEY`, and `TARGET_REPO`
 (`owner/repo`). `DATA_DIR` defaults to `~/.simple-coding-agent/`; its default
 clone location is `$DATA_DIR/repo/`. Other defaults are `POLL_INTERVAL=60`,
 `LOG_LEVEL=INFO`, `MODEL_TIMEOUT=3600`, `PUBLISH_TIMEOUT=120`,
-`MAX_RETRIES=3`, and `MAX_CONSECUTIVE_ERRORS=3`.
+`MAX_RETRIES=3`, `MAX_CONSECUTIVE_ERRORS=3`, and `MAX_AUTO_CONTINUATIONS=0`
+(no automatic continuation of `round-finished` issues without a human
+requeue).
 
 Use a fine-grained GitHub PAT limited to the configured repository with only
 `contents:write`, `pull-requests:write`, and `issues:write`. Configure provider

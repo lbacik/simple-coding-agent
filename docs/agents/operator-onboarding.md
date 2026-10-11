@@ -201,10 +201,22 @@ without a cooperative handoff note likewise ends in an emergency handoff
 
 A `handoff` outcome pushes the attempt branch (no pull request), posts the
 handoff note as an issue comment, removes `ready-for-agent`, and adds
-`round-finished`. **Continuation requires a human decision**: review the
-note and comment, then re-apply `ready-for-agent` to requeue the issue (this
-also clears `round-finished`), or leave it labelled `round-finished` to end
-the attempt sequence.
+`round-finished`. **By default, continuation requires a human decision**:
+review the note and comment, then re-apply `ready-for-agent` to requeue the
+issue (this also clears `round-finished`), or leave it labelled
+`round-finished` to end the attempt sequence.
+
+`MAX_AUTO_CONTINUATIONS` (default `0`) optionally lets the agent continue a
+`round-finished` issue on its own, up to N automatic continuations in a row,
+claimed ahead of new `ready-for-agent` work. A human requeue resets the
+count and grants another N rounds; removing `round-finished` stops the
+sequence at any time. Every handoff result comment then reports where the
+issue stands (`k/N used`, and whether a human requeue is now needed), and
+each automatic claim emits an `auto_continuation_claimed` event. The setting
+is operator-only on purpose: it lives in `.env`, never in the repository
+profile (an unknown profile key is refused), so an agent-written PR cannot
+raise its own round limit. See
+[ADR 0005](../adr/0005-automatic-continuation-budget.md).
 
 Independent of the handoff path, any dirty or untracked change left in the
 working tree once the model reports success is also committed automatically

@@ -1216,8 +1216,16 @@ class AgentLifecycle:
                     f"issue #{number} could not be verified: {error}."
                     " No control change was accepted."
                 ) from error
+            # The continuation count needs a comment read, so it is only
+            # consulted when it can matter: a positive budget and a target
+            # carrying only the continuation signal. Anything else follows
+            # the ordinary rule with the count at zero, exactly as before.
             auto_count = 0
-            if fresh is not None:
+            if (
+                fresh is not None
+                and self._max_auto_continuations > 0
+                and fresh.is_continuation_signal
+            ):
                 try:
                     auto_count = self._auto_continuation_count(fresh)
                 except NextIssueRejectedError:
@@ -2343,7 +2351,11 @@ class AgentLifecycle:
             count_before = self._auto_continuation_count(claim.issue)
         except Exception:
             return None
-        used = count_before + (1 if source == REQUEUE_SOURCE_AUTOMATIC else 0)
+        # The line reports where the issue stands once this handoff's own
+        # result comment lands: a human-stamped comment resets the count to
+        # zero (even after earlier automatic rounds), while an
+        # automatic-stamped one extends the current row by one.
+        used = count_before + 1 if source == REQUEUE_SOURCE_AUTOMATIC else 0
         shown = min(used, budget)
         if used >= budget:
             return (
@@ -2891,9 +2903,16 @@ class AgentLifecycle:
         target_number = int(snapshot["issue_number"])
         try:
             fresh = self._tracker.fetch_issue(target_number)
-            auto_count = (
-                0 if fresh is None else self._auto_continuation_count(fresh)
-            )
+            # As in ``submit_next_issue``: the comment read behind the count
+            # only runs when it can matter, so a zero budget (or an ordinary
+            # target) revalidates exactly as before.
+            auto_count = 0
+            if (
+                fresh is not None
+                and self._max_auto_continuations > 0
+                and fresh.is_continuation_signal
+            ):
+                auto_count = self._auto_continuation_count(fresh)
         except Exception as error:
             self._event_log(
                 "next_issue_claim_ambiguous",

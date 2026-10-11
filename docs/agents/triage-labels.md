@@ -12,6 +12,18 @@ The skills speak in terms of five canonical triage roles. This file maps those r
 
 When a skill mentions a role, use the corresponding label string from this table.
 
+## `round-finished` continuation
+
+`round-finished` is not a triage role: the agent applies it when a handoff
+releases the issue (removing `ready-for-agent` and the assignment). With the
+default `MAX_AUTO_CONTINUATIONS=0`, the issue waits there until a human
+re-applies `ready-for-agent` to requeue it. With `MAX_AUTO_CONTINUATIONS=N`,
+the agent claims a `round-finished` issue on its own — ahead of new
+`ready-for-agent` work — up to N automatic continuations in a row; the
+handoff that uses up the budget says a human requeue is needed. Re-applying
+`ready-for-agent` resets the count and grants another N rounds, while
+removing `round-finished` stops automatic continuation at any time.
+
 ## `agent-auto-merge` opt-in
 
 The `agent-auto-merge` label opts one implementation issue into pull-request

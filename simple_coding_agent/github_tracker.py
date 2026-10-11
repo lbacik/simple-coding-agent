@@ -299,10 +299,8 @@ class GitHubTracker:
             # Revalidated at claim time under the same rule as the queue
             # read: an issue whose budget ran out, or that a human
             # relabelled, between the two reads is skipped.
-            if (
-                current is None
-                or not current.is_eligible
-                and not self.is_auto_continuation_eligible(current)
+            if current is None or (
+                not current.is_eligible and not self.is_auto_continuation_eligible(current)
             ):
                 continue
             assignment = self._transport.assign_issue(current.id, identity.id)
