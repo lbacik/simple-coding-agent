@@ -401,11 +401,13 @@ class ModelAttemptRunner:
         self._wire_operator_handoff()
         try:
             execution = asyncio.run(
-                self._model_executor.execute(
+                _execute_model(
+                    self._model_executor,
                     issue_body=prompt_body,
                     working_directory=self._workspace.working_directory,
                     issue_number=claim.issue.number,
                     archive=archive,
+                    attempt_id=attempt_id,
                 )
             )
             self._archive_cli_transcripts(archive, claim.issue.number)
@@ -652,6 +654,9 @@ class ModelAttemptRunner:
                 claim.issue.number,
                 self._workspace.working_directory,
                 prepared.base_revision,
+            )
+            _emit_handoff_note_events(
+                self._event_log, claim.issue.number, validation
             )
             if not validation.valid:
                 # A committed-but-untrustworthy note is ordinary evidence,
@@ -1879,6 +1884,9 @@ class AgentLifecycle:
                     self._workspace.working_directory,
                     prepared.base_revision,
                 )
+                _emit_handoff_note_events(
+                    self._event_log, claim.issue.number, validation
+                )
                 if validation.valid:
                     decision = CompletionDecision(
                         AttemptOutcome.HANDOFF,
@@ -1941,6 +1949,10 @@ class AgentLifecycle:
                 )
             except Exception:
                 validation = None
+            if validation is not None:
+                _emit_handoff_note_events(
+                    self._event_log, claim.issue.number, validation
+                )
             if validation is not None and validation.valid:
                 return (
                     AttemptOutcome.HANDOFF,
@@ -3118,6 +3130,7 @@ class AgentLifecycle:
             )
         except Exception as error:
             return False, f"the handoff note could not be validated ({_exception_detail(error)})"
+        _emit_handoff_note_events(self._event_log, issue_number, validation)
         if not validation.valid:
             return False, validation.reason
         try:
@@ -3410,6 +3423,9 @@ class AgentLifecycle:
                         claim.issue.number,
                         self._workspace.working_directory,
                         prepared.base_revision,
+                    )
+                    _emit_handoff_note_events(
+                        self._event_log, claim.issue.number, validation
                     )
                     if validation.valid:
                         decision = CompletionDecision(
@@ -3813,6 +3829,70 @@ def _review_findings_text(review: ReviewEvidence, review_count: int) -> str:
     if review_count > 0:
         return "not collected"
     return "not run"
+
+
+def _execute_model(
+    model_executor: object,
+    *,
+    issue_body: str,
+    working_directory: Path,
+    issue_number: int | None,
+    archive: object | None,
+    attempt_id: str | None,
+) -> Any:
+    """Invoke the model executor, passing the attempt id when it accepts it.
+
+    Older executor doubles in tests predate the ``attempt_id`` seam: they
+    raise ``TypeError`` on the unexpected keyword. Fall back to the old
+    call shape for them instead of failing the attempt.
+    """
+
+    execute = getattr(model_executor, "execute")
+    try:
+        return execute(
+            issue_body=issue_body,
+            working_directory=working_directory,
+            issue_number=issue_number,
+            archive=archive,
+            attempt_id=attempt_id,
+        )
+    except TypeError:
+        return execute(
+            issue_body=issue_body,
+            working_directory=working_directory,
+            issue_number=issue_number,
+            archive=archive,
+        )
+
+
+def _emit_handoff_note_events(
+    event_log: Callable[..., None],
+    issue_number: int,
+    validation: _HandoffNoteValidation,
+) -> None:
+    """Emit the WARNING events for one handoff-note verdict.
+
+    A bad ``started_at`` never rejects the note: it emits
+    ``handoff_note_started_at_invalid`` and the note is otherwise judged as
+    before. Any invalid note additionally emits ``handoff_note_rejected``
+    with the validation reason, so a silent downgrade to ``incomplete`` is
+    always visible in the event stream.
+    """
+
+    if validation.started_at_warning:
+        event_log(
+            "handoff_note_started_at_invalid",
+            validation.started_at_warning,
+            level="WARNING",
+            issue_number=issue_number,
+        )
+    if not validation.valid:
+        event_log(
+            "handoff_note_rejected",
+            validation.reason,
+            level="WARNING",
+            issue_number=issue_number,
+        )
 
 
 def _attempt_evidence(
@@ -4507,6 +4587,7 @@ class _HandoffNoteValidation:
 
     valid: bool
     reason: str = ""
+    started_at_warning: str | None = None
 
 
 def _validate_handoff_note(
@@ -4546,22 +4627,38 @@ def _validate_handoff_note(
             "from the committed branch state.",
         )
     fields = _parse_handoff_note_fields(text)
+    # ``started_at`` is the attempt id owned by the runner: it is
+    # informational, never a gate. A missing or malformed value produces a
+    # warning carried alongside the verdict instead of rejecting the note.
+    started_at = fields.get("started_at", "")
+    started_at_warning: str | None = None
+    if not started_at:
+        started_at_warning = (
+            f"issue #{issue_number}: the handoff note's `started_at` field is"
+            " missing; it should carry the attempt id."
+        )
+    elif not _is_iso8601(started_at):
+        started_at_warning = (
+            f"issue #{issue_number}: the handoff note's `started_at` value"
+            f" {started_at!r} is not valid ISO-8601; it should carry the attempt id."
+        )
     if fields.get("title_issue") != str(issue_number):
         return _HandoffNoteValidation(
-            False, "Handoff note does not carry the required title for this issue."
+            False,
+            "Handoff note does not carry the required title for this issue.",
+            started_at_warning,
         )
     if fields.get("issue") != str(issue_number):
         return _HandoffNoteValidation(
-            False, "Handoff note is missing a matching `issue` field."
-        )
-    started_at = fields.get("started_at", "")
-    if not started_at or not _is_iso8601(started_at):
-        return _HandoffNoteValidation(
-            False, "Handoff note is missing a valid `started_at` field."
+            False,
+            "Handoff note is missing a matching `issue` field.",
+            started_at_warning,
         )
     if fields.get("reason") not in _ALLOWED_HANDOFF_REASONS:
         return _HandoffNoteValidation(
-            False, "Handoff note is missing a valid `reason` field."
+            False,
+            "Handoff note is missing a valid `reason` field.",
+            started_at_warning,
         )
     last_work_commit = fields.get("last_work_commit", "")
     # The note describes the work preserved beneath it: the attempt commit
@@ -4583,8 +4680,9 @@ def _validate_handoff_note(
             False,
             "Handoff note's `last_work_commit` does not match the last preserved "
             "work commit.",
+            started_at_warning,
         )
-    return _HandoffNoteValidation(True)
+    return _HandoffNoteValidation(True, started_at_warning=started_at_warning)
 
 
 def _parse_handoff_note_fields(text: str) -> dict[str, str]:
