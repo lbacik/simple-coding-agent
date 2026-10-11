@@ -130,20 +130,32 @@ def main() -> None:
     )
     restore_interruption_handler = interruption_handler.install()
     control_server = ControlServer(socket_path_for(config.data_dir), lifecycle)
-    try:
-        control_server.start()
-    except Exception as error:
-        logger.emit(
-            "control_endpoint_unavailable",
-            f"Operator control socket could not be opened: {error}",
-            level="ERROR",
-        )
-        raise SystemExit(1) from error
+    _start_control_endpoint(logger, control_server)
     try:
         lifecycle.run_forever(stop=lambda: False)
     finally:
         control_server.stop()
         restore_interruption_handler()
+
+
+def _start_control_endpoint(logger: JsonEventLogger, control_server: ControlServer) -> None:
+    """Start the operator control endpoint or log and exit.
+
+    A failure to open the control socket is fatal: emit exactly one
+    structured ``control_endpoint_unavailable`` event and exit 1 so the
+    operator sees JSON instead of a raw traceback.
+    """
+
+    try:
+        control_server.start()
+    except Exception as error:
+        logger.emit(
+            "control_endpoint_unavailable",
+            phase="startup",
+            detail=f"Operator control socket could not be opened: {error}",
+            level="ERROR",
+        )
+        raise SystemExit(1) from error
 
 
 if __name__ == "__main__":
