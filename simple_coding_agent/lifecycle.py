@@ -68,6 +68,7 @@ from simple_coding_agent.model_execution import ModelExecutionStatus, ModelExecu
 from simple_coding_agent.observability import AttemptArchive, Redactor
 from simple_coding_agent.operating import ConsecutiveErrorStore
 from simple_coding_agent.publication import AUTO_MERGE_LABEL, PublicationRequest
+from simple_coding_agent.recovery import requeue_source_for_labels
 
 
 class AttemptInterruptionHandler:
@@ -1640,6 +1641,7 @@ class AgentLifecycle:
                     base_branch=profile.base_branch,
                     note_commit_sha=note_sha,
                     auto_merge_opt_in=_claim_time_opt_in(claim, checkpoint),
+                    requeue_source=_claim_time_requeue_source(claim, checkpoint),
                 )
             )
         except Exception as error:
@@ -1797,6 +1799,7 @@ class AgentLifecycle:
         )
         branch = prepared.branch
         marker = attempt_marker(attempt_id)
+        source = _claim_time_requeue_source(claim, checkpoint)
         comment_body = release_comment_body(
             issue_number=issue_number,
             attempt_id=attempt_id,
@@ -1804,9 +1807,10 @@ class AgentLifecycle:
             failure_reason=failure_reason,
             saved_at=saved_at,
             branch=branch,
+            requeue_source=source,
         )
         confirmed = self._confirm_release_comment(
-            claim, marker, comment_body, attempt_id
+            claim, marker, comment_body, attempt_id, requeue_source=source
         )
         if confirmed is None:
             return False, (
@@ -2021,7 +2025,7 @@ class AgentLifecycle:
         )
 
     def _confirm_release_comment(
-        self, claim: Claim, marker: str, body: str, attempt_id: str
+        self, claim: Claim, marker: str, body: str, attempt_id: str, *, requeue_source: str = "human"
     ) -> bool | None:
         """Confirm the deduplicated release comment; ``None`` means ambiguous.
 
@@ -2070,6 +2074,7 @@ class AgentLifecycle:
                     review_findings="not run during recovery release",
                     details=body,
                     base_branch="main",
+                    requeue_source=requeue_source,
                 )
             )
         except Exception:
@@ -2456,6 +2461,7 @@ class AgentLifecycle:
                     claim, checkpoint.started_at, prepared, profile, outcome,
                     timeout=self._handoff_publish_budget(),
                     auto_merge_opt_in=_claim_time_opt_in(claim, checkpoint),
+                    requeue_source=_claim_time_requeue_source(claim, checkpoint),
                 )
                 comment_posted = getattr(published, "comment_posted", True)
             else:
@@ -2478,6 +2484,7 @@ class AgentLifecycle:
                         base_branch=profile.base_branch,
                         note_commit_sha=evidence.note_commit_sha,
                         auto_merge_opt_in=_claim_time_opt_in(claim, checkpoint),
+                        requeue_source=_claim_time_requeue_source(claim, checkpoint),
                     )
                 )
                 outcome = published.outcome
@@ -2523,6 +2530,7 @@ class AgentLifecycle:
                 claim, checkpoint.started_at, prepared, profile, error,
                 timeout=self._handoff_publish_budget(),
                 auto_merge_opt_in=_claim_time_opt_in(claim, checkpoint),
+                requeue_source=_claim_time_requeue_source(claim, checkpoint),
             )
             outcome = AttemptOutcome.INFRASTRUCTURE_ERROR
             comment_posted = getattr(published, "comment_posted", True)
@@ -2535,6 +2543,7 @@ class AgentLifecycle:
                 claim, checkpoint.started_at, prepared, profile, outcome,
                 timeout=self._handoff_publish_budget(),
                 auto_merge_opt_in=_claim_time_opt_in(claim, checkpoint),
+                requeue_source=_claim_time_requeue_source(claim, checkpoint),
             )
             comment_posted = getattr(published, "comment_posted", True)
         except BaseException as error:
@@ -2551,6 +2560,7 @@ class AgentLifecycle:
                     claim, checkpoint.started_at, prepared, profile, outcome,
                     timeout=self._handoff_publish_budget(),
                     auto_merge_opt_in=_claim_time_opt_in(claim, checkpoint),
+                    requeue_source=_claim_time_requeue_source(claim, checkpoint),
                 )
                 comment_posted = getattr(published, "comment_posted", True)
             except Exception:
@@ -2734,6 +2744,7 @@ class AgentLifecycle:
                 issue_number=claim.issue.number,
                 branch=f"agent/issue-{claim.issue.number}",
                 auto_merge_opt_in=AUTO_MERGE_LABEL in claim.issue.labels,
+                requeue_source=requeue_source_for_labels(claim.issue.labels),
             )
             self._attempt_processing = True
             if self._control_store is not None:
@@ -2848,6 +2859,7 @@ class AgentLifecycle:
             issue_number=claim.issue.number,
             branch=f"agent/issue-{claim.issue.number}",
             auto_merge_opt_in=AUTO_MERGE_LABEL in claim.issue.labels,
+            requeue_source=requeue_source_for_labels(claim.issue.labels),
         )
         self._attempt_processing = True
         return (claim, checkpoint)
@@ -3512,6 +3524,7 @@ class AgentLifecycle:
                     base_branch=profile.base_branch,
                     note_commit_sha=note_commit_sha,
                     auto_merge_opt_in=_claim_time_opt_in(claim, checkpoint),
+                    requeue_source=_claim_time_requeue_source(claim, checkpoint),
                 )
             )
             outcome = published.outcome
@@ -3561,6 +3574,7 @@ class AgentLifecycle:
                 claim, checkpoint.started_at, prepared, profile, error,
                 timeout=self._handoff_publish_budget(),
                 auto_merge_opt_in=_claim_time_opt_in(claim, checkpoint),
+                requeue_source=_claim_time_requeue_source(claim, checkpoint),
             )
             outcome = AttemptOutcome.INFRASTRUCTURE_ERROR
             comment_posted = getattr(published, "comment_posted", True)
@@ -3573,6 +3587,7 @@ class AgentLifecycle:
                 claim, checkpoint.started_at, prepared, profile, AttemptOutcome.INFRASTRUCTURE_ERROR,
                 timeout=self._handoff_publish_budget(),
                 auto_merge_opt_in=_claim_time_opt_in(claim, checkpoint),
+                requeue_source=_claim_time_requeue_source(claim, checkpoint),
             )
             outcome = AttemptOutcome.INFRASTRUCTURE_ERROR
             comment_posted = getattr(published, "comment_posted", True)
@@ -3586,6 +3601,7 @@ class AgentLifecycle:
                     claim, checkpoint.started_at, prepared, profile, AttemptOutcome.INFRASTRUCTURE_ERROR,
                     timeout=self._handoff_publish_budget(),
                     auto_merge_opt_in=_claim_time_opt_in(claim, checkpoint),
+                    requeue_source=_claim_time_requeue_source(claim, checkpoint),
                 )
                 comment_posted = getattr(published, "comment_posted", True)
             except Exception:
@@ -3690,6 +3706,7 @@ class AgentLifecycle:
         details: str = "Repository profile could not be loaded or the attempt could not start.",
         timeout: float | None = None,
         auto_merge_opt_in: bool = False,
+        requeue_source: str = "human",
     ):
         branch = prepared.branch if prepared is not None else f"agent/issue-{claim.issue.number}"
         base_branch = profile.base_branch if profile is not None else "main"
@@ -3706,6 +3723,7 @@ class AgentLifecycle:
             details=details,
             base_branch=base_branch,
             auto_merge_opt_in=auto_merge_opt_in,
+            requeue_source=requeue_source,
         )
         if timeout is None:
             return self._publisher.publish(request)
@@ -3720,6 +3738,7 @@ class AgentLifecycle:
         error: RebaseConflictError,
         timeout: float | None = None,
         auto_merge_opt_in: bool = False,
+        requeue_source: str = "human",
     ):
         """Report an unresolvable rebase conflict as the terminal infrastructure error.
 
@@ -3750,6 +3769,7 @@ class AgentLifecycle:
             ),
             timeout=timeout,
             auto_merge_opt_in=auto_merge_opt_in,
+            requeue_source=requeue_source,
         )
 
     def _record_terminal_outcome(
@@ -3838,6 +3858,22 @@ def _claim_time_opt_in(claim: Claim, checkpoint: AttemptCheckpoint | None) -> bo
     if checkpoint is not None:
         return bool(getattr(checkpoint, "auto_merge_opt_in", False))
     return AUTO_MERGE_LABEL in claim.issue.labels
+
+
+def _claim_time_requeue_source(claim: Claim, checkpoint: AttemptCheckpoint | None) -> str:
+    """How the attempt was requeued, decided once from the claim snapshot.
+
+    The checkpoint recorded the claim snapshot's labels, so a label change
+    while the attempt runs (or after it finishes) never rewrites that
+    attempt's result comment — including when a crashed attempt is
+    recovered, where the re-read claim carries the current labels instead.
+    """
+
+    if checkpoint is not None:
+        source = getattr(checkpoint, "requeue_source", None)
+        if source in ("human", "automatic"):
+            return source
+    return requeue_source_for_labels(claim.issue.labels)
 
 
 def _attempt_id(checkpoint: AttemptCheckpoint | None) -> str:

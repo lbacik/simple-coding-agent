@@ -11,6 +11,7 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 from simple_coding_agent.publication import PullRequest
+from simple_coding_agent.recovery import count_automatic_continuations
 
 
 READY_FOR_AGENT = "ready-for-agent"
@@ -287,6 +288,26 @@ class GitHubTracker:
             # incidentally matching another deleted account.
             if comment.author_login and comment.author_login in (issue.author_login, viewer.login)
         )
+
+    def automatic_continuation_count(self, issue: TrackerIssue) -> int:
+        """Count automatic continuations in a row since the last human requeue.
+
+        Only comments written by this agent's own GitHub identity are
+        examined; any other comment is ignored even if it contains the
+        marker. A human-requeue result (or a legacy unmarked result from
+        before the marker existed) resets the count to zero.
+        """
+
+        viewer = self._transport.viewer()
+        comments = self._transport.list_issue_comments(self._target_repo, issue.number)
+        own_bodies_newest_first = tuple(
+            comment.body
+            for comment in reversed(comments)
+            # An empty login means a deleted account; never count one by
+            # incidentally matching another deleted account.
+            if comment.author_login and comment.author_login == viewer.login
+        )
+        return count_automatic_continuations(own_bodies_newest_first)
 
 
 class GitHubGraphQLTransport:

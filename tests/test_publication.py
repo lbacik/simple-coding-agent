@@ -739,3 +739,41 @@ def test_pull_request_body_reports_reviews_performed(tmp_path: Path) -> None:
     assert "Reviews performed: 0" in body
     assert "Review repair cycles: 0/2" in body
     assert "code-review was not run" in body
+
+
+# --- Requeue source marker -----------------------------------------------------
+
+
+def test_result_comment_records_a_human_requeue_source_by_default(tmp_path: Path) -> None:
+    remote, _ = repository_with_main(tmp_path)
+    workspace = GitWorkspace(tmp_path / "clone", str(remote), token_provider=lambda: "token")
+    prepared = workspace.prepare_attempt(base_branch="main", issue_number=23)
+    write_and_commit(tmp_path / "clone", "feature.txt", "done", "Implement publication")
+    github = FakeGitHub()
+
+    Publisher(workspace, github, "octo/example").publish(
+        complete_request(prepared.branch)
+    )
+
+    (comment,) = [body for _, body in github.comments]
+    assert "<!-- agent-attempt: 2026-09-20T13:00:00Z -->" in comment
+    assert "<!-- requeue-source: human -->" in comment
+    assert "<!-- requeue-source: automatic -->" not in comment
+
+
+def test_result_comment_records_an_automatic_requeue_source_when_requested(
+    tmp_path: Path,
+) -> None:
+    remote, _ = repository_with_main(tmp_path)
+    workspace = GitWorkspace(tmp_path / "clone", str(remote), token_provider=lambda: "token")
+    prepared = workspace.prepare_attempt(base_branch="main", issue_number=23)
+    write_and_commit(tmp_path / "clone", "feature.txt", "done", "Implement publication")
+    github = FakeGitHub()
+
+    Publisher(workspace, github, "octo/example").publish(
+        complete_request(prepared.branch, requeue_source="automatic")
+    )
+
+    (comment,) = [body for _, body in github.comments]
+    assert "<!-- requeue-source: automatic -->" in comment
+    assert "<!-- requeue-source: human -->" not in comment
