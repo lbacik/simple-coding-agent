@@ -411,6 +411,8 @@ class ModelAttemptRunner:
                     issue_number=claim.issue.number,
                     archive=archive,
                     attempt_id=attempt_id,
+                    branch=prepared.branch,
+                    base_revision=prepared.base_revision,
                 )
             )
             self._archive_cli_transcripts(archive, claim.issue.number)
@@ -3914,15 +3916,31 @@ def _execute_model(
     issue_number: int | None,
     archive: object | None,
     attempt_id: str | None,
+    branch: str | None = None,
+    base_revision: str | None = None,
 ) -> Any:
     """Invoke the model executor, passing the attempt id when it accepts it.
 
     Older executor doubles in tests predate the ``attempt_id`` seam: they
     raise ``TypeError`` on the unexpected keyword. Fall back to the old
-    call shape for them instead of failing the attempt.
+    call shape for them instead of failing the attempt. The branch/base
+    seam (for the token soft-threshold state snapshot) falls back the same
+    way.
     """
 
     execute = model_executor.execute  # type: ignore[attr-defined]
+    try:
+        return execute(
+            issue_body=issue_body,
+            working_directory=working_directory,
+            issue_number=issue_number,
+            archive=archive,
+            attempt_id=attempt_id,
+            branch=branch,
+            base_revision=base_revision,
+        )
+    except TypeError:
+        pass
     try:
         return execute(
             issue_body=issue_body,

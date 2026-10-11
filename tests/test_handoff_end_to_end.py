@@ -1165,3 +1165,61 @@ def remote_has_branch(remote: Path, branch: str) -> bool:
 def git(cwd: Path, *arguments: str) -> str:
     env = dict(os.environ, GIT_EDITOR="true")
     return subprocess.run(("git", *arguments), cwd=cwd, env=env, check=True, text=True, capture_output=True).stdout.strip()
+
+
+# --- Scenario 11e: token soft-threshold two-call handoff -----------------------
+#
+# The model follows the injected snapshot: it writes the note with the
+# supplied header (``last_work_commit`` is HEAD at injection time) and
+# commits only the note, leaving its dirty work uncommitted. Sealing then
+# commits that work on top of the note. The note + seal layout must still
+# pass note validation and publish as a ``handoff`` outcome.
+
+
+def test_token_handoff_note_only_commit_with_dirty_work_seals_on_top(tmp_path: Path) -> None:
+    remote, _ = repository_with_main(tmp_path)
+    github = FakeGitHub(issue(24, body="Rewrite the parser.", labels=frozenset({"ready-for-agent"})))
+    clone_dir = tmp_path / "clone"
+
+    def do_token_handoff(working_directory: Path) -> None:
+        # Work committed before the threshold, as usual.
+        write_and_commit(working_directory, "parser.py", "half done", "Half-finish the parser")
+        # Injection-time HEAD: the supplied header points here.
+        head = git(working_directory, "rev-parse", "HEAD")
+        # The model writes the note with the supplied header verbatim and
+        # commits only the note in one Bash call, leaving dirty work behind.
+        note = (
+            "# Handoff note: issue #24\n\n"
+            "- issue: 24\n"
+            "- started_at: 2026-09-22T00:00:00Z\n"
+            "- reason: token_soft_threshold\n"
+            f"- last_work_commit: {head}\n\n"
+            "## Summary\n\nHalfway done.\n\n"
+            "## Remaining work\n\nFinish the parser.\n\n"
+            "## Evidence\n\nparser.py\n"
+        )
+        note_path = working_directory / ".agent" / "handoff" / "24.md"
+        note_path.parent.mkdir(parents=True, exist_ok=True)
+        note_path.write_text(note)
+        git(working_directory, "add", ".agent/handoff/24.md")
+        git(working_directory, "commit", "-m", "Handoff note: issue #24")
+        # Dirty work the model must not commit itself: sealing owns it.
+        (working_directory / "parser.py").write_text("half done, plus uncommitted edits")
+
+    executor = FakeModelExecutor(actions=[do_token_handoff], handoff=True)
+    lifecycle = build_lifecycle(remote, clone_dir, tmp_path / "data", github, executor)
+
+    result = lifecycle.run_once()
+
+    assert result.outcome is AttemptOutcome.HANDOFF
+    assert github.pull_requests == {}
+    assert github.added_labels == [("issue-24", "round-finished")]
+    subjects = git(clone_dir, "log", "agent/issue-24", "--format=%s").splitlines()
+    assert subjects[:3] == [
+        "Seal attempt work for #24 (handoff_requested)",
+        "Handoff note: issue #24",
+        "Half-finish the parser",
+    ]
+    [comment] = [c for c in github.comments if "Agent Attempt Result: handoff" in c.body]
+    assert "Halfway done." in comment.body
+    assert git(clone_dir, "show", "agent/issue-24:parser.py") == "half done, plus uncommitted edits"

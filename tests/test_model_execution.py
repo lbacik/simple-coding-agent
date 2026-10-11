@@ -2813,3 +2813,189 @@ def test_compact_boundary_is_logged_without_touching_the_ledger(tmp_path: Path) 
     assert logged_a == ["thread=main; trigger=auto; pre_tokens=150000"]
     assert logged_b == ["thread=main; trigger=None; pre_tokens=None"]
     assert with_meta.token_budget == baseline.token_budget == without_meta.token_budget
+
+
+# --- Token soft-threshold two-call handoff (state snapshot) -------------------
+
+import os as _os
+import subprocess as _subprocess
+
+_ATTEMPT_ID = "2026-10-08T17:29:39.642231Z"
+
+
+def _git(cwd: Path, *arguments: str) -> str:
+    env = dict(_os.environ, GIT_EDITOR="true")
+    return _subprocess.run(
+        ("git", *arguments), cwd=cwd, env=env, check=True, text=True, capture_output=True
+    ).stdout.strip()
+
+
+def _snapshot_repo(tmp_path: Path, *, issue_number: int = 149) -> tuple[Path, str, str]:
+    """A git repo with a base commit, one work commit, and one dirty file."""
+
+    repo = tmp_path / "repo"
+    _git(tmp_path, "init", str(repo))
+    _git(repo, "config", "user.name", "Test User")
+    _git(repo, "config", "user.email", "test@example.com")
+    _git(repo, "checkout", "-b", "main")
+    (repo / "base.txt").write_text("base\n")
+    _git(repo, "add", "base.txt")
+    _git(repo, "commit", "-m", "Initial commit")
+    base = _git(repo, "rev-parse", "HEAD")
+    _git(repo, "checkout", "-b", f"agent/issue-{issue_number}")
+    (repo / "work.txt").write_text("half done\n")
+    _git(repo, "add", "work.txt")
+    _git(repo, "commit", "-m", "Half-finish the work")
+    (repo / "dirty.txt").write_text("uncommitted\n")
+    return repo, base, _git(repo, "rev-parse", "HEAD")
+
+
+def test_token_snapshot_carries_branch_state_and_prefilled_header(tmp_path: Path) -> None:
+    from simple_coding_agent.model_execution import _token_handoff_snapshot
+
+    repo, base, head = _snapshot_repo(tmp_path)
+
+    snapshot = _token_handoff_snapshot(
+        repo,
+        branch="agent/issue-149",
+        base_revision=base,
+        issue_number=149,
+        attempt_id=_ATTEMPT_ID,
+    )
+
+    assert "agent/issue-149" in snapshot
+    assert base in snapshot
+    assert head in snapshot
+    assert "dirty.txt" in snapshot  # git status --short
+    assert "Half-finish the work" in snapshot  # git log --oneline <base>..HEAD
+    assert "work.txt" in snapshot  # git diff --stat <base>
+    assert _ATTEMPT_ID in snapshot
+    assert "# Handoff note: issue #149" in snapshot
+    assert "- issue: 149" in snapshot
+    assert "- reason: token_soft_threshold" in snapshot
+    assert f"- last_work_commit: {head}" in snapshot
+
+
+def test_token_snapshot_caps_each_git_output_at_forty_lines(tmp_path: Path) -> None:
+    from simple_coding_agent.model_execution import (
+        _SNAPSHOT_LINE_LIMIT,
+        _cap_snapshot_lines,
+        _token_handoff_snapshot,
+    )
+
+    assert _SNAPSHOT_LINE_LIMIT == 40
+    assert _cap_snapshot_lines("\n".join(f"l{i}" for i in range(40))) .count("\n") == 39
+    capped = _cap_snapshot_lines("\n".join(f"l{i}" for i in range(65)))
+    assert capped.splitlines()[-1] == "...+25 more"
+    assert len(capped.splitlines()) == 41
+
+    repo = tmp_path / "repo"
+    _git(tmp_path, "init", str(repo))
+    _git(repo, "config", "user.name", "Test User")
+    _git(repo, "config", "user.email", "test@example.com")
+    _git(repo, "checkout", "-b", "main")
+    (repo / "base.txt").write_text("base\n")
+    _git(repo, "add", "base.txt")
+    _git(repo, "commit", "-m", "Initial commit")
+    base = _git(repo, "rev-parse", "HEAD")
+    for index in range(60):
+        (repo / f"untracked-{index:02d}.txt").write_text("noise\n")
+
+    snapshot = _token_handoff_snapshot(
+        repo, branch="main", base_revision=base, issue_number=149, attempt_id=_ATTEMPT_ID
+    )
+
+    status_section = snapshot.split("git status --short:\n")[1].split("\n\n")[0]
+    assert status_section.splitlines()[-1] == "...+20 more"
+    assert len(status_section.splitlines()) == 41
+
+
+def test_token_instruction_and_followup_share_snapshot_and_two_call_steps(
+    tmp_path: Path,
+) -> None:
+    from simple_coding_agent.model_execution import (
+        _cost_handoff_followup_prompt,
+        _cost_handoff_instruction,
+    )
+
+    repo, base, head = _snapshot_repo(tmp_path)
+
+    captured: list[FakeClient] = []
+
+    def client_factory(options: object) -> FakeClient:
+        client = FakeClient(options, [result()])
+        captured.append(client)
+        return client
+
+    executor = ModelExecutor(
+        replace(runtime_config(tmp_path), max_budget_tokens=1_000_000),
+        client_factory=client_factory,
+    )
+    asyncio.run(
+        executor.execute(
+            issue_body="Fix it.",
+            working_directory=repo,
+            issue_number=149,
+            attempt_id=_ATTEMPT_ID,
+            branch="agent/issue-149",
+            base_revision=base,
+        )
+    )
+    executor._ledger.start_thread("sub-1", kind="subagent", prompt_chars=0)
+    executor._ledger_threads.add("sub-1")
+    executor._ledger.observe_response("sub-1", "r-big", 0)
+    executor._ledger.observe_usage("sub-1", "r-big", {"input_tokens": 900_000})
+    executor._check_limits("sub-1")
+    post_hook = captured[0].options.hooks["PostToolUse"][0].hooks[0]
+    notice = asyncio.run(
+        post_hook(
+            {"tool_name": "Bash", "tool_input": {"command": "pytest"}, "tool_response": "ok"},
+            None,
+            {},
+        )
+    )["hookSpecificOutput"]["additionalContext"]
+
+    followup = _cost_handoff_followup_prompt(
+        149, _ATTEMPT_ID, snapshot=executor._token_followup_snapshot()
+    )
+    plain_instruction = _cost_handoff_instruction(149, _ATTEMPT_ID)
+
+    for text in (notice, followup):
+        assert "agent/issue-149" in text
+        assert base in text
+        assert head in text
+        assert "dirty.txt" in text
+        assert "Half-finish the work" in text
+        assert _ATTEMPT_ID in text
+        assert f"- last_work_commit: {head}" in text
+        assert "Do not run diagnostic commands" in text
+        assert "Do not commit work yourself" in text
+        assert "Sealing will commit any uncommitted work" in text
+        assert "pre-filled header" in text
+        assert "Summary, Remaining work and Evidence" in text
+        assert 'git add .agent/handoff/149.md && git commit -m "Handoff note: issue #149"' in text
+    # The follow-up reuses the injection-time snapshot instead of re-reading git.
+    assert executor._token_followup_snapshot() in followup
+    assert executor._token_followup_snapshot() in notice
+    # Without a snapshot the prompts keep their legacy wording.
+    assert "Do not run diagnostic commands" not in plain_instruction
+    assert "handoff" in plain_instruction
+    # The snapshot variant must not contradict the two-call steps: the legacy
+    # "commit any outstanding work" directive would tell the model to commit
+    # work the steps forbid it from touching.
+    assert "commit any outstanding work" not in followup
+    assert "commit any outstanding work" not in notice
+    legacy_followup = _cost_handoff_followup_prompt(149, _ATTEMPT_ID)
+    assert "commit any outstanding work" in legacy_followup
+
+
+def test_token_snapshot_degrades_outside_a_git_repo(tmp_path: Path) -> None:
+    from simple_coding_agent.model_execution import _token_handoff_snapshot
+
+    snapshot = _token_handoff_snapshot(
+        tmp_path, branch=None, base_revision=None, issue_number=None, attempt_id=None
+    )
+
+    assert "(unknown)" in snapshot
+    assert "(unavailable)" in snapshot
+    assert ".agent/handoff/<issue-number>.md" in snapshot
