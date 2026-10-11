@@ -55,3 +55,7 @@ _Avoid_: Cost threshold, warning limit
 **Hard ceiling**:
 The point at which the attempt is stopped regardless of the model, whether or not it has handed off.
 _Avoid_: Budget cap, kill limit
+
+**Pinned runtime**:
+The single approved agent-SDK release, together with the Claude Code CLI shipped inside it, that every model execution must run on. Pinning the SDK pins the CLI; the CLI never has a version of its own to keep in step. Provenance verification confirms at startup that the CLI about to run is exactly the one this release ships, and refuses to start otherwise.
+_Avoid_: Runtime pair, SDK and CLI pins, the CLI on PATH
