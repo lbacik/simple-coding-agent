@@ -151,3 +151,48 @@ def test_never_moves_updated_at_before_started_at_when_the_clock_repeats(
     assert transitioned.started_at == "2026-09-20T13:00:00.000001Z"
     assert attempt.started_at == transitioned.started_at
     assert transitioned.updated_at == "2026-09-20T13:00:00.000002Z"
+
+
+def test_claim_time_auto_merge_opt_in_defaults_to_false(tmp_path: Path) -> None:
+    store = AttemptStateStore(tmp_path)
+
+    attempt = store.start(issue_number=42, branch="agent/issue-42")
+
+    assert attempt.auto_merge_opt_in is False
+
+
+def test_claim_time_auto_merge_opt_in_survives_transitions(tmp_path: Path) -> None:
+    started = datetime(2026, 9, 20, 13, 0, tzinfo=UTC)
+    store = AttemptStateStore(tmp_path, clock=SequenceClock(started, started))
+
+    store.start(issue_number=42, branch="agent/issue-42", auto_merge_opt_in=True)
+
+    transitioned = store.transition(AttemptPhase.SETUP)
+
+    assert transitioned.auto_merge_opt_in is True
+    assert store.read() is not None
+    assert store.read().auto_merge_opt_in is True
+
+
+def test_checkpoint_without_opt_in_reads_as_not_opted_in(tmp_path: Path) -> None:
+    path = tmp_path / "state" / "attempt.json"
+    path.parent.mkdir()
+    path.write_text(
+        '{"branch": "agent/issue-42", "issue_number": 42, "phase": "claimed",'
+        ' "started_at": "2026-09-20T13:00:00Z", "updated_at": "2026-09-20T13:00:00Z"}'
+    )
+
+    assert AttemptStateStore(tmp_path).read().auto_merge_opt_in is False
+
+
+def test_checkpoint_with_a_non_boolean_opt_in_is_malformed(tmp_path: Path) -> None:
+    path = tmp_path / "state" / "attempt.json"
+    path.parent.mkdir()
+    path.write_text(
+        '{"auto_merge_opt_in": "yes", "branch": "agent/issue-42", "issue_number": 42,'
+        ' "phase": "claimed", "started_at": "2026-09-20T13:00:00Z",'
+        ' "updated_at": "2026-09-20T13:00:00Z"}'
+    )
+
+    with pytest.raises(AttemptStateError, match="malformed"):
+        AttemptStateStore(tmp_path).read()

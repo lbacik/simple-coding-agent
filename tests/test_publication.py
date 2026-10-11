@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
+import pytest
+
 from simple_coding_agent.completion import AttemptOutcome, CompletionDecision, PublicationPath
 from simple_coding_agent.attempt_state import AttemptPhase, AttemptStateStore
 from simple_coding_agent.git_workspace import GitWorkspace, GitWorkspaceError
@@ -518,3 +520,129 @@ def test_merge_step_is_idempotent_when_direct_merge_reports_already_merged(
     assert result.outcome is AttemptOutcome.COMPLETE
     assert result.merge_result == "merged"
     assert "auto-merge failed" not in github.comments[0][1]
+
+
+def test_label_mode_merges_when_the_issue_was_opted_in_at_claim_time(tmp_path: Path) -> None:
+    remote, _ = repository_with_main(tmp_path)
+    workspace = GitWorkspace(tmp_path / "clone", str(remote), token_provider=lambda: "token")
+    prepared = workspace.prepare_attempt(base_branch="main", issue_number=23)
+    write_and_commit(tmp_path / "clone", "feature.txt", "done", "Implement publication")
+    github = FakeGitHub()
+
+    published = publish_label_mode(workspace, github, prepared.branch, opt_in=True)
+
+    assert published.outcome is AttemptOutcome.COMPLETE
+    assert published.merge_result == "auto-merge enabled (merge)"
+    assert github.auto_merge_calls == [("octo/example", 1, "merge")]
+    assert github.merge_calls == []
+    assert "**Merge**: auto-merge enabled (merge)" in github.comments[0][1]
+
+
+def test_label_mode_skips_the_merge_step_without_opt_in(tmp_path: Path) -> None:
+    remote, _ = repository_with_main(tmp_path)
+    workspace = GitWorkspace(tmp_path / "clone", str(remote), token_provider=lambda: "token")
+    prepared = workspace.prepare_attempt(base_branch="main", issue_number=23)
+    write_and_commit(tmp_path / "clone", "feature.txt", "done", "Implement publication")
+    github = FakeGitHub()
+
+    published = publish_label_mode(workspace, github, prepared.branch, opt_in=False)
+
+    assert published.outcome is AttemptOutcome.COMPLETE
+    assert published.pull_request == PullRequest(1, "https://example.test/pulls/1", "pr-node-1")
+    assert published.merge_result == (
+        "auto-merge skipped (issue not labelled `agent-auto-merge` at claim time)"
+    )
+    assert github.auto_merge_calls == []
+    assert github.merge_calls == []
+    assert (
+        "**Merge**: auto-merge skipped (issue not labelled `agent-auto-merge` at claim time)"
+        in github.comments[0][1]
+    )
+
+
+def test_label_mode_skips_when_the_request_carries_no_claim_time_decision(
+    tmp_path: Path,
+) -> None:
+    remote, _ = repository_with_main(tmp_path)
+    workspace = GitWorkspace(tmp_path / "clone", str(remote), token_provider=lambda: "token")
+    prepared = workspace.prepare_attempt(base_branch="main", issue_number=23)
+    write_and_commit(tmp_path / "clone", "feature.txt", "done", "Implement publication")
+    github = FakeGitHub()
+
+    result = Publisher(workspace, github, "octo/example", auto_merge="label").publish(
+        request(CompletionDecision(None, True, PublicationPath.COMPLETE, ("ready",)), prepared.branch)
+    )
+
+    assert result.outcome is AttemptOutcome.COMPLETE
+    assert result.pull_request is not None
+    assert result.merge_result == (
+        "auto-merge skipped (issue not labelled `agent-auto-merge` at claim time)"
+    )
+    assert github.auto_merge_calls == []
+    assert github.merge_calls == []
+
+
+def test_true_mode_still_merges_without_an_opt_in(tmp_path: Path) -> None:
+    remote, _ = repository_with_main(tmp_path)
+    workspace = GitWorkspace(tmp_path / "clone", str(remote), token_provider=lambda: "token")
+    prepared = workspace.prepare_attempt(base_branch="main", issue_number=23)
+    write_and_commit(tmp_path / "clone", "feature.txt", "done", "Implement publication")
+    github = FakeGitHub()
+
+    result = Publisher(workspace, github, "octo/example", auto_merge=True).publish(
+        request(CompletionDecision(None, True, PublicationPath.COMPLETE, ("ready",)), prepared.branch)
+    )
+
+    assert result.outcome is AttemptOutcome.COMPLETE
+    assert result.merge_result == "auto-merge enabled (merge)"
+    assert github.auto_merge_calls == [("octo/example", 1, "merge")]
+
+
+def test_false_mode_never_merges_even_when_opted_in(tmp_path: Path) -> None:
+    remote, _ = repository_with_main(tmp_path)
+    workspace = GitWorkspace(tmp_path / "clone", str(remote), token_provider=lambda: "token")
+    prepared = workspace.prepare_attempt(base_branch="main", issue_number=23)
+    write_and_commit(tmp_path / "clone", "feature.txt", "done", "Implement publication")
+    github = FakeGitHub()
+
+    result = Publisher(workspace, github, "octo/example", auto_merge="false").publish(
+        publish_request(prepared.branch, opt_in=True)
+    )
+
+    assert result.outcome is AttemptOutcome.COMPLETE
+    assert result.merge_result is None
+    assert github.auto_merge_calls == []
+    assert github.merge_calls == []
+    assert "**Merge**" not in github.comments[0][1]
+
+
+def test_rejects_an_unknown_auto_merge_mode(tmp_path: Path) -> None:
+    remote, _ = repository_with_main(tmp_path)
+    workspace = GitWorkspace(tmp_path / "clone", str(remote), token_provider=lambda: "token")
+
+    with pytest.raises(ValueError, match="auto_merge"):
+        Publisher(workspace, FakeGitHub(), "octo/example", auto_merge="sometimes")
+
+
+def publish_request(branch: str, *, opt_in: bool) -> PublicationRequest:
+    base = request(CompletionDecision(None, True, PublicationPath.COMPLETE, ("ready",)), branch)
+    return PublicationRequest(
+        base.issue_number,
+        base.issue_title,
+        base.branch,
+        base.started_at,
+        base.decision,
+        base.check_command,
+        base.check_exit_code,
+        base.review_cycles,
+        base.review_findings,
+        base.details,
+        base.base_branch,
+        auto_merge_opt_in=opt_in,
+    )
+
+
+def publish_label_mode(workspace, github: FakeGitHub, branch: str, *, opt_in: bool):
+    return Publisher(workspace, github, "octo/example", auto_merge="label").publish(
+        publish_request(branch, opt_in=opt_in)
+    )

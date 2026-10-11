@@ -67,7 +67,7 @@ from simple_coding_agent.github_tracker import (
 from simple_coding_agent.model_execution import ModelExecutionStatus, ModelExecutor, OperatorHandoff, ToolCallRecord
 from simple_coding_agent.observability import AttemptArchive
 from simple_coding_agent.operating import ConsecutiveErrorStore
-from simple_coding_agent.publication import PublicationRequest
+from simple_coding_agent.publication import AUTO_MERGE_LABEL, PublicationRequest
 
 
 class AttemptInterruptionHandler:
@@ -1585,6 +1585,7 @@ class AgentLifecycle:
                     details=details,
                     base_branch=profile.base_branch,
                     note_commit_sha=note_sha,
+                    auto_merge_opt_in=_claim_time_opt_in(claim, checkpoint),
                 )
             )
         except Exception as error:
@@ -2393,6 +2394,7 @@ class AgentLifecycle:
                 published = self._publish_terminal(
                     claim, checkpoint.started_at, prepared, profile, outcome,
                     timeout=self._handoff_publish_budget(),
+                    auto_merge_opt_in=_claim_time_opt_in(claim, checkpoint),
                 )
                 comment_posted = getattr(published, "comment_posted", True)
             else:
@@ -2413,6 +2415,7 @@ class AgentLifecycle:
                         details=evidence.details,
                         base_branch=profile.base_branch,
                         note_commit_sha=evidence.note_commit_sha,
+                        auto_merge_opt_in=_claim_time_opt_in(claim, checkpoint),
                     )
                 )
                 outcome = published.outcome
@@ -2457,6 +2460,7 @@ class AgentLifecycle:
             published = self._publish_rebase_conflict(
                 claim, checkpoint.started_at, prepared, profile, error,
                 timeout=self._handoff_publish_budget(),
+                auto_merge_opt_in=_claim_time_opt_in(claim, checkpoint),
             )
             outcome = AttemptOutcome.INFRASTRUCTURE_ERROR
             comment_posted = getattr(published, "comment_posted", True)
@@ -2468,6 +2472,7 @@ class AgentLifecycle:
             published = self._publish_terminal(
                 claim, checkpoint.started_at, prepared, profile, outcome,
                 timeout=self._handoff_publish_budget(),
+                auto_merge_opt_in=_claim_time_opt_in(claim, checkpoint),
             )
             comment_posted = getattr(published, "comment_posted", True)
         except BaseException as error:
@@ -2483,6 +2488,7 @@ class AgentLifecycle:
                 published = self._publish_terminal(
                     claim, checkpoint.started_at, prepared, profile, outcome,
                     timeout=self._handoff_publish_budget(),
+                    auto_merge_opt_in=_claim_time_opt_in(claim, checkpoint),
                 )
                 comment_posted = getattr(published, "comment_posted", True)
             except Exception:
@@ -2663,7 +2669,9 @@ class AgentLifecycle:
                 )
                 return (None, None)
             checkpoint = self._attempt_state.start(
-                issue_number=claim.issue.number, branch=f"agent/issue-{claim.issue.number}"
+                issue_number=claim.issue.number,
+                branch=f"agent/issue-{claim.issue.number}",
+                auto_merge_opt_in=AUTO_MERGE_LABEL in claim.issue.labels,
             )
             self._attempt_processing = True
             if self._control_store is not None:
@@ -2775,7 +2783,9 @@ class AgentLifecycle:
             issue_number=claim.issue.number,
         )
         checkpoint = self._attempt_state.start(
-            issue_number=claim.issue.number, branch=f"agent/issue-{claim.issue.number}"
+            issue_number=claim.issue.number,
+            branch=f"agent/issue-{claim.issue.number}",
+            auto_merge_opt_in=AUTO_MERGE_LABEL in claim.issue.labels,
         )
         self._attempt_processing = True
         return (claim, checkpoint)
@@ -3435,6 +3445,7 @@ class AgentLifecycle:
                     details=details,
                     base_branch=profile.base_branch,
                     note_commit_sha=note_commit_sha,
+                    auto_merge_opt_in=_claim_time_opt_in(claim, checkpoint),
                 )
             )
             outcome = published.outcome
@@ -3483,6 +3494,7 @@ class AgentLifecycle:
             published = self._publish_rebase_conflict(
                 claim, checkpoint.started_at, prepared, profile, error,
                 timeout=self._handoff_publish_budget(),
+                auto_merge_opt_in=_claim_time_opt_in(claim, checkpoint),
             )
             outcome = AttemptOutcome.INFRASTRUCTURE_ERROR
             comment_posted = getattr(published, "comment_posted", True)
@@ -3494,6 +3506,7 @@ class AgentLifecycle:
             published = self._publish_terminal(
                 claim, checkpoint.started_at, prepared, profile, AttemptOutcome.INFRASTRUCTURE_ERROR,
                 timeout=self._handoff_publish_budget(),
+                auto_merge_opt_in=_claim_time_opt_in(claim, checkpoint),
             )
             outcome = AttemptOutcome.INFRASTRUCTURE_ERROR
             comment_posted = getattr(published, "comment_posted", True)
@@ -3506,6 +3519,7 @@ class AgentLifecycle:
                 published = self._publish_terminal(
                     claim, checkpoint.started_at, prepared, profile, AttemptOutcome.INFRASTRUCTURE_ERROR,
                     timeout=self._handoff_publish_budget(),
+                    auto_merge_opt_in=_claim_time_opt_in(claim, checkpoint),
                 )
                 comment_posted = getattr(published, "comment_posted", True)
             except Exception:
@@ -3609,6 +3623,7 @@ class AgentLifecycle:
         outcome: AttemptOutcome,
         details: str = "Repository profile could not be loaded or the attempt could not start.",
         timeout: float | None = None,
+        auto_merge_opt_in: bool = False,
     ):
         branch = prepared.branch if prepared is not None else f"agent/issue-{claim.issue.number}"
         base_branch = profile.base_branch if profile is not None else "main"
@@ -3624,6 +3639,7 @@ class AgentLifecycle:
             review_findings="not run",
             details=details,
             base_branch=base_branch,
+            auto_merge_opt_in=auto_merge_opt_in,
         )
         if timeout is None:
             return self._publisher.publish(request)
@@ -3637,6 +3653,7 @@ class AgentLifecycle:
         profile: RepositoryProfile | None,
         error: RebaseConflictError,
         timeout: float | None = None,
+        auto_merge_opt_in: bool = False,
     ):
         """Report an unresolvable rebase conflict as the terminal infrastructure error.
 
@@ -3666,6 +3683,7 @@ class AgentLifecycle:
                 "instead of as an unrelated setup error."
             ),
             timeout=timeout,
+            auto_merge_opt_in=auto_merge_opt_in,
         )
 
     def _record_terminal_outcome(
@@ -3740,6 +3758,20 @@ def _remaining_conflicts(state: ConflictState, prepared: PreparedAttempt) -> tup
     return state.conflicted_files or tuple(
         str(path) for path in (prepared.rebase_conflicts or ()) if str(path).strip()
     )
+
+
+def _claim_time_opt_in(claim: Claim, checkpoint: AttemptCheckpoint | None) -> bool:
+    """Whether the issue was opted into auto-merge when it was claimed.
+
+    The checkpoint recorded the label set at claim time, so a label added
+    while the attempt runs (or after it finishes) never enables that
+    attempt's merge — including when a crashed attempt is recovered, where
+    the re-read claim carries the current labels instead.
+    """
+
+    if checkpoint is not None:
+        return bool(getattr(checkpoint, "auto_merge_opt_in", False))
+    return AUTO_MERGE_LABEL in claim.issue.labels
 
 
 def _attempt_id(checkpoint: AttemptCheckpoint | None) -> str:

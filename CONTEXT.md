@@ -17,7 +17,7 @@ A proposed solution that satisfies the implementation issue's acceptance criteri
 _Avoid_: Successful model response, merged issue
 
 **Auto-merge**:
-The orchestrator-owned follow-up that asks GitHub to merge a complete implementation's pull request when the operator sets `PR_AUTO_MERGE=true`. Auto-merge is distinct from completion: it never decides whether the solution is correct, only whether GitHub should merge an already-published PR (natively once branch protection passes, or directly when the PR is already mergeable). A failed merge step is reported in the result comment and leaves the attempt `complete`.
+The orchestrator-owned follow-up that asks GitHub to merge a complete implementation's pull request when the operator sets `PR_AUTO_MERGE=true`. Auto-merge is distinct from completion: it never decides whether the solution is correct, only whether GitHub should merge an already-published PR (natively once branch protection passes, or directly when the PR is already mergeable). A failed merge step is reported in the result comment and leaves the attempt `complete`. With `PR_AUTO_MERGE=label` the follow-up runs only for issues explicitly opted in with the `agent-auto-merge` label at claim time; an unopted issue still gets its PR, and the result comment reports that auto-merge was skipped for lack of opt-in.
 _Avoid_: Merged issue, human merge
 
 **Eligible issue**:
