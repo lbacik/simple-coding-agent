@@ -3847,7 +3847,7 @@ def _execute_model(
     call shape for them instead of failing the attempt.
     """
 
-    execute = getattr(model_executor, "execute")
+    execute = model_executor.execute  # type: ignore[attr-defined]
     try:
         return execute(
             issue_body=issue_body,
