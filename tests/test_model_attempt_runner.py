@@ -17,7 +17,7 @@ from simple_coding_agent.completion import (
 from simple_coding_agent.config import RepositoryProfile
 from simple_coding_agent.github_tracker import Assignment, Claim, TrackerIssue
 from simple_coding_agent.git_workspace import PreparedAttempt, RebaseConflictError
-from simple_coding_agent.lifecycle import ModelAttemptRunner
+from simple_coding_agent.lifecycle import ModelAttemptRunner, _build_starting_prompt
 from simple_coding_agent.model_execution import ModelExecution, ModelExecutionStatus
 from tests.fakes import InMemoryWorkspace
 
@@ -574,6 +574,177 @@ def test_baseline_failure_aborts_on_fresh_attempt_and_logs_error(
     assert executor.captured_prompt is None
 
 
+def failed_baseline(
+    *,
+    command: str = "vendor/bin/php-cs-fixer fix --dry-run --diff",
+    exit_code: int | None = 8,
+    stdout: str = "checked files",
+    stderr: str = "style violations",
+    timed_out: bool = False,
+    succeeded: bool = False,
+):
+    """Build a baseline-shaped stub carrying one failing command execution."""
+
+    return SimpleNamespace(
+        succeeded=succeeded,
+        commands=(
+            SimpleNamespace(
+                command=command,
+                exit_code=exit_code,
+                stdout=stdout,
+                stderr=stderr,
+                timed_out=timed_out,
+            ),
+        ),
+    )
+
+
+def test_starting_prompt_with_failed_baseline_names_command_and_both_streams() -> None:
+    """A red continuation baseline is quoted into the prompt with both streams.
+
+    Linters such as ``php-cs-fixer --dry-run --diff`` report on stdout, so
+    stderr alone (what the event detail carries) is not enough for the model
+    to diagnose the failure.
+    """
+
+    prompt = _build_starting_prompt(
+        "Fix the parser.",
+        (),
+        continuation=True,
+        issue_number=24,
+        profile=profile(),
+        baseline=failed_baseline(stdout="1) src/Foo.php", stderr="found violations"),
+    )
+
+    assert "vendor/bin/php-cs-fixer fix --dry-run --diff" in prompt
+    assert "exit 8" in prompt
+    assert "1) src/Foo.php" in prompt
+    assert "found violations" in prompt
+    assert "must pass this check before the work is considered done" in prompt
+
+
+def test_starting_prompt_with_failed_baseline_keeps_issue_body_and_handoff_pointer() -> None:
+    prompt = _build_starting_prompt(
+        "Fix the parser.",
+        ("keep the old retry behaviour",),
+        continuation=True,
+        issue_number=24,
+        profile=profile(),
+        baseline=failed_baseline(),
+    )
+
+    assert prompt.startswith("Fix the parser.\n\nkeep the old retry behaviour\n\n")
+    assert ".agent/handoff/24.md" in prompt
+
+
+def test_starting_prompt_truncates_long_baseline_output_from_the_front() -> None:
+    stdout = "old line\n" * 2000 + "final stdout line"
+    stderr = "old err\n" * 2000 + "final stderr line"
+
+    prompt = _build_starting_prompt(
+        "Fix the parser.",
+        (),
+        continuation=True,
+        issue_number=24,
+        profile=profile(),
+        baseline=failed_baseline(stdout=stdout, stderr=stderr),
+    )
+
+    assert "final stdout line" in prompt
+    assert "final stderr line" in prompt
+    # Cut from the front: most of the repeated head is gone from each stream.
+    assert prompt.count("old line") < 2000
+    assert prompt.count("old err") < 2000
+    assert "truncat" in prompt.lower()
+
+
+def test_starting_prompt_with_passing_baseline_is_unchanged() -> None:
+    baseline = failed_baseline(succeeded=True)
+
+    prompt = _build_starting_prompt(
+        "Fix the parser.",
+        ("keep the old retry behaviour",),
+        continuation=True,
+        issue_number=24,
+        profile=profile(),
+        baseline=baseline,
+    )
+
+    assert prompt == _build_starting_prompt(
+        "Fix the parser.",
+        ("keep the old retry behaviour",),
+        continuation=True,
+        issue_number=24,
+        profile=profile(),
+    )
+    assert "Baseline check failure" not in prompt
+
+
+def test_starting_prompt_without_baseline_is_unchanged() -> None:
+    prompt = _build_starting_prompt(
+        "Fix the parser.", (), continuation=False, issue_number=24, profile=profile()
+    )
+
+    assert prompt.startswith("Fix the parser.\n\n---\n## Completion gate")
+    assert "Baseline check failure" not in prompt
+
+
+def test_continuation_with_red_baseline_dispatches_prompt_with_failure(
+    tmp_path: Path,
+) -> None:
+    """Lifecycle: a tolerated red baseline on a continuation reaches the model."""
+
+    executor = FakeModelExecutor()
+    workspace = seeded_workspace(tmp_path / "repo", "Previous work")
+    verifier = FakeVerifier(
+        baseline_succeeded=False,
+        baseline_commands=(
+            SimpleNamespace(
+                command="vendor/bin/php-cs-fixer fix --dry-run --diff",
+                exit_code=8,
+                stdout="1) src/Foo.php",
+                stderr="found violations",
+                timed_out=False,
+            ),
+        ),
+    )
+    runner = build_runner(
+        tmp_path, model_executor=executor, workspace=workspace, verifier=verifier
+    )
+
+    runner(claim(issue_number=24, issue_body="Fix the parser."), profile(), FakePrepared())
+
+    assert executor.captured_prompt is not None
+    assert "vendor/bin/php-cs-fixer fix --dry-run --diff" in executor.captured_prompt
+    assert "exit 8" in executor.captured_prompt
+    assert "1) src/Foo.php" in executor.captured_prompt
+    assert "found violations" in executor.captured_prompt
+    assert "must pass this check before the work is considered done" in (
+        executor.captured_prompt
+    )
+    # The gate stays last: the baseline failure comes before it.
+    assert executor.captured_prompt.index("Baseline check failure") < (
+        executor.captured_prompt.index("## Completion gate")
+    )
+
+
+def test_continuation_with_green_baseline_dispatches_unchanged_prompt(
+    tmp_path: Path,
+) -> None:
+    executor = FakeModelExecutor()
+    workspace = seeded_workspace(tmp_path / "repo", "Previous work")
+    runner = build_runner(
+        tmp_path, model_executor=executor, workspace=workspace
+    )
+
+    runner(claim(issue_number=24, issue_body="Fix the parser."), profile(), FakePrepared())
+
+    assert executor.captured_prompt == _build_starting_prompt(
+        "Fix the parser.", (), continuation=True, issue_number=24, profile=profile()
+    )
+    assert "Baseline check failure" not in executor.captured_prompt
+
+
 class FakeModelExecutor:
     def __init__(
         self,
@@ -611,10 +782,12 @@ class FakeVerifier:
         baseline_succeeded: bool = True,
         setup_succeeded: bool = True,
         calls: "list[str] | None" = None,
+        baseline_commands: tuple[object, ...] | None = None,
     ) -> None:
         self._baseline_succeeded = baseline_succeeded
         self._setup_succeeded = setup_succeeded
         self._calls = calls
+        self._baseline_commands = baseline_commands
 
     def prepare(self, profile: object, working_directory: Path, **kwargs: object):
         if self._calls is not None:
@@ -627,7 +800,7 @@ class FakeVerifier:
         )
         baseline = SimpleNamespace(
             succeeded=self._baseline_succeeded,
-            commands=(),
+            commands=self._baseline_commands if self._baseline_commands is not None else (),
             exit_code=0 if self._baseline_succeeded else 1,
         )
         return SimpleNamespace(setup=setup, baseline=baseline)

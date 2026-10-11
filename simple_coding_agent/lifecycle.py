@@ -370,6 +370,18 @@ class ModelAttemptRunner:
         # point is carried over from a resumed attempt, not produced by this
         # run. `commits_added` is read again after the model runs to count
         # what this run itself added.
+        # A tolerated red baseline on a continuation is the model's to fix
+        # (it almost always comes from the earlier attempt's own commits), so
+        # the failure rides along in the starting prompt. A red first-attempt
+        # baseline never reaches here: preparation returns early above.
+        failed_baseline = None
+        if (
+            preparation is not None
+            and continuation
+            and preparation.baseline is not None
+            and not preparation.baseline.succeeded
+        ):
+            failed_baseline = preparation.baseline
         prompt_body = _build_starting_prompt(
             claim.issue.body,
             self._issue_comments(claim.issue),
@@ -378,6 +390,7 @@ class ModelAttemptRunner:
             profile=profile,
             redactions=self._prompt_redactions,
             setup_deferred=setup_deferred,
+            baseline=failed_baseline,
         )
         self._event_log(
             "model_dispatch_starting",
@@ -3822,13 +3835,25 @@ def _attempt_evidence(
     )
 
 
-def _command_failure_detail(result: object, *, limit: int = 4000) -> str:
-    """Surface the failing command and its stderr for the live event stream."""
+def _select_failed_command(result: object):
+    """Return the command execution the failure detail blames.
+
+    The first command with a non-zero exit wins; when every command exited
+    cleanly (a timeout leaves the trailing command with ``exit_code None``)
+    the last command is blamed instead. ``None`` means no command ran.
+    """
 
     commands = getattr(result, "commands", ())
     failed = next((command for command in commands if getattr(command, "exit_code", 0) != 0), None)
     if failed is None and commands:
         failed = commands[-1]
+    return failed
+
+
+def _command_failure_detail(result: object, *, limit: int = 4000) -> str:
+    """Surface the failing command and its stderr for the live event stream."""
+
+    failed = _select_failed_command(result)
     if failed is None:
         return "timed out before any command ran"
     stderr = (getattr(failed, "stderr", "") or "").strip()
@@ -3920,6 +3945,62 @@ def _gate_section(profile: RepositoryProfile, redactions: Sequence[str]) -> str:
     return "\n".join(lines)
 
 
+#: Per-stream cap for baseline failure output quoted in the model starting
+#: prompt. Matches the scale of the event-detail limit: bounded, but enough
+#: for the model to diagnose the failure. Output is cut from the front so the
+#: tail (usually the summary a linter prints last) survives.
+_BASELINE_PROMPT_STREAM_LIMIT = 4000
+
+
+def _tail_stream(output: object, *, limit: int = _BASELINE_PROMPT_STREAM_LIMIT) -> str:
+    """Keep the end of a command stream, marking front-truncation visibly."""
+
+    text = output if isinstance(output, str) else (output or "")
+    if not text.strip():
+        return "(no output)"
+    if len(text) <= limit:
+        return text
+    return f"...[truncated; showing the last {limit} characters]\n{text[-limit:]}"
+
+
+def _build_baseline_failure_section(baseline: object) -> str:
+    """Render a red pre-model baseline for the continuation starting prompt.
+
+    The baseline output is already credential-scrubbed by the command runner;
+    this only selects and bounds what the model sees. Both streams are quoted:
+    linters such as ``php-cs-fixer --dry-run --diff`` report on stdout, so
+    stderr alone is not enough to diagnose the failure.
+    """
+
+    header = (
+        "## Baseline check failure (fix before finishing)\n\n"
+        "The baseline check — the same gate the final check uses — failed on the "
+        "current branch before this attempt started"
+    )
+    instruction = (
+        "This failure most likely comes from the earlier attempt's own commits on "
+        "this branch. You must pass this check before the work is considered done: "
+        "fix the underlying failure as part of this attempt rather than working "
+        "around it."
+    )
+    failed = _select_failed_command(baseline)
+    if failed is None:
+        return f"{header} (it timed out before any command ran).\n\n{instruction}"
+    command = getattr(failed, "command", "")
+    if getattr(failed, "timed_out", False) or getattr(failed, "exit_code", None) is None:
+        result = "timed out"
+    else:
+        result = f"exit {getattr(failed, 'exit_code', None)}"
+    return (
+        f"{header}: `{command}` ({result}).\n\n"
+        f"{instruction}\n\n"
+        "Failing command stdout (tail):\n"
+        f"```\n{_tail_stream(getattr(failed, 'stdout', ''))}\n```\n\n"
+        "Failing command stderr (tail):\n"
+        f"```\n{_tail_stream(getattr(failed, 'stderr', ''))}\n```"
+    )
+
+
 def _build_starting_prompt(
     issue_body: str,
     comments: Sequence[str],
@@ -3929,6 +4010,7 @@ def _build_starting_prompt(
     profile: RepositoryProfile,
     redactions: Sequence[str] = (),
     setup_deferred: bool = False,
+    baseline: object | None = None,
 ) -> str:
     """Compose the model's starting context from the issue body and trusted comments.
 
@@ -3937,6 +4019,12 @@ def _build_starting_prompt(
     sentence: the handoff note's own content is never fetched or digested
     here, since it is already reachable on the resumed branch. A
     setup-deferred attempt adds the rebase-conflict resolution instruction.
+
+    A failed pre-model ``baseline`` (only possible on a tolerated continuation
+    baseline; a red first-attempt baseline stops before dispatch) adds the
+    failure section so the model knows the branch is red and what to fix. A
+    passing or absent baseline leaves the prompt byte-for-byte unchanged.
+
     Every prompt ends with the repository check gate so the model knows
     which commands the final check runs, in which order.
     """
@@ -3954,6 +4042,8 @@ def _build_starting_prompt(
             "files, stage with git add, and run git rebase --continue until the rebase completes), "
             "then continue the implementation."
         )
+    if baseline is not None and not getattr(baseline, "succeeded", True):
+        parts.append(_build_baseline_failure_section(baseline))
     parts.append(_gate_section(profile, redactions))
     return "\n\n".join(parts)
 
