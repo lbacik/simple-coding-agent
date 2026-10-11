@@ -662,7 +662,7 @@ class ModelAttemptRunner:
         )
         if decision.publication_eligible or decision.publication_path is PublicationPath.PARTIAL:
             self._attempt_state.transition(AttemptPhase.PUSHING)
-        findings = "all clear" if not review.findings else "; ".join(finding.summary for finding in review.findings)
+        findings = _review_findings_text(review, review_count)
         details = execution.explanation
         note_commit_sha = None
         if decision.outcome is AttemptOutcome.HANDOFF:
@@ -3786,6 +3786,22 @@ def _attempt_id(checkpoint: AttemptCheckpoint | None) -> str:
     if checkpoint is None:
         return "unknown"
     return checkpoint.started_at
+
+
+def _review_findings_text(review: ReviewEvidence, review_count: int) -> str:
+    """Render the published "Review findings" line without claiming uncollected work.
+
+    Findings are never parsed out of the ``code-review`` skill output (tracked
+    separately), so an empty tuple must not read as ``all clear``: when the
+    skill was invoked its findings were not collected, and when it was never
+    invoked no review ran.
+    """
+
+    if review.findings:
+        return "; ".join(finding.summary for finding in review.findings)
+    if review_count > 0:
+        return "not collected"
+    return "not run"
 
 
 def _attempt_evidence(
