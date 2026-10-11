@@ -37,7 +37,7 @@ The structured result of an implementation attempt. Exactly one of: `complete` (
 _Avoid_: Status, result code, exit status
 
 **Handoff note**:
-The durable record of a `handoff` outcome: a committed file at a fixed per-issue path (`.agent/handoff/<issue-number>.md`) describing remaining work, plus a verbatim copy posted as an issue comment. The comment copy is what a continuation's starting prompt is enriched with; the file itself is only pointed at, never digested, since it is already reachable on the resumed branch.
+The durable record of a `handoff` outcome: a committed file at a fixed per-issue path (`.agent/handoff/<issue-number>.md`) describing remaining work, plus a verbatim copy posted as an issue comment. The comment copy is what a continuation's starting prompt is enriched with; the file itself is only pointed at, never digested, since it is already reachable on the resumed branch. Its `started_at` field is the attempt id (the attempt checkpoint's `started_at`, the same value as the `<!-- agent-attempt: ... -->` marker): an informational value owned by the driving process, never a gate on the handoff.
 _Avoid_: Progress note, status update, summary
 
 **Attempt workspace**:

@@ -28,7 +28,8 @@ other publishing command.
    # Handoff note: issue #<issue-number>
 
    - issue: <issue-number>
-   - started_at: <UTC ISO-8601 timestamp, e.g. from `date -u +%Y-%m-%dT%H:%M:%SZ`>
+   - started_at: <the attempt id given in the handoff instruction; write it
+     verbatim. If no attempt id was given, omit this line>
    - reason: <token_soft_threshold | token_hard_ceiling | cost_hard_limit | turn_limit | time_limit | operator_request>
    - last_work_commit: <SHA of the last commit from step 1, or the branch's
      existing HEAD if step 1 committed nothing>
