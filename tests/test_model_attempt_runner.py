@@ -456,7 +456,7 @@ def test_logs_final_check_start_and_success(tmp_path: Path) -> None:
 
     runner(claim(issue_number=24, issue_body="Fix the parser."), profile(), FakePrepared())
 
-    assert events[-2:] == ["final_check_started", "final_check_succeeded"]
+    assert events[-3:] == ["final_check_started", "final_check_succeeded", "completion_decided"]
 
 
 def test_writes_final_check_markers_to_the_archive(tmp_path: Path) -> None:
@@ -523,6 +523,7 @@ def test_logs_setup_baseline_and_model_dispatch_stages(tmp_path: Path) -> None:
         "setup_succeeded",
         "baseline_check_succeeded",
         "model_dispatch_starting",
+        "completion_decided",
     ]
     assert all(issue_number == 24 for _, issue_number in events)
 
@@ -549,6 +550,7 @@ def test_baseline_failure_tolerated_on_continuation_and_logs_warning(tmp_path: P
         ("setup_succeeded", "INFO"),
         ("baseline_check_failed", "WARNING"),
         ("model_dispatch_starting", "INFO"),
+        ("completion_decided", "WARNING"),
     ]
     assert executor.captured_prompt is not None
 
@@ -575,6 +577,7 @@ def test_baseline_failure_aborts_on_fresh_attempt_and_logs_error(
         ("setup_started", "INFO"),
         ("setup_succeeded", "INFO"),
         ("baseline_check_failed", "ERROR"),
+        ("completion_decided", "WARNING"),
     ]
     assert executor.captured_prompt is None
 
