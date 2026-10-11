@@ -76,24 +76,53 @@ _HANDOFF_SKILL_TOOL_HINT = (
 )
 
 
-def _cost_handoff_instruction(issue_number: int | None) -> str:
+def _attempt_id_sentence(attempt_id: str | None) -> str:
+    """Name the attempt id every handoff instruction must carry.
+
+    The value is the ``started_at`` the model must write verbatim into the
+    handoff note. When the driving process supplied no attempt id, the
+    sentence says so and tells the model to leave the field out: the field
+    is informational and never blocks the handoff.
+    """
+
+    if attempt_id is not None:
+        return (
+            f" Your attempt id is `{attempt_id}`; write it verbatim as the"
+            " `started_at` field in the handoff note."
+        )
+    return (
+        " No attempt id was given in this instruction; leave the `started_at`"
+        " field out of the handoff note (it is informational and never blocks"
+        " the handoff)."
+    )
+
+
+def _cost_handoff_instruction(
+    issue_number: int | None, attempt_id: str | None = None
+) -> str:
     return (
         "This attempt is approaching its token budget. Invoke the `handoff` skill now "
         "to preserve your progress cooperatively instead of continuing further work. "
         f"{_HANDOFF_SKILL_TOOL_HINT} {_handoff_target(issue_number)}"
+        f"{_attempt_id_sentence(attempt_id)}"
     )
 
 
-def _cost_handoff_followup_prompt(issue_number: int | None) -> str:
+def _cost_handoff_followup_prompt(
+    issue_number: int | None, attempt_id: str | None = None
+) -> str:
     return (
         "This attempt crossed its token soft threshold and must now end by handing off. "
         "Invoke the `handoff` skill now to preserve your progress: commit any outstanding "
         "work, then write and commit the handoff note. Do not attempt further implementation "
         f"work. {_HANDOFF_SKILL_TOOL_HINT} {_handoff_target(issue_number)}"
+        f"{_attempt_id_sentence(attempt_id)}"
     )
 
 
-def _operator_handoff_instruction(issue_number: int | None) -> str:
+def _operator_handoff_instruction(
+    issue_number: int | None, attempt_id: str | None = None
+) -> str:
     return (
         "The operator requested a handoff (`agentctl handoff now`). Invoke the"
         " `handoff` skill now to preserve your progress cooperatively instead of"
@@ -102,19 +131,25 @@ def _operator_handoff_instruction(issue_number: int | None) -> str:
         " commit it separately as the final commit. Do not start another"
         f" implementation step. {_HANDOFF_SKILL_TOOL_HINT}"
         f" {_handoff_target(issue_number)}"
+        f"{_attempt_id_sentence(attempt_id)}"
     )
 
 
-def _limit_handoff_followup_prompt(issue_number: int | None) -> str:
+def _limit_handoff_followup_prompt(
+    issue_number: int | None, attempt_id: str | None = None
+) -> str:
     return (
         "Execution reached its turn or time limit. Invoke the `handoff` skill now to "
         "preserve your progress: commit any outstanding work, then write and commit "
         f"the handoff note. Do not attempt further implementation work. {_HANDOFF_SKILL_TOOL_HINT}"
         f" {_handoff_target(issue_number)}"
+        f"{_attempt_id_sentence(attempt_id)}"
     )
 
 
-def _operator_handoff_followup_prompt(issue_number: int | None) -> str:
+def _operator_handoff_followup_prompt(
+    issue_number: int | None, attempt_id: str | None = None
+) -> str:
     return (
         "The operator requested a handoff (`agentctl handoff now`) and the safe"
         " boundary was missed. Invoke the `handoff` skill now to preserve your"
@@ -122,6 +157,7 @@ def _operator_handoff_followup_prompt(issue_number: int | None) -> str:
         " the handoff note with `reason: operator_request` and commit it separately"
         " as the final commit. Do not attempt further implementation work."
         f" {_HANDOFF_SKILL_TOOL_HINT} {_handoff_target(issue_number)}"
+        f"{_attempt_id_sentence(attempt_id)}"
     )
 
 
@@ -279,6 +315,7 @@ class ModelExecutor:
         self._skill_events: list[SkillEvent] = []
         self._review_count = 0
         self._issue_number: int | None = None
+        self._attempt_id: str | None = None
         self._archive: EvidenceWriter | None = None
         self._event_sequence = 0
         self._started_at = self._clock()
@@ -532,7 +569,9 @@ class ModelExecutor:
         await client.interrupt()
         await self._drain(client)
         try:
-            await client.query(_operator_handoff_followup_prompt(self._issue_number))
+            await client.query(
+                _operator_handoff_followup_prompt(self._issue_number, self._attempt_id)
+            )
             followup_terminal, followup_models = await self._receive_terminal(client)
         except Exception:
             return None
@@ -622,12 +661,14 @@ class ModelExecutor:
         working_directory: Path,
         issue_number: int | None = None,
         archive: EvidenceWriter | None = None,
+        attempt_id: str | None = None,
     ) -> ModelExecution:
         """Dispatch ``/implement`` and classify its one terminal SDK result."""
 
         self._skill_events.clear()
         self._review_count = 0
         self._issue_number = issue_number
+        self._attempt_id = attempt_id
         self._archive = archive
         self._event_sequence = 0
         self._started_at = self._clock()
@@ -703,7 +744,9 @@ class ModelExecutor:
                     followup = await self._attempt_handoff_followup(
                         client,
                         observed_models,
-                        prompt=_cost_handoff_followup_prompt(self._issue_number),
+                        prompt=_cost_handoff_followup_prompt(
+                            self._issue_number, self._attempt_id
+                        ),
                         success_explanation=(
                             "Model invoked the handoff skill after a token"
                             " soft-threshold instruction."
@@ -885,7 +928,7 @@ class ModelExecutor:
         """
 
         if prompt is None:
-            prompt = _limit_handoff_followup_prompt(self._issue_number)
+            prompt = _limit_handoff_followup_prompt(self._issue_number, self._attempt_id)
         try:
             await client.query(prompt)
             async with asyncio.timeout(_HANDOFF_FOLLOWUP_TIMEOUT):
@@ -1788,7 +1831,9 @@ class ModelExecutor:
                 # frees the remaining budget for the handoff.
                 self._handoff_context_delivered = True
                 self._log("token_soft_threshold_handoff_context_injected")
-                contexts.append(_cost_handoff_instruction(self._issue_number))
+                contexts.append(
+                    _cost_handoff_instruction(self._issue_number, self._attempt_id)
+                )
             else:
                 # Subagents are still recorded as running (for example the
                 # crossing flag was set without going through the stop
@@ -1802,7 +1847,9 @@ class ModelExecutor:
                 "operator_handoff_context_delivered",
                 f"request={self._operator_handoff.request_id}",
             )
-            contexts.append(_operator_handoff_instruction(self._issue_number))
+            contexts.append(
+                _operator_handoff_instruction(self._issue_number, self._attempt_id)
+            )
         if contexts:
             return {
                 "hookSpecificOutput": {
