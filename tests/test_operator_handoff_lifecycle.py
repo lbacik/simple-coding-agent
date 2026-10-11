@@ -68,7 +68,12 @@ def claim(number: int = ISSUE_NUMBER) -> Claim:
 
 def profile() -> object:
     return SimpleNamespace(
-        setup=(), check=("true",), base_branch="main", timeout=30, env={}
+        setup=(),
+        check=("true",),
+        base_branch="main",
+        timeout=30,
+        env={},
+        model_instructions="",
     )
 
 
