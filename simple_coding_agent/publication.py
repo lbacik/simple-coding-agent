@@ -442,7 +442,8 @@ def _error_text(error: Exception) -> str:
 def _is_already_mergeable(error: Exception) -> bool:
     """Whether enabling auto-merge was refused because the PR can merge now."""
 
-    return "mergeable" in _error_text(error)
+    text = _error_text(error)
+    return "mergeable" in text or "clean status" in text or "unstable status" in text
 
 
 def _is_already_enabled(error: Exception) -> bool:
