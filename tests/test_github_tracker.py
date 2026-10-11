@@ -322,6 +322,10 @@ def test_enable_auto_merge_sends_the_configured_method(method: str, expected: st
 
     assert "enablePullRequestAutoMerge" in transport.queries[0]
     assert transport.variables[0] == {"pullRequestId": "pr-node-8", "mergeMethod": expected}
+    assert "$mergeMethod: PullRequestMergeMethod!" in transport.queries[0]
+    assert "$mergeMethod: MergeMethod!" not in transport.queries[0].replace(
+        "$mergeMethod: PullRequestMergeMethod!", ""
+    )
 
 
 def test_merge_pull_request_sends_the_configured_method() -> None:
@@ -333,6 +337,10 @@ def test_merge_pull_request_sends_the_configured_method() -> None:
 
     assert "mergePullRequest" in transport.queries[0]
     assert transport.variables[0] == {"pullRequestId": "pr-node-8", "mergeMethod": "SQUASH"}
+    assert "$mergeMethod: PullRequestMergeMethod!" in transport.queries[0]
+    assert "$mergeMethod: MergeMethod!" not in transport.queries[0].replace(
+        "$mergeMethod: PullRequestMergeMethod!", ""
+    )
 
 
 def test_merge_operations_reject_a_pull_request_without_an_id() -> None:

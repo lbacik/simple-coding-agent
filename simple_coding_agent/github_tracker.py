@@ -568,7 +568,7 @@ class GitHubGraphQLTransport:
             raise GitHubTrackerError("GitHub returned a pull request without an id")
         self._execute(
             """
-            mutation EnableAutoMerge($pullRequestId: ID!, $mergeMethod: MergeMethod!) {
+            mutation EnableAutoMerge($pullRequestId: ID!, $mergeMethod: PullRequestMergeMethod!) {
               enablePullRequestAutoMerge(
                 input: {pullRequestId: $pullRequestId, mergeMethod: $mergeMethod}
               ) { pullRequest { autoMergeRequest { mergeMethod } } }
@@ -591,7 +591,7 @@ class GitHubGraphQLTransport:
             raise GitHubTrackerError("GitHub returned a pull request without an id")
         self._execute(
             """
-            mutation MergePullRequest($pullRequestId: ID!, $mergeMethod: MergeMethod!) {
+            mutation MergePullRequest($pullRequestId: ID!, $mergeMethod: PullRequestMergeMethod!) {
               mergePullRequest(
                 input: {pullRequestId: $pullRequestId, mergeMethod: $mergeMethod}
               ) { pullRequest { merged } }
@@ -755,7 +755,7 @@ def _retry_delay(error: Exception, attempt: int) -> float:
 
 
 def _graphql_merge_method(merge_method: str) -> str:
-    """Map the operator merge method to GitHub's ``MergeMethod`` enum."""
+    """Map the operator merge method to GitHub's ``PullRequestMergeMethod`` enum."""
 
     try:
         return {"merge": "MERGE", "squash": "SQUASH", "rebase": "REBASE"}[merge_method.strip().lower()]

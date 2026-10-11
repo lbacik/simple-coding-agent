@@ -398,6 +398,35 @@ def test_auto_merge_falls_back_to_direct_merge_when_already_mergeable(tmp_path: 
     assert "**Merge**: merged" in github.comments[0][1]
 
 
+@pytest.mark.parametrize(
+    "refusal",
+    [
+        "Pull request is in clean status",
+        "Pull request is in unstable status",
+    ],
+)
+def test_auto_merge_falls_back_to_direct_merge_on_unprotected_branch(
+    tmp_path: Path, refusal: str
+) -> None:
+    remote, _ = repository_with_main(tmp_path)
+    workspace = GitWorkspace(tmp_path / "clone", str(remote), token_provider=lambda: "token")
+    prepared = workspace.prepare_attempt(base_branch="main", issue_number=23)
+    write_and_commit(tmp_path / "clone", "feature.txt", "done", "Implement publication")
+    github = FakeGitHub(enable_error=OSError(refusal))
+
+    result = Publisher(
+        workspace, github, "octo/example", auto_merge=True, merge_method="squash"
+    ).publish(
+        request(CompletionDecision(None, True, PublicationPath.COMPLETE, ("ready",)), prepared.branch)
+    )
+
+    assert result.outcome is AttemptOutcome.COMPLETE
+    assert result.merge_result == "merged"
+    assert len(github.auto_merge_calls) == 1
+    assert github.merge_calls == [("octo/example", 1, "squash")]
+    assert "**Merge**: merged" in github.comments[0][1]
+
+
 def test_auto_merge_failure_keeps_complete_and_reports_the_reason(tmp_path: Path) -> None:
     remote, _ = repository_with_main(tmp_path)
     workspace = GitWorkspace(tmp_path / "clone", str(remote), token_provider=lambda: "token")
