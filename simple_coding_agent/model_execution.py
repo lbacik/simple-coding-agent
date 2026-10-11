@@ -21,6 +21,10 @@ from claude_agent_sdk import (
     ResultMessage,
     SystemMessage,
     StreamEvent,
+    TaskNotificationMessage,
+    TaskStartedMessage,
+    TaskUpdatedMessage,
+    TERMINAL_TASK_STATUSES,
     TextBlock,
     UserMessage,
 )
@@ -216,6 +220,8 @@ class SDKClient(Protocol):
     async def query(self, prompt: str) -> None: ...
 
     def receive_response(self) -> Any: ...
+
+    def receive_messages(self) -> Any: ...
 
 
 class EvidenceWriter(Protocol):
@@ -932,7 +938,18 @@ class ModelExecutor:
         self, client: SDKClient
     ) -> tuple[ResultMessage | None, tuple[str, ...]]:
         observed_models: list[str] = []
-        stream = client.receive_response().__aiter__()
+        stream = _message_stream(client)
+        # Background subagents (``Agent`` tool calls run asynchronously by
+        # default) keep the execution open: a ``ResultMessage`` that arrives
+        # while any are still active is deferred, not terminal. Task ids join
+        # on ``TaskStartedMessage`` and leave on a terminal status from either
+        # a ``TaskNotificationMessage`` or a ``TaskUpdatedMessage`` — either
+        # message can be the only terminal signal for a task.
+        background_pending: dict[str, dict[str, str | None]] = {}
+        background_finished: list[dict[str, str | None]] = []
+        deferred_results = 0
+        model_turn_after_defer = False
+        background_followup_sent = False
         # One pending ``__anext__()`` shared across loop iterations: waiting
         # for it with ``asyncio.wait`` (instead of ``asyncio.timeout``) lets
         # operator boundaries pass without cancelling the generator, which
@@ -968,7 +985,20 @@ class ModelExecutor:
                     try:
                         message = await pending
                     except StopAsyncIteration:
-                        return None, tuple(observed_models)
+                        pending = None
+                        resumed = await self._maybe_background_followup(
+                            client,
+                            background_pending,
+                            background_finished,
+                            deferred_results,
+                            model_turn_after_defer,
+                            background_followup_sent,
+                        )
+                        if resumed is None:
+                            return None, tuple(observed_models)
+                        stream = resumed
+                        background_followup_sent = True
+                        continue
                     pending = None
                 else:
                     done, _ = await asyncio.wait({pending}, timeout=wait)
@@ -979,14 +1009,53 @@ class ModelExecutor:
                     try:
                         message = task.result()
                     except StopAsyncIteration:
-                        return None, tuple(observed_models)
+                        resumed = await self._maybe_background_followup(
+                            client,
+                            background_pending,
+                            background_finished,
+                            deferred_results,
+                            model_turn_after_defer,
+                            background_followup_sent,
+                        )
+                        if resumed is None:
+                            return None, tuple(observed_models)
+                        stream = resumed
+                        background_followup_sent = True
+                        continue
                 self._record_cli_session_id(message)
                 if isinstance(message, SystemMessage) and message.subtype == "compact_boundary":
                     self._log_context_compacted(message)
-                if isinstance(message, ResultMessage) or _looks_like_result(message):
+                had_pending_background = bool(background_pending)
+                if self._observe_background_task(
+                    message, background_pending, background_finished
+                ):
+                    if (
+                        had_pending_background
+                        and not background_pending
+                        and deferred_results
+                    ):
+                        self._log(
+                            "background_tasks_settled",
+                            f"pending_task_ids=none; finished_task_ids="
+                            f"{','.join(sorted(entry['task_id'] for entry in background_finished if entry['task_id']))}; "
+                            "every background task reached a terminal status",
+                        )
+                elif isinstance(message, ResultMessage) or _looks_like_result(message):
+                    if background_pending:
+                        self._settle_all_threads_and_log()
+                        deferred_results += 1
+                        self._log(
+                            "background_result_deferred",
+                            f"pending_task_ids={','.join(sorted(background_pending))}; "
+                            f"deferred_results={deferred_results}; the result is not "
+                            "terminal while background tasks are still running",
+                        )
+                        continue
                     self._settle_all_threads_and_log()
                     return message, tuple(observed_models)
-                if isinstance(message, AssistantMessage):
+                elif isinstance(message, AssistantMessage):
+                    if deferred_results:
+                        model_turn_after_defer = True
                     for block in message.content:
                         if isinstance(block, TextBlock) and block.text.strip():
                             self._log("model_response", self._model_response_detail(block.text))
@@ -1008,6 +1077,98 @@ class ModelExecutor:
             # The outer model-timeout/follow-up timeout may cancel this method
             # while a ``__anext__()`` is still pending; never leave it dangling.
             await _cancel_stream_wait(pending)
+
+    def _observe_background_task(
+        self,
+        message: object,
+        pending: dict[str, dict[str, str | None]],
+        finished: list[dict[str, str | None]],
+    ) -> bool:
+        """Track one background-task lifecycle message; True when handled.
+
+        ``pending`` maps active task ids to their (initially empty) detail;
+        ``finished`` accumulates one summary entry per settled task for the
+        wake-up follow-up prompt. A terminal status on either a
+        ``TaskNotificationMessage`` or a ``TaskUpdatedMessage`` settles the
+        task; anything else leaves the sets untouched.
+        """
+
+        if isinstance(message, TaskStartedMessage):
+            if message.task_id:
+                pending.setdefault(message.task_id, {})
+            return True
+        if isinstance(message, TaskNotificationMessage):
+            if message.status in TERMINAL_TASK_STATUSES:
+                self._record_background_finished(
+                    finished, message.task_id, message.summary, message.output_file
+                )
+                pending.pop(message.task_id, None)
+            return True
+        if isinstance(message, TaskUpdatedMessage):
+            status = message.status
+            if status is None:
+                patch = message.patch
+                if isinstance(patch, Mapping):
+                    candidate = patch.get("status")
+                    status = candidate if isinstance(candidate, str) else None
+            if status is not None and status in TERMINAL_TASK_STATUSES:
+                self._record_background_finished(finished, message.task_id, None, None)
+                pending.pop(message.task_id, None)
+            return True
+        return False
+
+    @staticmethod
+    def _record_background_finished(
+        finished: list[dict[str, str | None]],
+        task_id: str | None,
+        summary: str | None,
+        output_file: str | None,
+    ) -> None:
+        """Append one settled-task entry, keeping one entry per task id."""
+
+        if not task_id:
+            return
+        if any(entry.get("task_id") == task_id for entry in finished):
+            return
+        finished.append(
+            {"task_id": task_id, "summary": summary, "output_file": output_file}
+        )
+
+    async def _maybe_background_followup(
+        self,
+        client: SDKClient,
+        pending: dict[str, dict[str, str | None]],
+        finished: list[dict[str, str | None]],
+        deferred_results: int,
+        model_turn_after_defer: bool,
+        followup_sent: bool,
+    ) -> Any | None:
+        """Send the single wake-up follow-up after settled background tasks.
+
+        Returns a fresh message stream when the follow-up is issued (the
+        caller keeps reading from it), else ``None`` to end the execution.
+        The follow-up fires at most once per receive loop, only after at
+        least one result was deferred, every pending task settled, and the
+        stream then ended without the model starting a new turn on its own.
+        """
+
+        if (
+            followup_sent
+            or pending
+            or not finished
+            or not deferred_results
+            or model_turn_after_defer
+        ):
+            return None
+        prompt = _background_tasks_followup_prompt(finished)
+        self._log(
+            "background_tasks_followup",
+            f"task_ids={','.join(sorted(entry['task_id'] for entry in finished if entry['task_id']))}; "
+            "no new model turn followed the settled background tasks, so a "
+            "single wake-up prompt is issued",
+        )
+        await client.query(prompt)
+        return _message_stream(client)
 
     def _log_usage_shape(self, usage: Any) -> None:
         if not self._usage_shape_logged:
@@ -1998,6 +2159,44 @@ def _looks_like_result(message: object) -> bool:
     """Permit fake SDK streams without weakening production ResultMessage handling."""
 
     return all(hasattr(message, attribute) for attribute in ("is_error", "stop_reason", "model_usage"))
+
+
+def _message_stream(client: SDKClient) -> Any:
+    """The continuing message stream, past terminal-looking results.
+
+    The pinned SDK's ``receive_response()`` stops after the first
+    ``ResultMessage``; ``receive_messages()`` keeps yielding, so background
+    task notifications (and the model's woken turn) are still observed.
+    Clients without ``receive_messages`` (test fakes) already yield the whole
+    session from ``receive_response()``.
+    """
+
+    receive_messages = getattr(client, "receive_messages", None)
+    if callable(receive_messages):
+        return receive_messages().__aiter__()
+    return client.receive_response().__aiter__()
+
+
+def _background_tasks_followup_prompt(
+    finished: list[dict[str, str | None]],
+) -> str:
+    """Wake the model after its background agents finished without a new turn."""
+
+    lines = []
+    for entry in finished:
+        task_id = entry.get("task_id") or "unknown"
+        summary = entry.get("summary") or f"task {task_id}"
+        output_file = entry.get("output_file")
+        if output_file:
+            lines.append(f"- {task_id}: {summary} (full output in {output_file})")
+        else:
+            lines.append(f"- {task_id}: {summary}")
+    return (
+        "Your background agents finished while the conversation was idle:\n"
+        + "\n".join(lines)
+        + "\nRead their output, incorporate the results into the implementation, "
+        "and finish the work that depended on them instead of waiting."
+    )
 
 
 def _skill_name(hook_input: object) -> str | None:
