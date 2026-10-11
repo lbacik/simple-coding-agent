@@ -348,7 +348,9 @@ class ModelExecutor:
         self._operator_handoff_reporter: OperatorHandoffReporter | None = None
         self._operator_handoff: OperatorHandoff | None = None
         self._operator_context_delivered = False
+        self._operator_delivery_via: str | None = None
         self._operator_fallback_used = False
+        self._operator_fallback_was_blocked = False
         self._operator_begun = False
         self._operator_deadline_expired = False
         self._cli_session_id: str | None = None
@@ -570,6 +572,75 @@ class ModelExecutor:
 
         return self._hard_token_limit_reached()
 
+    def _operator_delivery_label(self) -> str:
+        """How the handoff instruction reached the model, if it did.
+
+        Only a main-thread tool boundary or the fallback follow-up counts as
+        delivered: a subagent boundary can never perform the handoff.
+        """
+
+        if not self._operator_context_delivered:
+            return "no"
+        if self._operator_delivery_via == "fallback":
+            return "fallback"
+        return "main-thread tool boundary"
+
+    def _operator_fallback_label(self) -> str:
+        """Whether the single fallback follow-up was consumed, and how."""
+
+        if self._operator_fallback_was_blocked:
+            return "blocked"
+        if self._operator_fallback_used:
+            return "fired"
+        return "not due"
+
+    def _operator_step_trail(self) -> str:
+        """One-line delivered/fallback/begun trail for expiry evidence."""
+
+        begun = "yes" if self._operator_begun else "no"
+        return (
+            f"delivered={self._operator_delivery_label()}; "
+            f"fallback={self._operator_fallback_label()}; "
+            f"begun={begun}"
+        )
+
+    def _operator_expired_explanation(self) -> str:
+        """Explain an operator handoff expiry without misstating the steps.
+
+        The old wording always claimed the model never invoked the handoff
+        skill, even when it had begun but not finished before the deadline.
+        """
+
+        latched = self._operator_handoff
+        request_id = latched.request_id if latched is not None else None
+        steps = self._operator_step_trail()
+        if self._operator_begun:
+            return (
+                f"Operator handoff {request_id} reached its"
+                f" {_OPERATOR_HANDOFF_MODEL_DEADLINE_SECONDS}-second model"
+                " deadline after the model invoked the handoff skill but before"
+                f" it finished ({steps})."
+            )
+        return (
+            f"Operator handoff {request_id} reached its"
+            f" {_OPERATOR_HANDOFF_MODEL_DEADLINE_SECONDS}-second model"
+            " deadline without the model invoking the handoff skill"
+            f" ({steps})."
+        )
+
+    def _operator_expired_evidence(
+        self, observed_models: tuple[str, ...]
+    ) -> ModelExecution:
+        """Build the ``OPERATOR_HANDOFF_EXPIRED`` evidence for the latched request."""
+
+        return self._evidence(
+            ModelExecutionStatus.OPERATOR_HANDOFF_EXPIRED,
+            self._operator_expired_explanation(),
+            None,
+            None,
+            observed_models,
+        )
+
     async def _run_operator_fallback(
         self, client: SDKClient, observed_models: list[str]
     ) -> tuple[ResultMessage | None, tuple[str, ...]] | None:
@@ -586,6 +657,7 @@ class ModelExecutor:
         if latched is None:
             return None
         if self._operator_fallback_blocked():
+            self._operator_fallback_was_blocked = True
             self._log(
                 "operator_handoff_fallback_blocked",
                 f"request={latched.request_id}; token budget reached the hard"
@@ -594,6 +666,7 @@ class ModelExecutor:
             )
             return None
         self._operator_context_delivered = True
+        self._operator_delivery_via = "fallback"
         self._report_operator("delivered")
         self._log(
             "operator_handoff_fallback",
@@ -719,7 +792,9 @@ class ModelExecutor:
         self._ensure_ledger_thread("main", prompt_chars=len(issue_body))
         self._operator_handoff = None
         self._operator_context_delivered = False
+        self._operator_delivery_via = None
         self._operator_fallback_used = False
+        self._operator_fallback_was_blocked = False
         self._operator_begun = False
         self._operator_deadline_expired = False
         self._cli_session_id = None
@@ -800,15 +875,7 @@ class ModelExecutor:
 
         if terminal is None:
             if self._operator_deadline_expired and self._operator_handoff is not None:
-                return self._evidence(
-                    ModelExecutionStatus.OPERATOR_HANDOFF_EXPIRED,
-                    f"Operator handoff {self._operator_handoff.request_id} reached"
-                    f" its {_OPERATOR_HANDOFF_MODEL_DEADLINE_SECONDS}-second model"
-                    " deadline without the model invoking the handoff skill.",
-                    None,
-                    None,
-                    observed_models,
-                )
+                return self._operator_expired_evidence(observed_models)
             return self._evidence(
                 ModelExecutionStatus.INFRASTRUCTURE_ERROR,
                 "Claude SDK stream ended without a terminal ResultMessage.",
@@ -1054,7 +1121,8 @@ class ModelExecutor:
                     self._log(
                         "operator_handoff_model_deadline_expired",
                         f"request={self._operator_handoff.request_id if self._operator_handoff else None}; "
-                        f"deadline_seconds={_OPERATOR_HANDOFF_MODEL_DEADLINE_SECONDS}",
+                        f"deadline_seconds={_OPERATOR_HANDOFF_MODEL_DEADLINE_SECONDS}; "
+                        f"{self._operator_step_trail()}",
                     )
                     return None, tuple(observed_models)
                 wait = self._operator_stream_wait()
@@ -1917,15 +1985,21 @@ class ModelExecutor:
                 # instruction stays withheld until they are stopped.
                 pass
         if self._operator_handoff is not None and not self._operator_context_delivered:
-            self._operator_context_delivered = True
-            self._report_operator("delivered")
-            self._log(
-                "operator_handoff_context_delivered",
-                f"request={self._operator_handoff.request_id}",
-            )
-            contexts.append(
-                _operator_handoff_instruction(self._issue_number, self._attempt_id)
-            )
+            # Only the main thread can perform the handoff, so a subagent
+            # boundary neither receives the instruction nor marks it delivered:
+            # the single fallback stays due until a main-thread boundary or
+            # the follow-up query reaches the model.
+            if _is_main_thread(hook_input):
+                self._operator_context_delivered = True
+                self._operator_delivery_via = "post_tool"
+                self._report_operator("delivered")
+                self._log(
+                    "operator_handoff_context_delivered",
+                    f"request={self._operator_handoff.request_id}",
+                )
+                contexts.append(
+                    _operator_handoff_instruction(self._issue_number, self._attempt_id)
+                )
         if contexts:
             return {
                 "hookSpecificOutput": {
