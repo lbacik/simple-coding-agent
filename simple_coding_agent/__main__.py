@@ -51,7 +51,6 @@ def main() -> None:
         provenance = ProvenanceVerifier(
             home=Path.home(),
             expected_sdk_version=config.claude_agent_sdk_version,
-            expected_cli_version=config.claude_code_version,
         ).verify()
     except ProvenanceError as error:
         logger.emit("provenance_verification_failed", phase="startup", detail=str(error), level="ERROR")
@@ -81,6 +80,7 @@ def main() -> None:
         issue_comments=tracker.trusted_comments,
         model_executor=ModelExecutor(
             config,
+            cli_path=provenance.cli_path,
             event_log=lambda event, detail="", level="INFO", issue_number=None: logger.emit(
                 event, phase="model_execution", detail=detail, level=level, issue_number=issue_number
             ),

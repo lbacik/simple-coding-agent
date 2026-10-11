@@ -33,7 +33,6 @@ _DEFAULT_MODEL_AUTH_MODE = "auth_token"
 _MODEL_AUTH_MODES = frozenset({"auth_token", "api_key"})
 _DEFAULT_MODEL_STREAM_IDLE_TIMEOUT_MS = 60000
 _DEFAULT_CLAUDE_AGENT_SDK_VERSION = "0.2.163"
-_DEFAULT_CLAUDE_CODE_VERSION = "2.1.286"
 
 
 @dataclass(frozen=True)
@@ -57,7 +56,6 @@ class RuntimeConfig:
     profile_path: str = ""
     model: str = _DEFAULT_MODEL_NAME
     claude_agent_sdk_version: str = _DEFAULT_CLAUDE_AGENT_SDK_VERSION
-    claude_code_version: str = _DEFAULT_CLAUDE_CODE_VERSION
     max_turns: int = 60
     max_budget_usd: int = 20
     max_budget_tokens: int = 4_000_000
@@ -152,14 +150,12 @@ def load_runtime_config(environ: Mapping[str, str] | None = None) -> RuntimeConf
         claude_agent_sdk_version=_non_empty(
             values, "CLAUDE_AGENT_SDK_VERSION", _DEFAULT_CLAUDE_AGENT_SDK_VERSION
         ),
-        claude_code_version=_non_empty(
-            values, "CLAUDE_CODE_VERSION", _DEFAULT_CLAUDE_CODE_VERSION
-        ),
         max_turns=_positive_integer(values, "MAX_TURNS", 60),
         max_budget_usd=_positive_integer(values, "MAX_BUDGET_USD", 20),
         max_budget_tokens=_positive_integer(values, "MAX_BUDGET_TOKENS", 4_000_000),
         soft_threshold_percentage=_fraction(values, "SOFT_THRESHOLD_PERCENTAGE", 0.2),
     )
+    _warn_when_claude_code_version_is_set(values)
     _warn_when_usd_backstop_is_tighter(config)
     return config
 
@@ -200,6 +196,21 @@ def load_repository_profile(repository_dir: Path, profile_path: str = "") -> Rep
         setup_timeout=_profile_duration(raw_profile, "setup_timeout", 120),
         env=_profile_environment(raw_profile),
     )
+
+
+def _warn_when_claude_code_version_is_set(values: Mapping[str, str]) -> None:
+    """Warn that CLAUDE_CODE_VERSION no longer has any effect.
+
+    The CLI version follows the pinned ``CLAUDE_AGENT_SDK_VERSION`` release
+    and its bundled CLI; a separately pinned CLI version is not checked.
+    """
+
+    if "CLAUDE_CODE_VERSION" in values:
+        logger.warning(
+            "CLAUDE_CODE_VERSION=%s no longer has any effect; the CLI version "
+            "follows CLAUDE_AGENT_SDK_VERSION and its bundled CLI",
+            values.get("CLAUDE_CODE_VERSION", ""),
+        )
 
 
 def _warn_when_usd_backstop_is_tighter(config: RuntimeConfig) -> None:

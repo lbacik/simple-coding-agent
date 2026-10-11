@@ -68,10 +68,20 @@ def test_dockerfile_installs_pinned_python_sdk() -> None:
     )
 
 
-def test_dockerfile_installs_pinned_claude_code_cli() -> None:
+def test_dockerfile_does_not_install_a_separate_claude_code_cli() -> None:
     content = _dockerfile()
-    assert "@anthropic-ai/claude-code@2.1.286" in content, (
-        "Dockerfile must install @anthropic-ai/claude-code@2.1.286"
+    assert "@anthropic-ai/claude-code" not in content, (
+        "Dockerfile must not install a separate @anthropic-ai/claude-code: "
+        "the CLI comes bundled inside the pinned claude-agent-sdk"
+    )
+    assert "COPY package.json" not in content, (
+        "Dockerfile must not copy package.json: there is no npm CLI pin left"
+    )
+
+
+def test_npm_cli_package_json_is_removed() -> None:
+    assert not (ROOT / "package.json").exists(), (
+        "package.json must be deleted: the SDK's bundled CLI needs no npm pin"
     )
 
 
@@ -582,19 +592,22 @@ class TestDockerSmoke:
             f"SDK version mismatch: {result.stdout.strip()}"
         )
 
-    def test_claude_code_cli_version_matches_pin(self) -> None:
+    def test_bundled_cli_version_matches_sdk_pin(self) -> None:
         result = subprocess.run(
             [
                 "docker", "run", "--rm",
                 "simple-coding-agent:smoke-test",
-                "claude", "--version",
+                "python", "-c",
+                "from claude_agent_sdk._cli_version import __cli_version__;"
+                " print(__cli_version__)",
             ],
             capture_output=True,
             text=True,
         )
         assert result.returncode == 0
-        version = result.stdout.strip().split()[-1].lstrip("v")
-        assert version == "2.1.286", f"CLI version mismatch: {version}"
+        assert result.stdout.strip() == "2.1.286", (
+            f"Bundled CLI version mismatch: {result.stdout.strip()}"
+        )
 
     def test_skills_are_visible_in_agent_home(self) -> None:
         result = subprocess.run(

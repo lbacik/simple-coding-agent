@@ -40,17 +40,16 @@ def test_loads_required_operator_settings_and_defaults(tmp_path: Path) -> None:
 
 
 def test_default_runtime_versions_match_dockerfile_pins(tmp_path: Path) -> None:
-    # The provenance check compares these defaults with the installed pair, so
-    # a container built without overrides only starts if they match the image.
+    # The provenance check compares this default with the installed SDK, so
+    # a container built without overrides only starts if it matches the image.
+    # The CLI version follows the SDK release and its bundled CLI.
     dockerfile = (Path(__file__).parent.parent / "Dockerfile").read_text()
     sdk_pin = re.search(r'"claude-agent-sdk==([^"]+)"', dockerfile)
-    cli_pin = re.search(r"npm install --global @anthropic-ai/claude-code@(\S+)", dockerfile)
-    assert sdk_pin and cli_pin, "Dockerfile must pin both the SDK and the CLI"
+    assert sdk_pin, "Dockerfile must pin the SDK"
 
     config = load_runtime_config(_operator_env(tmp_path))
 
     assert config.claude_agent_sdk_version == sdk_pin.group(1)
-    assert config.claude_code_version == cli_pin.group(1)
 
 
 @pytest.mark.parametrize(
@@ -114,7 +113,6 @@ def test_applies_operator_overrides_including_the_test_only_review_gate(
             "REVIEW_BLOCKING_SEVERITIES": "",
             "MODEL_NAME": "muse-spark-2.0",
             "CLAUDE_AGENT_SDK_VERSION": "0.3.0",
-            "CLAUDE_CODE_VERSION": "3.0.0",
             "MAX_TURNS": "90",
             "MAX_BUDGET_USD": "10",
             "MAX_BUDGET_TOKENS": "1000000",
@@ -138,7 +136,6 @@ def test_applies_operator_overrides_including_the_test_only_review_gate(
     assert config.review_blocking_severities == frozenset()
     assert config.model == "muse-spark-2.0"
     assert config.claude_agent_sdk_version == "0.3.0"
-    assert config.claude_code_version == "3.0.0"
 
 
 def test_model_backend_defaults_to_meta(tmp_path: Path) -> None:
@@ -273,6 +270,35 @@ def test_no_warning_when_usd_backstop_covers_token_budget(
         load_runtime_config(_operator_env(tmp_path))
 
     assert [record for record in caplog.records if record.levelname == "WARNING"] == []
+
+
+def test_retired_claude_code_version_warns_and_has_no_effect(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    with caplog.at_level("WARNING", logger="simple_coding_agent.config"):
+        config = load_runtime_config(
+            _operator_env(tmp_path, CLAUDE_CODE_VERSION="9.9.9")
+        )
+
+    assert not hasattr(config, "claude_code_version")
+    warnings = [record for record in caplog.records if record.levelname == "WARNING"]
+    assert any(
+        "CLAUDE_CODE_VERSION" in record.message
+        and "no longer has any effect" in record.message
+        and "CLAUDE_AGENT_SDK_VERSION" in record.message
+        for record in warnings
+    )
+
+
+def test_no_warning_when_retired_claude_code_version_is_absent(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    with caplog.at_level("WARNING", logger="simple_coding_agent.config"):
+        load_runtime_config(_operator_env(tmp_path))
+
+    assert all(
+        "CLAUDE_CODE_VERSION" not in record.message for record in caplog.records
+    )
 
 
 def test_profile_path_defaults_to_empty_string(tmp_path: Path) -> None:
