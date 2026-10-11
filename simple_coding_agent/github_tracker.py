@@ -494,7 +494,7 @@ class GitHubGraphQLTransport:
             query PullRequest($owner: String!, $name: String!, $head: String!) {
               repository(owner: $owner, name: $name) {
                 pullRequests(first: 1, states: OPEN, headRefName: $head) {
-                  nodes { number url }
+                  nodes { id number url }
                 }
               }
             }
@@ -520,7 +520,7 @@ class GitHubGraphQLTransport:
             ) {
               createPullRequest(input: {
                 repositoryId: $repositoryId, headRefName: $head, baseRefName: $base, title: $title, body: $body
-              }) { pullRequest { number url } }
+              }) { pullRequest { id number url } }
             }
             """,
             {
@@ -535,6 +535,52 @@ class GitHubGraphQLTransport:
             return _pull_request_from_graphql(data["createPullRequest"]["pullRequest"])
         except (KeyError, TypeError, ValueError) as error:
             raise GitHubTrackerError("GitHub returned an invalid created pull request") from error
+
+    def enable_auto_merge(
+        self, repository: str, pull_request: PullRequest, merge_method: str
+    ) -> None:
+        """Enable GitHub's native auto-merge so the PR merges once protection passes."""
+
+        _repository_parts(repository)
+        pull_request_id = pull_request.node_id
+        if not pull_request_id:
+            raise GitHubTrackerError("GitHub returned a pull request without an id")
+        self._execute(
+            """
+            mutation EnableAutoMerge($pullRequestId: ID!, $mergeMethod: MergeMethod!) {
+              enablePullRequestAutoMerge(
+                input: {pullRequestId: $pullRequestId, mergeMethod: $mergeMethod}
+              ) { pullRequest { autoMergeRequest { mergeMethod } } }
+            }
+            """,
+            {
+                "pullRequestId": pull_request_id,
+                "mergeMethod": _graphql_merge_method(merge_method),
+            },
+        )
+
+    def merge_pull_request(
+        self, repository: str, pull_request: PullRequest, merge_method: str
+    ) -> None:
+        """Merge an already-mergeable PR directly with the configured method."""
+
+        _repository_parts(repository)
+        pull_request_id = pull_request.node_id
+        if not pull_request_id:
+            raise GitHubTrackerError("GitHub returned a pull request without an id")
+        self._execute(
+            """
+            mutation MergePullRequest($pullRequestId: ID!, $mergeMethod: MergeMethod!) {
+              mergePullRequest(
+                input: {pullRequestId: $pullRequestId, mergeMethod: $mergeMethod}
+              ) { pullRequest { merged } }
+            }
+            """,
+            {
+                "pullRequestId": pull_request_id,
+                "mergeMethod": _graphql_merge_method(merge_method),
+            },
+        )
 
     def find_attempt_comment(self, repository: str, issue_number: int, marker: str) -> bool:
         """Find a result only when it carries this attempt's durable marker."""
@@ -687,6 +733,15 @@ def _retry_delay(error: Exception, attempt: int) -> float:
     return min(2 * 2**attempt, 30)
 
 
+def _graphql_merge_method(merge_method: str) -> str:
+    """Map the operator merge method to GitHub's ``MergeMethod`` enum."""
+
+    try:
+        return {"merge": "MERGE", "squash": "SQUASH", "rebase": "REBASE"}[merge_method.strip().lower()]
+    except (AttributeError, KeyError) as error:
+        raise GitHubTrackerError("PR_MERGE_METHOD must be merge, squash, or rebase") from error
+
+
 def _repository_parts(repository: str) -> tuple[str, str]:
     try:
         owner, name = repository.split("/", 1)
@@ -724,6 +779,9 @@ def _comment_from_graphql(value: dict[str, Any]) -> IssueComment:
 def _pull_request_from_graphql(value: dict[str, Any]) -> PullRequest:
     number = value["number"]
     url = value["url"]
+    node_id = value.get("id", "")
     if isinstance(number, bool) or not isinstance(number, int) or not isinstance(url, str) or not url:
         raise ValueError("invalid pull request")
-    return PullRequest(number, url)
+    if not isinstance(node_id, str):
+        raise ValueError("invalid pull request")
+    return PullRequest(number, url, node_id)

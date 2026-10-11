@@ -103,6 +103,8 @@ def main() -> None:
             config.target_repo,
             max_retries=config.max_retries,
             publish_timeout=config.publish_timeout,
+            auto_merge=config.pr_auto_merge,
+            merge_method=config.pr_merge_method,
             attempt_state=attempt_state,
             event_log=lambda event, detail="", level="INFO", issue_number=None: logger.emit(
                 event, phase="publication", detail=detail, level=level, issue_number=issue_number

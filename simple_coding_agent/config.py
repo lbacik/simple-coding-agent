@@ -31,6 +31,7 @@ _DEFAULT_MODEL_NAME = "muse-spark-1.3-contributor"
 _DEFAULT_MODEL_BASE_URL = "https://api.meta.ai"
 _DEFAULT_MODEL_AUTH_MODE = "auth_token"
 _MODEL_AUTH_MODES = frozenset({"auth_token", "api_key"})
+_MERGE_METHODS = frozenset({"merge", "squash", "rebase"})
 _DEFAULT_MODEL_STREAM_IDLE_TIMEOUT_MS = 60000
 _DEFAULT_CLAUDE_AGENT_SDK_VERSION = "0.2.163"
 _DEFAULT_CLAUDE_CODE_VERSION = "2.1.286"
@@ -66,6 +67,8 @@ class RuntimeConfig:
     model_api_key: str = ""
     model_auth_mode: str = _DEFAULT_MODEL_AUTH_MODE
     model_stream_idle_timeout_ms: int = _DEFAULT_MODEL_STREAM_IDLE_TIMEOUT_MS
+    pr_auto_merge: bool = False
+    pr_merge_method: str = "merge"
 
     @property
     def soft_threshold_tokens(self) -> int:
@@ -159,6 +162,8 @@ def load_runtime_config(environ: Mapping[str, str] | None = None) -> RuntimeConf
         max_budget_usd=_positive_integer(values, "MAX_BUDGET_USD", 20),
         max_budget_tokens=_positive_integer(values, "MAX_BUDGET_TOKENS", 4_000_000),
         soft_threshold_percentage=_fraction(values, "SOFT_THRESHOLD_PERCENTAGE", 0.2),
+        pr_auto_merge=_boolean(values, "PR_AUTO_MERGE", False),
+        pr_merge_method=_merge_method(values),
     )
     _warn_when_usd_backstop_is_tighter(config)
     return config
@@ -271,6 +276,13 @@ def _boolean(values: Mapping[str, str], name: str, default: bool) -> bool:
     if value == "false":
         return False
     raise ConfigurationError(f"{name} must be true or false")
+
+
+def _merge_method(values: Mapping[str, str]) -> str:
+    value = values.get("PR_MERGE_METHOD", "merge").strip().lower()
+    if value not in _MERGE_METHODS:
+        raise ConfigurationError("PR_MERGE_METHOD must be merge, squash, or rebase")
+    return value
 
 
 def _review_severities(values: Mapping[str, str]) -> frozenset[str]:

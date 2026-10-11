@@ -36,7 +36,7 @@ def test_publishes_a_complete_attempt_once_and_renders_the_standard_result(tmp_p
     )
 
     assert result.outcome is AttemptOutcome.COMPLETE
-    assert result.pull_request == PullRequest(1, "https://example.test/pulls/1")
+    assert result.pull_request == PullRequest(1, "https://example.test/pulls/1", "pr-node-1")
     assert git(tmp_path / "clone", "ls-remote", "origin", "refs/heads/agent/issue-23")
     assert github.created == [("octo/example", "agent/issue-23", "main", "agent: Implement publication")]
     assert "Closes #23" in github.pull_request_bodies[0]
@@ -130,7 +130,7 @@ def test_verifies_a_pull_request_created_before_an_ambiguous_response(tmp_path: 
     )
 
     assert result.outcome is AttemptOutcome.COMPLETE
-    assert result.pull_request == PullRequest(1, "https://example.test/pulls/1")
+    assert result.pull_request == PullRequest(1, "https://example.test/pulls/1", "pr-node-1")
     assert len(github.created) == 1
 
 
@@ -262,11 +262,15 @@ def publishing_state(tmp_path: Path) -> AttemptStateStore:
 class FakeGitHub:
     pull_request: PullRequest | None = None
     fail_creation_after_write: bool = False
+    enable_error: Exception | None = None
+    merge_error: Exception | None = None
 
     def __post_init__(self) -> None:
         self.created: list[tuple[str, str, str, str]] = []
         self.pull_request_bodies: list[str] = []
         self.comments: list[tuple[int, str]] = []
+        self.auto_merge_calls: list[tuple[str, int, str]] = []
+        self.merge_calls: list[tuple[str, int, str]] = []
 
     def find_pull_request(self, repository: str, head: str) -> PullRequest | None:
         return self.pull_request
@@ -274,10 +278,24 @@ class FakeGitHub:
     def create_pull_request(self, repository: str, head: str, base: str, title: str, body: str) -> PullRequest:
         self.created.append((repository, head, base, title))
         self.pull_request_bodies.append(body)
-        self.pull_request = PullRequest(1, "https://example.test/pulls/1")
+        self.pull_request = PullRequest(1, "https://example.test/pulls/1", "pr-node-1")
         if self.fail_creation_after_write:
             raise OSError("connection closed after write")
         return self.pull_request
+
+    def enable_auto_merge(
+        self, repository: str, pull_request: PullRequest, merge_method: str
+    ) -> None:
+        self.auto_merge_calls.append((repository, pull_request.number, merge_method))
+        if self.enable_error is not None:
+            raise self.enable_error
+
+    def merge_pull_request(
+        self, repository: str, pull_request: PullRequest, merge_method: str
+    ) -> None:
+        self.merge_calls.append((repository, pull_request.number, merge_method))
+        if self.merge_error is not None:
+            raise self.merge_error
 
     def find_attempt_comment(self, repository: str, issue_number: int, marker: str) -> bool:
         return any(number == issue_number and marker in body for number, body in self.comments)
@@ -298,3 +316,205 @@ class AlwaysFailingGitHub(FakeGitHub):
 
     def create_pull_request(self, repository: str, head: str, base: str, title: str, body: str) -> PullRequest:
         raise OSError("pull request creation unavailable")
+
+
+def test_auto_merge_off_makes_no_merge_calls_and_reports_nothing(tmp_path: Path) -> None:
+    remote, _ = repository_with_main(tmp_path)
+    workspace = GitWorkspace(tmp_path / "clone", str(remote), token_provider=lambda: "token")
+    prepared = workspace.prepare_attempt(base_branch="main", issue_number=23)
+    write_and_commit(tmp_path / "clone", "feature.txt", "done", "Implement publication")
+    github = FakeGitHub()
+
+    result = Publisher(workspace, github, "octo/example").publish(
+        request(CompletionDecision(None, True, PublicationPath.COMPLETE, ("ready",)), prepared.branch)
+    )
+
+    assert result.outcome is AttemptOutcome.COMPLETE
+    assert result.merge_result is None
+    assert github.auto_merge_calls == []
+    assert github.merge_calls == []
+    assert "**Merge**" not in github.comments[0][1]
+
+
+def test_auto_merge_enabled_after_pr_creation(tmp_path: Path) -> None:
+    remote, _ = repository_with_main(tmp_path)
+    workspace = GitWorkspace(tmp_path / "clone", str(remote), token_provider=lambda: "token")
+    prepared = workspace.prepare_attempt(base_branch="main", issue_number=23)
+    write_and_commit(tmp_path / "clone", "feature.txt", "done", "Implement publication")
+    github = FakeGitHub()
+
+    result = Publisher(
+        workspace, github, "octo/example", auto_merge=True, merge_method="squash"
+    ).publish(
+        request(CompletionDecision(None, True, PublicationPath.COMPLETE, ("ready",)), prepared.branch)
+    )
+
+    assert result.outcome is AttemptOutcome.COMPLETE
+    assert result.merge_result == "auto-merge enabled (squash)"
+    assert github.auto_merge_calls == [("octo/example", 1, "squash")]
+    assert github.merge_calls == []
+    assert "**Merge**: auto-merge enabled (squash)" in github.comments[0][1]
+
+
+def test_auto_merge_runs_for_an_already_existing_pr(tmp_path: Path) -> None:
+    remote, _ = repository_with_main(tmp_path)
+    workspace = GitWorkspace(tmp_path / "clone", str(remote), token_provider=lambda: "token")
+    prepared = workspace.prepare_attempt(base_branch="main", issue_number=23)
+    write_and_commit(tmp_path / "clone", "feature.txt", "done", "Implement publication")
+    github = FakeGitHub(pull_request=PullRequest(7, "https://example.test/pulls/7", "pr-node-7"))
+
+    result = Publisher(
+        workspace, github, "octo/example", auto_merge=True, merge_method="rebase"
+    ).publish(
+        request(CompletionDecision(None, True, PublicationPath.COMPLETE, ("ready",)), prepared.branch)
+    )
+
+    assert result.outcome is AttemptOutcome.COMPLETE
+    assert result.pull_request == PullRequest(7, "https://example.test/pulls/7", "pr-node-7")
+    assert github.created == []
+    assert github.auto_merge_calls == [("octo/example", 7, "rebase")]
+    assert result.merge_result == "auto-merge enabled (rebase)"
+
+
+def test_auto_merge_falls_back_to_direct_merge_when_already_mergeable(tmp_path: Path) -> None:
+    remote, _ = repository_with_main(tmp_path)
+    workspace = GitWorkspace(tmp_path / "clone", str(remote), token_provider=lambda: "token")
+    prepared = workspace.prepare_attempt(base_branch="main", issue_number=23)
+    write_and_commit(tmp_path / "clone", "feature.txt", "done", "Implement publication")
+    github = FakeGitHub(enable_error=OSError("Pull request is already mergeable"))
+
+    result = Publisher(
+        workspace, github, "octo/example", auto_merge=True, merge_method="squash"
+    ).publish(
+        request(CompletionDecision(None, True, PublicationPath.COMPLETE, ("ready",)), prepared.branch)
+    )
+
+    assert result.outcome is AttemptOutcome.COMPLETE
+    assert result.merge_result == "merged"
+    assert len(github.auto_merge_calls) == 1
+    assert github.merge_calls == [("octo/example", 1, "squash")]
+    assert "**Merge**: merged" in github.comments[0][1]
+
+
+def test_auto_merge_failure_keeps_complete_and_reports_the_reason(tmp_path: Path) -> None:
+    remote, _ = repository_with_main(tmp_path)
+    workspace = GitWorkspace(tmp_path / "clone", str(remote), token_provider=lambda: "token")
+    prepared = workspace.prepare_attempt(base_branch="main", issue_number=23)
+    write_and_commit(tmp_path / "clone", "feature.txt", "done", "Implement publication")
+    github = FakeGitHub(enable_error=OSError("auto-merge not allowed on this repository"))
+
+    result = Publisher(workspace, github, "octo/example", auto_merge=True).publish(
+        request(CompletionDecision(None, True, PublicationPath.COMPLETE, ("ready",)), prepared.branch)
+    )
+
+    assert result.outcome is AttemptOutcome.COMPLETE
+    assert result.merge_result == "auto-merge failed: auto-merge not allowed on this repository"
+    assert github.merge_calls == []
+    assert "auto-merge failed: auto-merge not allowed on this repository" in github.comments[0][1]
+
+
+def test_direct_merge_failure_keeps_complete_and_reports_the_reason(tmp_path: Path) -> None:
+    remote, _ = repository_with_main(tmp_path)
+    workspace = GitWorkspace(tmp_path / "clone", str(remote), token_provider=lambda: "token")
+    prepared = workspace.prepare_attempt(base_branch="main", issue_number=23)
+    write_and_commit(tmp_path / "clone", "feature.txt", "done", "Implement publication")
+    github = FakeGitHub(
+        enable_error=OSError("Pull request is already mergeable"),
+        merge_error=OSError("merge conflict: 2 files"),
+    )
+
+    result = Publisher(workspace, github, "octo/example", auto_merge=True).publish(
+        request(CompletionDecision(None, True, PublicationPath.COMPLETE, ("ready",)), prepared.branch)
+    )
+
+    assert result.outcome is AttemptOutcome.COMPLETE
+    assert result.merge_result == "auto-merge failed: merge conflict: 2 files"
+    assert "**Merge**: auto-merge failed: merge conflict: 2 files" in github.comments[0][1]
+
+
+def test_non_complete_outcomes_never_trigger_the_merge_step(tmp_path: Path) -> None:
+    decisions = [
+        CompletionDecision(AttemptOutcome.INCOMPLETE, False, PublicationPath.PARTIAL, ("check failed",)),
+        CompletionDecision(AttemptOutcome.NO_CHANGES, False, PublicationPath.NONE, ("no commits",)),
+        CompletionDecision(AttemptOutcome.INFRASTRUCTURE_ERROR, False, PublicationPath.NONE, ("broken",)),
+        CompletionDecision(AttemptOutcome.HANDOFF, False, PublicationPath.PARTIAL, ("handoff",)),
+    ]
+    for decision in decisions:
+        remote, _ = repository_with_main(tmp_path / f"repo-{decision.outcome.value}")
+        workspace = GitWorkspace(
+            tmp_path / f"clone-{decision.outcome.value}",
+            str(remote),
+            token_provider=lambda: "token",
+        )
+        prepared = workspace.prepare_attempt(base_branch="main", issue_number=23)
+        if decision.publication_path is PublicationPath.PARTIAL:
+            write_and_commit(
+                tmp_path / f"clone-{decision.outcome.value}",
+                "partial.txt",
+                "partial",
+                "Partial work",
+            )
+        github = FakeGitHub()
+
+        result = Publisher(workspace, github, "octo/example", auto_merge=True).publish(
+            request(decision, prepared.branch)
+        )
+
+        assert result.outcome is decision.outcome
+        assert result.merge_result is None
+        assert github.auto_merge_calls == []
+        assert github.merge_calls == []
+
+
+def test_merge_step_is_idempotent_for_already_enabled_pr(tmp_path: Path) -> None:
+    remote, _ = repository_with_main(tmp_path)
+    workspace = GitWorkspace(tmp_path / "clone", str(remote), token_provider=lambda: "token")
+    prepared = workspace.prepare_attempt(base_branch="main", issue_number=23)
+    write_and_commit(tmp_path / "clone", "feature.txt", "done", "Implement publication")
+    github = FakeGitHub(enable_error=OSError("auto-merge already enabled for this pull request"))
+
+    result = Publisher(workspace, github, "octo/example", auto_merge=True).publish(
+        request(CompletionDecision(None, True, PublicationPath.COMPLETE, ("ready",)), prepared.branch)
+    )
+
+    assert result.outcome is AttemptOutcome.COMPLETE
+    assert result.merge_result == "auto-merge enabled (merge)"
+    assert "auto-merge failed" not in github.comments[0][1]
+
+
+def test_merge_step_is_idempotent_for_an_already_merged_pr(tmp_path: Path) -> None:
+    remote, _ = repository_with_main(tmp_path)
+    workspace = GitWorkspace(tmp_path / "clone", str(remote), token_provider=lambda: "token")
+    prepared = workspace.prepare_attempt(base_branch="main", issue_number=23)
+    write_and_commit(tmp_path / "clone", "feature.txt", "done", "Implement publication")
+    github = FakeGitHub(enable_error=OSError("Pull request was already merged"))
+
+    result = Publisher(workspace, github, "octo/example", auto_merge=True).publish(
+        request(CompletionDecision(None, True, PublicationPath.COMPLETE, ("ready",)), prepared.branch)
+    )
+
+    assert result.outcome is AttemptOutcome.COMPLETE
+    assert result.merge_result == "merged"
+    assert github.merge_calls == []
+    assert "auto-merge failed" not in github.comments[0][1]
+
+
+def test_merge_step_is_idempotent_when_direct_merge_reports_already_merged(
+    tmp_path: Path,
+) -> None:
+    remote, _ = repository_with_main(tmp_path)
+    workspace = GitWorkspace(tmp_path / "clone", str(remote), token_provider=lambda: "token")
+    prepared = workspace.prepare_attempt(base_branch="main", issue_number=23)
+    write_and_commit(tmp_path / "clone", "feature.txt", "done", "Implement publication")
+    github = FakeGitHub(
+        enable_error=OSError("Pull request is already mergeable"),
+        merge_error=OSError("Pull request was already merged"),
+    )
+
+    result = Publisher(workspace, github, "octo/example", auto_merge=True).publish(
+        request(CompletionDecision(None, True, PublicationPath.COMPLETE, ("ready",)), prepared.branch)
+    )
+
+    assert result.outcome is AttemptOutcome.COMPLETE
+    assert result.merge_result == "merged"
+    assert "auto-merge failed" not in github.comments[0][1]
