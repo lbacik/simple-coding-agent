@@ -392,6 +392,41 @@ def test_loads_repository_profile_with_defaults_and_environment(tmp_path: Path) 
     assert profile.timeout == 300
     assert profile.setup_timeout == 120
     assert profile.env == {"APP_ENV": "test"}
+    assert profile.model_instructions == ""
+
+
+def test_loads_repository_profile_model_instructions(tmp_path: Path) -> None:
+    profile_path = tmp_path / "docs" / "agents" / "simple-coding-agent-profile.yml"
+    profile_path.parent.mkdir(parents=True)
+    profile_path.write_text(
+        "setup: pytest\ncheck: pytest\nmodel_instructions: Run php-cs-fixer fix before committing.\n"
+    )
+
+    profile = load_repository_profile(tmp_path)
+
+    assert profile.model_instructions == "Run php-cs-fixer fix before committing."
+
+
+def test_blank_model_instructions_loads_as_blank(tmp_path: Path) -> None:
+    profile_path = tmp_path / "docs" / "agents" / "simple-coding-agent-profile.yml"
+    profile_path.parent.mkdir(parents=True)
+    profile_path.write_text('setup: pytest\ncheck: pytest\nmodel_instructions: "   "\n')
+
+    profile = load_repository_profile(tmp_path)
+
+    assert profile.model_instructions == "   "
+
+
+@pytest.mark.parametrize("contents", ["setup: pytest\ncheck: pytest\nmodel_instructions: 5\n"])
+def test_rejects_non_string_model_instructions(tmp_path: Path, contents: str) -> None:
+    profile_path = tmp_path / "docs" / "agents" / "simple-coding-agent-profile.yml"
+    profile_path.parent.mkdir(parents=True)
+    profile_path.write_text(contents)
+
+    with pytest.raises(ProfileError) as error:
+        load_repository_profile(tmp_path)
+
+    assert error.value.outcome == "infrastructure_error"
 
 
 @pytest.mark.parametrize(

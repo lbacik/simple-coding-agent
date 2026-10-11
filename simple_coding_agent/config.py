@@ -95,6 +95,7 @@ class RepositoryProfile:
     timeout: int
     setup_timeout: int
     env: dict[str, str]
+    model_instructions: str = ""
 
 
 def load_runtime_config(environ: Mapping[str, str] | None = None) -> RuntimeConfig:
@@ -188,7 +189,15 @@ def load_repository_profile(repository_dir: Path, profile_path: str = "") -> Rep
     if not isinstance(raw_profile, dict):
         raise ProfileError("Repository profile must be a mapping")
 
-    allowed_keys = {"setup", "check", "base_branch", "timeout", "setup_timeout", "env"}
+    allowed_keys = {
+        "setup",
+        "check",
+        "base_branch",
+        "timeout",
+        "setup_timeout",
+        "env",
+        "model_instructions",
+    }
     unknown_keys = raw_profile.keys() - allowed_keys
     if unknown_keys:
         raise ProfileError("Repository profile contains unsupported settings")
@@ -200,6 +209,7 @@ def load_repository_profile(repository_dir: Path, profile_path: str = "") -> Rep
         timeout=_profile_duration(raw_profile, "timeout", 300),
         setup_timeout=_profile_duration(raw_profile, "setup_timeout", 120),
         env=_profile_environment(raw_profile),
+        model_instructions=_profile_model_instructions(raw_profile),
     )
 
 
@@ -351,3 +361,16 @@ def _profile_environment(profile: dict[object, object]) -> dict[str, str]:
     ):
         raise ProfileError("Repository profile env must map strings to strings")
     return dict(value)
+
+
+def _profile_model_instructions(profile: dict[object, object]) -> str:
+    """Read the optional free-form repository guidance for the model."""
+
+    if "model_instructions" not in profile:
+        return ""
+    value = profile.get("model_instructions")
+    if value is None:
+        return ""
+    if not isinstance(value, str):
+        raise ProfileError("Repository profile model_instructions must be a string")
+    return value
