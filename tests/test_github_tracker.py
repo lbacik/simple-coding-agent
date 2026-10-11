@@ -215,6 +215,88 @@ def test_publication_transport_uses_attempt_marker_and_reuses_an_existing_pr() -
     assert "comments(last: 100)" in transport.queries[1]
 
 
+def test_find_pull_request_reads_the_node_id_for_auto_merge() -> None:
+    transport = RecordingGraphQLTransport(
+        [
+            {"repository": {"pullRequests": {"nodes": [
+                {"id": "pr-node-8", "number": 8, "url": "https://example.test/8"}
+            ]}}},
+        ]
+    )
+
+    found = transport.find_pull_request("octo/example", "agent/issue-23")
+
+    assert found == PullRequest(8, "https://example.test/8", "pr-node-8")
+
+
+@pytest.mark.parametrize(
+    ("method", "expected"),
+    [("merge", "MERGE"), ("squash", "SQUASH"), ("rebase", "REBASE")],
+)
+def test_enable_auto_merge_sends_the_configured_method(method: str, expected: str) -> None:
+    transport = RecordingGraphQLTransport([{}])
+
+    transport.enable_auto_merge(
+        "octo/example", PullRequest(8, "https://example.test/8", "pr-node-8"), method
+    )
+
+    assert "enablePullRequestAutoMerge" in transport.queries[0]
+    assert transport.variables[0] == {"pullRequestId": "pr-node-8", "mergeMethod": expected}
+
+
+def test_merge_pull_request_sends_the_configured_method() -> None:
+    transport = RecordingGraphQLTransport([{}])
+
+    transport.merge_pull_request(
+        "octo/example", PullRequest(8, "https://example.test/8", "pr-node-8"), "squash"
+    )
+
+    assert "mergePullRequest" in transport.queries[0]
+    assert transport.variables[0] == {"pullRequestId": "pr-node-8", "mergeMethod": "SQUASH"}
+
+
+def test_merge_operations_reject_a_pull_request_without_an_id() -> None:
+    from simple_coding_agent.github_tracker import GitHubGraphQLTransport
+
+    transport = GitHubGraphQLTransport("token")
+    bare = PullRequest(8, "https://example.test/8")
+
+    with pytest.raises(GitHubTrackerError):
+        transport.enable_auto_merge("octo/example", bare, "merge")
+    with pytest.raises(GitHubTrackerError):
+        transport.merge_pull_request("octo/example", bare, "merge")
+
+
+def test_merge_operations_reject_an_unknown_method() -> None:
+    transport = RecordingGraphQLTransport([{}, {}])
+    known = PullRequest(8, "https://example.test/8", "pr-node-8")
+
+    with pytest.raises(GitHubTrackerError):
+        transport.enable_auto_merge("octo/example", known, "fast-forward")
+    with pytest.raises(GitHubTrackerError):
+        transport.merge_pull_request("octo/example", known, "fast-forward")
+
+
+def test_graphql_errors_surface_for_the_merge_step() -> None:
+    from simple_coding_agent.github_tracker import GitHubGraphQLTransport
+
+    transport = GitHubGraphQLTransport("token")
+
+    def _rejected(query: str, variables: dict[str, object]) -> dict:
+        raise GitHubTrackerError(
+            "GitHub GraphQL request was rejected: Pull request is already mergeable"
+        )
+
+    transport._execute = _rejected  # type: ignore[method-assign]
+
+    with pytest.raises(GitHubTrackerError) as error:
+        transport.enable_auto_merge(
+            "octo/example", PullRequest(8, "https://example.test/8", "pr-node-8"), "merge"
+        )
+
+    assert "already mergeable" in str(error.value)
+
+
 def test_releases_only_the_ready_label_and_the_authenticated_agent_assignment() -> None:
     claimed = replace(issue(24), assignee_logins=("agent", "human"), labels=frozenset({"ready-for-agent", "bug"}))
     after_label = replace(claimed, labels=frozenset({"bug"}))
@@ -358,14 +440,22 @@ class RecordingGraphQLTransport:
         self._delegate = GitHubGraphQLTransport("token")
         self._responses = iter(responses)
         self.queries: list[str] = []
+        self.variables: list[dict[str, object]] = []
         self._delegate._execute = self._execute  # type: ignore[method-assign]
 
     def _execute(self, query: str, variables: dict[str, object]) -> dict:
         self.queries.append(query)
+        self.variables.append(variables)
         return next(self._responses)
 
     def find_pull_request(self, repository: str, head: str):
         return self._delegate.find_pull_request(repository, head)
+
+    def enable_auto_merge(self, repository: str, pull_request, merge_method: str):
+        return self._delegate.enable_auto_merge(repository, pull_request, merge_method)
+
+    def merge_pull_request(self, repository: str, pull_request, merge_method: str):
+        return self._delegate.merge_pull_request(repository, pull_request, merge_method)
 
     def find_attempt_comment(self, repository: str, issue_number: int, marker: str):
         return self._delegate.find_attempt_comment(repository, issue_number, marker)

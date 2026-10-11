@@ -37,6 +37,8 @@ def test_loads_required_operator_settings_and_defaults(tmp_path: Path) -> None:
     assert config.max_budget_tokens == 4_000_000
     assert config.soft_threshold_percentage == 0.2
     assert config.soft_threshold_tokens == 3_200_000
+    assert config.pr_auto_merge is False
+    assert config.pr_merge_method == "merge"
 
 
 def test_default_runtime_versions_match_dockerfile_pins(tmp_path: Path) -> None:
@@ -74,6 +76,11 @@ def test_default_runtime_versions_match_dockerfile_pins(tmp_path: Path) -> None:
         ("SOFT_THRESHOLD_PERCENTAGE", "1"),
         ("SOFT_THRESHOLD_PERCENTAGE", "-0.1"),
         ("SOFT_THRESHOLD_PERCENTAGE", "not-a-number"),
+        ("PR_AUTO_MERGE", "sometimes"),
+        ("PR_AUTO_MERGE", "yes"),
+        ("PR_MERGE_METHOD", "fast-forward"),
+        ("PR_MERGE_METHOD", ""),
+        ("PR_MERGE_METHOD", "MERGE!"),
     ],
 )
 def test_rejects_invalid_operator_settings_without_leaking_secrets(
@@ -225,6 +232,34 @@ def test_credential_redactions_cover_both_api_key_settings(tmp_path: Path) -> No
         "meta-secret",
         "model-secret",
     )
+
+
+def test_applies_pr_auto_merge_overrides(tmp_path: Path) -> None:
+    config = load_runtime_config(
+        _operator_env(tmp_path, PR_AUTO_MERGE="true", PR_MERGE_METHOD="squash")
+    )
+
+    assert config.pr_auto_merge is True
+    assert config.pr_merge_method == "squash"
+
+
+def test_pr_merge_method_is_case_insensitive(tmp_path: Path) -> None:
+    config = load_runtime_config(_operator_env(tmp_path, PR_MERGE_METHOD="Rebase"))
+
+    assert config.pr_merge_method == "rebase"
+
+
+def test_rejects_auto_merge_keys_in_the_repository_profile(tmp_path: Path) -> None:
+    profile_path = tmp_path / "docs" / "agents" / "simple-coding-agent-profile.yml"
+    profile_path.parent.mkdir(parents=True)
+    profile_path.write_text(
+        "setup: pytest\ncheck: pytest\npr_auto_merge: true\npr_merge_method: squash\n"
+    )
+
+    with pytest.raises(ProfileError) as error:
+        load_repository_profile(tmp_path)
+
+    assert error.value.outcome == "infrastructure_error"
 
 
 def test_applies_model_backend_overrides(tmp_path: Path) -> None:

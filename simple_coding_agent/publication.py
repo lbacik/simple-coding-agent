@@ -21,6 +21,7 @@ class PullRequest:
 
     number: int
     url: str
+    node_id: str = ""
 
 
 class PublicationTransport(Protocol):
@@ -31,6 +32,14 @@ class PublicationTransport(Protocol):
     def create_pull_request(
         self, repository: str, head: str, base: str, title: str, body: str
     ) -> PullRequest: ...
+
+    def enable_auto_merge(
+        self, repository: str, pull_request: PullRequest, merge_method: str
+    ) -> None: ...
+
+    def merge_pull_request(
+        self, repository: str, pull_request: PullRequest, merge_method: str
+    ) -> None: ...
 
     def find_attempt_comment(self, repository: str, issue_number: int, marker: str) -> bool: ...
 
@@ -64,6 +73,7 @@ class PublicationResult:
     pull_request: PullRequest | None
     comment_posted: bool = True
     details: str = ""
+    merge_result: str | None = None
 
 
 class Publisher:
@@ -83,6 +93,8 @@ class Publisher:
         event_log: Callable[..., None] = (
             lambda event, detail="", level="INFO", issue_number=None: None
         ),
+        auto_merge: bool = False,
+        merge_method: str = "merge",
     ) -> None:
         self._workspace = workspace
         self._github = github
@@ -93,6 +105,8 @@ class Publisher:
         self._sleeper = sleeper
         self._monotonic = monotonic
         self._event_log = event_log
+        self._auto_merge = auto_merge
+        self._merge_method = merge_method
 
     def publish(
         self, request: PublicationRequest, *, timeout: float | None = None
@@ -156,10 +170,20 @@ class Publisher:
                 return PublicationResult(outcome, branch_url, None, comment_posted, details)
             outcome = AttemptOutcome.COMPLETE
 
+        merge_result: str | None = None
+        if outcome is AttemptOutcome.COMPLETE and pull_request is not None and self._auto_merge:
+            # Merging is a follow-up to publication: it never redefines
+            # completion, so any failure stays reported on a complete outcome.
+            merge_result = self._maybe_auto_merge(request, pull_request, deadline)
+
         if outcome is None:
             outcome = AttemptOutcome.INFRASTRUCTURE_ERROR
-        comment_posted = self._post_result(request, outcome, branch_url, pull_request, request.details)
-        return PublicationResult(outcome, branch_url, pull_request, comment_posted, request.details)
+        comment_posted = self._post_result(
+            request, outcome, branch_url, pull_request, request.details, merge_result
+        )
+        return PublicationResult(
+            outcome, branch_url, pull_request, comment_posted, request.details, merge_result
+        )
 
     def _mark_publishing(self) -> None:
         """Durably record a verified branch write before any PR write can begin."""
@@ -203,6 +227,83 @@ class Publisher:
         if self._monotonic() >= deadline:
             raise TimeoutError("PUBLISH_TIMEOUT exceeded")
 
+    def _maybe_auto_merge(
+        self,
+        request: PublicationRequest,
+        pull_request: PullRequest,
+        deadline: float,
+    ) -> str:
+        """Enable native auto-merge, falling back to a direct merge when ready.
+
+        Every path returns a comment-ready result; failures never raise, so
+        the attempt stays ``complete`` and recovery re-runs stay idempotent.
+        """
+
+        try:
+            self._check_deadline(deadline)
+            self._github.enable_auto_merge(
+                self._repository, pull_request, self._merge_method
+            )
+            result = f"auto-merge enabled ({self._merge_method})"
+            self._event_log(
+                "auto_merge_enabled", result, level="INFO", issue_number=request.issue_number
+            )
+            return result
+        except Exception as error:
+            if _is_already_merged(error):
+                self._event_log(
+                    "pull_request_merged",
+                    "pull request was already merged",
+                    level="INFO",
+                    issue_number=request.issue_number,
+                )
+                return "merged"
+            if _is_already_enabled(error):
+                result = f"auto-merge enabled ({self._merge_method})"
+                self._event_log(
+                    "auto_merge_enabled",
+                    result,
+                    level="INFO",
+                    issue_number=request.issue_number,
+                )
+                return result
+            if _is_already_mergeable(error):
+                return self._merge_directly(request, pull_request, deadline)
+            return self._merge_failure(request, error)
+
+    def _merge_directly(
+        self,
+        request: PublicationRequest,
+        pull_request: PullRequest,
+        deadline: float,
+    ) -> str:
+        """Merge an already-mergeable PR after auto-merge was refused."""
+
+        try:
+            self._check_deadline(deadline)
+            self._github.merge_pull_request(
+                self._repository, pull_request, self._merge_method
+            )
+            self._event_log(
+                "pull_request_merged",
+                f"merged with method {self._merge_method}",
+                level="INFO",
+                issue_number=request.issue_number,
+            )
+            return "merged"
+        except Exception as error:
+            if _is_already_merged(error):
+                return "merged"
+            return self._merge_failure(request, error)
+
+    def _merge_failure(self, request: PublicationRequest, error: Exception) -> str:
+        reason = str(error).strip() or type(error).__name__
+        result = f"auto-merge failed: {reason}"
+        self._event_log(
+            "auto_merge_failed", result, level="WARNING", issue_number=request.issue_number
+        )
+        return result
+
     def _post_result(
         self,
         request: PublicationRequest,
@@ -210,6 +311,7 @@ class Publisher:
         branch_url: str | None,
         pull_request: PullRequest | None,
         details: str,
+        merge_result: str | None = None,
     ) -> bool:
         marker = f"<!-- agent-attempt: {request.started_at} -->"
         try:
@@ -218,7 +320,9 @@ class Publisher:
             self._github.add_comment(
                 self._repository,
                 request.issue_number,
-                _result_comment(request, outcome, branch_url, pull_request, details, marker),
+                _result_comment(
+                    request, outcome, branch_url, pull_request, details, marker, merge_result
+                ),
             )
             return True
         except Exception:
@@ -246,6 +350,7 @@ def _result_comment(
     pull_request: PullRequest | None,
     details: str,
     marker: str,
+    merge_result: str | None = None,
 ) -> str:
     branch = f"[{request.branch}]({branch_url})" if branch_url else "no branch created"
     pr = f"[#{pull_request.number}]({pull_request.url})" if pull_request else "none"
@@ -254,10 +359,12 @@ def _result_comment(
         if outcome is AttemptOutcome.HANDOFF and request.note_commit_sha
         else ""
     )
+    merge_line = f"**Merge**: {merge_result}\n" if merge_result is not None else ""
     return (
         f"## Agent Attempt Result: {outcome.value}\n\n"
         f"**Branch**: {branch}\n"
         f"**PR**: {pr}\n"
+        f"{merge_line}"
         f"{commit_line}\n"
         "### Evidence\n"
         f"- Check command: `{request.check_command}` → exit code {request.check_exit_code}\n"
@@ -266,4 +373,30 @@ def _result_comment(
         "### Details\n"
         f"{details}\n\n"
         f"{marker}"
+    )
+
+
+def _error_text(error: Exception) -> str:
+    return f"{type(error).__name__}: {error}".lower()
+
+
+def _is_already_mergeable(error: Exception) -> bool:
+    """Whether enabling auto-merge was refused because the PR can merge now."""
+
+    return "mergeable" in _error_text(error)
+
+
+def _is_already_enabled(error: Exception) -> bool:
+    """Whether auto-merge was already enabled on a previous run."""
+
+    text = _error_text(error)
+    return "already" in text and ("auto-merge" in text or "auto_merge" in text or "auto merge" in text)
+
+
+def _is_already_merged(error: Exception) -> bool:
+    """Whether the PR was already merged on a previous run."""
+
+    text = _error_text(error)
+    return "merg" in text and (
+        "already merged" in text or "was merged" in text or "is merged" in text
     )

@@ -42,6 +42,43 @@ repository with exactly:
 Do not use a classic token or a token with broader scope.  Store the token in
 `GITHUB_TOKEN` inside the `.env` file (never in source control).
 
+## Pull-request auto-merge (`PR_AUTO_MERGE`)
+
+By default the agent only opens a pull request for a complete implementation
+and leaves merging to a human.  Set `PR_AUTO_MERGE=true` to let the
+orchestrator (never the model) ask GitHub to merge that PR right after
+creating it, with `PR_MERGE_METHOD` (`merge`, `squash`, or `rebase`; default
+`merge`) selecting the method for both paths:
+
+1. It first enables GitHub's native auto-merge on the PR, so GitHub merges
+   it once the base branch's protection rules are met.  Deciding when it is
+   safe to merge stays with the repository's branch protection.
+2. If GitHub refuses because the PR is already mergeable (nothing is
+   pending), it merges the PR directly with the same method.
+
+Merging is a follow-up to publication and never redefines completion: an
+attempt whose PR was created stays `complete` even if the merge step fails,
+and the issue result comment reports what the step did (`auto-merge enabled
+(<method>)`, `merged`, or `auto-merge failed: <reason>`).  The existing
+`Closes #N` in the PR body closes the issue when the PR merges.
+
+Prerequisites:
+
+- Turn on **Allow auto-merge** in the target repository's settings;
+  otherwise every merge step fails and is reported in the result comment.
+- Configure branch protection on the base branch with the required status
+  checks (and required reviews if a human must still approve): without
+  protection, auto-merged PRs land with no human review.
+- No new token scope is needed: the existing PAT scopes (`contents: write`,
+  `pull-requests: write`) are enough; issue comments already use
+  `issues: write`.
+
+Auto-merge is operator-only on purpose: the repository profile must not
+carry it (an unknown profile key is refused), because the profile lives in
+the target repository and an auto-merged PR could otherwise edit the profile
+to grant itself more trust.  See
+[ADR 0004](../adr/0004-pr-auto-merge-operator-setting.md).
+
 ## `ready-for-agent` trust policy
 
 The `ready-for-agent` label is the trust boundary.  Only repository

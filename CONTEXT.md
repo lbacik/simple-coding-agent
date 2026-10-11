@@ -16,6 +16,10 @@ _Avoid_: Issue, model turn
 A proposed solution that satisfies the implementation issue's acceptance criteria and the configured repository checks. Completion makes the solution eligible for a pull request; it does not mean the solution has been merged.
 _Avoid_: Successful model response, merged issue
 
+**Auto-merge**:
+The orchestrator-owned follow-up that asks GitHub to merge a complete implementation's pull request when the operator sets `PR_AUTO_MERGE=true`. Auto-merge is distinct from completion: it never decides whether the solution is correct, only whether GitHub should merge an already-published PR (natively once branch protection passes, or directly when the PR is already mergeable). A failed merge step is reported in the result comment and leaves the attempt `complete`.
+_Avoid_: Merged issue, human merge
+
 **Eligible issue**:
 An implementation issue that the agent may claim: labelled `ready-for-agent`, OPEN, unassigned, with a non-empty body, and no open native GitHub blockers.
 _Avoid_: Available issue, queued issue
