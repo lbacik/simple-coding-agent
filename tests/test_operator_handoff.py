@@ -507,3 +507,266 @@ def test_a_failing_reporter_never_breaks_delivery(tmp_path: Path) -> None:
     )
 
     assert "operator_request" in reply["hookSpecificOutput"]["additionalContext"]
+
+
+# --- regression tests: subagent boundaries must not consume delivery (issue #182)
+
+
+def subagent_hook_input(*, agent_id: str = "sub-1", tool_name: str = "Edit") -> dict:
+    return {
+        "tool_name": tool_name,
+        "tool_input": {"file_path": "src/a.py"},
+        "agent_id": agent_id,
+    }
+
+
+def test_subagent_boundary_does_not_deliver_the_operator_instruction(
+    tmp_path: Path,
+) -> None:
+    client = FakeClient(object(), [result()])
+    executor, reported = make_executor(
+        tmp_path, client, handoff=OperatorHandoff("req-1", datetime.now(UTC))
+    )
+
+    reply = asyncio.run(executor._record_post_tool_use(subagent_hook_input(), None, {}))
+
+    assert reply == {}
+    assert executor._operator_context_delivered is False
+    assert reported == []
+
+
+def test_fallback_stays_due_after_subagent_only_boundaries(tmp_path: Path) -> None:
+    now = datetime.now(UTC)
+    client = FakeClient(object(), [result()])
+    executor, _ = make_executor(
+        tmp_path,
+        client,
+        handoff=OperatorHandoff("req-1", now - timedelta(seconds=61)),
+        now=now,
+    )
+
+    asyncio.run(executor._record_post_tool_use(subagent_hook_input(), None, {}))
+
+    assert executor._operator_context_delivered is False
+    assert executor._operator_due_action() == "fallback"
+
+
+def test_main_thread_boundary_after_a_subagent_boundary_delivers_exactly_once(
+    tmp_path: Path,
+) -> None:
+    client = FakeClient(object(), [result()])
+    executor, reported = make_executor(
+        tmp_path, client, handoff=OperatorHandoff("req-1", datetime.now(UTC))
+    )
+
+    subagent_reply = asyncio.run(
+        executor._record_post_tool_use(subagent_hook_input(), None, {})
+    )
+    first = asyncio.run(
+        executor._record_post_tool_use(
+            {"tool_name": "Edit", "tool_input": {"file_path": "src/a.py"}}, None, {}
+        )
+    )
+    second = asyncio.run(
+        executor._record_post_tool_use(
+            {"tool_name": "Edit", "tool_input": {"file_path": "src/b.py"}}, None, {}
+        )
+    )
+
+    assert subagent_reply == {}
+    assert "operator_request" in first["hookSpecificOutput"]["additionalContext"]
+    assert second == {}
+    assert reported == [("delivered", "req-1")]
+
+
+class HandoffInvokingClient(FakeClient):
+    """A fallback double whose follow-up turn invokes the handoff skill."""
+
+    def __init__(self, *args: object, executor_holder: list, **kwargs: object) -> None:
+        super().__init__(*args, **kwargs)
+        self.executor_holder = executor_holder
+
+    async def query(self, prompt: str) -> None:
+        await super().query(prompt)
+        executor = self.executor_holder[0]
+        if executor is not None and "operator_request" in prompt:
+            await executor._record_skill_event(
+                "PreToolUse", skill_hook_input("handoff"), "tool-9", {}
+            )
+
+
+def test_fallback_after_subagent_only_boundaries_can_still_hand_off(
+    tmp_path: Path,
+) -> None:
+    now = datetime.now(UTC)
+    holder: list = [None]
+    client = HandoffInvokingClient(
+        object(),
+        [result()],
+        followup_messages=[result()],
+        executor_holder=holder,
+    )
+    executor, reported = make_executor(
+        tmp_path,
+        client,
+        handoff=OperatorHandoff("req-1", now - timedelta(seconds=61)),
+        now=now,
+    )
+    holder[0] = executor
+
+    async def run() -> object:
+        task = asyncio.ensure_future(
+            executor.execute(issue_body="Fix it.", working_directory=tmp_path)
+        )
+        for _ in range(100):
+            await asyncio.sleep(0)
+            if client.queried_prompts:
+                break
+        # Only subagent boundaries happen while the request is pending.
+        await executor._record_post_tool_use(subagent_hook_input(), None, {})
+        return await task
+
+    execution = asyncio.run(run())
+
+    assert len(client.queried_prompts) == 1
+    assert "operator_request" in client.queried_prompts[0]
+    assert execution.status is ModelExecutionStatus.HANDOFF_REQUESTED
+    assert reported == [("delivered", "req-1"), ("begun", "req-1")]
+
+
+def test_expiry_after_begun_does_not_claim_the_skill_was_never_invoked(
+    tmp_path: Path,
+) -> None:
+    now = [datetime.now(UTC)]
+    client = FakeClient(object(), [result()])
+    events: list[tuple[str, str]] = []
+    executor = ModelExecutor(
+        runtime_config(tmp_path),
+        client_factory=lambda options: client,
+        clock=lambda: now[0],
+        event_log=lambda event,
+        detail="",
+        level="INFO",
+        issue_number=None: events.append((event, detail)),
+    )
+    executor.set_operator_handoff_provider(lambda: OperatorHandoff("req-1", now[0]))
+
+    asyncio.run(
+        executor._record_post_tool_use(
+            {"tool_name": "Edit", "tool_input": {"file_path": "src/a.py"}}, None, {}
+        )
+    )
+    asyncio.run(
+        executor._record_skill_event(
+            "PreToolUse", skill_hook_input("handoff"), "tool-1", {}
+        )
+    )
+    now[0] = now[0] + timedelta(seconds=241)
+    terminal, models = asyncio.run(executor._receive_terminal(client))
+
+    assert terminal is None
+    expired = [
+        detail
+        for event, detail in events
+        if event == "operator_handoff_model_deadline_expired"
+    ]
+    assert len(expired) == 1
+    assert "req-1" in expired[0]
+    assert "begun=yes" in expired[0]
+
+    execution = executor._operator_expired_evidence(models)
+
+    assert execution.status is ModelExecutionStatus.OPERATOR_HANDOFF_EXPIRED
+    assert "req-1" in execution.explanation
+    assert "without the model invoking the handoff skill" not in execution.explanation
+    assert "begun=yes" in execution.explanation
+
+
+def test_expiry_log_details_include_the_steps_reached(tmp_path: Path) -> None:
+    now = datetime.now(UTC)
+    client = FakeClient(object(), [result()])
+    events: list[tuple[str, str]] = []
+    executor = ModelExecutor(
+        runtime_config(tmp_path),
+        client_factory=lambda options: client,
+        clock=lambda: now,
+        event_log=lambda event,
+        detail="",
+        level="INFO",
+        issue_number=None: events.append((event, detail)),
+    )
+    executor.set_operator_handoff_provider(
+        lambda: OperatorHandoff("req-1", now - timedelta(seconds=241))
+    )
+
+    execution = asyncio.run(
+        executor.execute(issue_body="Fix it.", working_directory=tmp_path)
+    )
+
+    assert execution.status is ModelExecutionStatus.OPERATOR_HANDOFF_EXPIRED
+    expired = [
+        detail
+        for event, detail in events
+        if event == "operator_handoff_model_deadline_expired"
+    ]
+    assert len(expired) == 1
+    assert "delivered=no" in expired[0]
+    assert "fallback=" in expired[0]
+    assert "begun=no" in expired[0]
+    assert "delivered=no" in execution.explanation
+    assert "begun=no" in execution.explanation
+
+
+class ClockAdvancingClient(FakeClient):
+    """A fallback double whose follow-up turn outlives the model deadline."""
+
+    def __init__(self, *args: object, advance=None, **kwargs: object) -> None:
+        super().__init__(*args, **kwargs)
+        self.advance = advance
+
+    async def query(self, prompt: str) -> None:
+        await super().query(prompt)
+        if self.advance is not None:
+            self.advance()
+
+
+def test_expiry_after_a_fired_fallback_reports_the_fallback_step(
+    tmp_path: Path,
+) -> None:
+    now = [datetime.now(UTC)]
+    client = ClockAdvancingClient(
+        object(),
+        [result()],
+        followup_messages=[],
+        advance=lambda: now.__setitem__(0, now[0] + timedelta(seconds=200)),
+    )
+    events: list[tuple[str, str]] = []
+    executor = ModelExecutor(
+        runtime_config(tmp_path),
+        client_factory=lambda options: client,
+        clock=lambda: now[0],
+        event_log=lambda event,
+        detail="",
+        level="INFO",
+        issue_number=None: events.append((event, detail)),
+    )
+    executor.set_operator_handoff_provider(
+        lambda: OperatorHandoff("req-1", now[0] - timedelta(seconds=61))
+    )
+
+    execution = asyncio.run(
+        executor.execute(issue_body="Fix it.", working_directory=tmp_path)
+    )
+
+    assert execution.status is ModelExecutionStatus.OPERATOR_HANDOFF_EXPIRED
+    assert "delivered=fallback" in execution.explanation
+    assert "fallback=fired" in execution.explanation
+    assert "begun=no" in execution.explanation
+    expired = [
+        detail
+        for event, detail in events
+        if event == "operator_handoff_model_deadline_expired"
+    ]
+    assert len(expired) == 1
+    assert "delivered=fallback" in expired[0]
+    assert "fallback=fired" in expired[0]
