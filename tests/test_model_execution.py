@@ -151,6 +151,43 @@ def test_dispatches_the_issue_body_to_the_pinned_sdk_and_returns_execution_evide
     }
 
 
+def test_model_execution_runs_the_verified_bundled_cli(tmp_path: Path) -> None:
+    from simple_coding_agent.provenance import ProvenanceEvidence
+
+    cli_path = tmp_path / "claude_agent_sdk" / "_bundled" / "claude"
+    evidence = ProvenanceEvidence(
+        skill_hashes={},
+        sdk_version="0.2.163",
+        cli_version="2.1.286",
+        cli_path=cli_path,
+    )
+    captured: list[FakeClient] = []
+
+    def client_factory(options: object) -> FakeClient:
+        client = FakeClient(
+            options,
+            [
+                SimpleNamespace(model="muse-spark-1.3-contributor"),
+                result(),
+            ],
+        )
+        captured.append(client)
+        return client
+
+    execution = asyncio.run(
+        ModelExecutor(
+            runtime_config(tmp_path),
+            client_factory=client_factory,
+            cli_path=evidence.cli_path,
+        ).execute(
+            issue_body="Fix the parser.", working_directory=tmp_path / "repo"
+        )
+    )
+
+    assert execution.status is ModelExecutionStatus.SUCCEEDED
+    assert captured[0].options.cli_path == evidence.cli_path
+
+
 def test_default_meta_config_matches_the_legacy_meta_environment_mapping(
     tmp_path: Path,
 ) -> None:

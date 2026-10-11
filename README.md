@@ -30,8 +30,8 @@ Use a fine-grained GitHub PAT limited to the configured repository with only
 `contents:write`, `pull-requests:write`, and `issues:write`. Configure provider
 spending controls in Meta: SDK `max_budget_usd=5` is only a circuit breaker.
 The agent uses only `muse-spark-1.3-contributor`; no fallback model is set.
-The runtime pair is pinned to `claude-agent-sdk==0.2.163` and
-`@anthropic-ai/claude-code@2.1.286`.
+The pinned runtime is `claude-agent-sdk==0.2.163` together with the Claude
+Code CLI bundled inside it; pinning the SDK pins the CLI.
 
 The model backend is configured through operator settings that default to
 Meta, so an existing `.env` with only `META_API_KEY` keeps working with no
@@ -168,7 +168,9 @@ reset the guard, or allow a later non-infrastructure outcome to reset it.
 
 Before model execution, the agent verifies `agent-installer list --json` for
 the pinned upstream skill commit, installed skill hashes, and valid HOME links,
-plus the exact pinned SDK and CLI versions. Any mismatch blocks model execution.
+plus the exact pinned SDK version and the version reported by the SDK's
+bundled Claude Code CLI. Any mismatch blocks model execution, and every model
+execution runs exactly the verified bundled binary.
 The process emits credential-redacted JSON Lines with `timestamp`, `level`,
 `event`, `issue_number`, `phase`, and `detail`. Attempt evidence is retained
 without automatic cleanup under `$DATA_DIR/logs/<issue>/<timestamp>/`, including

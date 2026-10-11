@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1
 # Unattended single-repository coding agent.
 #
-# Runtime pair: claude-agent-sdk==0.2.163 + @anthropic-ai/claude-code@2.1.286
+# Pinned runtime: claude-agent-sdk==0.2.163 with its bundled Claude Code CLI
 # Dedicated agent user: UID 1000, HOME=/home/agent
 # Persistent data root: /data  (mount as a named volume)
 
@@ -58,10 +58,6 @@ RUN pip install --no-cache-dir \
 # checkout's virtual environment to PATH, where a bare `agentctl` could
 # resolve to the target package instead of this agent's installed package.
 RUN test -x /usr/local/bin/agentctl
-
-# Pinned CLI runtime (installed globally so agent user can use it)
-COPY package.json ./
-RUN npm install --global @anthropic-ai/claude-code@2.1.286
 
 # Pinned skill installer (installed globally as root: the agent user cannot
 # write the global npm prefix). install-skills.sh rejects any other version,

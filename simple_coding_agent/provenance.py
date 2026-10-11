@@ -33,12 +33,16 @@ class ProvenanceEvidence:
     skill_hashes: dict[str, str]
     sdk_version: str
     cli_version: str
+    cli_path: Path
     agent_version: str = UNKNOWN_VERSION
 
     def summary(self) -> str:
         """One-line startup log detail naming the agent, SDK and CLI versions."""
 
-        return f"agent={self.agent_version}; sdk={self.sdk_version}; cli={self.cli_version}"
+        return (
+            f"agent={self.agent_version}; sdk={self.sdk_version}; "
+            f"cli={self.cli_version} ({self.cli_path})"
+        )
 
 
 class ProvenanceVerifier:
@@ -49,15 +53,17 @@ class ProvenanceVerifier:
         *,
         home: Path,
         expected_sdk_version: str,
-        expected_cli_version: str,
         run: Callable[[tuple[str, ...]], str] | None = None,
         sdk_version: Callable[[], str] | None = None,
+        cli_path: str | Path | None = None,
+        bundled_cli_version: Callable[[], str] | None = None,
     ) -> None:
         self._home = home
         self._expected_sdk_version = expected_sdk_version
-        self._expected_cli_version = expected_cli_version
         self._run = run or _run
         self._sdk_version = sdk_version or _installed_sdk_version
+        self._cli_path = cli_path
+        self._bundled_cli_version = bundled_cli_version or _expected_bundled_cli_version
 
     def verify(self) -> ProvenanceEvidence:
         artifacts = _artifacts(self._run(("agent-installer", "list", "--json")))
@@ -77,10 +83,17 @@ class ProvenanceVerifier:
         sdk_version = self._sdk_version()
         if sdk_version != self._expected_sdk_version:
             raise ProvenanceError("Claude Agent SDK version does not match the pinned runtime")
-        cli_version = _version(self._run(("claude", "--version")))
-        if cli_version != self._expected_cli_version:
+        cli_path = Path(self._cli_path).expanduser() if self._cli_path is not None else _bundled_cli_path()
+        if not cli_path.is_file():
+            raise ProvenanceError(
+                f"Bundled Claude Code CLI is missing at {cli_path}; "
+                "the pinned runtime cannot be verified"
+            )
+        expected_cli_version = self._bundled_cli_version()
+        cli_version = _version(self._run((str(cli_path), "--version")))
+        if cli_version != expected_cli_version:
             raise ProvenanceError("Claude Code CLI version does not match the pinned runtime")
-        return ProvenanceEvidence(hashes, sdk_version, cli_version, agent_version())
+        return ProvenanceEvidence(hashes, sdk_version, cli_version, cli_path, agent_version())
 
 
 def _artifacts(output: str) -> dict[str, dict[str, Any]]:
@@ -118,6 +131,37 @@ def _verify_link(home: Path, skill: str) -> None:
     link = home / ".claude" / "skills" / skill
     if not source.is_dir() or not link.is_symlink() or link.resolve() != source.resolve():
         raise ProvenanceError(f"Required skill HOME link is invalid: {skill}")
+
+
+def _bundled_cli_path() -> Path:
+    """Resolve the Claude Code CLI bundled inside the installed SDK package.
+
+    This is the only reliance on SDK package internals: the SDK runs this
+    same bundled binary in preference to ``PATH`` unless ``cli_path`` is set,
+    so provenance must verify exactly this file and the executor must run it.
+    """
+
+    try:
+        import claude_agent_sdk
+
+        return Path(claude_agent_sdk.__file__).parent / "_bundled" / "claude"
+    except Exception as error:
+        raise ProvenanceError("Bundled Claude Code CLI location is unavailable") from error
+
+
+def _expected_bundled_cli_version() -> str:
+    """Read the CLI version the installed SDK release ships."""
+
+    try:
+        from claude_agent_sdk._cli_version import __cli_version__
+
+        if not isinstance(__cli_version__, str) or not __cli_version__.strip():
+            raise ValueError("bundled CLI version is empty")
+        return __cli_version__
+    except ProvenanceError:
+        raise
+    except Exception as error:
+        raise ProvenanceError("Bundled Claude Code CLI version is unavailable") from error
 
 
 def _installed_sdk_version() -> str:

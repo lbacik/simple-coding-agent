@@ -263,8 +263,10 @@ class ModelExecutor:
         client_factory: ClientFactory = ClaudeSDKClient,
         clock: Clock = lambda: datetime.now(UTC),
         event_log: EventLog = lambda event, detail="", level="INFO", issue_number=None: None,
+        cli_path: str | Path | None = None,
     ) -> None:
         self._config = config
+        self._cli_path = Path(cli_path).expanduser() if cli_path is not None else None
         self._client_factory = client_factory
         self._clock = clock
         self._event_log = event_log
@@ -910,6 +912,7 @@ class ModelExecutor:
             max_budget_usd=self._config.max_budget_usd,
             include_partial_messages=True,
             cwd=working_directory,
+            cli_path=self._cli_path,
             env=_model_environment(self._config),
             setting_sources=settings_sources,
             strict_mcp_config=self._config.agent_trust_project_settings,
