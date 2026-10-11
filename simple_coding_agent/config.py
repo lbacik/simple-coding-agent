@@ -67,6 +67,7 @@ class RuntimeConfig:
     model_stream_idle_timeout_ms: int = _DEFAULT_MODEL_STREAM_IDLE_TIMEOUT_MS
     pr_auto_merge: str = "false"
     pr_merge_method: str = "merge"
+    max_auto_continuations: int = 0
 
     @property
     def soft_threshold_tokens(self) -> int:
@@ -160,6 +161,7 @@ def load_runtime_config(environ: Mapping[str, str] | None = None) -> RuntimeConf
         soft_threshold_percentage=_fraction(values, "SOFT_THRESHOLD_PERCENTAGE", 0.2),
         pr_auto_merge=_auto_merge_mode(values),
         pr_merge_method=_merge_method(values),
+        max_auto_continuations=_non_negative_integer(values, "MAX_AUTO_CONTINUATIONS", 0),
     )
     _warn_when_claude_code_version_is_set(values)
     _warn_when_usd_backstop_is_tighter(config)
@@ -276,6 +278,17 @@ def _positive_integer(values: Mapping[str, str], name: str, default: int) -> int
         raise ConfigurationError(f"{name} must be a positive integer") from error
     if number <= 0:
         raise ConfigurationError(f"{name} must be a positive integer")
+    return number
+
+
+def _non_negative_integer(values: Mapping[str, str], name: str, default: int) -> int:
+    value = values.get(name, str(default))
+    try:
+        number = int(str(value).strip())
+    except ValueError as error:
+        raise ConfigurationError(f"{name} must be a non-negative integer") from error
+    if number < 0:
+        raise ConfigurationError(f"{name} must be a non-negative integer")
     return number
 
 
