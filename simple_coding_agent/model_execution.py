@@ -11,6 +11,7 @@ import json
 from pathlib import Path
 import re
 import shlex
+import subprocess
 from typing import Any, Protocol
 
 from claude_agent_sdk import (
@@ -97,27 +98,185 @@ def _attempt_id_sentence(attempt_id: str | None) -> str:
     )
 
 
-def _cost_handoff_instruction(
-    issue_number: int | None, attempt_id: str | None = None
+#: How many lines of each git output the token soft-threshold snapshot
+#: carries before capping it with a ``+N more`` line. Forty lines fit the
+#: branch state the model needs (short status, oneline log, diff stat)
+#: without spending the reserve the handoff itself must write in.
+_SNAPSHOT_LINE_LIMIT = 40
+
+
+def _cap_snapshot_lines(text: str, limit: int = _SNAPSHOT_LINE_LIMIT) -> str:
+    """Cap ``text`` at ``limit`` lines, appending a ``+N more`` line on overflow."""
+
+    lines = text.splitlines()
+    if len(lines) <= limit:
+        return text
+    kept = lines[:limit]
+    return "\n".join([*kept, f"...+{len(lines) - limit} more"])
+
+
+def _run_snapshot_git(working_directory: Path, *arguments: str) -> str | None:
+    """Best-effort git output for the handoff snapshot; ``None`` when unavailable."""
+
+    try:
+        completed = subprocess.run(
+            ("git", *arguments),
+            cwd=working_directory,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except Exception:
+        return None
+    if completed.returncode != 0:
+        return None
+    return completed.stdout.strip()
+
+
+def _snapshot_section(title: str, output: str | None, empty: str) -> str:
+    """Render one capped git section of the handoff snapshot."""
+
+    if output is None:
+        return f"{title}:\n(unavailable)"
+    body = output.strip() or empty
+    return f"{title}:\n{_cap_snapshot_lines(body)}"
+
+
+def _token_handoff_prefill(
+    issue_number: int | None, attempt_id: str | None, head_sha: str | None
 ) -> str:
+    """The note header the model must copy verbatim into its handoff note."""
+
+    issue_label = str(issue_number) if issue_number is not None else "<issue-number>"
+    lines = [
+        f"# Handoff note: issue #{issue_label}",
+        "",
+        f"- issue: {issue_label}",
+    ]
+    if attempt_id is not None:
+        lines.append(f"- started_at: {attempt_id}")
+    lines.append("- reason: token_soft_threshold")
+    lines.append(f"- last_work_commit: {head_sha or '(unknown)'}")
+    return "\n".join(lines)
+
+
+def _token_handoff_snapshot(
+    working_directory: Path | None,
+    *,
+    branch: str | None,
+    base_revision: str | None,
+    issue_number: int | None,
+    attempt_id: str | None,
+) -> str:
+    """Collect the branch state the two-call token handoff needs.
+
+    Taken at injection time so the model never spends its remaining turns
+    on orientation commands: the current branch, the base revision, the
+    current HEAD SHA, ``git status --short``, ``git log --oneline
+    <base>..HEAD`` and ``git diff --stat <base>`` (each capped at
+    ``_SNAPSHOT_LINE_LIMIT`` lines), the attempt's ``started_at``, and a
+    pre-filled note header whose ``last_work_commit`` is HEAD at injection
+    time. Anything git cannot report degrades to ``(unavailable)`` instead
+    of failing: the handoff must still be writable.
+    """
+
+    if working_directory is None:
+        head_sha: str | None = None
+        status = log = diff_stat = None
+        current_branch = branch or "(unknown)"
+    else:
+        shown_branch = _run_snapshot_git(working_directory, "branch", "--show-current")
+        current_branch = (shown_branch or "").strip() or branch or "(unknown)"
+        head_raw = _run_snapshot_git(working_directory, "rev-parse", "HEAD")
+        head_sha = (head_raw or "").strip() or None
+        status = _run_snapshot_git(working_directory, "status", "--short")
+        if base_revision:
+            log = _run_snapshot_git(
+                working_directory, "log", "--oneline", f"{base_revision}..HEAD"
+            )
+            diff_stat = _run_snapshot_git(
+                working_directory, "diff", "--stat", base_revision
+            )
+        else:
+            log = diff_stat = None
+    note_label = str(issue_number) if issue_number is not None else "<issue-number>"
+    started = attempt_id if attempt_id is not None else "(none given; omit started_at)"
+    parts = [
+        f"Branch: {current_branch}",
+        f"Base revision: {base_revision or '(unknown)'}",
+        f"HEAD: {head_sha or '(unavailable)'}",
+        _snapshot_section("git status --short", status, "(clean)"),
+        (
+            "git log --oneline <base>..HEAD:\n(unknown base revision; log unavailable)"
+            if base_revision is None
+            else _snapshot_section("git log --oneline <base>..HEAD", log, "(no commits)")
+        ),
+        (
+            "git diff --stat <base>:\n(unknown base revision; diff unavailable)"
+            if base_revision is None
+            else _snapshot_section("git diff --stat <base>", diff_stat, "(no differences)")
+        ),
+        f"started_at: {started}",
+        (
+            f"Pre-filled note header (copy verbatim, then fill in Summary,"
+            f" Remaining work and Evidence):\n"
+            f"{_token_handoff_prefill(issue_number, attempt_id, head_sha)}"
+        ),
+        f"The handoff note path is exactly `.agent/handoff/{note_label}.md`.",
+    ]
+    return "\n\n".join(parts)
+
+
+def _token_handoff_steps(issue_number: int | None) -> str:
+    """The only five steps the token soft-threshold handoff may take."""
+
+    note_label = str(issue_number) if issue_number is not None else "<issue-number>"
     return (
+        "Do exactly the following and nothing else:\n"
+        "1. Do not run diagnostic commands; the state above is current.\n"
+        "2. Do not commit work yourself. Sealing will commit any uncommitted"
+        " work after the attempt.\n"
+        "3. Write the handoff note using the pre-filled header above verbatim,"
+        " and fill in Summary, Remaining work and Evidence.\n"
+        f"4. In one `Bash` call, run `git add .agent/handoff/{note_label}.md"
+        f" && git commit -m \"Handoff note: issue #{note_label}\"`.\n"
+        "5. Stop."
+    )
+
+
+def _cost_handoff_instruction(
+    issue_number: int | None,
+    attempt_id: str | None = None,
+    *,
+    snapshot: str | None = None,
+) -> str:
+    base = (
         "This attempt is approaching its token budget. Invoke the `handoff` skill now "
         "to preserve your progress cooperatively instead of continuing further work. "
         f"{_HANDOFF_SKILL_TOOL_HINT} {_handoff_target(issue_number)}"
         f"{_attempt_id_sentence(attempt_id)}"
     )
+    if snapshot is None:
+        return base
+    return f"{base}\n\n{snapshot}\n\n{_token_handoff_steps(issue_number)}"
 
 
 def _cost_handoff_followup_prompt(
-    issue_number: int | None, attempt_id: str | None = None
+    issue_number: int | None,
+    attempt_id: str | None = None,
+    *,
+    snapshot: str | None = None,
 ) -> str:
-    return (
+    base = (
         "This attempt crossed its token soft threshold and must now end by handing off. "
         "Invoke the `handoff` skill now to preserve your progress: commit any outstanding "
         "work, then write and commit the handoff note. Do not attempt further implementation "
         f"work. {_HANDOFF_SKILL_TOOL_HINT} {_handoff_target(issue_number)}"
         f"{_attempt_id_sentence(attempt_id)}"
     )
+    if snapshot is None:
+        return base
+    return f"{base}\n\n{snapshot}\n\n{_token_handoff_steps(issue_number)}"
 
 
 def _operator_handoff_instruction(
@@ -341,6 +500,10 @@ class ModelExecutor:
         self._soft_threshold_crossed_at_tokens: float | None = None
         self._total_cost_usd: float | None = None
         self._handoff_context_delivered = False
+        self._working_directory: Path | None = None
+        self._attempt_branch: str | None = None
+        self._attempt_base_revision: str | None = None
+        self._token_handoff_snapshot: str | None = None
         self._running_subagents: set[str] = set()
         self._stopped_subagent_ids: list[str] = []
         self._usage_shape_logged = False
@@ -769,6 +932,8 @@ class ModelExecutor:
         issue_number: int | None = None,
         archive: EvidenceWriter | None = None,
         attempt_id: str | None = None,
+        branch: str | None = None,
+        base_revision: str | None = None,
     ) -> ModelExecution:
         """Dispatch ``/implement`` and classify its one terminal SDK result."""
 
@@ -785,6 +950,10 @@ class ModelExecutor:
         self._total_cost_usd = None
         self._token_hard_ceiling_reached = False
         self._handoff_context_delivered = False
+        self._working_directory = working_directory
+        self._attempt_branch = branch
+        self._attempt_base_revision = base_revision
+        self._token_handoff_snapshot = None
         self._running_subagents = set()
         self._stopped_subagent_ids = []
         self._usage_shape_logged = False
@@ -855,7 +1024,9 @@ class ModelExecutor:
                         client,
                         observed_models,
                         prompt=_cost_handoff_followup_prompt(
-                            self._issue_number, self._attempt_id
+                            self._issue_number,
+                            self._attempt_id,
+                            snapshot=self._token_followup_snapshot(),
                         ),
                         success_explanation=(
                             "Model invoked the handoff skill after a token"
@@ -938,6 +1109,31 @@ class ModelExecutor:
             event.name == "handoff" and event.agent_id is None
             for event in self._skill_events
         )
+
+    def _build_token_snapshot(self) -> str:
+        """Collect the branch state for the two-call token handoff, now."""
+
+        return _token_handoff_snapshot(
+            self._working_directory,
+            branch=self._attempt_branch,
+            base_revision=self._attempt_base_revision,
+            issue_number=self._issue_number,
+            attempt_id=self._attempt_id,
+        )
+
+    def _token_followup_snapshot(self) -> str:
+        """The injection-time snapshot, or a fresh one when never injected.
+
+        The follow-up prompt carries the state taken at injection time, so
+        the model still sees the branch as it was when the threshold
+        crossed even if the injection raced a commit. When no injection
+        happened (the crossing landed on the terminal result itself), the
+        snapshot is collected fresh.
+        """
+
+        if self._token_handoff_snapshot is None:
+            self._token_handoff_snapshot = self._build_token_snapshot()
+        return self._token_handoff_snapshot
 
     def _cost_followup_blocked(self) -> bool:
         """Whether the cost follow-up would bypass the hard token limit."""
@@ -1975,8 +2171,13 @@ class ModelExecutor:
                 # frees the remaining budget for the handoff.
                 self._handoff_context_delivered = True
                 self._log("token_soft_threshold_handoff_context_injected")
+                self._token_handoff_snapshot = self._build_token_snapshot()
                 contexts.append(
-                    _cost_handoff_instruction(self._issue_number, self._attempt_id)
+                    _cost_handoff_instruction(
+                        self._issue_number,
+                        self._attempt_id,
+                        snapshot=self._token_handoff_snapshot,
+                    )
                 )
             else:
                 # Subagents are still recorded as running (for example the

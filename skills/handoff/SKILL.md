@@ -12,7 +12,33 @@ The driving process owns remote publication (push, PR, comments, labels).
 This skill only commits locally. Never run `git push`, `gh pr create`, or any
 other publishing command.
 
-## Steps
+## Token soft-threshold handoff (two tool calls)
+
+When the handoff was triggered by a token soft-threshold notice, the
+instruction already supplies the current branch state: the branch, the base
+revision, the HEAD SHA, `git status --short`, `git log --oneline
+<base>..HEAD`, `git diff --stat <base>`, and a pre-filled note header whose
+`last_work_commit` is HEAD at injection time. Trust that state; do not run
+diagnostic commands to re-derive it.
+
+The handoff then takes at most two tool calls, and work is not committed in
+this case:
+
+1. Write `.agent/handoff/<issue-number>.md` using the pre-filled header
+   verbatim, and fill in Summary, Remaining work and Evidence.
+2. In one `Bash` call, run
+   `git add .agent/handoff/<issue-number>.md && git commit -m "Handoff note: issue #<issue-number>"`.
+3. Stop.
+
+Do not commit work yourself on this path: sealing commits any uncommitted
+work after the attempt, so the branch ends as the earlier work commits, then
+the note commit, then (if there was uncommitted work) the seal commit.
+
+## Steps (operator and turn/time-limit handoffs)
+
+This is the documented path for operator `handoff now` requests and for
+turn/time-limit follow-ups. (Token soft-threshold handoffs use the two-call
+path above instead and skip step 1.)
 
 1. **Preserve outstanding work.** If there is any dirty or untracked change
    in the working directory, commit it now, as one or more ordinary work
