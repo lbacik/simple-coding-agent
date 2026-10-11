@@ -9,7 +9,14 @@ from types import SimpleNamespace
 
 import pytest
 
-from claude_agent_sdk import AssistantMessage, StreamEvent, TextBlock, ToolResultBlock, UserMessage
+from claude_agent_sdk import (
+    AssistantMessage,
+    StreamEvent,
+    SystemMessage,
+    TextBlock,
+    ToolResultBlock,
+    UserMessage,
+)
 
 from simple_coding_agent.config import RuntimeConfig
 from simple_coding_agent.model_execution import (
@@ -3209,3 +3216,467 @@ def test_threshold_events_carry_the_reserve_fields(tmp_path: Path) -> None:
     assert budget["handoff_reserve_turns"] == 6
     assert budget["soft_threshold_rule"] is None
     assert budget["effective_soft_threshold_tokens"] is None
+
+
+# --- Handoff gate until the note commit (issue #204) -------------------------
+
+_ATTEMPT_ID_204 = "2026-10-11T13:48:18.485562Z"
+
+
+def _hooked_executor_204(tmp_path: Path, repo: Path, *, issue_number: int = 24):
+    """An executed executor with captured Pre/PostToolUse hooks and events."""
+
+    captured: list[FakeClient] = []
+
+    def client_factory(options: object) -> FakeClient:
+        client = FakeClient(options, [result()])
+        captured.append(client)
+        return client
+
+    events: list[tuple[str, str]] = []
+    executor = ModelExecutor(
+        replace(runtime_config(tmp_path), max_budget_tokens=1_000_000),
+        client_factory=client_factory,
+        event_log=lambda event, detail="", level="INFO", issue_number=None: events.append(
+            (event, detail)
+        ),
+    )
+    asyncio.run(
+        executor.execute(
+            issue_body="Fix it.",
+            working_directory=repo,
+            issue_number=issue_number,
+            attempt_id=_ATTEMPT_ID_204,
+        )
+    )
+    hooks = captured[0].options.hooks
+    return (
+        executor,
+        events,
+        hooks["PreToolUse"][0].hooks[0],
+        hooks["PostToolUse"][0].hooks[0],
+    )
+
+
+def _cross_soft_threshold_204(executor: ModelExecutor) -> None:
+    """Latch the real soft-threshold crossing (also capturing the git baseline)."""
+
+    executor._ledger.observe_response("main", "r-big", 0)
+    executor._ledger.observe_usage("main", "r-big", {"input_tokens": 900_000})
+    executor._check_limits("main")
+    assert executor._soft_threshold_crossed is True
+    assert executor._handoff_baseline_sha is not None
+
+
+def _invoke_handoff_skill_204(pre_hook) -> None:
+    assert (
+        asyncio.run(
+            pre_hook({"tool_name": "Skill", "tool_input": {"skill": "handoff"}}, None, {})
+        )
+        == {}
+    )
+
+
+def test_cost_guard_stays_active_after_handoff_skill_until_note_commit(
+    tmp_path: Path,
+) -> None:
+    repo, _, _ = _snapshot_repo(tmp_path, issue_number=24)
+    executor, _, pre_hook, _ = _hooked_executor_204(tmp_path, repo)
+    _cross_soft_threshold_204(executor)
+    _invoke_handoff_skill_204(pre_hook)
+    assert executor._main_thread_handoff_invoked() is True
+
+    # Invoking the skill is the first step of the handoff, not its end:
+    # implementation edits, arbitrary Bash, and new launches stay denied.
+    for hook_input in (
+        {"tool_name": "Edit", "tool_input": {"file_path": "src/a.py"}},
+        {
+            "tool_name": "Bash",
+            "tool_input": {"command": "npx vitest run tests/engine-scenes.test.ts"},
+        },
+        {
+            "tool_name": "Bash",
+            "tool_input": {
+                "command": (
+                    "rm .agent/handoff/24.md"
+                    " && npx vitest run tests/engine-scenes.test.ts"
+                )
+            },
+        },
+        {"tool_name": "Agent", "tool_input": {"description": "review"}},
+        {
+            "tool_name": "Task",
+            "tool_input": {"description": "review", "prompt": "review"},
+        },
+    ):
+        denied = asyncio.run(pre_hook(hook_input, None, {}))
+        assert denied["hookSpecificOutput"]["permissionDecision"] == "deny", hook_input
+
+    # Only handoff work stays allowed.
+    assert (
+        asyncio.run(
+            pre_hook({"tool_name": "Bash", "tool_input": {"command": "git status"}}, None, {})
+        )
+        == {}
+    )
+    assert (
+        asyncio.run(
+            pre_hook(
+                {"tool_name": "Write", "tool_input": {"file_path": ".agent/handoff/24.md"}},
+                None,
+                {},
+            )
+        )
+        == {}
+    )
+
+
+def test_cost_guard_releases_after_the_handoff_note_commit(tmp_path: Path) -> None:
+    repo, _, _ = _snapshot_repo(tmp_path, issue_number=24)
+    executor, events, pre_hook, post_hook = _hooked_executor_204(tmp_path, repo)
+    _cross_soft_threshold_204(executor)
+    _invoke_handoff_skill_204(pre_hook)
+
+    denied = asyncio.run(
+        pre_hook({"tool_name": "Edit", "tool_input": {"file_path": "src/a.py"}}, None, {})
+    )
+    assert denied["hookSpecificOutput"]["permissionDecision"] == "deny"
+
+    # The handoff note goes through the observed tools.
+    assert (
+        asyncio.run(
+            pre_hook(
+                {"tool_name": "Write", "tool_input": {"file_path": ".agent/handoff/24.md"}},
+                None,
+                {},
+            )
+        )
+        == {}
+    )
+    (repo / ".agent" / "handoff" / "24.md").parent.mkdir(parents=True, exist_ok=True)
+    (repo / ".agent" / "handoff" / "24.md").write_text(
+        "# Handoff note: issue #24\n\n- issue: 24\n"
+    )
+    asyncio.run(
+        post_hook(
+            {
+                "tool_name": "Write",
+                "tool_input": {"file_path": ".agent/handoff/24.md"},
+                "tool_response": "ok",
+            },
+            "w1",
+            {},
+        )
+    )
+    commit_command = (
+        'git add .agent/handoff/24.md && git commit -m "Handoff note: issue #24"'
+    )
+    assert (
+        asyncio.run(
+            pre_hook({"tool_name": "Bash", "tool_input": {"command": commit_command}}, None, {})
+        )
+        == {}
+    )
+    _git(repo, "add", ".agent/handoff/24.md")
+    _git(repo, "commit", "-m", "Handoff note: issue #24")
+    asyncio.run(
+        post_hook(
+            {
+                "tool_name": "Bash",
+                "tool_input": {"command": commit_command},
+                "tool_response": "ok",
+            },
+            "c1",
+            {},
+        )
+    )
+
+    assert executor._handoff_note_committed is True
+    assert any(
+        name == "token_soft_threshold_handoff_note_committed" for name, _ in events
+    )
+
+    # The gate is released: the handoff is done, the turn can settle.
+    assert (
+        asyncio.run(
+            pre_hook({"tool_name": "Edit", "tool_input": {"file_path": "src/a.py"}}, None, {})
+        )
+        == {}
+    )
+    assert (
+        asyncio.run(
+            pre_hook({"tool_name": "Agent", "tool_input": {"description": "review"}}, None, {})
+        )
+        == {}
+    )
+
+
+def test_carried_over_note_commit_does_not_release_the_gate(tmp_path: Path) -> None:
+    """A note from an earlier round never releases a new round's gate."""
+
+    repo, _, _ = _snapshot_repo(tmp_path, issue_number=24)
+    (repo / ".agent" / "handoff").mkdir(parents=True, exist_ok=True)
+    (repo / ".agent" / "handoff" / "24.md").write_text(
+        "# Handoff note: issue #24\n\nold round\n"
+    )
+    _git(repo, "add", ".agent/handoff/24.md")
+    _git(repo, "commit", "-m", "Handoff note: issue #24")
+    executor, _, pre_hook, post_hook = _hooked_executor_204(tmp_path, repo)
+    _cross_soft_threshold_204(executor)
+    _invoke_handoff_skill_204(pre_hook)
+
+    # The old note predates the handoff baseline: the gate stays active and
+    # an unrelated commit result does not release it either.
+    denied = asyncio.run(
+        pre_hook({"tool_name": "Edit", "tool_input": {"file_path": "src/a.py"}}, None, {})
+    )
+    assert denied["hookSpecificOutput"]["permissionDecision"] == "deny"
+    asyncio.run(
+        post_hook(
+            {
+                "tool_name": "Bash",
+                "tool_input": {"command": 'git commit -m "work"'},
+                "tool_response": "ok",
+            },
+            "c1",
+            {},
+        )
+    )
+    assert executor._handoff_note_committed is False
+    still_denied = asyncio.run(
+        pre_hook({"tool_name": "Edit", "tool_input": {"file_path": "src/a.py"}}, None, {})
+    )
+    assert still_denied["hookSpecificOutput"]["permissionDecision"] == "deny"
+
+
+def test_cost_guard_denies_deleting_the_handoff_note_with_next_step(
+    tmp_path: Path,
+) -> None:
+    repo, _, _ = _snapshot_repo(tmp_path, issue_number=24)
+    executor, _, pre_hook, _ = _hooked_executor_204(tmp_path, repo)
+    executor._soft_threshold_crossed = True
+    _invoke_handoff_skill_204(pre_hook)
+
+    for command in (
+        "rm .agent/handoff/24.md && npx vitest run tests/engine-scenes.test.ts",
+        "rm -f .agent/handoff/24.md",
+        "git rm .agent/handoff/24.md",
+        "mv .agent/handoff/24.md /tmp/note.md",
+        "git clean -fd .agent/handoff",
+    ):
+        denied = asyncio.run(
+            pre_hook({"tool_name": "Bash", "tool_input": {"command": command}}, None, {})
+        )
+        assert denied["hookSpecificOutput"]["permissionDecision"] == "deny", command
+        reason = denied["hookSpecificOutput"]["permissionDecisionReason"]
+        assert "handoff note" in reason, command
+        assert "then stop" in reason, command
+
+    # Unrelated removals keep the generic guard wording.
+    denied = asyncio.run(
+        pre_hook({"tool_name": "Bash", "tool_input": {"command": "rm -rf /tmp/work"}}, None, {})
+    )
+    assert denied["hookSpecificOutput"]["permissionDecision"] == "deny"
+    assert (
+        "Do not delete or move the handoff note"
+        not in denied["hookSpecificOutput"]["permissionDecisionReason"]
+    )
+
+
+def test_deletes_handoff_note_detection() -> None:
+    from simple_coding_agent.model_execution import _deletes_handoff_note
+
+    for command in (
+        "rm .agent/handoff/24.md",
+        "rm -rf .agent/handoff && echo done",
+        "git rm --cached .agent/handoff/24.md",
+        "git clean -fdx .agent/handoff",
+        "mv .agent/handoff/24.md /tmp/note.md",
+        "sh -c 'rm .agent/handoff/24.md'",
+    ):
+        assert _deletes_handoff_note(command) is True, command
+    for command in (
+        'git add .agent/handoff/24.md && git commit -m "Handoff note: issue #24"',
+        "git status",
+        "git diff --stat",
+        "rm -rf /tmp/work",
+        "rm -rf .agent/handoff_backup",
+        "mv .agent/handoff_backup/24.md /tmp/note.md",
+        "pytest -q",
+    ):
+        assert _deletes_handoff_note(command) is False, command
+
+
+def test_compaction_during_pending_handoff_reinjects_the_instruction(
+    tmp_path: Path,
+) -> None:
+    repo, _, _ = _snapshot_repo(tmp_path, issue_number=24)
+    executor, events, pre_hook, post_hook = _hooked_executor_204(tmp_path, repo)
+    _cross_soft_threshold_204(executor)
+
+    first = asyncio.run(
+        post_hook(
+            {
+                "tool_name": "Bash",
+                "tool_input": {"command": "git status"},
+                "tool_response": "ok",
+            },
+            "t0",
+            {},
+        )
+    )
+    assert "handoff" in first["hookSpecificOutput"]["additionalContext"]
+    assert executor._handoff_context_delivered is True
+    _invoke_handoff_skill_204(pre_hook)
+
+    # The auto-compaction lands inside the handoff window, before the note
+    # commit: the runner re-arms the instruction itself.
+    compact_client = FakeClient(
+        None,
+        [
+            SystemMessage(
+                subtype="compact_boundary",
+                data={"compact_metadata": {"trigger": "auto", "pre_tokens": 170603}},
+            ),
+            result(),
+        ],
+    )
+    asyncio.run(executor._receive_terminal(compact_client))
+    assert executor._handoff_reinject_pending is True
+    assert any(
+        name == "token_soft_threshold_handoff_reinject_pending" for name, _ in events
+    )
+
+    # The next tool boundary re-sends the handoff instruction.
+    second = asyncio.run(
+        post_hook(
+            {
+                "tool_name": "Bash",
+                "tool_input": {"command": "git status"},
+                "tool_response": "ok",
+            },
+            "t1",
+            {},
+        )
+    )
+    repeated = second["hookSpecificOutput"]["additionalContext"]
+    assert "handoff" in repeated
+    assert "compacted" in repeated
+    assert ".agent/handoff/24.md" in repeated
+    assert executor._handoff_reinject_pending is False
+    assert any(
+        name == "token_soft_threshold_handoff_context_reinjected"
+        for name, _ in events
+    )
+
+
+def test_compaction_after_note_commit_does_not_reinject(tmp_path: Path) -> None:
+    repo, _, _ = _snapshot_repo(tmp_path, issue_number=24)
+    executor, events, pre_hook, post_hook = _hooked_executor_204(tmp_path, repo)
+    _cross_soft_threshold_204(executor)
+    _invoke_handoff_skill_204(pre_hook)
+
+    (repo / ".agent" / "handoff").mkdir(parents=True, exist_ok=True)
+    (repo / ".agent" / "handoff" / "24.md").write_text(
+        "# Handoff note: issue #24\n\n- issue: 24\n"
+    )
+    commit_command = (
+        'git add .agent/handoff/24.md && git commit -m "Handoff note: issue #24"'
+    )
+    _git(repo, "add", ".agent/handoff/24.md")
+    _git(repo, "commit", "-m", "Handoff note: issue #24")
+    asyncio.run(
+        post_hook(
+            {
+                "tool_name": "Bash",
+                "tool_input": {"command": commit_command},
+                "tool_response": "ok",
+            },
+            "c1",
+            {},
+        )
+    )
+    assert executor._handoff_note_committed is True
+
+    compact_client = FakeClient(
+        None,
+        [
+            SystemMessage(
+                subtype="compact_boundary",
+                data={"compact_metadata": {"trigger": "auto", "pre_tokens": 170603}},
+            ),
+            result(),
+        ],
+    )
+    asyncio.run(executor._receive_terminal(compact_client))
+    assert executor._handoff_reinject_pending is False
+    quiet = asyncio.run(
+        post_hook(
+            {
+                "tool_name": "Bash",
+                "tool_input": {"command": "git status"},
+                "tool_response": "ok",
+            },
+            "t2",
+            {},
+        )
+    )
+    assert quiet == {}
+
+
+def test_compaction_during_pending_operator_handoff_reinjects(tmp_path: Path) -> None:
+    from datetime import datetime, UTC
+
+    from simple_coding_agent.model_execution import OperatorHandoff
+
+    repo, _, _ = _snapshot_repo(tmp_path, issue_number=24)
+    executor, events, _, post_hook = _hooked_executor_204(tmp_path, repo)
+    executor.set_operator_handoff_provider(
+        lambda: OperatorHandoff(request_id="req-1", accepted_at=datetime.now(UTC))
+    )
+
+    first = asyncio.run(
+        post_hook(
+            {
+                "tool_name": "Bash",
+                "tool_input": {"command": "git status"},
+                "tool_response": "ok",
+            },
+            "t0",
+            {},
+        )
+    )
+    assert "handoff" in first["hookSpecificOutput"]["additionalContext"]
+    assert executor._operator_context_delivered is True
+
+    compact_client = FakeClient(
+        None,
+        [
+            SystemMessage(
+                subtype="compact_boundary",
+                data={"compact_metadata": {"trigger": "auto", "pre_tokens": 150000}},
+            ),
+            result(),
+        ],
+    )
+    asyncio.run(executor._receive_terminal(compact_client))
+    assert executor._operator_reinject_pending is True
+
+    second = asyncio.run(
+        post_hook(
+            {
+                "tool_name": "Bash",
+                "tool_input": {"command": "git status"},
+                "tool_response": "ok",
+            },
+            "t1",
+            {},
+        )
+    )
+    repeated = second["hookSpecificOutput"]["additionalContext"]
+    assert "handoff" in repeated
+    assert "compacted" in repeated
+    assert executor._operator_reinject_pending is False
+    assert any(
+        name == "operator_handoff_context_reinjected" for name, _ in events
+    )

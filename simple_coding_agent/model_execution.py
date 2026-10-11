@@ -481,6 +481,17 @@ class ModelExecutor:
     thread (``agent_id is None``). Partial subagent output already written
     to the working tree is left as is for the normal dirty-work
     preservation.
+
+    The tool gate stays active until the handoff note commit is observed on
+    the branch, not just until the ``handoff`` skill is invoked: invoking
+    the skill is the first step of the handoff, and an auto-compaction
+    inside the remaining window must not reopen implementation work. While
+    the gate is active only handoff work stays allowed (the ``handoff``
+    skill, ``Write``/``Edit`` under ``.agent/handoff/``, and
+    ``_is_handoff_command`` Bash). Deleting or moving the note while the
+    handoff is pending is denied with a message naming the next step. A
+    compaction during a pending handoff re-arms the handoff instruction so
+    it is re-sent at the next tool boundary.
     """
 
     def __init__(
@@ -512,6 +523,10 @@ class ModelExecutor:
         self._soft_threshold_effective_tokens: int | None = None
         self._total_cost_usd: float | None = None
         self._handoff_context_delivered = False
+        self._handoff_note_committed = False
+        self._handoff_baseline_sha: str | None = None
+        self._handoff_reinject_pending = False
+        self._operator_reinject_pending = False
         self._working_directory: Path | None = None
         self._attempt_branch: str | None = None
         self._attempt_base_revision: str | None = None
@@ -842,6 +857,7 @@ class ModelExecutor:
             return None
         self._operator_context_delivered = True
         self._operator_delivery_via = "fallback"
+        self._capture_handoff_baseline()
         self._report_operator("delivered")
         self._log(
             "operator_handoff_fallback",
@@ -964,6 +980,10 @@ class ModelExecutor:
         self._total_cost_usd = None
         self._token_hard_ceiling_reached = False
         self._handoff_context_delivered = False
+        self._handoff_note_committed = False
+        self._handoff_baseline_sha = None
+        self._handoff_reinject_pending = False
+        self._operator_reinject_pending = False
         self._working_directory = working_directory
         self._attempt_branch = branch
         self._attempt_base_revision = base_revision
@@ -1128,6 +1148,124 @@ class ModelExecutor:
         return any(
             event.name == "handoff" and event.agent_id is None
             for event in self._skill_events
+        )
+
+    def _handoff_note_relpath(self) -> str | None:
+        """The issue's handoff note path, or ``None`` when the issue is unknown."""
+
+        if self._issue_number is None:
+            return None
+        return f".agent/handoff/{self._issue_number}.md"
+
+    def _capture_handoff_baseline(self) -> None:
+        """Remember HEAD while a handoff is pending so the note commit is detectable.
+
+        The gate releases only on a note commit newer than this baseline, so a
+        note carried over from an earlier round of a continued branch never
+        releases it. Best-effort: when git cannot report HEAD the baseline
+        stays ``None`` and the gate fails closed until it can.
+        """
+
+        if self._handoff_baseline_sha is not None or self._working_directory is None:
+            return
+        self._handoff_baseline_sha = (
+            _run_snapshot_git(self._working_directory, "rev-parse", "HEAD") or None
+        )
+
+    def _confirmed_handoff_note_revision(self) -> str | None:
+        """The newest note-touching commit since the handoff baseline, if any.
+
+        Position check only (the path gained a commit newer than the
+        baseline); content validation stays with finalization. ``None`` when
+        the issue, the working directory, or the baseline is unknown, or when
+        git reports no such commit: the gate fails closed in every case.
+        """
+
+        relpath = self._handoff_note_relpath()
+        if (
+            relpath is None
+            or self._working_directory is None
+            or self._handoff_baseline_sha is None
+        ):
+            return None
+        output = _run_snapshot_git(
+            self._working_directory,
+            "log",
+            "--format=%H",
+            f"{self._handoff_baseline_sha}..HEAD",
+            "--",
+            relpath,
+        )
+        if not output:
+            return None
+        return output.splitlines()[0].strip() or None
+
+    def _arm_handoff_reinject_after_compaction(self) -> None:
+        """Re-send a pending handoff instruction at the next tool boundary.
+
+        A compaction inside the handoff window erases the instruction from
+        the model's context while the runner's flags survive: without a
+        re-send the model resumes implementing (or deletes its own
+        uncommitted note) under a gate it no longer understands. Arming here
+        covers both the not-yet-delivered case (harmless: the ordinary
+        delivery is still pending) and the delivered-but-uncommitted case.
+        """
+
+        if self._handoff_note_committed:
+            return
+        if self._soft_threshold_crossed and self._handoff_context_delivered:
+            if not self._handoff_reinject_pending:
+                self._handoff_reinject_pending = True
+                self._log(
+                    "token_soft_threshold_handoff_reinject_pending",
+                    "context compacted while the token handoff note was still"
+                    " uncommitted; the handoff instruction will be re-sent at"
+                    " the next tool boundary",
+                )
+        if self._operator_context_delivered and not self._operator_begun:
+            if not self._operator_reinject_pending:
+                self._operator_reinject_pending = True
+                self._log(
+                    "operator_handoff_reinject_pending",
+                    "context compacted while the operator handoff note was still"
+                    " uncommitted; the handoff instruction will be re-sent at"
+                    " the next main-thread tool boundary",
+                )
+
+    def _observe_handoff_note_commit(self, hook_input: Any) -> None:
+        """Release the handoff gate once the note commit lands on the branch.
+
+        Every model commit goes through the observed ``Bash`` tool, so a
+        main-thread command mentioning ``commit`` while a handoff is pending
+        is the only moment the gate needs to re-check git. The branch state
+        (not the command text) decides: only a commit touching the note path
+        newer than the handoff baseline releases the gate. A release also
+        clears any armed re-injection.
+        """
+
+        if self._handoff_note_committed:
+            return
+        if not self._soft_threshold_crossed and not self._operator_context_delivered:
+            return
+        if not _is_main_thread(hook_input):
+            return
+        if _hook_field(hook_input, "tool_name") != "Bash":
+            return
+        tool_input = _hook_field(hook_input, "tool_input", {})
+        command = tool_input.get("command") if isinstance(tool_input, Mapping) else None
+        if not isinstance(command, str) or "commit" not in command:
+            return
+        revision = self._confirmed_handoff_note_revision()
+        if revision is None:
+            return
+        self._handoff_note_committed = True
+        self._handoff_reinject_pending = False
+        self._operator_reinject_pending = False
+        self._log(
+            "token_soft_threshold_handoff_note_committed"
+            if self._soft_threshold_crossed
+            else "operator_handoff_note_committed",
+            f"revision={revision}; note={self._handoff_note_relpath()}",
         )
 
     def _build_token_snapshot(self) -> str:
@@ -1388,6 +1526,7 @@ class ModelExecutor:
                 self._record_cli_session_id(message)
                 if isinstance(message, SystemMessage) and message.subtype == "compact_boundary":
                     self._log_context_compacted(message)
+                    self._arm_handoff_reinject_after_compaction()
                 had_pending_background = bool(background_pending)
                 if self._observe_background_task(
                     message, background_pending, background_finished
@@ -1811,6 +1950,7 @@ class ModelExecutor:
                 f"reserve_tokens={reserve_tokens}; "
                 f"thread={thread_id}",
             )
+            self._capture_handoff_baseline()
             self._stop_running_subagents()
         ceiling = self._config.max_budget_tokens
         if not self._token_hard_ceiling_reached and budget >= ceiling:
@@ -2126,7 +2266,11 @@ class ModelExecutor:
                 return _deny("At most two code-review repair cycles are allowed.")
         if not self._soft_threshold_crossed:
             self._track_subagent_seen(hook_input)
-        if self._soft_threshold_crossed and not self._main_thread_handoff_invoked():
+        # The gate stays active until the handoff note commit is on the branch:
+        # invoking the skill is the first step of the handoff, not its end,
+        # and an auto-compaction inside the remaining window must not reopen
+        # implementation work.
+        if self._soft_threshold_crossed and not self._handoff_note_committed:
             if not _is_main_thread(hook_input):
                 agent_id = _hook_agent_id(hook_input)
                 if agent_id is not None and agent_id not in self._stopped_subagent_ids:
@@ -2146,6 +2290,8 @@ class ModelExecutor:
                         return _cost_deny("Further implementation work is disabled.")
                 elif tool_name == "Bash":
                     command = str(_hook_field(hook_input, "tool_input", {}).get("command", ""))
+                    if _deletes_handoff_note(command):
+                        return _note_delete_deny(self._issue_number)
                     if not _is_handoff_command(command):
                         return _cost_deny("Further implementation work is disabled.")
         if self._operator_context_delivered:
@@ -2167,6 +2313,8 @@ class ModelExecutor:
                     )
             elif tool_name == "Bash":
                 command = str(_hook_field(hook_input, "tool_input", {}).get("command", ""))
+                if _deletes_handoff_note(command):
+                    return _operator_note_delete_deny(self._issue_number)
                 if not _is_handoff_command(command):
                     return _deny(
                         "Operator handoff in progress. Further implementation work is"
@@ -2226,6 +2374,7 @@ class ModelExecutor:
         if not self._soft_threshold_crossed:
             self._track_subagent_seen(hook_input)
         self._poll_operator_handoff()
+        self._observe_handoff_note_commit(hook_input)
         contexts: list[str] = []
         if self._soft_threshold_crossed and not self._handoff_context_delivered:
             if _is_main_thread(hook_input) or not self._running_subagents:
@@ -2258,6 +2407,7 @@ class ModelExecutor:
             if _is_main_thread(hook_input):
                 self._operator_context_delivered = True
                 self._operator_delivery_via = "post_tool"
+                self._capture_handoff_baseline()
                 self._report_operator("delivered")
                 self._log(
                     "operator_handoff_context_delivered",
@@ -2266,6 +2416,40 @@ class ModelExecutor:
                 contexts.append(
                     _operator_handoff_instruction(self._issue_number, self._attempt_id)
                 )
+        if (
+            self._handoff_reinject_pending
+            and self._soft_threshold_crossed
+            and not self._handoff_note_committed
+            and (_is_main_thread(hook_input) or not self._running_subagents)
+        ):
+            self._handoff_reinject_pending = False
+            self._log("token_soft_threshold_handoff_context_reinjected")
+            contexts.append(
+                "Your context was compacted while the handoff was still pending,"
+                " so the handoff instruction is repeated here. "
+                + _cost_handoff_instruction(
+                    self._issue_number,
+                    self._attempt_id,
+                    snapshot=self._token_followup_snapshot(),
+                )
+            )
+        if (
+            self._operator_reinject_pending
+            and self._operator_handoff is not None
+            and not self._operator_begun
+            and not self._handoff_note_committed
+            and _is_main_thread(hook_input)
+        ):
+            self._operator_reinject_pending = False
+            self._log(
+                "operator_handoff_context_reinjected",
+                f"request={self._operator_handoff.request_id}",
+            )
+            contexts.append(
+                "Your context was compacted while the operator handoff was still"
+                " pending, so the handoff instruction is repeated here. "
+                + _operator_handoff_instruction(self._issue_number, self._attempt_id)
+            )
         if contexts:
             return {
                 "hookSpecificOutput": {
@@ -2555,6 +2739,98 @@ def _cost_deny(restriction: str) -> dict[str, Any]:
         "You must invoke the `handoff` skill now to preserve your progress. "
         f"{_COST_ALLOWED_COMMANDS}"
     )
+
+
+def _handoff_note_commit_line(issue_number: int | None) -> tuple[str, str]:
+    """The note path and commit command the handoff must end with."""
+
+    label = str(issue_number) if issue_number is not None else "<issue-number>"
+    path = f".agent/handoff/{label}.md"
+    command = f'git add {path} && git commit -m "Handoff note: issue #{label}"'
+    return path, command
+
+
+def _note_delete_deny(issue_number: int | None) -> dict[str, Any]:
+    """Deny deleting/moving the note while the token handoff is pending."""
+
+    path, command = _handoff_note_commit_line(issue_number)
+    return _deny(
+        "Token soft threshold reached. Do not delete or move the handoff note at"
+        f" `{path}` while the handoff is pending. Write the note, commit it with"
+        f" `{command}`, then stop."
+    )
+
+
+def _operator_note_delete_deny(issue_number: int | None) -> dict[str, Any]:
+    """Deny deleting/moving the note while the operator handoff is pending."""
+
+    path, _ = _handoff_note_commit_line(issue_number)
+    return _deny(
+        "Operator handoff in progress. Do not delete or move the handoff note at"
+        f" `{path}` while the handoff is pending. Write the note, commit it"
+        " separately as the final commit, then stop."
+    )
+
+
+#: Path marker shared by every handoff note (``.agent/handoff/<n>.md``).
+_HANDOFF_NOTE_MARKER = ".agent/handoff"
+
+
+def _token_targets_handoff_note(token: str) -> bool:
+    """Whether a shell token names the handoff note dir or a file under it.
+
+    Substring matching alone would false-positive on siblings such as
+    ``.agent/handoff_backup``: the marker must end the token or be followed
+    by a path separator.
+    """
+
+    index = token.find(_HANDOFF_NOTE_MARKER)
+    while index != -1:
+        rest = token[index + len(_HANDOFF_NOTE_MARKER) :]
+        if not rest or rest.startswith("/"):
+            return True
+        index = token.find(_HANDOFF_NOTE_MARKER, index + 1)
+    return False
+
+
+def _deletes_handoff_note(command: str) -> bool:
+    """Whether ``command`` deletes or moves the handoff note.
+
+    ``rm``/``unlink``/``rmdir``/``mv`` of anything under ``.agent/handoff``
+    and ``git rm``/``git mv``/``git clean`` touching that path count, however
+    the invocation is wrapped (``env``/``command`` prefixes, ``-C`` flags,
+    ``sh -c`` nesting). Anything else (including the note's own
+    ``git add``/``git commit``) does not.
+    """
+
+    for segment in _shell_segments(command):
+        if not segment:
+            continue
+        index = 0
+        while index < len(segment) and "=" in segment[index] and not segment[index].startswith("-"):
+            index += 1
+        if index < len(segment) and segment[index] in {"command", "env"}:
+            index += 1
+        if index >= len(segment):
+            continue
+        executable = Path(segment[index]).name
+        arguments = segment[index + 1 :]
+        if executable in ("rm", "unlink", "rmdir", "mv"):
+            if any(_token_targets_handoff_note(token) for token in arguments):
+                return True
+        elif executable == "git":
+            subcommand = _git_subcommand(arguments)
+            if subcommand in ("rm", "mv", "clean"):
+                rest = _git_subcommand_arguments(arguments) or []
+                if any(_token_targets_handoff_note(token) for token in rest):
+                    return True
+        elif executable in ("sh", "bash", "zsh") and "-c" in arguments:
+            script_index = arguments.index("-c") + 1
+            if script_index < len(arguments) and _deletes_handoff_note(
+                arguments[script_index]
+            ):
+                return True
+    return False
 
 
 def _model_environment(config: RuntimeConfig) -> dict[str, str]:
