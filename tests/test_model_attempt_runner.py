@@ -12,13 +12,18 @@ from simple_coding_agent.attempt_state import AttemptPhase, AttemptStateStore
 from simple_coding_agent.completion import (
     AttemptOutcome,
     CompletionDecision,
+    CompletionEvaluator,
     PublicationPath,
 )
 from simple_coding_agent.config import RepositoryProfile
 from simple_coding_agent.github_tracker import Assignment, Claim, TrackerIssue
 from simple_coding_agent.git_workspace import PreparedAttempt, RebaseConflictError
 from simple_coding_agent.lifecycle import ModelAttemptRunner, _build_starting_prompt
-from simple_coding_agent.model_execution import ModelExecution, ModelExecutionStatus
+from simple_coding_agent.model_execution import (
+    ModelExecution,
+    ModelExecutionStatus,
+    SkillEvent,
+)
 from tests.fakes import InMemoryWorkspace
 
 
@@ -451,7 +456,7 @@ def test_logs_final_check_start_and_success(tmp_path: Path) -> None:
 
     runner(claim(issue_number=24, issue_body="Fix the parser."), profile(), FakePrepared())
 
-    assert events[-2:] == ["final_check_started", "final_check_succeeded"]
+    assert events[-3:] == ["final_check_started", "final_check_succeeded", "completion_decided"]
 
 
 def test_writes_final_check_markers_to_the_archive(tmp_path: Path) -> None:
@@ -518,6 +523,7 @@ def test_logs_setup_baseline_and_model_dispatch_stages(tmp_path: Path) -> None:
         "setup_succeeded",
         "baseline_check_succeeded",
         "model_dispatch_starting",
+        "completion_decided",
     ]
     assert all(issue_number == 24 for _, issue_number in events)
 
@@ -544,6 +550,7 @@ def test_baseline_failure_tolerated_on_continuation_and_logs_warning(tmp_path: P
         ("setup_succeeded", "INFO"),
         ("baseline_check_failed", "WARNING"),
         ("model_dispatch_starting", "INFO"),
+        ("completion_decided", "WARNING"),
     ]
     assert executor.captured_prompt is not None
 
@@ -570,6 +577,7 @@ def test_baseline_failure_aborts_on_fresh_attempt_and_logs_error(
         ("setup_started", "INFO"),
         ("setup_succeeded", "INFO"),
         ("baseline_check_failed", "ERROR"),
+        ("completion_decided", "WARNING"),
     ]
     assert executor.captured_prompt is None
 
@@ -751,11 +759,17 @@ class FakeModelExecutor:
         *,
         status: ModelExecutionStatus = ModelExecutionStatus.MODEL_LIMIT_REACHED,
         calls: "list[str] | None" = None,
+        skill_events: tuple = (),
     ) -> None:
         self.captured_prompt: str | None = None
         self._status = status
         self._calls = calls
+        self._skill_events = skill_events
         self.after_execute = None
+        self.new_commits_provider = None
+
+    def set_new_commits_provider(self, provider) -> None:
+        self.new_commits_provider = provider
 
     async def execute(
         self, *, issue_body: str, working_directory: Path, issue_number: int | None = None, archive=None
@@ -771,7 +785,7 @@ class FakeModelExecutor:
             stop_reason="end_turn",
             model_usage=None,
             observed_models=(),
-            skill_events=(),
+            skill_events=self._skill_events,
         )
 
 
@@ -1262,3 +1276,155 @@ def test_gate_redacts_model_instructions(tmp_path: Path) -> None:
     assert "operator-secret" not in executor.captured_prompt
     assert "s3cr3t" not in executor.captured_prompt
     assert "[REDACTED]" in executor.captured_prompt
+
+
+# --- Missing code-review is visible instead of silent (issue #178) --------------
+
+
+def real_evaluator() -> CompletionEvaluator:
+    return CompletionEvaluator(frozenset({"must-fix"}))
+
+
+def build_real_runner(tmp_path: Path, **kwargs: object) -> ModelAttemptRunner:
+    """Build a runner with the real completion evaluator instead of the stub."""
+
+    attempt_state = AttemptStateStore(tmp_path)
+    attempt_state.start(issue_number=24, branch="agent/issue-24")
+    attempt_state.transition(AttemptPhase.SETUP)
+    workspace = kwargs.pop("workspace", None) or InMemoryWorkspace(tmp_path / "repo")
+    executor = kwargs.pop("model_executor", None) or FakeModelExecutor()
+    verifier = kwargs.pop("verifier", None) or FakeVerifier()
+    event_log = kwargs.pop("event_log", None)
+    runner_kwargs = {} if event_log is None else {"event_log": event_log}
+    return ModelAttemptRunner(
+        attempt_state=attempt_state,
+        workspace=workspace,
+        verifier=verifier,
+        evaluator=real_evaluator(),
+        model_executor=executor,
+        **runner_kwargs,
+    )
+
+
+def code_review_event() -> SkillEvent:
+    return SkillEvent(
+        phase="PreToolUse",
+        name="code-review",
+        agent_id=None,
+        timestamp="2026-10-11T00:00:00Z",
+    )
+
+
+def test_starting_prompt_requires_code_review_before_finishing(tmp_path: Path) -> None:
+    executor = FakeModelExecutor()
+    runner = build_runner(tmp_path, model_executor=executor)
+
+    runner(claim(issue_body="Fix it."), profile(), FakePrepared())
+
+    assert executor.captured_prompt is not None
+    assert "code-review" in executor.captured_prompt
+    assert "incomplete" in executor.captured_prompt.lower()
+
+
+def test_continuation_prompt_requires_code_review_before_finishing(
+    tmp_path: Path,
+) -> None:
+    executor = FakeModelExecutor()
+    workspace = seeded_workspace(tmp_path / "repo", "Previous attempt work")
+    runner = build_runner(tmp_path, model_executor=executor, workspace=workspace, issue_number=24)
+
+    runner(claim(issue_number=24, issue_body="Fix it."), profile(), FakePrepared())
+
+    assert executor.captured_prompt is not None
+    assert ".agent/handoff/24.md" in executor.captured_prompt
+    assert "code-review" in executor.captured_prompt
+
+
+def test_missing_review_ends_incomplete_with_reason_and_event(
+    tmp_path: Path,
+) -> None:
+    executor = FakeModelExecutor(status=ModelExecutionStatus.SUCCEEDED)
+    workspace = seeded_workspace(tmp_path / "repo", "Implemented")
+    events: list[tuple[str, str, str]] = []
+    runner = build_real_runner(
+        tmp_path,
+        model_executor=executor,
+        workspace=workspace,
+        event_log=lambda event, detail="", level="INFO", issue_number=None: events.append(
+            (event, level, detail)
+        ),
+    )
+
+    evidence = runner(claim(issue_number=24, issue_body="Fix it."), profile(), FakePrepared())
+
+    assert evidence.decision.outcome is AttemptOutcome.INCOMPLETE
+    assert evidence.reviews_performed == 0
+    assert evidence.review_cycles == 0
+    assert evidence.review_findings == "not run"
+    assert "Acceptance criteria are not satisfied." in evidence.details
+    decided = [detail for event, _, detail in events if event == "completion_decided"]
+    assert len(decided) == 1
+    assert "outcome=incomplete" in decided[0]
+    assert "Acceptance criteria are not satisfied." in decided[0]
+
+
+def test_reviewed_run_does_not_end_incomplete_for_a_missing_review(
+    tmp_path: Path,
+) -> None:
+    executor = FakeModelExecutor(
+        status=ModelExecutionStatus.SUCCEEDED, skill_events=(code_review_event(),)
+    )
+    workspace = seeded_workspace(tmp_path / "repo", "Implemented")
+    events: list[tuple[str, str, str]] = []
+    runner = build_real_runner(
+        tmp_path,
+        model_executor=executor,
+        workspace=workspace,
+        event_log=lambda event, detail="", level="INFO", issue_number=None: events.append(
+            (event, level, detail)
+        ),
+    )
+
+    evidence = runner(claim(issue_number=24, issue_body="Fix it."), profile(), FakePrepared())
+
+    assert evidence.decision.outcome is None
+    assert evidence.decision.publication_eligible
+    assert evidence.reviews_performed == 1
+    assert evidence.review_cycles == 0
+    decided = [detail for event, _, detail in events if event == "completion_decided"]
+    assert len(decided) == 1
+    assert "outcome=none" in decided[0]
+
+
+def test_runner_wires_a_new_commits_provider_into_the_executor(
+    tmp_path: Path,
+) -> None:
+    executor = FakeModelExecutor(status=ModelExecutionStatus.SUCCEEDED)
+    workspace = seeded_workspace(tmp_path / "repo", "Implemented")
+    executor.after_execute = lambda: workspace.model_commit("Format fix")
+    runner = build_real_runner(tmp_path, model_executor=executor, workspace=workspace)
+
+    runner(claim(issue_number=24, issue_body="Fix it."), profile(), FakePrepared())
+
+    assert executor.new_commits_provider is not None
+    assert executor.new_commits_provider() == 1
+
+
+def test_setup_failure_emits_completion_decided(tmp_path: Path) -> None:
+    executor = FakeModelExecutor()
+    events: list[tuple[str, str, str]] = []
+    runner = build_real_runner(
+        tmp_path,
+        model_executor=executor,
+        verifier=FakeVerifier(setup_succeeded=False),
+        event_log=lambda event, detail="", level="INFO", issue_number=None: events.append(
+            (event, level, detail)
+        ),
+    )
+
+    evidence = runner(claim(issue_number=24, issue_body="Fix it."), profile(), FakePrepared())
+
+    assert evidence.decision.outcome is AttemptOutcome.INFRASTRUCTURE_ERROR
+    decided = [detail for event, _, detail in events if event == "completion_decided"]
+    assert len(decided) == 1
+    assert "outcome=infrastructure_error" in decided[0]
