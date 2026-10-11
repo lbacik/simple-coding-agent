@@ -2863,7 +2863,7 @@ def test_token_snapshot_carries_branch_state_and_prefilled_header(tmp_path: Path
         attempt_id=_ATTEMPT_ID,
     )
 
-    assert f"agent/issue-149" in snapshot
+    assert "agent/issue-149" in snapshot
     assert base in snapshot
     assert head in snapshot
     assert "dirty.txt" in snapshot  # git status --short
@@ -2980,6 +2980,13 @@ def test_token_instruction_and_followup_share_snapshot_and_two_call_steps(
     # Without a snapshot the prompts keep their legacy wording.
     assert "Do not run diagnostic commands" not in plain_instruction
     assert "handoff" in plain_instruction
+    # The snapshot variant must not contradict the two-call steps: the legacy
+    # "commit any outstanding work" directive would tell the model to commit
+    # work the steps forbid it from touching.
+    assert "commit any outstanding work" not in followup
+    assert "commit any outstanding work" not in notice
+    legacy_followup = _cost_handoff_followup_prompt(149, _ATTEMPT_ID)
+    assert "commit any outstanding work" in legacy_followup
 
 
 def test_token_snapshot_degrades_outside_a_git_repo(tmp_path: Path) -> None:

@@ -276,7 +276,15 @@ def _cost_handoff_followup_prompt(
     )
     if snapshot is None:
         return base
-    return f"{base}\n\n{snapshot}\n\n{_token_handoff_steps(issue_number)}"
+    token_base = (
+        "This attempt crossed its token soft threshold and must now end by handing off. "
+        "Invoke the `handoff` skill now and use the current branch state below: "
+        "write and commit the handoff note, leaving any uncommitted work alone. "
+        "Do not attempt further implementation "
+        f"work. {_HANDOFF_SKILL_TOOL_HINT} {_handoff_target(issue_number)}"
+        f"{_attempt_id_sentence(attempt_id)}"
+    )
+    return f"{token_base}\n\n{snapshot}\n\n{_token_handoff_steps(issue_number)}"
 
 
 def _operator_handoff_instruction(
