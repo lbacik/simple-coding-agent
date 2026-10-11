@@ -12,7 +12,14 @@ Every target repository must supply a profile at
 for a reference.  Required fields are `setup` (one command or a list) and
 `check` (the same shape).  Optional fields: `base_branch` (default `main`),
 `timeout` (seconds, default 300), `setup_timeout` (seconds, default 120),
-and `env` (a string→string map).
+`env` (a string→string map), and `model_instructions` (a free-form string of
+repository-provided guidance for the model; omit it or leave it blank when
+there is nothing to add — a non-string value is rejected).
+
+The `check` commands are the completion gate and are also shown to the model
+in its starting prompt, in profile order, alongside `model_instructions`
+(when non-blank) and the gate's environment-variable names (never values).
+Operator credentials and profile `env` values are redacted from that listing.
 
 The profile must be in the default branch before a `ready-for-agent` issue is
 claimed.  A missing or unparseable profile is an `infrastructure_error`; the

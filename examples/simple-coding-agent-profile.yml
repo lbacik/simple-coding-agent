@@ -1,5 +1,8 @@
 # Required: a shell command or a non-empty list of shell commands.
 setup: "pip install -e '.[dev]'"
+# The check commands are the completion gate: they run as the baseline check
+# and the final check, and they are also shown to the model in its starting
+# prompt (in this order) so it knows what the attempt is judged by.
 check:
   - "pytest"
   - "ruff check ."
@@ -10,3 +13,8 @@ timeout: 300
 setup_timeout: 120
 env:
   APP_ENV: test
+
+# Optional free-form guidance shown to the model alongside the check commands
+# in its starting prompt (for example: "Run `php-cs-fixer fix` before
+# committing."). Omit it or leave it blank when there is nothing to add.
+# model_instructions: "Run php-cs-fixer fix before committing."

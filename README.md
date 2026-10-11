@@ -233,8 +233,16 @@ The target repository supplies
 `setup` and `check` are required, each as a command string or non-empty list of
 command strings. `base_branch` defaults to `main`, `timeout` to 300 seconds,
 and `setup_timeout` to 120 seconds. `env` maps environment-variable names to
-string values. Missing or invalid profiles are infrastructure errors for the
+string values. `model_instructions` is an optional free-form string shown to
+the model alongside the check commands (for example, repo-specific guidance
+such as when to run a formatter); omit it or leave it blank when there is
+nothing to add. Missing or invalid profiles are infrastructure errors for the
 lifecycle, never silent success.
+
+The `check` commands are the completion gate (baseline check and final check),
+and they are also listed in the model's starting prompt, in profile order, so
+the model knows what the attempt is judged by. Operator credentials and
+profile `env` values are redacted from that listing.
 
 Set `PROFILE_PATH` to load the profile from a path outside the target
 repository instead, such as alongside the agent's own `Dockerfile`. When unset

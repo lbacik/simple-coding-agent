@@ -78,6 +78,7 @@ def main() -> None:
         ),
         evaluator=CompletionEvaluator(config.review_blocking_severities),
         issue_comments=tracker.trusted_comments,
+        prompt_redactions=config.credential_redactions,
         model_executor=ModelExecutor(
             config,
             cli_path=provenance.cli_path,

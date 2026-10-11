@@ -38,9 +38,15 @@ def test_prompt_appends_trusted_comments_in_order(tmp_path: Path) -> None:
 
     runner(claim(issue_body="Fix the parser."), profile(), FakePrepared())
 
-    assert executor.captured_prompt == (
+    assert executor.captured_prompt is not None
+    assert executor.captured_prompt.startswith(
         "Fix the parser.\n\nplease also handle timeouts\n\nkeep the old retry behaviour"
     )
+    first = executor.captured_prompt.index("please also handle timeouts")
+    second = executor.captured_prompt.index("keep the old retry behaviour")
+    assert first < second
+    assert "## Completion gate" in executor.captured_prompt
+    assert "1. pytest" in executor.captured_prompt
 
 
 def test_prompt_degrades_to_the_bare_issue_body_with_no_comments_or_continuation(
@@ -51,7 +57,10 @@ def test_prompt_degrades_to_the_bare_issue_body_with_no_comments_or_continuation
 
     runner(claim(issue_body="Fix the parser."), profile(), FakePrepared())
 
-    assert executor.captured_prompt == "Fix the parser."
+    assert executor.captured_prompt is not None
+    assert executor.captured_prompt.startswith("Fix the parser.")
+    assert "## Completion gate" in executor.captured_prompt
+    assert "1. pytest" in executor.captured_prompt
 
 
 def test_continuation_adds_only_a_pointer_to_the_handoff_note(tmp_path: Path) -> None:
@@ -61,11 +70,16 @@ def test_continuation_adds_only_a_pointer_to_the_handoff_note(tmp_path: Path) ->
 
     runner(claim(issue_number=24, issue_body="Fix the parser."), profile(), FakePrepared())
 
-    assert executor.captured_prompt == (
+    assert executor.captured_prompt is not None
+    assert (
         "Fix the parser.\n\n"
         "This is a continued attempt; if it exists, the handoff note from the "
         "previous attempt is at .agent/handoff/24.md."
-    )
+    ) in executor.captured_prompt
+    assert "## Completion gate" in executor.captured_prompt
+    pointer = executor.captured_prompt.index(".agent/handoff/24.md")
+    gate = executor.captured_prompt.index("## Completion gate")
+    assert pointer < gate
 
 
 def test_missing_continuation_branch_skips_the_model_when_label_present(tmp_path: Path) -> None:
@@ -462,6 +476,7 @@ def build_runner(
     issue_comments=lambda issue: (),
     issue_number: int = 24,
     event_log=None,
+    prompt_redactions: tuple[str, ...] = (),
 ) -> ModelAttemptRunner:
     attempt_state = AttemptStateStore(tmp_path)
     attempt_state.start(issue_number=issue_number, branch=f"agent/issue-{issue_number}")
@@ -474,6 +489,7 @@ def build_runner(
         evaluator=FakeEvaluator(),
         model_executor=model_executor,
         issue_comments=issue_comments,
+        prompt_redactions=prompt_redactions,
         **kwargs,
     )
 
@@ -683,10 +699,18 @@ def claim(
     )
 
 
-def profile() -> RepositoryProfile:
-    return RepositoryProfile(
-        setup=(), check=("pytest",), base_branch="main", timeout=60, setup_timeout=60, env={}
-    )
+def profile(**overrides: object) -> RepositoryProfile:
+    fields: dict[str, object] = {
+        "setup": (),
+        "check": ("pytest",),
+        "base_branch": "main",
+        "timeout": 60,
+        "setup_timeout": 60,
+        "env": {},
+        "model_instructions": "",
+    }
+    fields.update(overrides)
+    return RepositoryProfile(**fields)  # type: ignore[arg-type]
 
 
 def test_infrastructure_error_seals_dirty_work(
@@ -911,3 +935,157 @@ def test_token_hard_ceiling_emergency_note_carries_the_token_hard_ceiling_reason
 
     assert len(workspace.note_calls) == 1
     assert "- reason: token_hard_ceiling" in workspace.note_calls[0][1]
+
+
+def test_gate_section_lists_check_commands_in_order(tmp_path: Path) -> None:
+    executor = FakeModelExecutor()
+    comments = ("trusted note",)
+    runner = build_runner(
+        tmp_path, model_executor=executor, issue_comments=lambda issue: comments
+    )
+
+    runner(
+        claim(issue_body="Fix it."),
+        profile(check=("pytest", "ruff check .")),
+        FakePrepared(),
+    )
+
+    assert executor.captured_prompt is not None
+    prompt = executor.captured_prompt
+    assert prompt.startswith("Fix it.\n\ntrusted note")
+    assert "## Completion gate" in prompt
+    first = prompt.index("1. pytest")
+    second = prompt.index("2. ruff check .")
+    assert first < second
+    assert "in this order" in prompt
+    assert "first failure fails the gate" in prompt
+    assert "final check after the model finishes" in prompt
+
+
+def test_gate_section_present_on_continuation(tmp_path: Path) -> None:
+    executor = FakeModelExecutor()
+    workspace = seeded_workspace(tmp_path / "repo", "Previous attempt work")
+    runner = build_runner(tmp_path, model_executor=executor, workspace=workspace, issue_number=24)
+
+    runner(
+        claim(issue_number=24, issue_body="Fix it."),
+        profile(check=("pytest", "ruff check .")),
+        FakePrepared(),
+    )
+
+    assert executor.captured_prompt is not None
+    assert ".agent/handoff/24.md" in executor.captured_prompt
+    assert "## Completion gate" in executor.captured_prompt
+    assert "1. pytest" in executor.captured_prompt
+    assert "2. ruff check ." in executor.captured_prompt
+
+
+def test_gate_section_present_on_setup_deferred_attempt(tmp_path: Path) -> None:
+    executor = FakeModelExecutor(status=ModelExecutionStatus.SUCCEEDED)
+    workspace = seeded_workspace(tmp_path / "repo", "Retained work")
+    workspace.leave_conflict(files=("SubscriptionController.php",))
+    executor.after_execute = workspace.note_model_finished
+    runner = build_runner(tmp_path, model_executor=executor, workspace=workspace)
+
+    runner(
+        claim(issue_number=24, issue_body="Fix it."),
+        profile(check=("pytest", "ruff check .")),
+        FakePrepared(),
+    )
+
+    assert executor.captured_prompt is not None
+    assert "git rebase --continue" in executor.captured_prompt
+    assert "## Completion gate" in executor.captured_prompt
+    assert "1. pytest" in executor.captured_prompt
+    assert "2. ruff check ." in executor.captured_prompt
+
+
+def test_gate_redacts_operator_credential_and_env_values(tmp_path: Path) -> None:
+    executor = FakeModelExecutor()
+    runner = build_runner(
+        tmp_path,
+        model_executor=executor,
+        prompt_redactions=("operator-secret",),
+    )
+
+    runner(
+        claim(issue_body="Fix it."),
+        profile(
+            check=("pytest --token operator-secret", "pytest --db-pass s3cr3t"),
+            env={"DB_PASS": "s3cr3t"},
+        ),
+        FakePrepared(),
+    )
+
+    assert executor.captured_prompt is not None
+    assert "operator-secret" not in executor.captured_prompt
+    assert "s3cr3t" not in executor.captured_prompt
+    assert "[REDACTED]" in executor.captured_prompt
+
+
+def test_gate_lists_env_names_without_values(tmp_path: Path) -> None:
+    executor = FakeModelExecutor()
+    runner = build_runner(tmp_path, model_executor=executor)
+
+    runner(
+        claim(issue_body="Fix it."),
+        profile(check=("pytest",), env={"APP_ENV": "test", "DB_PASS": "s3cr3t"}),
+        FakePrepared(),
+    )
+
+    assert executor.captured_prompt is not None
+    assert "APP_ENV" in executor.captured_prompt
+    assert "DB_PASS" in executor.captured_prompt
+    assert "s3cr3t" not in executor.captured_prompt
+
+
+def test_gate_includes_model_instructions_when_present(tmp_path: Path) -> None:
+    executor = FakeModelExecutor()
+    runner = build_runner(tmp_path, model_executor=executor)
+
+    runner(
+        claim(issue_body="Fix it."),
+        profile(
+            check=("pytest",),
+            model_instructions="Run php-cs-fixer fix before committing.",
+        ),
+        FakePrepared(),
+    )
+
+    assert executor.captured_prompt is not None
+    assert "Run php-cs-fixer fix before committing." in executor.captured_prompt
+    assert "Repository guidance" in executor.captured_prompt
+
+
+def test_gate_omits_instructions_heading_when_absent(tmp_path: Path) -> None:
+    executor = FakeModelExecutor()
+    runner = build_runner(tmp_path, model_executor=executor)
+
+    runner(claim(issue_body="Fix it."), profile(check=("pytest",)), FakePrepared())
+
+    assert executor.captured_prompt is not None
+    assert "Repository guidance" not in executor.captured_prompt
+
+
+def test_gate_redacts_model_instructions(tmp_path: Path) -> None:
+    executor = FakeModelExecutor()
+    runner = build_runner(
+        tmp_path,
+        model_executor=executor,
+        prompt_redactions=("operator-secret",),
+    )
+
+    runner(
+        claim(issue_body="Fix it."),
+        profile(
+            check=("pytest",),
+            env={"DB_PASS": "s3cr3t"},
+            model_instructions="Use operator-secret and s3cr3t to connect.",
+        ),
+        FakePrepared(),
+    )
+
+    assert executor.captured_prompt is not None
+    assert "operator-secret" not in executor.captured_prompt
+    assert "s3cr3t" not in executor.captured_prompt
+    assert "[REDACTED]" in executor.captured_prompt

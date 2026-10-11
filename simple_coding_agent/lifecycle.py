@@ -65,7 +65,7 @@ from simple_coding_agent.github_tracker import (
     ineligibility_reason,
 )
 from simple_coding_agent.model_execution import ModelExecutionStatus, ModelExecutor, OperatorHandoff, ToolCallRecord
-from simple_coding_agent.observability import AttemptArchive
+from simple_coding_agent.observability import AttemptArchive, Redactor
 from simple_coding_agent.operating import ConsecutiveErrorStore
 from simple_coding_agent.publication import AUTO_MERGE_LABEL, PublicationRequest
 
@@ -277,6 +277,7 @@ class ModelAttemptRunner:
             lambda event, detail="", level="INFO", issue_number=None: None
         ),
         operator_handoff: OperatorHandoffControl | None = None,
+        prompt_redactions: Sequence[str] = (),
     ) -> None:
         self._attempt_state = attempt_state
         self._workspace = workspace
@@ -288,6 +289,7 @@ class ModelAttemptRunner:
         self._attempt_archive_factory = attempt_archive_factory
         self._event_log = event_log
         self._operator_handoff = operator_handoff
+        self._prompt_redactions = tuple(prompt_redactions)
 
     def set_operator_handoff(self, control: OperatorHandoffControl | None) -> None:
         """Attach (or detach) the operator handoff served by the next execution.
@@ -373,14 +375,10 @@ class ModelAttemptRunner:
             self._issue_comments(claim.issue),
             continuation=continuation,
             issue_number=claim.issue.number,
+            profile=profile,
+            redactions=self._prompt_redactions,
+            setup_deferred=setup_deferred,
         )
-        if setup_deferred:
-            prompt_body = (
-                f"{prompt_body}\n\nThe attempt branch has unresolved merge conflicts from rebasing onto "
-                f"`{profile.base_branch}`. Resolve them first (inspect with git status, edit the conflicted "
-                "files, stage with git add, and run git rebase --continue until the rebase completes), "
-                "then continue the implementation."
-            )
         self._event_log(
             "model_dispatch_starting",
             f"continuation={continuation}",
@@ -3850,15 +3848,81 @@ def _read_handoff_note(working_directory: Path, issue_number: int) -> str:
         return "Handoff was requested, but the handoff note file could not be read."
 
 
+def _prompt_redactor(
+    profile: RepositoryProfile, redactions: Sequence[str]
+) -> Redactor:
+    """Combine operator credentials with profile env values for prompt redaction."""
+
+    values = [*redactions, *(value for value in profile.env.values() if value)]
+    return Redactor(values)
+
+
+def _gate_section(profile: RepositoryProfile, redactions: Sequence[str]) -> str:
+    """Describe the repository check gate the attempt is judged by.
+
+    Every check command is listed exactly as the profile gives it (after
+    redaction), one per line and numbered, in profile order. When the
+    profile carries ``env``, only the variable names are shown so the model
+    can reproduce the gate's environment without seeing the values.
+    """
+
+    redactor = _prompt_redactor(profile, redactions)
+    lines = [
+        "---",
+        "## Completion gate",
+        "",
+        "Before the attempt counts as complete, the branch must pass the "
+        "following commands, in this order:",
+        "",
+    ]
+    for index, command in enumerate(profile.check, start=1):
+        redacted = redactor.redact(command)
+        lines.append(f"{index}. {redacted}")
+    lines += [
+        "",
+        "The agent runs these commands itself as the final check after the "
+        "model finishes. They run in sequence and the first failure fails "
+        "the gate.",
+    ]
+    if profile.env:
+        names = ", ".join(profile.env.keys())
+        lines.append(
+            "The gate runs with these environment variables set: "
+            f"{names}. Their values are not shown here."
+        )
+    instructions = profile.model_instructions
+    if isinstance(instructions, str) and instructions.strip():
+        redacted_instructions = redactor.redact(instructions)
+        lines += [
+            "",
+            "### Repository guidance",
+            "",
+            "The following repository-provided guidance also applies:",
+            "",
+            str(redacted_instructions),
+        ]
+    return "\n".join(lines)
+
+
 def _build_starting_prompt(
-    issue_body: str, comments: Sequence[str], *, continuation: bool, issue_number: int
+    issue_body: str,
+    comments: Sequence[str],
+    *,
+    continuation: bool,
+    issue_number: int,
+    profile: RepositoryProfile,
+    redactions: Sequence[str] = (),
+    setup_deferred: bool = False,
 ) -> str:
     """Compose the model's starting context from the issue body and trusted comments.
 
     Trusted comments are appended verbatim in the chronological order the
     tracker already returns them in. A continuation adds only a pointer
     sentence: the handoff note's own content is never fetched or digested
-    here, since it is already reachable on the resumed branch.
+    here, since it is already reachable on the resumed branch. A
+    setup-deferred attempt adds the rebase-conflict resolution instruction.
+    Every prompt ends with the repository check gate so the model knows
+    which commands the final check runs, in which order.
     """
 
     parts = [issue_body, *comments]
@@ -3867,6 +3931,14 @@ def _build_starting_prompt(
             "This is a continued attempt; if it exists, the handoff note from the "
             f"previous attempt is at .agent/handoff/{issue_number}.md."
         )
+    if setup_deferred:
+        parts.append(
+            "The attempt branch has unresolved merge conflicts from rebasing onto "
+            f"`{profile.base_branch}`. Resolve them first (inspect with git status, edit the conflicted "
+            "files, stage with git add, and run git rebase --continue until the rebase completes), "
+            "then continue the implementation."
+        )
+    parts.append(_gate_section(profile, redactions))
     return "\n\n".join(parts)
 
 
