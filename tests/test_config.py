@@ -37,7 +37,7 @@ def test_loads_required_operator_settings_and_defaults(tmp_path: Path) -> None:
     assert config.max_budget_tokens == 4_000_000
     assert config.soft_threshold_percentage == 0.2
     assert config.soft_threshold_tokens == 3_200_000
-    assert config.pr_auto_merge is False
+    assert config.pr_auto_merge == "false"
     assert config.pr_merge_method == "merge"
 
 
@@ -77,6 +77,8 @@ def test_default_runtime_versions_match_dockerfile_pins(tmp_path: Path) -> None:
         ("SOFT_THRESHOLD_PERCENTAGE", "not-a-number"),
         ("PR_AUTO_MERGE", "sometimes"),
         ("PR_AUTO_MERGE", "yes"),
+        ("PR_AUTO_MERGE", "labels"),
+        ("PR_AUTO_MERGE", ""),
         ("PR_MERGE_METHOD", "fast-forward"),
         ("PR_MERGE_METHOD", ""),
         ("PR_MERGE_METHOD", "MERGE!"),
@@ -236,8 +238,20 @@ def test_applies_pr_auto_merge_overrides(tmp_path: Path) -> None:
         _operator_env(tmp_path, PR_AUTO_MERGE="true", PR_MERGE_METHOD="squash")
     )
 
-    assert config.pr_auto_merge is True
+    assert config.pr_auto_merge == "true"
     assert config.pr_merge_method == "squash"
+
+
+def test_applies_pr_auto_merge_label_mode(tmp_path: Path) -> None:
+    config = load_runtime_config(_operator_env(tmp_path, PR_AUTO_MERGE="label"))
+
+    assert config.pr_auto_merge == "label"
+
+
+def test_pr_auto_merge_mode_is_case_insensitive(tmp_path: Path) -> None:
+    config = load_runtime_config(_operator_env(tmp_path, PR_AUTO_MERGE="Label"))
+
+    assert config.pr_auto_merge == "label"
 
 
 def test_pr_merge_method_is_case_insensitive(tmp_path: Path) -> None:

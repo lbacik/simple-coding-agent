@@ -15,6 +15,33 @@ from simple_coding_agent.git_workspace import GitWorkspaceError
 _SUCCEEDED_BUT_UNPUBLISHED = "Implementation succeeded but publication failed."
 
 
+#: The issue label opting one implementation into auto-merge when the
+#: operator runs with ``PR_AUTO_MERGE=label``. Like ``ready-for-agent`` it
+#: sits on the collaborator trust boundary: only writers can apply it. It is
+#: read once, when the issue is claimed, so a label added while the attempt
+#: runs (or after it finishes) never enables that attempt's merge.
+AUTO_MERGE_LABEL = "agent-auto-merge"
+
+#: The merge result reported when ``label`` mode skips an unopted attempt.
+#: The PR is still created; no merge-related GitHub call runs.
+AUTO_MERGE_SKIPPED = (
+    f"auto-merge skipped (issue not labelled `{AUTO_MERGE_LABEL}` at claim time)"
+)
+
+_AUTO_MERGE_MODES = frozenset({"false", "true", "label"})
+
+
+def _normalize_auto_merge(value: bool | str) -> str:
+    """Normalize the auto-merge mode, accepting the legacy boolean form."""
+
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    normalized = str(value).strip().lower()
+    if normalized not in _AUTO_MERGE_MODES:
+        raise ValueError(f"auto_merge must be one of {sorted(_AUTO_MERGE_MODES)}")
+    return normalized
+
+
 @dataclass(frozen=True)
 class PullRequest:
     """The small, stable portion of a GitHub pull request used by an attempt."""
@@ -62,6 +89,7 @@ class PublicationRequest:
     details: str
     base_branch: str
     note_commit_sha: str | None = None
+    auto_merge_opt_in: bool = False
 
 
 @dataclass(frozen=True)
@@ -93,7 +121,7 @@ class Publisher:
         event_log: Callable[..., None] = (
             lambda event, detail="", level="INFO", issue_number=None: None
         ),
-        auto_merge: bool = False,
+        auto_merge: bool | str = False,
         merge_method: str = "merge",
     ) -> None:
         self._workspace = workspace
@@ -105,7 +133,7 @@ class Publisher:
         self._sleeper = sleeper
         self._monotonic = monotonic
         self._event_log = event_log
-        self._auto_merge = auto_merge
+        self._auto_merge = _normalize_auto_merge(auto_merge)
         self._merge_method = merge_method
 
     def publish(
@@ -171,10 +199,17 @@ class Publisher:
             outcome = AttemptOutcome.COMPLETE
 
         merge_result: str | None = None
-        if outcome is AttemptOutcome.COMPLETE and pull_request is not None and self._auto_merge:
-            # Merging is a follow-up to publication: it never redefines
-            # completion, so any failure stays reported on a complete outcome.
-            merge_result = self._maybe_auto_merge(request, pull_request, deadline)
+        if outcome is AttemptOutcome.COMPLETE and pull_request is not None:
+            if self._auto_merge == "true" or (
+                self._auto_merge == "label" and request.auto_merge_opt_in
+            ):
+                # Merging is a follow-up to publication: it never redefines
+                # completion, so any failure stays reported on a complete outcome.
+                merge_result = self._maybe_auto_merge(request, pull_request, deadline)
+            elif self._auto_merge == "label":
+                # Label-gated mode without a claim-time opt-in: the PR stands
+                # for human review and no merge-related GitHub call runs.
+                merge_result = AUTO_MERGE_SKIPPED
 
         if outcome is None:
             outcome = AttemptOutcome.INFRASTRUCTURE_ERROR

@@ -65,7 +65,7 @@ class RuntimeConfig:
     model_api_key: str = ""
     model_auth_mode: str = _DEFAULT_MODEL_AUTH_MODE
     model_stream_idle_timeout_ms: int = _DEFAULT_MODEL_STREAM_IDLE_TIMEOUT_MS
-    pr_auto_merge: bool = False
+    pr_auto_merge: str = "false"
     pr_merge_method: str = "merge"
 
     @property
@@ -157,7 +157,7 @@ def load_runtime_config(environ: Mapping[str, str] | None = None) -> RuntimeConf
         max_budget_usd=_positive_integer(values, "MAX_BUDGET_USD", 20),
         max_budget_tokens=_positive_integer(values, "MAX_BUDGET_TOKENS", 4_000_000),
         soft_threshold_percentage=_fraction(values, "SOFT_THRESHOLD_PERCENTAGE", 0.2),
-        pr_auto_merge=_boolean(values, "PR_AUTO_MERGE", False),
+        pr_auto_merge=_auto_merge_mode(values),
         pr_merge_method=_merge_method(values),
     )
     _warn_when_claude_code_version_is_set(values)
@@ -287,6 +287,13 @@ def _boolean(values: Mapping[str, str], name: str, default: bool) -> bool:
     if value == "false":
         return False
     raise ConfigurationError(f"{name} must be true or false")
+
+
+def _auto_merge_mode(values: Mapping[str, str]) -> str:
+    value = values.get("PR_AUTO_MERGE", "false").strip().lower()
+    if value not in {"false", "true", "label"}:
+        raise ConfigurationError("PR_AUTO_MERGE must be false, true, or label")
+    return value
 
 
 def _merge_method(values: Mapping[str, str]) -> str:

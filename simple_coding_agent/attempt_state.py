@@ -45,6 +45,7 @@ class AttemptCheckpoint:
     phase: AttemptPhase
     started_at: str
     updated_at: str
+    auto_merge_opt_in: bool = False
 
 
 class AttemptStateStore:
@@ -74,8 +75,15 @@ class AttemptStateStore:
         except (TypeError, ValueError, json.JSONDecodeError) as error:
             raise AttemptStateError("Attempt checkpoint is malformed") from error
 
-    def start(self, *, issue_number: int, branch: str) -> AttemptCheckpoint:
-        """Record the initial claimed phase for a new implementation attempt."""
+    def start(
+        self, *, issue_number: int, branch: str, auto_merge_opt_in: bool = False
+    ) -> AttemptCheckpoint:
+        """Record the initial claimed phase for a new implementation attempt.
+
+        ``auto_merge_opt_in`` captures whether the claimed issue carried the
+        ``agent-auto-merge`` label at claim time, so recovery keeps the
+        claim-time decision instead of re-reading the current labels.
+        """
 
         if self.read() is not None:
             raise AttemptStateError("An implementation attempt is already active")
@@ -83,6 +91,8 @@ class AttemptStateStore:
             raise AttemptStateError("Issue number must be a positive integer")
         if not isinstance(branch, str) or not branch.strip():
             raise AttemptStateError("Branch must be a non-empty string")
+        if not isinstance(auto_merge_opt_in, bool):
+            raise AttemptStateError("Auto-merge opt-in must be a boolean")
 
         timestamp = self._next_timestamp()
         checkpoint = AttemptCheckpoint(
@@ -91,6 +101,7 @@ class AttemptStateStore:
             phase=AttemptPhase.CLAIMED,
             started_at=timestamp,
             updated_at=timestamp,
+            auto_merge_opt_in=auto_merge_opt_in,
         )
         self._write(checkpoint)
         return checkpoint
@@ -113,6 +124,7 @@ class AttemptStateStore:
             phase=phase,
             started_at=checkpoint.started_at,
             updated_at=self._next_timestamp(),
+            auto_merge_opt_in=checkpoint.auto_merge_opt_in,
         )
         self._write(transitioned)
         return transitioned
@@ -170,24 +182,35 @@ def _as_utc(value: datetime) -> datetime:
     return value.astimezone(UTC)
 
 
-def _checkpoint_to_json(checkpoint: AttemptCheckpoint) -> dict[str, int | str]:
+def _checkpoint_to_json(checkpoint: AttemptCheckpoint) -> dict[str, bool | int | str]:
     return {
         "issue_number": checkpoint.issue_number,
         "branch": checkpoint.branch,
         "phase": checkpoint.phase.value,
         "started_at": checkpoint.started_at,
         "updated_at": checkpoint.updated_at,
+        "auto_merge_opt_in": checkpoint.auto_merge_opt_in,
     }
 
 
 def _checkpoint_from_json(value: object) -> AttemptCheckpoint:
-    if not isinstance(value, dict) or set(value) != {
-        "issue_number",
-        "branch",
-        "phase",
-        "started_at",
-        "updated_at",
-    }:
+    if not isinstance(value, dict) or set(value) not in (
+        {
+            "issue_number",
+            "branch",
+            "phase",
+            "started_at",
+            "updated_at",
+        },
+        {
+            "issue_number",
+            "branch",
+            "phase",
+            "started_at",
+            "updated_at",
+            "auto_merge_opt_in",
+        },
+    ):
         raise ValueError("invalid checkpoint shape")
 
     issue_number = value["issue_number"]
@@ -195,6 +218,7 @@ def _checkpoint_from_json(value: object) -> AttemptCheckpoint:
     phase = value["phase"]
     started_at = value["started_at"]
     updated_at = value["updated_at"]
+    auto_merge_opt_in = value.get("auto_merge_opt_in", False)
     if isinstance(issue_number, bool) or not isinstance(issue_number, int) or issue_number <= 0:
         raise ValueError("invalid issue number")
     if not isinstance(branch, str) or not branch.strip():
@@ -203,6 +227,8 @@ def _checkpoint_from_json(value: object) -> AttemptCheckpoint:
         raise ValueError("invalid phase")
     if not isinstance(started_at, str) or not isinstance(updated_at, str):
         raise ValueError("invalid timestamps")
+    if not isinstance(auto_merge_opt_in, bool):
+        raise ValueError("invalid auto-merge opt-in")
     _parse_timestamp(started_at)
     _parse_timestamp(updated_at)
     return AttemptCheckpoint(
@@ -211,6 +237,7 @@ def _checkpoint_from_json(value: object) -> AttemptCheckpoint:
         phase=AttemptPhase(phase),
         started_at=started_at,
         updated_at=updated_at,
+        auto_merge_opt_in=auto_merge_opt_in,
     )
 
 

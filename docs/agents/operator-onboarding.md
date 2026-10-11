@@ -44,11 +44,14 @@ Do not use a classic token or a token with broader scope.  Store the token in
 
 ## Pull-request auto-merge (`PR_AUTO_MERGE`)
 
-By default the agent only opens a pull request for a complete implementation
-and leaves merging to a human.  Set `PR_AUTO_MERGE=true` to let the
-orchestrator (never the model) ask GitHub to merge that PR right after
-creating it, with `PR_MERGE_METHOD` (`merge`, `squash`, or `rebase`; default
-`merge`) selecting the method for both paths:
+By default (`PR_AUTO_MERGE=false`) the agent only opens a pull request for a
+complete implementation and leaves merging to a human.  Set
+`PR_AUTO_MERGE=true` to let the orchestrator (never the model) ask GitHub to
+merge that PR right after creating it, or `PR_AUTO_MERGE=label` to merge
+only issues explicitly opted in with the `agent-auto-merge` label (see the
+trust policy below).  Any other value fails at startup with a configuration
+error.  `PR_MERGE_METHOD` (`merge`, `squash`, or `rebase`; default `merge`)
+selects the method for both paths:
 
 1. It first enables GitHub's native auto-merge on the PR, so GitHub merges
    it once the base branch's protection rules are met.  Deciding when it is
@@ -61,6 +64,15 @@ attempt whose PR was created stays `complete` even if the merge step fails,
 and the issue result comment reports what the step did (`auto-merge enabled
 (<method>)`, `merged`, or `auto-merge failed: <reason>`).  The existing
 `Closes #N` in the PR body closes the issue when the PR merges.
+
+In `label` mode the merge step runs only when the implementation issue
+carried `agent-auto-merge` at claim time, and goes through the same two
+paths with the same `PR_MERGE_METHOD`.  A complete implementation of an
+issue without the label still gets its PR but no merge-related GitHub calls,
+and the result comment reports `auto-merge skipped (issue not labelled
+`agent-auto-merge` at claim time)`.  A label added while the attempt runs,
+or after it finishes, never enables that attempt's merge — including when a
+crashed attempt is recovered, which keeps the claim-time decision.
 
 Prerequisites:
 
@@ -91,6 +103,14 @@ Policy requirements:
 - Never apply the label to an issue you did not write or have not read in full.
 - Treat the label as equivalent to allowing arbitrary code execution inside
   the repository clone.
+
+The `agent-auto-merge` label sits on the same trust boundary: only
+collaborators with **write access** may apply it.  Once applied (with
+`PR_AUTO_MERGE=label` configured), the agent merges the complete
+implementation's PR with no human review unless branch protection requires
+one, so review the issue — and the risk of landing its solution unreviewed —
+before opting it in.  The label counts only when the issue carries it at
+claim time; adding it mid-attempt never enables that attempt's merge.
 
 ## Project settings opt-in and residual risks
 
