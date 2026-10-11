@@ -646,3 +646,96 @@ def publish_label_mode(workspace, github: FakeGitHub, branch: str, *, opt_in: bo
     return Publisher(workspace, github, "octo/example", auto_merge="label").publish(
         publish_request(branch, opt_in=opt_in)
     )
+
+
+# --- Reviews performed vs repair cycles (issue #178) ---------------------------
+
+
+def complete_request(branch: str, **overrides: object) -> PublicationRequest:
+    fields: dict[str, object] = {
+        "issue_number": 23,
+        "issue_title": "Implement publication",
+        "branch": branch,
+        "started_at": "2026-09-20T13:00:00Z",
+        "decision": CompletionDecision(None, True, PublicationPath.COMPLETE, ("ready",)),
+        "check_command": "pytest",
+        "check_exit_code": 0,
+        "review_cycles": 0,
+        "review_findings": "not collected",
+        "details": "Implemented the publication boundary.",
+        "base_branch": "main",
+    }
+    fields.update(overrides)
+    return PublicationRequest(**fields)  # type: ignore[arg-type]
+
+
+def test_result_comment_reports_zero_reviews_explicitly(tmp_path: Path) -> None:
+    remote, _ = repository_with_main(tmp_path)
+    workspace = GitWorkspace(tmp_path / "clone", str(remote), token_provider=lambda: "token")
+    prepared = workspace.prepare_attempt(base_branch="main", issue_number=23)
+    write_and_commit(tmp_path / "clone", "feature.txt", "done", "Implement publication")
+    github = FakeGitHub()
+
+    Publisher(workspace, github, "octo/example").publish(
+        complete_request(prepared.branch, reviews_performed=0, review_cycles=0)
+    )
+
+    (comment,) = [body for _, body in github.comments]
+    assert "Reviews performed: 0" in comment
+    assert "Review repair cycles: 0/2" in comment
+    assert "code-review was not run" in comment
+
+
+def test_result_comment_distinguishes_reviews_from_repair_cycles(
+    tmp_path: Path,
+) -> None:
+    remote, _ = repository_with_main(tmp_path)
+    workspace = GitWorkspace(tmp_path / "clone", str(remote), token_provider=lambda: "token")
+    prepared = workspace.prepare_attempt(base_branch="main", issue_number=23)
+    write_and_commit(tmp_path / "clone", "feature.txt", "done", "Implement publication")
+    github = FakeGitHub()
+
+    Publisher(workspace, github, "octo/example").publish(
+        complete_request(prepared.branch, reviews_performed=1, review_cycles=0)
+    )
+
+    (comment,) = [body for _, body in github.comments]
+    assert "Reviews performed: 1" in comment
+    assert "Review repair cycles: 0/2" in comment
+    assert "code-review was not run" not in comment
+
+
+def test_result_comment_reports_repair_cycles_for_repeated_reviews(
+    tmp_path: Path,
+) -> None:
+    remote, _ = repository_with_main(tmp_path)
+    workspace = GitWorkspace(tmp_path / "clone", str(remote), token_provider=lambda: "token")
+    prepared = workspace.prepare_attempt(base_branch="main", issue_number=23)
+    write_and_commit(tmp_path / "clone", "feature.txt", "done", "Implement publication")
+    github = FakeGitHub()
+
+    Publisher(workspace, github, "octo/example").publish(
+        complete_request(prepared.branch, reviews_performed=3, review_cycles=2)
+    )
+
+    (comment,) = [body for _, body in github.comments]
+    assert "Reviews performed: 3" in comment
+    assert "Review repair cycles: 2/2" in comment
+    assert "code-review was not run" not in comment
+
+
+def test_pull_request_body_reports_reviews_performed(tmp_path: Path) -> None:
+    remote, _ = repository_with_main(tmp_path)
+    workspace = GitWorkspace(tmp_path / "clone", str(remote), token_provider=lambda: "token")
+    prepared = workspace.prepare_attempt(base_branch="main", issue_number=23)
+    write_and_commit(tmp_path / "clone", "feature.txt", "done", "Implement publication")
+    github = FakeGitHub()
+
+    Publisher(workspace, github, "octo/example").publish(
+        complete_request(prepared.branch, reviews_performed=0, review_cycles=0)
+    )
+
+    (body,) = github.pull_request_bodies
+    assert "Reviews performed: 0" in body
+    assert "Review repair cycles: 0/2" in body
+    assert "code-review was not run" in body

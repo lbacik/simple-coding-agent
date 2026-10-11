@@ -640,6 +640,104 @@ def test_blocks_a_third_repair_cycle_after_three_code_reviews(tmp_path: Path) ->
     assert decisions[3]["hookSpecificOutput"]["permissionDecision"] == "deny"
 
 
+# --- Code-review gate on finishing (issue #178) -------------------------------
+
+
+def stop_hook_client(tmp_path: Path, captured: list[FakeClient]) -> ModelExecutor:
+    def client_factory(options: object) -> FakeClient:
+        client = FakeClient(options, [result()])
+        captured.append(client)
+        return client
+
+    return ModelExecutor(runtime_config(tmp_path), client_factory=client_factory)
+
+
+def test_stop_hook_is_registered(tmp_path: Path) -> None:
+    captured: list[FakeClient] = []
+    executor = stop_hook_client(tmp_path, captured)
+    asyncio.run(executor.execute(issue_body="Fix it.", working_directory=tmp_path))
+
+    assert "Stop" in captured[0].options.hooks
+    assert len(captured[0].options.hooks["Stop"][0].hooks) == 1
+
+
+def test_stop_blocks_finish_once_when_commits_exist_without_review(
+    tmp_path: Path,
+) -> None:
+    captured: list[FakeClient] = []
+    executor = stop_hook_client(tmp_path, captured)
+    asyncio.run(executor.execute(issue_body="Fix it.", working_directory=tmp_path))
+    stop_hook = captured[0].options.hooks["Stop"][0].hooks[0]
+    executor.set_new_commits_provider(lambda: 1)
+
+    first = asyncio.run(stop_hook({"stop_hook_active": False}, None, {}))
+    second = asyncio.run(stop_hook({"stop_hook_active": False}, None, {}))
+
+    assert first["decision"] == "block"
+    assert "code-review" in first["reason"]
+    assert second == {}
+
+
+def test_stop_allows_finish_after_review(tmp_path: Path) -> None:
+    captured: list[FakeClient] = []
+    executor = stop_hook_client(tmp_path, captured)
+    asyncio.run(executor.execute(issue_body="Fix it.", working_directory=tmp_path))
+    stop_hook = captured[0].options.hooks["Stop"][0].hooks[0]
+    pre_hook = captured[0].options.hooks["PreToolUse"][0].hooks[0]
+    executor.set_new_commits_provider(lambda: 1)
+    asyncio.run(pre_hook({"tool_name": "Skill", "tool_input": {"skill": "code-review"}}, None, {}))
+
+    assert asyncio.run(stop_hook({"stop_hook_active": False}, None, {})) == {}
+
+
+def test_stop_allows_finish_without_new_commits(tmp_path: Path) -> None:
+    captured: list[FakeClient] = []
+    executor = stop_hook_client(tmp_path, captured)
+    asyncio.run(executor.execute(issue_body="Fix it.", working_directory=tmp_path))
+    stop_hook = captured[0].options.hooks["Stop"][0].hooks[0]
+    executor.set_new_commits_provider(lambda: 0)
+
+    assert asyncio.run(stop_hook({"stop_hook_active": False}, None, {})) == {}
+
+
+def test_stop_allows_finish_without_a_commit_provider(tmp_path: Path) -> None:
+    captured: list[FakeClient] = []
+    executor = stop_hook_client(tmp_path, captured)
+    asyncio.run(executor.execute(issue_body="Fix it.", working_directory=tmp_path))
+    stop_hook = captured[0].options.hooks["Stop"][0].hooks[0]
+
+    assert asyncio.run(stop_hook({"stop_hook_active": False}, None, {})) == {}
+
+
+def test_stop_nudge_resets_for_each_execution(tmp_path: Path) -> None:
+    captured: list[FakeClient] = []
+    executor = stop_hook_client(tmp_path, captured)
+    asyncio.run(executor.execute(issue_body="Fix it.", working_directory=tmp_path))
+    stop_hook = captured[0].options.hooks["Stop"][0].hooks[0]
+    executor.set_new_commits_provider(lambda: 1)
+    asyncio.run(stop_hook({"stop_hook_active": False}, None, {}))
+
+    asyncio.run(executor.execute(issue_body="Fix it.", working_directory=tmp_path))
+
+    assert executor._review_nudge_sent is False
+
+
+def test_stop_treats_a_failing_commit_provider_as_no_new_commits(
+    tmp_path: Path,
+) -> None:
+    captured: list[FakeClient] = []
+    executor = stop_hook_client(tmp_path, captured)
+    asyncio.run(executor.execute(issue_body="Fix it.", working_directory=tmp_path))
+    stop_hook = captured[0].options.hooks["Stop"][0].hooks[0]
+
+    def failing() -> int:
+        raise OSError("git is unavailable")
+
+    executor.set_new_commits_provider(failing)
+
+    assert asyncio.run(stop_hook({"stop_hook_active": False}, None, {})) == {}
+
+
 # --- Resource-aware execution (issue #54) ------------------------------------
 
 

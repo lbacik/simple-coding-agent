@@ -195,6 +195,22 @@ class OperatorHandoff:
 OperatorHandoffProvider = Callable[[], "OperatorHandoff | None"]
 OperatorHandoffReporter = Callable[[str, str], None]
 
+#: Commits added by this run, as seen by the driving process. The lifecycle
+#: wires this to the attempt workspace before dispatch; without it the
+#: review gate cannot tell a no-change run apart from unfinished work and
+#: stays silent.
+NewCommitsProvider = Callable[[], int]
+
+#: Corrective message blocking the first finish attempt when the branch holds
+#: commits added by this run but no ``code-review`` invocation was observed.
+#: Sent at most once per run; a model that still finishes without a review is
+#: classified ``incomplete`` with the evaluator's reason reported elsewhere.
+_CODE_REVIEW_NUDGE = (
+    "Invoke the `code-review` skill on your changes before finishing: "
+    "completion requires at least one `code-review` invocation in this run, "
+    "even when the checks pass and the change is small (for example formatting)."
+)
+
 
 @dataclass(frozen=True)
 class SkillEvent:
@@ -314,6 +330,8 @@ class ModelExecutor:
         self._event_log = event_log
         self._skill_events: list[SkillEvent] = []
         self._review_count = 0
+        self._review_nudge_sent = False
+        self._new_commits_provider: NewCommitsProvider | None = None
         self._issue_number: int | None = None
         self._attempt_id: str | None = None
         self._archive: EvidenceWriter | None = None
@@ -368,6 +386,22 @@ class ModelExecutor:
         """
 
         self._operator_handoff_provider = provider
+
+    def set_new_commits_provider(self, provider: NewCommitsProvider | None) -> None:
+        """Observe commits added by this run for the end-of-turn review gate.
+
+        The driving process wires this before dispatch (and only real
+        executors carry the seam; older fakes are left alone). ``None``
+        clears the provider and disables the gate.
+        """
+
+        self._new_commits_provider = provider
+
+    @property
+    def review_nudge_sent(self) -> bool:
+        """Whether the once-per-run review nudge was already delivered."""
+
+        return self._review_nudge_sent
 
     def set_operator_handoff_reporter(
         self, reporter: OperatorHandoffReporter | None
@@ -667,6 +701,7 @@ class ModelExecutor:
 
         self._skill_events.clear()
         self._review_count = 0
+        self._review_nudge_sent = False
         self._issue_number = issue_number
         self._attempt_id = attempt_id
         self._archive = archive
@@ -974,6 +1009,7 @@ class ModelExecutor:
                     HookMatcher(hooks=[self._guard_and_record_pre_tool_use])
                 ],
                 "PostToolUse": [HookMatcher(hooks=[self._record_post_tool_use])],
+                "Stop": [HookMatcher(hooks=[self._gate_review_on_stop])],
             },
         )
 
@@ -1809,6 +1845,46 @@ class ModelExecutor:
                         " progress."
                     )
         return await publication_guard(hook_input, tool_use_id, context)
+
+    async def _gate_review_on_stop(
+        self, hook_input: Any, tool_use_id: str | None, context: Any
+    ) -> dict[str, Any]:
+        """Block the first finish attempt when new commits lack a review.
+
+        Completion requires at least one ``code-review`` invocation in the
+        run, but nothing else enforces that before the turn ends — scoped-down
+        continuation runs ("just fix formatting") are especially likely to
+        skip it and then end ``incomplete`` with no visible reason. When the
+        branch holds commits added by this run and no review was observed,
+        the stop is blocked once with a corrective message; afterwards the
+        model may still finish without a review and the attempt is classified
+        ``incomplete`` with the evaluator's reason reported. Runs with no new
+        commits (or no commit provider) are never nudged.
+        """
+
+        if self._review_nudge_sent or self._review_count > 0:
+            return {}
+        if self._new_commits_count() <= 0:
+            return {}
+        self._review_nudge_sent = True
+        self._log(
+            "code_review_nudge",
+            "The model tried to finish with commits added by this run and no"
+            " `code-review` invocation; the stop was blocked once with a"
+            " corrective message.",
+        )
+        return {"decision": "block", "reason": _CODE_REVIEW_NUDGE}
+
+    def _new_commits_count(self) -> int:
+        """Commits added by this run, or 0 when unknown or unreadable."""
+
+        provider = self._new_commits_provider
+        if provider is None:
+            return 0
+        try:
+            return max(0, int(provider()))
+        except Exception:
+            return 0
 
     async def _record_post_tool_use(
         self, hook_input: Any, tool_use_id: str | None, context: Any

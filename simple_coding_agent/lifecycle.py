@@ -161,6 +161,7 @@ class AttemptEvidence:
     review_findings: str
     details: str
     note_commit_sha: str | None = None
+    reviews_performed: int = 0
 
 
 #: The handoff-note reason an operator ``handoff now`` request requires.
@@ -399,6 +400,7 @@ class ModelAttemptRunner:
             issue_number=claim.issue.number,
         )
         self._wire_operator_handoff()
+        self._wire_review_gate(prepared, initial_commits)
         try:
             execution = asyncio.run(
                 _execute_model(
@@ -676,6 +678,7 @@ class ModelAttemptRunner:
             late_operator_snapshot,
             decision,
         )
+        _log_completion_decision(self._event_log, claim.issue.number, decision)
         if decision.publication_eligible or decision.publication_path is PublicationPath.PARTIAL:
             self._attempt_state.transition(AttemptPhase.PUSHING)
         findings = _review_findings_text(review, review_count)
@@ -692,9 +695,43 @@ class ModelAttemptRunner:
                 note_commit_sha = note_commit.revision
         elif handoff_rejection_reason is not None:
             details = handoff_rejection_reason
+        elif (
+            decision.outcome in (AttemptOutcome.INCOMPLETE, AttemptOutcome.NO_CHANGES)
+            and decision.reasons
+        ):
+            # The evaluator's reason (for example a missing ``code-review``)
+            # is the human-visible cause; the generic SDK explanation would
+            # otherwise hide it behind a green check.
+            details = "; ".join(decision.reasons)
         return _attempt_evidence(
-            decision, profile, final_check, review_cycles, findings, details, note_commit_sha
+            decision,
+            profile,
+            final_check,
+            review_cycles,
+            findings,
+            details,
+            note_commit_sha,
+            reviews_performed=review_count,
         )
+
+    def _wire_review_gate(self, prepared: object, initial_commits: Sequence[object]) -> None:
+        """Let the model execution nudge the model toward ``code-review``.
+
+        The stop gate blocks the first finish attempt while the branch holds
+        commits added by this run and no review was observed. ``prepared``
+        and the pre-dispatch commit snapshot delimit "added by this run";
+        executors without the seam (older fakes) are left alone.
+        """
+
+        set_provider = getattr(self._model_executor, "set_new_commits_provider", None)
+        if not callable(set_provider):
+            return
+        baseline = len(initial_commits)
+
+        def new_commits() -> int:
+            return len(self._workspace.commits_added(prepared)) - baseline  # type: ignore[arg-type]
+
+        set_provider(new_commits)
 
     def _wire_operator_handoff(self) -> None:
         """Serve the pending operator handoff through this model execution.
@@ -940,6 +977,7 @@ class ModelAttemptRunner:
                     review=ReviewEvidence((), 0),
                     final_check=None,
                 )
+            _log_completion_decision(self._event_log, claim.issue.number, decision)
             details = decision.reasons[0] if decision.reasons else None
             if not preparation.setup.succeeded:
                 failure_detail = _command_failure_detail(preparation.setup)
@@ -2434,6 +2472,7 @@ class AgentLifecycle:
                         check_command=evidence.check_command,
                         check_exit_code=evidence.check_exit_code,
                         review_cycles=evidence.review_cycles,
+                        reviews_performed=evidence.reviews_performed,
                         review_findings=evidence.review_findings,
                         details=evidence.details,
                         base_branch=profile.base_branch,
@@ -3903,6 +3942,7 @@ def _attempt_evidence(
     review_findings: str,
     details: str = "Attempt did not reach local completion evidence.",
     note_commit_sha: str | None = None,
+    reviews_performed: int = 0,
 ) -> AttemptEvidence:
     return AttemptEvidence(
         decision=decision,
@@ -3912,6 +3952,34 @@ def _attempt_evidence(
         review_findings=review_findings,
         details=details,
         note_commit_sha=note_commit_sha,
+        reviews_performed=reviews_performed,
+    )
+
+
+def _log_completion_decision(
+    event_log: Callable[..., None],
+    issue_number: int,
+    decision: CompletionDecision,
+) -> None:
+    """Emit the evaluator's outcome and reasons as one auditable event.
+
+    A run that commits changes but never invokes ``code-review`` ends
+    ``incomplete`` ("Acceptance criteria are not satisfied.") with no other
+    visible cause; this event keeps that reason in ``agent_output.json``.
+    """
+
+    outcome = decision.outcome.value if decision.outcome is not None else "none"
+    reasons = "; ".join(decision.reasons) if decision.reasons else "none"
+    event_log(
+        "completion_decided",
+        f"outcome={outcome}; reasons={reasons}",
+        level=(
+            "WARNING"
+            if decision.outcome
+            in (AttemptOutcome.INCOMPLETE, AttemptOutcome.NO_CHANGES, AttemptOutcome.INFRASTRUCTURE_ERROR)
+            else "INFO"
+        ),
+        issue_number=issue_number,
     )
 
 
@@ -4004,6 +4072,11 @@ def _gate_section(profile: RepositoryProfile, redactions: Sequence[str]) -> str:
         "The agent runs these commands itself as the final check after the "
         "model finishes. They run in sequence and the first failure fails "
         "the gate.",
+        "",
+        "Before finishing, invoke the `code-review` skill on your changes: "
+        "an attempt with commits but no `code-review` invocation in this run "
+        "is classified as incomplete, even when the checks pass and the "
+        "change is small (for example formatting).",
     ]
     if profile.env:
         names = ", ".join(profile.env.keys())
@@ -4113,7 +4186,11 @@ def _build_starting_prompt(
     if continuation:
         parts.append(
             "This is a continued attempt; if it exists, the handoff note from the "
-            f"previous attempt is at .agent/handoff/{issue_number}.md."
+            f"previous attempt is at .agent/handoff/{issue_number}.md. "
+            "Invoke the `code-review` skill on your changes before finishing, "
+            "even when this run only verifies earlier work or fixes formatting: "
+            "without a `code-review` invocation in this run the attempt is "
+            "classified as incomplete."
         )
     if setup_deferred:
         parts.append(
