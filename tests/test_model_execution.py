@@ -1185,7 +1185,8 @@ def test_zero_usage_stream_crosses_soft_threshold_from_estimates(tmp_path: Path)
 
 def test_per_category_token_pricing_discounts_cache_read_tokens(tmp_path: Path) -> None:
     captured: list[FakeClient] = []
-
+    # Kept small on purpose: a multi-million-token context would trip the
+    # handoff-reserve rule and steer this pricing test into a handoff.
     def client_factory(options: object) -> FakeClient:
         client = FakeClient(
             options,
