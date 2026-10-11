@@ -68,7 +68,7 @@ from simple_coding_agent.model_execution import ModelExecutionStatus, ModelExecu
 from simple_coding_agent.observability import AttemptArchive, Redactor
 from simple_coding_agent.operating import ConsecutiveErrorStore
 from simple_coding_agent.publication import AUTO_MERGE_LABEL, PublicationRequest
-from simple_coding_agent.recovery import requeue_source_for_labels
+from simple_coding_agent.recovery import REQUEUE_SOURCE_AUTOMATIC, requeue_source_for_labels
 
 
 class AttemptInterruptionHandler:
@@ -247,6 +247,8 @@ class AttemptTracker(Protocol):
     def is_self_assigned(self, issue: TrackerIssue) -> bool: ...
 
     def claim_verified(self, issue: TrackerIssue) -> Claim: ...
+
+    def automatic_continuation_count(self, issue: TrackerIssue) -> int: ...
 
     def recover_claim(self, issue_number: int) -> Claim | None: ...
 
@@ -1018,6 +1020,7 @@ class AgentLifecycle:
         sleeper: Callable[[float], None] = time.sleep,
         error_store: ConsecutiveErrorStore | None = None,
         max_consecutive_errors: int = 3,
+        max_auto_continuations: int = 0,
         event_log: Callable[..., None] = (
             lambda event, detail="", level="INFO", issue_number=None: None
         ),
@@ -1037,6 +1040,7 @@ class AgentLifecycle:
         self._sleeper = sleeper
         self._error_store = error_store
         self._max_consecutive_errors = max_consecutive_errors
+        self._max_auto_continuations = max_auto_continuations
         self._event_log = event_log
         self._attempt_archive_factory = attempt_archive_factory
         self._completion_store = completion_store
@@ -1174,13 +1178,15 @@ class AgentLifecycle:
 
         The target is fetched and checked against the ordinary eligibility
         rules (open, unassigned, labelled ``ready-for-agent``, with a
-        non-empty body and no open blocker) before anything is recorded; an
-        invalid, ineligible, or unverifiable target is rejected without
-        changing the intake state or an existing priority. A newer accepted
-        priority supersedes only the earlier priority, never a stop plan,
-        and never resumes intake. Retrying the same request ID with the
-        identical payload returns the stored acknowledgement without
-        re-fetching GitHub or applying the command twice.
+        non-empty body and no open blocker) or, within the operator's
+        automatic-continuation budget, the ``round-finished`` continuation
+        rule before anything is recorded; an invalid, ineligible, or
+        unverifiable target is rejected without changing the intake state or
+        an existing priority. A newer accepted priority supersedes only the
+        earlier priority, never a stop plan, and never resumes intake.
+        Retrying the same request ID with the identical payload returns the
+        stored acknowledgement without re-fetching GitHub or applying the
+        command twice.
         """
 
         if self._control_store is None:
@@ -1210,7 +1216,31 @@ class AgentLifecycle:
                     f"issue #{number} could not be verified: {error}."
                     " No control change was accepted."
                 ) from error
-            reason = ineligibility_reason(fresh, number)
+            # The continuation count needs a comment read, so it is only
+            # consulted when it can matter: a positive budget and a target
+            # carrying only the continuation signal. Anything else follows
+            # the ordinary rule with the count at zero, exactly as before.
+            auto_count = 0
+            if (
+                fresh is not None
+                and self._max_auto_continuations > 0
+                and fresh.is_continuation_signal
+            ):
+                try:
+                    auto_count = self._auto_continuation_count(fresh)
+                except NextIssueRejectedError:
+                    raise
+                except Exception as error:
+                    raise NextIssueRejectedError(
+                        f"issue #{number} could not be verified: {error}."
+                        " No control change was accepted."
+                    ) from error
+            reason = ineligibility_reason(
+                fresh,
+                number,
+                max_auto_continuations=self._max_auto_continuations,
+                auto_continuation_count=auto_count,
+            )
             if reason is not None:
                 raise NextIssueRejectedError(
                     f"{reason}. No control change was accepted."
@@ -1639,7 +1669,9 @@ class AgentLifecycle:
                     check_exit_code=None,
                     review_cycles=0,
                     review_findings="not rerun during recovery retry",
-                    details=details,
+                    details=self._handoff_publication_details(
+                        claim, checkpoint, details, decision.outcome
+                    ),
                     base_branch=profile.base_branch,
                     note_commit_sha=note_sha,
                     auto_merge_opt_in=_claim_time_opt_in(claim, checkpoint),
@@ -2256,6 +2288,87 @@ class AgentLifecycle:
 
         return bool(self._tracker.is_self_assigned(found))
 
+    def _auto_continuation_count(self, issue: TrackerIssue) -> int:
+        """The issue's automatic-continuation count since the last human requeue.
+
+        Trackers without the seam (older test doubles) read as zero, which
+        keeps the continuation path disabled-safe: with a zero budget the
+        count is never consulted for eligibility.
+        """
+
+        counter = getattr(self._tracker, "automatic_continuation_count", None)
+        if not callable(counter):
+            return 0
+        return int(counter(issue))
+
+    def _emit_auto_continuation_claim(
+        self, issue_number: int, auto_count: int | None
+    ) -> None:
+        """Emit the observability event for an automatic-continuation claim."""
+
+        budget = self._max_auto_continuations
+        used = "unknown" if auto_count is None else f"{auto_count}/{budget}"
+        self._event_log(
+            "auto_continuation_claimed",
+            f"issue #{issue_number}; automatic continuation count {used}",
+            level="INFO",
+            issue_number=issue_number,
+        )
+
+    def _handoff_publication_details(
+        self,
+        claim: Claim,
+        checkpoint: AttemptCheckpoint | None,
+        details: str,
+        outcome: AttemptOutcome,
+    ) -> str:
+        """Append the automatic-continuation standing to a handoff's details.
+
+        Written once, when the handoff is released: with a positive operator
+        budget the result comment reports how much of the budget the issue
+        has used (including this handoff's own requeue source) and whether
+        the agent continues automatically or needs a human requeue. Any other
+        outcome, or a zero budget, passes the details through unchanged.
+        """
+
+        if outcome is not AttemptOutcome.HANDOFF:
+            return details
+        line = self._auto_continuation_status_line(claim, checkpoint)
+        if line is None:
+            return details
+        return f"{details}\n\n{line}" if details else line
+
+    def _auto_continuation_status_line(
+        self, claim: Claim, checkpoint: AttemptCheckpoint | None
+    ) -> str | None:
+        """The handoff comment's budget-standing line, or ``None`` when silent."""
+
+        budget = self._max_auto_continuations
+        if budget <= 0:
+            return None
+        source = _claim_time_requeue_source(claim, checkpoint)
+        try:
+            count_before = self._auto_continuation_count(claim.issue)
+        except Exception:
+            return None
+        # The line reports where the issue stands once this handoff's own
+        # result comment lands: a human-stamped comment resets the count to
+        # zero (even after earlier automatic rounds), while an
+        # automatic-stamped one extends the current row by one.
+        used = count_before + 1 if source == REQUEUE_SOURCE_AUTOMATIC else 0
+        shown = min(used, budget)
+        if used >= budget:
+            return (
+                f"Automatic continuation {shown}/{budget} used; the automatic"
+                " continuation budget is exhausted and the issue now needs a"
+                " human requeue (re-apply `ready-for-agent`) before the agent"
+                " can continue it."
+            )
+        return (
+            f"Automatic continuation {shown}/{budget} used; the agent will"
+            " continue automatically."
+        )
+
     def get_command(self, request_id: str) -> CommandRecord | None:
         """Return one command's current durable acknowledgement."""
 
@@ -2482,7 +2595,12 @@ class AgentLifecycle:
                         review_cycles=evidence.review_cycles,
                         reviews_performed=evidence.reviews_performed,
                         review_findings=evidence.review_findings,
-                        details=evidence.details,
+                        details=self._handoff_publication_details(
+                            claim,
+                            checkpoint,
+                            evidence.details,
+                            evidence.decision.outcome,
+                        ),
                         base_branch=profile.base_branch,
                         note_commit_sha=evidence.note_commit_sha,
                         auto_merge_opt_in=_claim_time_opt_in(claim, checkpoint),
@@ -2749,6 +2867,12 @@ class AgentLifecycle:
                 requeue_source=requeue_source_for_labels(claim.issue.labels),
             )
             self._attempt_processing = True
+            if requeue_source_for_labels(claim.issue.labels) == REQUEUE_SOURCE_AUTOMATIC:
+                try:
+                    auto_count = self._auto_continuation_count(claim.issue)
+                except Exception:
+                    auto_count = None
+                self._emit_auto_continuation_claim(claim.issue.number, auto_count)
             if self._control_store is not None:
                 # The final counted attempt of a ``stop --after`` plan enters
                 # ``stopping`` at claim; earlier claims leave intake running
@@ -2779,6 +2903,16 @@ class AgentLifecycle:
         target_number = int(snapshot["issue_number"])
         try:
             fresh = self._tracker.fetch_issue(target_number)
+            # As in ``submit_next_issue``: the comment read behind the count
+            # only runs when it can matter, so a zero budget (or an ordinary
+            # target) revalidates exactly as before.
+            auto_count = 0
+            if (
+                fresh is not None
+                and self._max_auto_continuations > 0
+                and fresh.is_continuation_signal
+            ):
+                auto_count = self._auto_continuation_count(fresh)
         except Exception as error:
             self._event_log(
                 "next_issue_claim_ambiguous",
@@ -2793,7 +2927,12 @@ class AgentLifecycle:
             raise ControlStoreError(
                 "The tracker returned a different issue than the pending priority"
             )
-        reason = ineligibility_reason(fresh, target_number)
+        reason = ineligibility_reason(
+            fresh,
+            target_number,
+            max_auto_continuations=self._max_auto_continuations,
+            auto_continuation_count=auto_count,
+        )
         if reason is not None:
             if fresh is not None and self._is_self_assignment(fresh):
                 # Our own assignment is an ambiguous prior claim (the
@@ -2857,6 +2996,8 @@ class AgentLifecycle:
             level="INFO",
             issue_number=claim.issue.number,
         )
+        if requeue_source_for_labels(fresh.labels) == REQUEUE_SOURCE_AUTOMATIC:
+            self._emit_auto_continuation_claim(claim.issue.number, auto_count)
         checkpoint = self._attempt_state.start(
             issue_number=claim.issue.number,
             branch=f"agent/issue-{claim.issue.number}",
@@ -3522,7 +3663,9 @@ class AgentLifecycle:
                     check_exit_code=None,
                     review_cycles=0,
                     review_findings="not rerun during startup recovery",
-                    details=details,
+                    details=self._handoff_publication_details(
+                        claim, checkpoint, details, decision.outcome
+                    ),
                     base_branch=profile.base_branch,
                     note_commit_sha=note_commit_sha,
                     auto_merge_opt_in=_claim_time_opt_in(claim, checkpoint),

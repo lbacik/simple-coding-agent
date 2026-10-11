@@ -18,13 +18,23 @@ READY_FOR_AGENT = "ready-for-agent"
 ROUND_FINISHED = "round-finished"
 
 
-def ineligibility_reason(issue: TrackerIssue | None, number: int) -> str | None:
+def ineligibility_reason(
+    issue: TrackerIssue | None,
+    number: int,
+    *,
+    max_auto_continuations: int = 0,
+    auto_continuation_count: int = 0,
+) -> str | None:
     """Explain why a ``next issue`` target cannot be accepted or claimed.
 
     Returns ``None`` when the issue is currently eligible under the ordinary
     queue rules (open, unassigned, labelled ``ready-for-agent``, with a
-    non-empty body and no open blocker); otherwise returns a visible reason
-    naming the observed state.
+    non-empty body and no open blocker) or as an automatic continuation (open,
+    unassigned, labelled ``round-finished`` without ``ready-for-agent``, with
+    a non-empty body and no open blocker, whose automatic-continuation count
+    is below ``max_auto_continuations``); otherwise returns a visible reason
+    naming the observed state. An over-budget continuation names the limit as
+    ``(k/N)``.
     """
 
     if issue is None:
@@ -32,7 +42,18 @@ def ineligibility_reason(issue: TrackerIssue | None, number: int) -> str | None:
     if issue.state != "OPEN":
         return f"issue #{number} is not open (state {issue.state})"
     if READY_FOR_AGENT not in issue.labels:
-        return f"issue #{number} is not labelled `{READY_FOR_AGENT}`"
+        if max_auto_continuations > 0 and ROUND_FINISHED in issue.labels:
+            if issue.meets_base_queue_rules:
+                if auto_continuation_count < max_auto_continuations:
+                    return None
+                return (
+                    f"issue #{number}: automatic continuation limit reached"
+                    f" ({auto_continuation_count}/{max_auto_continuations})"
+                )
+            # A ``round-finished`` issue that fails the base queue rules is
+            # reported through the same checks as an ordinary issue below.
+        else:
+            return f"issue #{number} is not labelled `{READY_FOR_AGENT}`"
     if issue.assignee_logins:
         holders = ", ".join(issue.assignee_logins)
         return f"issue #{number} is already assigned to {holders}"
@@ -74,6 +95,31 @@ class TrackerIssue:
             and bool(self.body.strip())
             and self.blocked_by == 0
         )
+
+    @property
+    def meets_base_queue_rules(self) -> bool:
+        """The runnable-queue rules shared by ordinary and continuation issues.
+
+        Open, unassigned, with a non-empty body and no open native blockers;
+        the queue label itself is checked separately.
+        """
+
+        return (
+            self.state == "OPEN"
+            and not self.assignee_logins
+            and bool(self.body.strip())
+            and self.blocked_by == 0
+        )
+
+    @property
+    def is_continuation_signal(self) -> bool:
+        """Whether the issue carries a handoff continuation signal only.
+
+        ``round-finished`` without ``ready-for-agent``: a human requeue (which
+        re-applies ``ready-for-agent``) stays an ordinary queue issue.
+        """
+
+        return ROUND_FINISHED in self.labels and READY_FOR_AGENT not in self.labels
 
 
 @dataclass(frozen=True)
@@ -139,22 +185,65 @@ class GitHubTransport(Protocol):
 class GitHubTracker:
     """Select and claim one eligible issue within exactly one repository."""
 
-    def __init__(self, transport: GitHubTransport, target_repo: str) -> None:
+    def __init__(
+        self, transport: GitHubTransport, target_repo: str, *, max_auto_continuations: int = 0
+    ) -> None:
+        if (
+            isinstance(max_auto_continuations, bool)
+            or not isinstance(max_auto_continuations, int)
+            or max_auto_continuations < 0
+        ):
+            raise GitHubTrackerError("MAX_AUTO_CONTINUATIONS must be a non-negative integer")
         self._transport = transport
         self._target_repo = target_repo
+        self._max_auto_continuations = max_auto_continuations
+
+    @property
+    def max_auto_continuations(self) -> int:
+        """The operator's automatic-continuation budget (0 disables the path)."""
+
+        return self._max_auto_continuations
+
+    def is_auto_continuation_eligible(self, issue: TrackerIssue) -> bool:
+        """Whether a ``round-finished`` issue may continue without a human requeue.
+
+        The issue must carry only the continuation signal (never alongside
+        ``ready-for-agent``, which stays ordinary), meet the base queue rules,
+        and have an automatic-continuation count below the operator budget.
+        With a zero budget this is always False and reads no comments.
+        """
+
+        if self._max_auto_continuations <= 0:
+            return False
+        if not issue.is_continuation_signal or not issue.meets_base_queue_rules:
+            return False
+        return self.automatic_continuation_count(issue) < self._max_auto_continuations
 
     def runnable_queue(self) -> tuple[TrackerIssue, ...]:
-        """Return all eligible issues in FIFO creation order."""
+        """Return all eligible issues, continuations before ordinary issues.
 
-        issues: list[TrackerIssue] = []
+        Issues eligible for automatic continuation are claimed before ordinary
+        ``ready-for-agent`` issues so a started branch does not wait behind
+        new work; within each group the order is FIFO by creation date. A
+        ``ready-for-agent`` issue that is also a continuation (a human requeue
+        after a handoff) stays in the ordinary group.
+        """
+
+        continuations: list[TrackerIssue] = []
+        ordinary: list[TrackerIssue] = []
         cursor: str | None = None
         while True:
             page = self._transport.list_issues(self._target_repo, cursor)
-            issues.extend(issue for issue in page.issues if issue.is_eligible)
+            for issue in page.issues:
+                if issue.is_eligible:
+                    ordinary.append(issue)
+                elif self.is_auto_continuation_eligible(issue):
+                    continuations.append(issue)
             if page.next_cursor is None:
                 break
             cursor = page.next_cursor
-        return tuple(sorted(issues, key=lambda issue: (issue.created_at, issue.number)))
+        by_fifo = lambda issue: (issue.created_at, issue.number)
+        return tuple(sorted(continuations, key=by_fifo) + sorted(ordinary, key=by_fifo))
 
     def fetch_issue(self, number: int) -> TrackerIssue | None:
         """Re-read one issue's current state for ``next issue`` validation."""
@@ -207,7 +296,12 @@ class GitHubTracker:
         identity = self._transport.viewer()
         for candidate in queue:
             current = self._transport.get_issue(self._target_repo, candidate.number)
-            if current is None or not current.is_eligible:
+            # Revalidated at claim time under the same rule as the queue
+            # read: an issue whose budget ran out, or that a human
+            # relabelled, between the two reads is skipped.
+            if current is None or (
+                not current.is_eligible and not self.is_auto_continuation_eligible(current)
+            ):
                 continue
             assignment = self._transport.assign_issue(current.id, identity.id)
             if ROUND_FINISHED in current.labels:

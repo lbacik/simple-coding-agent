@@ -336,10 +336,12 @@ class FakeTracker:
         *,
         fifo: list[int] | None = None,
         next_claim: Claim | None = None,
+        auto_counts: dict[int, int] | None = None,
     ) -> None:
         self.issues = dict(issues or {})
         self.fifo: list[int] = list(fifo or [])
         self.next_claim = next_claim
+        self.auto_counts = dict(auto_counts or {})
         if next_claim is not None:
             self.issues.setdefault(next_claim.issue.number, next_claim.issue)
         self.fetch_errors: dict[int, Exception] = {}
@@ -372,6 +374,11 @@ class FakeTracker:
 
     def is_self_assigned(self, issue: TrackerIssue) -> bool:
         return "agent" in issue.assignee_logins
+
+    def automatic_continuation_count(self, issue: TrackerIssue) -> int:
+        """The recorded automatic-continuation count for ``issue`` (default 0)."""
+
+        return self.auto_counts.get(issue.number, 0)
 
     def claim_verified(self, issue: TrackerIssue) -> Claim:
         if issue.number in self.assign_errors:
