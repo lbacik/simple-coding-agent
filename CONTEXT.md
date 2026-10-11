@@ -32,6 +32,14 @@ _Avoid_: Backlog, work queue, job queue
 Reserving an eligible issue by assigning the agent's GitHub identity as the issue assignee, after verifying the assignee is still empty. A claimed issue is no longer eligible for other sessions.
 _Avoid_: Lock, reservation
 
+**Automatic continuation**:
+An implementation attempt claimed from `round-finished` without a human requeue: the issue carried only `round-finished` (no `ready-for-agent`) at claim time, so the agent continues the previous round on its own. It is counted by the requeue source recorded in each attempt-result comment.
+_Avoid_: Auto-retry, self requeue
+
+**Requeue source**:
+How one implementation attempt was requeued: **human** (the issue carried `ready-for-agent` at claim time) or **automatic** (it carried only `round-finished` at claim time). The source is decided once from the claim snapshot and recorded as a hidden `<!-- requeue-source: ... -->` marker in the attempt-result comment, next to the `<!-- agent-attempt: ... -->` marker. The automatic-continuation count is the number of automatic-requeue result comments in a row from the newest, up to the most recent human-requeue result; a human requeue (including a legacy unmarked result) resets it to zero.
+_Avoid_: Claim reason, retry count
+
 **Attempt outcome**:
 The structured result of an implementation attempt. Exactly one of: `complete` (all acceptance criteria met, checks pass, review clear, PR created), `incomplete` (work performed but criteria not met), `infrastructure_error` (failure unrelated to implementation logic), `no_changes` (skill loop finished with zero commits), or `handoff` (work paused cooperatively near a resource limit, with progress committed and published as a Handoff note for human-approved continuation; a zero-commit handoff downgrades to `no_changes`).
 _Avoid_: Status, result code, exit status

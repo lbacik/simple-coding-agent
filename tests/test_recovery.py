@@ -18,6 +18,7 @@ from simple_coding_agent.recovery import (
     RecoveryRejectedError,
     parse_attempt_id,
     parse_saved_at,
+    release_comment_body,
 )
 from tests.fakes import FakePublisher, FakeTracker, InMemoryWorkspace
 
@@ -620,3 +621,37 @@ def test_status_format_shows_recovery_hold(tmp_path: Path) -> None:
     assert "hold_reason" in rendered
     assert "next_action" in rendered
     assert "agentctl recovery retry" in rendered
+
+
+# ---------------------------------------------------------------------------
+# acceptance: release comments carry the attempt and requeue-source markers
+# ---------------------------------------------------------------------------
+
+
+def release_body(**overrides: object) -> str:
+    fields: dict[str, object] = {
+        "issue_number": 24,
+        "attempt_id": "2026-09-20T13:00:00Z",
+        "actual_outcome": "incomplete",
+        "failure_reason": "The operator secured the retained work.",
+        "saved_at": "/tmp/secured",
+        "branch": "agent/issue-24",
+    }
+    fields.update(overrides)
+    return release_comment_body(**fields)  # type: ignore[arg-type]
+
+
+def test_release_comment_records_a_human_requeue_source_by_default() -> None:
+    body = release_body()
+
+    assert "<!-- agent-attempt: 2026-09-20T13:00:00Z -->" in body
+    assert "<!-- requeue-source: human -->" in body
+    assert "<!-- requeue-source: automatic -->" not in body
+
+
+def test_release_comment_records_an_automatic_requeue_source_when_requested() -> None:
+    body = release_body(requeue_source="automatic")
+
+    assert "<!-- agent-attempt: 2026-09-20T13:00:00Z -->" in body
+    assert "<!-- requeue-source: automatic -->" in body
+    assert "<!-- requeue-source: human -->" not in body

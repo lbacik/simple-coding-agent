@@ -17,6 +17,7 @@ from simple_coding_agent.github_tracker import (
     TrackerIssue,
 )
 from simple_coding_agent.publication import PullRequest
+from simple_coding_agent.recovery import requeue_source_marker
 
 
 def test_lists_only_eligible_open_issues() -> None:
@@ -169,6 +170,85 @@ def test_trusted_comments_never_matches_a_deleted_account_by_empty_login() -> No
     trusted = GitHubTracker(transport, "octo/example").trusted_comments(issue(1, author_login=""))
 
     assert trusted == ()
+
+
+def test_automatic_continuation_count_is_zero_with_no_history() -> None:
+    transport = FakeCommentTransport(comments=())
+
+    assert GitHubTracker(transport, "octo/example").automatic_continuation_count(issue(1)) == 0
+
+
+def test_automatic_continuation_count_treats_legacy_unmarked_results_as_human() -> None:
+    transport = FakeCommentTransport(
+        comments=(
+            IssueComment(
+                author_login="agent",
+                body="## Agent Attempt Result: complete\n<!-- agent-attempt: first -->",
+            ),
+            IssueComment(
+                author_login="agent",
+                body="## Agent Attempt Result: incomplete\n<!-- agent-attempt: second -->",
+            ),
+        )
+    )
+
+    assert GitHubTracker(transport, "octo/example").automatic_continuation_count(issue(1)) == 0
+
+
+def test_automatic_continuation_count_counts_consecutive_automatic_results() -> None:
+    transport = FakeCommentTransport(
+        comments=(
+            IssueComment(author_login="agent", body=result_body("human", "first")),
+            IssueComment(author_login="agent", body=result_body("automatic", "second")),
+            IssueComment(author_login="agent", body=result_body("automatic", "third")),
+        )
+    )
+
+    assert GitHubTracker(transport, "octo/example").automatic_continuation_count(issue(1)) == 2
+
+
+def test_automatic_continuation_count_resets_at_the_most_recent_human_result() -> None:
+    transport = FakeCommentTransport(
+        comments=(
+            IssueComment(author_login="agent", body=result_body("automatic", "first")),
+            IssueComment(author_login="agent", body=result_body("human", "second")),
+        )
+    )
+
+    assert GitHubTracker(transport, "octo/example").automatic_continuation_count(issue(1)) == 0
+
+
+def test_automatic_continuation_count_ignores_markers_in_other_users_comments() -> None:
+    transport = FakeCommentTransport(
+        comments=(
+            IssueComment(author_login="agent", body=result_body("automatic", "first")),
+            IssueComment(author_login="random-passerby", body=result_body("human", "second")),
+            IssueComment(author_login="random-passerby", body=result_body("automatic", "third")),
+            IssueComment(author_login="agent", body=result_body("automatic", "fourth")),
+        )
+    )
+
+    assert GitHubTracker(transport, "octo/example").automatic_continuation_count(issue(1)) == 2
+
+
+def test_automatic_continuation_count_ignores_a_deleted_account_by_empty_login() -> None:
+    transport = FakeCommentTransport(
+        comments=(
+            IssueComment(
+                author_login="",
+                body=result_body("automatic", "first"),
+            ),
+        )
+    )
+
+    assert GitHubTracker(transport, "octo/example").automatic_continuation_count(issue(1)) == 0
+
+
+def result_body(source: str, attempt_id: str) -> str:
+    return (
+        f"## Agent Attempt Result: complete\n<!-- agent-attempt: {attempt_id} -->\n"
+        f"{requeue_source_marker(source)}"
+    )
 
 
 def test_lists_issue_comments_with_author_login_via_graphql() -> None:

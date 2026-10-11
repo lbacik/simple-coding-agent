@@ -46,6 +46,7 @@ class AttemptCheckpoint:
     started_at: str
     updated_at: str
     auto_merge_opt_in: bool = False
+    requeue_source: str = "human"
 
 
 class AttemptStateStore:
@@ -76,13 +77,22 @@ class AttemptStateStore:
             raise AttemptStateError("Attempt checkpoint is malformed") from error
 
     def start(
-        self, *, issue_number: int, branch: str, auto_merge_opt_in: bool = False
+        self,
+        *,
+        issue_number: int,
+        branch: str,
+        auto_merge_opt_in: bool = False,
+        requeue_source: str = "human",
     ) -> AttemptCheckpoint:
         """Record the initial claimed phase for a new implementation attempt.
 
         ``auto_merge_opt_in`` captures whether the claimed issue carried the
         ``agent-auto-merge`` label at claim time, so recovery keeps the
         claim-time decision instead of re-reading the current labels.
+        ``requeue_source`` captures how the attempt was requeued (``human``
+        when the issue carried ``ready-for-agent`` at claim time, otherwise
+        ``automatic``), so every attempt-result comment records the actual
+        reason for the claim even across recovery.
         """
 
         if self.read() is not None:
@@ -93,6 +103,8 @@ class AttemptStateStore:
             raise AttemptStateError("Branch must be a non-empty string")
         if not isinstance(auto_merge_opt_in, bool):
             raise AttemptStateError("Auto-merge opt-in must be a boolean")
+        if requeue_source not in ("human", "automatic"):
+            raise AttemptStateError("Requeue source must be 'human' or 'automatic'")
 
         timestamp = self._next_timestamp()
         checkpoint = AttemptCheckpoint(
@@ -102,6 +114,7 @@ class AttemptStateStore:
             started_at=timestamp,
             updated_at=timestamp,
             auto_merge_opt_in=auto_merge_opt_in,
+            requeue_source=requeue_source,
         )
         self._write(checkpoint)
         return checkpoint
@@ -125,6 +138,7 @@ class AttemptStateStore:
             started_at=checkpoint.started_at,
             updated_at=self._next_timestamp(),
             auto_merge_opt_in=checkpoint.auto_merge_opt_in,
+            requeue_source=checkpoint.requeue_source,
         )
         self._write(transitioned)
         return transitioned
@@ -190,6 +204,7 @@ def _checkpoint_to_json(checkpoint: AttemptCheckpoint) -> dict[str, bool | int |
         "started_at": checkpoint.started_at,
         "updated_at": checkpoint.updated_at,
         "auto_merge_opt_in": checkpoint.auto_merge_opt_in,
+        "requeue_source": checkpoint.requeue_source,
     }
 
 
@@ -210,6 +225,23 @@ def _checkpoint_from_json(value: object) -> AttemptCheckpoint:
             "updated_at",
             "auto_merge_opt_in",
         },
+        {
+            "issue_number",
+            "branch",
+            "phase",
+            "started_at",
+            "updated_at",
+            "requeue_source",
+        },
+        {
+            "issue_number",
+            "branch",
+            "phase",
+            "started_at",
+            "updated_at",
+            "auto_merge_opt_in",
+            "requeue_source",
+        },
     ):
         raise ValueError("invalid checkpoint shape")
 
@@ -219,6 +251,7 @@ def _checkpoint_from_json(value: object) -> AttemptCheckpoint:
     started_at = value["started_at"]
     updated_at = value["updated_at"]
     auto_merge_opt_in = value.get("auto_merge_opt_in", False)
+    requeue_source = value.get("requeue_source", "human")
     if isinstance(issue_number, bool) or not isinstance(issue_number, int) or issue_number <= 0:
         raise ValueError("invalid issue number")
     if not isinstance(branch, str) or not branch.strip():
@@ -229,6 +262,8 @@ def _checkpoint_from_json(value: object) -> AttemptCheckpoint:
         raise ValueError("invalid timestamps")
     if not isinstance(auto_merge_opt_in, bool):
         raise ValueError("invalid auto-merge opt-in")
+    if requeue_source not in ("human", "automatic"):
+        raise ValueError("invalid requeue source")
     _parse_timestamp(started_at)
     _parse_timestamp(updated_at)
     return AttemptCheckpoint(
@@ -238,6 +273,7 @@ def _checkpoint_from_json(value: object) -> AttemptCheckpoint:
         started_at=started_at,
         updated_at=updated_at,
         auto_merge_opt_in=auto_merge_opt_in,
+        requeue_source=requeue_source,
     )
 
 

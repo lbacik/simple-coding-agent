@@ -10,6 +10,7 @@ from simple_coding_agent.completion import AttemptOutcome, CompletionDecision, P
 from simple_coding_agent.attempt_state import AttemptPhase, AttemptStateStore
 from simple_coding_agent.attempt_workspace import BranchPusher
 from simple_coding_agent.git_workspace import GitWorkspaceError
+from simple_coding_agent.recovery import REQUEUE_SOURCE_HUMAN, requeue_source_marker
 
 
 _SUCCEEDED_BUT_UNPUBLISHED = "Implementation succeeded but publication failed."
@@ -91,6 +92,7 @@ class PublicationRequest:
     note_commit_sha: str | None = None
     auto_merge_opt_in: bool = False
     reviews_performed: int = 0
+    requeue_source: str = REQUEUE_SOURCE_HUMAN
 
 
 @dataclass(frozen=True)
@@ -415,6 +417,7 @@ def _result_comment(
     )
     merge_line = f"**Merge**: {merge_result}\n" if merge_result is not None else ""
     review_lines = "\n".join(_review_lines(request))
+    source_marker = requeue_source_marker(request.requeue_source)
     return (
         f"## Agent Attempt Result: {outcome.value}\n\n"
         f"**Branch**: {branch}\n"
@@ -427,7 +430,8 @@ def _result_comment(
         f"- Review findings: {request.review_findings}\n\n"
         "### Details\n"
         f"{details}\n\n"
-        f"{marker}"
+        f"{marker}\n"
+        f"{source_marker}"
     )
 
 
