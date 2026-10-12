@@ -267,14 +267,23 @@ class InMemoryWorkspace:
 
         return self._record_commit(subject, "", frozenset(files), clear_dirty=False, prior_round=True)
 
+    def handoff_note_commits(
+        self, prepared: PreparedAttempt, issue_number: int, *, attempt_id: str
+    ) -> tuple[AttemptCommit, ...]:
+        relpath = handoff_note_relpath(issue_number)
+        return tuple(
+            AttemptCommit(revision=record.revision, subject=record.subject)
+            for record in reversed(self._commits)
+            if relpath in record.files and not record.prior_round
+        )
+
     def handoff_note_commit(
         self, prepared: PreparedAttempt, issue_number: int, *, attempt_id: str
     ) -> AttemptCommit | None:
-        relpath = handoff_note_relpath(issue_number)
-        for record in reversed(self._commits):
-            if relpath in record.files and not record.prior_round:
-                return AttemptCommit(revision=record.revision, subject=record.subject)
-        return None
+        commits = self.handoff_note_commits(
+            prepared, issue_number, attempt_id=attempt_id
+        )
+        return commits[0] if commits else None
 
     def cleanup(
         self, *, base_branch: str, prepared: PreparedAttempt, retain_branch: bool

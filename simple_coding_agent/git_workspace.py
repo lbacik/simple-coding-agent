@@ -396,6 +396,37 @@ class GitWorkspace:
         revision = self._git("rev-parse", "HEAD")
         return AttemptCommit(revision=revision, subject=subject)
 
+    def handoff_note_commits(
+        self, prepared: PreparedAttempt, issue_number: int, *, attempt_id: str
+    ) -> tuple[AttemptCommit, ...]:
+        """Return every commit of this attempt touching the handoff note path.
+
+        Newest first, under the same rules as :meth:`handoff_note_commit`:
+        position-independent, and limited to this attempt (notes carried over
+        from earlier rounds of a continued branch are ignored: only commits
+        authored at or after the attempt start count). Author dates survive
+        the rebase onto the base branch, unlike revisions. An unparseable
+        ``attempt_id`` applies no time bound.
+        """
+
+        started = attempt_start_epoch(attempt_id)
+        output = self._git(
+            "log",
+            "--format=%H%x00%at%x00%s",
+            f"{prepared.base_revision}..{prepared.branch}",
+            "--",
+            handoff_note_relpath(issue_number),
+        )
+        found: list[AttemptCommit] = []
+        for line in output.splitlines():
+            revision, _, rest = line.partition("\x00")
+            authored, separator, subject = rest.partition("\x00")
+            if not separator or not revision or not authored.isdigit():
+                raise GitWorkspaceError("Git returned an invalid commit listing")
+            if started is None or int(authored) >= started:
+                found.append(AttemptCommit(revision=revision, subject=subject))
+        return tuple(found)
+
     def handoff_note_commit(
         self, prepared: PreparedAttempt, issue_number: int, *, attempt_id: str
     ) -> AttemptCommit | None:
@@ -410,22 +441,10 @@ class GitWorkspace:
         ``attempt_id`` applies no time bound.
         """
 
-        started = attempt_start_epoch(attempt_id)
-        output = self._git(
-            "log",
-            "--format=%H%x00%at%x00%s",
-            f"{prepared.base_revision}..{prepared.branch}",
-            "--",
-            handoff_note_relpath(issue_number),
+        commits = self.handoff_note_commits(
+            prepared, issue_number, attempt_id=attempt_id
         )
-        for line in output.splitlines():
-            revision, _, rest = line.partition("\x00")
-            authored, separator, subject = rest.partition("\x00")
-            if not separator or not revision or not authored.isdigit():
-                raise GitWorkspaceError("Git returned an invalid commit listing")
-            if started is None or int(authored) >= started:
-                return AttemptCommit(revision=revision, subject=subject)
-        return None
+        return commits[0] if commits else None
 
     def cleanup(
         self, *, base_branch: str, prepared: PreparedAttempt, retain_branch: bool = True
