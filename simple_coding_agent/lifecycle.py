@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -661,6 +661,9 @@ class ModelAttemptRunner:
                 claim.issue.number,
                 self._workspace.working_directory,
                 prepared.base_revision,
+                note_commit_revisions=_this_attempt_note_commit_revisions(
+                    self._workspace, prepared, claim.issue.number, attempt_id
+                ),
             )
             _emit_handoff_note_events(
                 self._event_log, claim.issue.number, validation
@@ -1959,6 +1962,12 @@ class AgentLifecycle:
                     claim.issue.number,
                     self._workspace.working_directory,
                     prepared.base_revision,
+                    note_commit_revisions=_this_attempt_note_commit_revisions(
+                        self._workspace,
+                        prepared,
+                        claim.issue.number,
+                        checkpoint.started_at,
+                    ),
                 )
                 _emit_handoff_note_events(
                     self._event_log, claim.issue.number, validation
@@ -2022,6 +2031,12 @@ class AgentLifecycle:
                     claim.issue.number,
                     self._workspace.working_directory,
                     prepared.base_revision,
+                    note_commit_revisions=_this_attempt_note_commit_revisions(
+                        self._workspace,
+                        prepared,
+                        claim.issue.number,
+                        checkpoint.started_at,
+                    ),
                 )
             except Exception:
                 validation = None
@@ -3321,6 +3336,9 @@ class AgentLifecycle:
                 issue_number,
                 working_directory,
                 prepared.base_revision,
+                note_commit_revisions=_this_attempt_note_commit_revisions(
+                    self._workspace, prepared, issue_number, attempt_id
+                ),
             )
         except Exception as error:
             return False, f"the handoff note could not be validated ({_exception_detail(error)})"
@@ -3617,6 +3635,12 @@ class AgentLifecycle:
                         claim.issue.number,
                         self._workspace.working_directory,
                         prepared.base_revision,
+                        note_commit_revisions=_this_attempt_note_commit_revisions(
+                            self._workspace,
+                            prepared,
+                            claim.issue.number,
+                            checkpoint.started_at,
+                        ),
                     )
                     _emit_handoff_note_events(
                         self._event_log, claim.issue.number, validation
@@ -4864,12 +4888,36 @@ class _HandoffNoteValidation:
     started_at_warning: str | None = None
 
 
+def _this_attempt_note_commit_revisions(
+    workspace: AttemptWorkspace,
+    prepared: PreparedAttempt,
+    issue_number: int,
+    attempt_id: str,
+) -> frozenset[str]:
+    """Revisions of this attempt's note-touching commits for note validation.
+
+    An unreadable note history fails closed to just the newest note commit,
+    which is exactly the pre-fix strictness: validation then expects the
+    commit directly beneath the note.
+    """
+
+    try:
+        commits = workspace.handoff_note_commits(
+            prepared, issue_number, attempt_id=attempt_id
+        )
+    except Exception:
+        return frozenset()
+    return frozenset(commit.revision for commit in commits)
+
+
 def _validate_handoff_note(
     note_commit: AttemptCommit | None,
     commits: Sequence[AttemptCommit],
     issue_number: int,
     working_directory: Path,
     base_revision: str,
+    *,
+    note_commit_revisions: Collection[str] | None = None,
 ) -> _HandoffNoteValidation:
     """Confirm a handoff has a trustworthy, committed note before it may publish.
 
@@ -4937,15 +4985,33 @@ def _validate_handoff_note(
     last_work_commit = fields.get("last_work_commit", "")
     # The note describes the work preserved beneath it: the attempt commit
     # directly under the note in newest-first order, or the base revision
-    # when the note is the oldest attempt commit.
+    # when the note is the oldest attempt commit. When the model committed
+    # the note more than once, the commits beneath the newest note commit
+    # are earlier note commits of this same attempt, not work: skip the
+    # unbroken run of this attempt's note-touching commits below the note
+    # (whatever other files they also carry) and expect the first commit
+    # beneath that run. Note commits from earlier rounds of a continued
+    # branch are never in ``note_commit_revisions``, so a new round that
+    # names the previous round's note commit (HEAD at injection) still
+    # validates.
+    if note_commit_revisions is None:
+        note_revisions = {note_commit.revision}
+    else:
+        note_revisions = set(note_commit_revisions) | {note_commit.revision}
     note_index = next(
         (index for index, commit in enumerate(commits) if commit.revision == note_commit.revision),
         None,
     )
-    if note_index is not None and note_index + 1 < len(commits):
-        expected_last_work_commit = commits[note_index + 1].revision
-    else:
+    if note_index is None:
         expected_last_work_commit = base_revision
+    else:
+        cursor = note_index + 1
+        while cursor < len(commits) and commits[cursor].revision in note_revisions:
+            cursor += 1
+        if cursor < len(commits):
+            expected_last_work_commit = commits[cursor].revision
+        else:
+            expected_last_work_commit = base_revision
     if (
         len(last_work_commit) < 7
         or not expected_last_work_commit.startswith(last_work_commit)

@@ -87,6 +87,20 @@ class AttemptWorkspace(Protocol):
         """
         ...
 
+    def handoff_note_commits(
+        self, prepared: PreparedAttempt, issue_number: int, *, attempt_id: str
+    ) -> tuple[AttemptCommit, ...]:
+        """Every commit of this attempt touching the issue's handoff note path.
+
+        Newest first, under the same rules as :meth:`handoff_note_commit`:
+        position-independent, and limited to this attempt (earlier rounds'
+        note commits are excluded). The newest entry is what
+        :meth:`handoff_note_commit` returns. Used by handoff-note validation
+        to skip the unbroken run of this attempt's note commits beneath the
+        newest one when deriving the expected ``last_work_commit``.
+        """
+        ...
+
     def cleanup(
         self, *, base_branch: str, prepared: PreparedAttempt, retain_branch: bool
     ) -> None:

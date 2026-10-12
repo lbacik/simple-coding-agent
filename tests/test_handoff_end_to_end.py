@@ -675,6 +675,235 @@ def test_handoff_note_with_stale_last_work_commit_publishes_as_ordinary_incomple
     assert "last_work_commit" in comment.body
 
 
+# --- Scenario 11d: a handoff note committed more than once --------------------
+#
+# The model sometimes commits the note, then edits and commits it again. The
+# commit beneath the newest note commit is then the previous note commit, not
+# work -- but the note still names the last preserved work commit beneath the
+# whole run of this attempt's note commits, so it must still publish as a
+# ``handoff``.
+
+
+def test_handoff_note_committed_twice_names_the_work_commit(tmp_path: Path) -> None:
+    """The #33 shape: work commit W, note-only commit, note-only commit."""
+
+    remote, _ = repository_with_main(tmp_path)
+    github = FakeGitHub(issue(24, body="Rewrite the parser.", labels=frozenset({"ready-for-agent"})))
+    clone_dir = tmp_path / "clone"
+
+    def do_handoff(working_directory: Path) -> None:
+        write_and_commit(working_directory, "parser.py", "half done", "Half-finish the parser")
+        work = git(working_directory, "rev-parse", "HEAD")
+        write_handoff_note(working_directory, 24, "Halfway done.\n", last_work_commit=work)
+        write_handoff_note(
+            working_directory, 24, "Halfway done, with more detail.\n", last_work_commit=work
+        )
+
+    executor = FakeModelExecutor(actions=[do_handoff], handoff=True)
+    lifecycle = build_lifecycle(remote, clone_dir, tmp_path / "data", github, executor)
+
+    result = lifecycle.run_once()
+
+    assert result.outcome is AttemptOutcome.HANDOFF
+    assert github.pull_requests == {}
+    assert github.added_labels == [("issue-24", "round-finished")]
+    [comment] = [c for c in github.comments if "Agent Attempt Result: handoff" in c.body]
+    assert "Halfway done, with more detail." in comment.body
+
+
+def test_handoff_note_with_work_swept_into_first_note_names_the_base(tmp_path: Path) -> None:
+    """The #34 shape: the first note commit also carries another staged file.
+
+    The swept-in change does not count as "last work": it stays preserved on
+    the branch for the continuation to read, while the note names the base
+    revision beneath the run of this attempt's note commits.
+    """
+
+    remote, _ = repository_with_main(tmp_path)
+    github = FakeGitHub(issue(24, body="Rewrite the parser.", labels=frozenset({"ready-for-agent"})))
+    clone_dir = tmp_path / "clone"
+
+    def do_handoff(working_directory: Path) -> None:
+        base = git(working_directory, "rev-parse", "HEAD")
+        (working_directory / "moved.txt").write_text("moved work")
+        note_dir = working_directory / ".agent" / "handoff"
+        note_dir.mkdir(parents=True, exist_ok=True)
+        (note_dir / "24.md").write_text(_note_text(24, base, "Halfway done.\n"))
+        git(working_directory, "add", ".agent/handoff/24.md", "moved.txt")
+        git(working_directory, "commit", "-m", "Handoff note: issue #24")
+        write_handoff_note(
+            working_directory, 24, "Halfway done, with more detail.\n", last_work_commit=base
+        )
+
+    executor = FakeModelExecutor(actions=[do_handoff], handoff=True)
+    lifecycle = build_lifecycle(remote, clone_dir, tmp_path / "data", github, executor)
+
+    result = lifecycle.run_once()
+
+    assert result.outcome is AttemptOutcome.HANDOFF
+    assert github.added_labels == [("issue-24", "round-finished")]
+    # The swept-in change is still preserved on the branch.
+    assert git(clone_dir, "show", "agent/issue-24:moved.txt") == "moved work"
+
+
+def test_handoff_note_with_work_swept_into_first_note_names_prior_work(tmp_path: Path) -> None:
+    """The #34 shape on top of a work commit: the note names that work commit."""
+
+    remote, _ = repository_with_main(tmp_path)
+    github = FakeGitHub(issue(24, body="Rewrite the parser.", labels=frozenset({"ready-for-agent"})))
+    clone_dir = tmp_path / "clone"
+
+    def do_handoff(working_directory: Path) -> None:
+        write_and_commit(working_directory, "parser.py", "half done", "Half-finish the parser")
+        work = git(working_directory, "rev-parse", "HEAD")
+        (working_directory / "moved.txt").write_text("moved work")
+        note_dir = working_directory / ".agent" / "handoff"
+        note_dir.mkdir(parents=True, exist_ok=True)
+        (note_dir / "24.md").write_text(_note_text(24, work, "Halfway done.\n"))
+        git(working_directory, "add", ".agent/handoff/24.md", "moved.txt")
+        git(working_directory, "commit", "-m", "Handoff note: issue #24")
+        write_handoff_note(
+            working_directory, 24, "Halfway done, with more detail.\n", last_work_commit=work
+        )
+
+    executor = FakeModelExecutor(actions=[do_handoff], handoff=True)
+    lifecycle = build_lifecycle(remote, clone_dir, tmp_path / "data", github, executor)
+
+    result = lifecycle.run_once()
+
+    assert result.outcome is AttemptOutcome.HANDOFF
+    assert github.added_labels == [("issue-24", "round-finished")]
+    assert git(clone_dir, "show", "agent/issue-24:moved.txt") == "moved work"
+
+
+def test_handoff_note_naming_an_earlier_note_commit_is_rejected(tmp_path: Path) -> None:
+    """A note naming a commit inside the skipped run is still a mismatch."""
+
+    remote, _ = repository_with_main(tmp_path)
+    github = FakeGitHub(issue(24, body="Rewrite the parser.", labels=frozenset({"ready-for-agent"})))
+    clone_dir = tmp_path / "clone"
+
+    def do_handoff(working_directory: Path) -> None:
+        write_and_commit(working_directory, "parser.py", "half done", "Half-finish the parser")
+        work = git(working_directory, "rev-parse", "HEAD")
+        write_handoff_note(working_directory, 24, "Halfway done.\n", last_work_commit=work)
+        first_note = git(working_directory, "rev-parse", "HEAD")
+        write_handoff_note(
+            working_directory, 24, "Halfway done, with more detail.\n", last_work_commit=first_note
+        )
+
+    executor = FakeModelExecutor(actions=[do_handoff], handoff=True)
+    lifecycle = build_lifecycle(remote, clone_dir, tmp_path / "data", github, executor)
+
+    result = lifecycle.run_once()
+
+    assert result.outcome is AttemptOutcome.INCOMPLETE
+    assert github.added_labels == []
+    [comment] = github.comments
+    assert "## Agent Attempt Result: incomplete" in comment.body
+    assert "last_work_commit" in comment.body
+
+
+# --- Scenario 11f: this round's note on a continued branch --------------------
+#
+# An earlier round's note commit can sit directly under this round's notes.
+# When this round made no commit before the note, the note names that earlier
+# note commit (HEAD at injection) -- and it must stay accepted, as before.
+# Earlier rounds' note commits are never skipped.
+
+
+def test_continuation_round_note_names_the_prior_round_note_commit(tmp_path: Path) -> None:
+    remote, _ = repository_with_main(tmp_path)
+    _publish_prior_round_with_note(tmp_path, remote, 24)
+    github = FakeGitHub(issue(24, body="Rewrite the parser.", labels=frozenset({"ready-for-agent"})))
+    clone_dir = tmp_path / "clone"
+
+    def do_handoff(working_directory: Path) -> None:
+        head = git(working_directory, "rev-parse", "HEAD")
+        write_handoff_note(working_directory, 24, "Continuing prior work.\n", last_work_commit=head)
+
+    executor = FakeModelExecutor(actions=[do_handoff], handoff=True)
+    lifecycle = build_lifecycle(remote, clone_dir, tmp_path / "data", github, executor)
+
+    result = lifecycle.run_once()
+
+    assert result.outcome is AttemptOutcome.HANDOFF
+    assert github.added_labels == [("issue-24", "round-finished")]
+
+
+def test_continuation_round_note_committed_twice_names_the_prior_note_commit(
+    tmp_path: Path,
+) -> None:
+    remote, _ = repository_with_main(tmp_path)
+    _publish_prior_round_with_note(tmp_path, remote, 24)
+    github = FakeGitHub(issue(24, body="Rewrite the parser.", labels=frozenset({"ready-for-agent"})))
+    clone_dir = tmp_path / "clone"
+
+    def do_handoff(working_directory: Path) -> None:
+        head = git(working_directory, "rev-parse", "HEAD")
+        write_handoff_note(working_directory, 24, "Continuing prior work.\n", last_work_commit=head)
+        write_handoff_note(
+            working_directory, 24, "Continuing prior work, with detail.\n", last_work_commit=head
+        )
+
+    executor = FakeModelExecutor(actions=[do_handoff], handoff=True)
+    lifecycle = build_lifecycle(remote, clone_dir, tmp_path / "data", github, executor)
+
+    result = lifecycle.run_once()
+
+    assert result.outcome is AttemptOutcome.HANDOFF
+    assert github.added_labels == [("issue-24", "round-finished")]
+
+
+def _note_text(issue_number: int, last_work_commit: str, body: str) -> str:
+    """Render a valid handoff note body the way ``write_handoff_note`` does."""
+
+    return (
+        f"# Handoff note: issue #{issue_number}\n\n"
+        f"- issue: {issue_number}\n"
+        "- started_at: 2026-09-22T00:00:00Z\n"
+        "- reason: token_soft_threshold\n"
+        f"- last_work_commit: {last_work_commit}\n\n"
+        f"{body}"
+    )
+
+
+def _publish_prior_round_with_note(tmp_path: Path, remote: Path, issue_number: int) -> str:
+    """Push an earlier round's work commit plus valid note commit, both backdated.
+
+    The backdated author dates keep them out of the next round's attempt, the
+    way ``prior_round_commit`` does in the workspace conformance suite (the
+    ``--date`` flag sets the author date, which is what note-commit filtering
+    reads). Returns the prior note revision.
+    """
+
+    published = tmp_path / f"prior-{issue_number}"
+    git(tmp_path, "clone", str(remote), str(published))
+    git(published, "config", "user.name", "Test User")
+    git(published, "config", "user.email", "test@example.com")
+    git(published, "checkout", "-b", f"agent/issue-{issue_number}")
+    write_and_commit(published, "parser.py", "prior work", "Prior round work")
+    # Backdate the work commit's author date as well, so the whole prior
+    # round reads as an earlier round.
+    git(published, "commit", "--amend", "--no-edit", "--date=2020-01-01T00:00:00Z")
+    prior_work = git(published, "rev-parse", "HEAD")
+    note_dir = published / ".agent" / "handoff"
+    note_dir.mkdir(parents=True, exist_ok=True)
+    (note_dir / f"{issue_number}.md").write_text(
+        _note_text(issue_number, prior_work, "Prior round halfway done.\n")
+    )
+    git(published, "add", f".agent/handoff/{issue_number}.md")
+    git(
+        published,
+        "commit",
+        "--date=2020-01-01T00:00:00Z",
+        "-m",
+        f"Handoff note: issue #{issue_number}",
+    )
+    git(published, "push", "-u", "origin", f"agent/issue-{issue_number}")
+    return git(published, "rev-parse", "HEAD")
+
+
 def test_handoff_holds_for_the_operator_when_the_seal_commit_fails(tmp_path: Path) -> None:
     """Apply the evidence-preserving hold when the seal commit itself fails.
 

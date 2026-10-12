@@ -335,6 +335,104 @@ def test_handoff_note_commit_ignores_a_note_from_an_earlier_round(
     assert found.revision == note.revision
 
 
+def test_handoff_note_commits_returns_every_note_commit_newest_first(
+    attempt: SimpleNamespace,
+) -> None:
+    first = attempt.workspace.commit_handoff_note(24, "# Handoff note: issue #24\n\none\n")
+    model_commit(attempt, "work.txt", "work", "Model work")
+    second = attempt.workspace.commit_handoff_note(24, "# Handoff note: issue #24\n\ntwo\n")
+
+    commits = attempt.workspace.handoff_note_commits(
+        attempt.prepared, 24, attempt_id=attempt.attempt_id
+    )
+
+    assert [entry.revision for entry in commits] == [second.revision, first.revision]
+    assert (
+        attempt.workspace.handoff_note_commit(
+            attempt.prepared, 24, attempt_id=attempt.attempt_id
+        )
+        == commits[0]
+    )
+
+
+def test_handoff_note_commits_includes_a_note_commit_with_other_files(
+    attempt: SimpleNamespace,
+) -> None:
+    """A note commit that also carries work still touches the note path (#34)."""
+
+    if attempt.kind == "git":
+        note_path = attempt.root / ".agent" / "handoff" / "24.md"
+        note_path.parent.mkdir(parents=True, exist_ok=True)
+        note_path.write_text("# Handoff note: issue #24\n")
+        (attempt.root / "work.txt").write_text("work")
+        git(attempt.root, "add", ".agent/handoff/24.md", "work.txt")
+        git(attempt.root, "commit", "-m", "Handoff note: issue #24")
+        note = attempt.workspace.handoff_note_commit(
+            attempt.prepared, 24, attempt_id=attempt.attempt_id
+        )
+        assert note is not None
+    else:
+        attempt.workspace.make_dirty(".agent/handoff/24.md", "# Handoff note: issue #24\n")
+        attempt.workspace.make_dirty("work.txt", "work")
+        note = attempt.workspace.model_commit(
+            "Handoff note: issue #24",
+            files=(".agent/handoff/24.md", "work.txt"),
+        )
+
+    commits = attempt.workspace.handoff_note_commits(
+        attempt.prepared, 24, attempt_id=attempt.attempt_id
+    )
+
+    assert [entry.revision for entry in commits] == [note.revision]
+
+
+def test_handoff_note_commits_excludes_notes_from_an_earlier_round(
+    attempt: SimpleNamespace,
+) -> None:
+    prior_round_commit(
+        attempt, ".agent/handoff/24.md", "# Handoff note: issue #24\n", "Handoff note: issue #24"
+    )
+    note = attempt.workspace.commit_handoff_note(24, "# Handoff note: issue #24\n\nnew\n")
+
+    commits = attempt.workspace.handoff_note_commits(
+        attempt.prepared, 24, attempt_id=attempt.attempt_id
+    )
+
+    assert [entry.revision for entry in commits] == [note.revision]
+
+
+def test_handoff_note_commits_survives_a_seal_commit_on_top(
+    attempt: SimpleNamespace,
+) -> None:
+    note = attempt.workspace.commit_handoff_note(24, "# Handoff note: issue #24\n")
+    dirty_file(attempt, "work.txt", "uncommitted edits")
+    seal_commit = attempt.workspace.seal(
+        issue_number=24,
+        attempt_id="2026-09-29T00:00:00Z",
+        status=ModelExecutionStatus.HANDOFF_REQUESTED,
+    )
+    assert seal_commit is not None
+
+    commits = attempt.workspace.handoff_note_commits(
+        attempt.prepared, 24, attempt_id=attempt.attempt_id
+    )
+
+    assert [entry.revision for entry in commits] == [note.revision]
+
+
+def test_handoff_note_commits_is_empty_without_a_note(
+    attempt: SimpleNamespace,
+) -> None:
+    model_commit(attempt, "work.txt", "work", "Model work")
+
+    assert (
+        attempt.workspace.handoff_note_commits(
+            attempt.prepared, 24, attempt_id=attempt.attempt_id
+        )
+        == ()
+    )
+
+
 def test_cleanup_on_a_dirty_tree_stays_on_the_attempt_branch(
     attempt: SimpleNamespace,
 ) -> None:
