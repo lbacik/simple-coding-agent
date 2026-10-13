@@ -96,8 +96,22 @@ class AttemptWorkspace(Protocol):
         position-independent, and limited to this attempt (earlier rounds'
         note commits are excluded). The newest entry is what
         :meth:`handoff_note_commit` returns. Used by handoff-note validation
-        to skip the unbroken run of this attempt's note commits beneath the
-        newest one when deriving the expected ``last_work_commit``.
+        together with :meth:`handoff_note_commit_carries_work` to skip the
+        unbroken run of this attempt's note commits beneath the newest one
+        when deriving the expected ``last_work_commit``.
+        """
+        ...
+
+    def handoff_note_commit_carries_work(self, revision: str, issue_number: int) -> bool:
+        """Whether a note-touching commit is really a work commit.
+
+        True only when ``revision`` deletes the issue's handoff note while
+        also changing other files -- a work commit that dropped a stale
+        note as a "process artifact" alongside a real change. Such a
+        commit ends the note run, so validation expects it as
+        ``last_work_commit``. A commit that leaves the note in place
+        (even with other files swept in) or that only touches the note
+        (including deleting just the note) is still part of the run.
         """
         ...
 
