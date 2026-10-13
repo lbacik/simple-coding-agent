@@ -97,6 +97,7 @@ class _RecordedCommit:
     body: str
     files: frozenset[str]
     prior_round: bool = False
+    existing: frozenset[str] = frozenset()
 
 
 class InMemoryWorkspace:
@@ -285,6 +286,14 @@ class InMemoryWorkspace:
         )
         return commits[0] if commits else None
 
+    def handoff_note_commit_carries_work(self, revision: str, issue_number: int) -> bool:
+        relpath = handoff_note_relpath(issue_number)
+        record = next((entry for entry in self._commits if entry.revision == revision), None)
+        if record is None:
+            return True
+        touches_other_files = any(name != relpath for name in record.files)
+        return touches_other_files and relpath not in record.existing
+
     def cleanup(
         self, *, base_branch: str, prepared: PreparedAttempt, retain_branch: bool
     ) -> None:
@@ -315,6 +324,9 @@ class InMemoryWorkspace:
             body=body,
             files=files,
             prior_round=prior_round,
+            existing=frozenset(
+                name for name in files if (self.working_directory / name).exists()
+            ),
         )
         self._commits.append(record)
         if clear_dirty:

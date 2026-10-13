@@ -711,6 +711,46 @@ def test_handoff_note_committed_twice_names_the_work_commit(tmp_path: Path) -> N
     assert "Halfway done, with more detail." in comment.body
 
 
+def test_handoff_note_names_work_commit_that_deleted_a_stale_note(tmp_path: Path) -> None:
+    """The #216 shape: a work commit deletes a stale note alongside a code change.
+
+    The work commit touches the handoff note path (by dropping an earlier
+    round's note as a "process artifact"), so it shows up in this attempt's
+    note-touching commits -- but it deletes the note instead of writing it,
+    so it ends the note run: the note names it as ``last_work_commit`` and
+    the attempt still publishes as a ``handoff``.
+    """
+
+    remote, _ = repository_with_main(tmp_path)
+    github = FakeGitHub(issue(24, body="Rewrite the parser.", labels=frozenset({"ready-for-agent"})))
+    clone_dir = tmp_path / "clone"
+
+    def do_handoff(working_directory: Path) -> None:
+        # A stale note from an earlier round, still on the branch.
+        write_handoff_note(working_directory, 24, "Stale note from an earlier round.\n")
+        # This round's work: a code change that also drops the stale note.
+        (working_directory / "parser.py").write_text("half done")
+        git(working_directory, "rm", ".agent/handoff/24.md")
+        git(working_directory, "add", "parser.py")
+        git(working_directory, "commit", "-m", "Half-finish the parser, drop the stale handoff note")
+        work = git(working_directory, "rev-parse", "HEAD")
+        write_handoff_note(working_directory, 24, "Halfway done.\n", last_work_commit=work)
+        write_handoff_note(
+            working_directory, 24, "Halfway done, with more detail.\n", last_work_commit=work
+        )
+
+    executor = FakeModelExecutor(actions=[do_handoff], handoff=True)
+    lifecycle = build_lifecycle(remote, clone_dir, tmp_path / "data", github, executor)
+
+    result = lifecycle.run_once()
+
+    assert result.outcome is AttemptOutcome.HANDOFF
+    assert github.pull_requests == {}
+    assert github.added_labels == [("issue-24", "round-finished")]
+    [comment] = [c for c in github.comments if "Agent Attempt Result: handoff" in c.body]
+    assert "Halfway done, with more detail." in comment.body
+
+
 def test_handoff_note_with_work_swept_into_first_note_names_the_base(tmp_path: Path) -> None:
     """The #34 shape: the first note commit also carries another staged file.
 

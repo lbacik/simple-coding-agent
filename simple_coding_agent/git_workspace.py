@@ -446,6 +446,33 @@ class GitWorkspace:
         )
         return commits[0] if commits else None
 
+    def handoff_note_commit_carries_work(self, revision: str, issue_number: int) -> bool:
+        """Whether a note-touching commit is really a work commit.
+
+        True only when ``revision`` deletes the issue's handoff note while
+        also changing other files. ``git log -- <note path>`` (which backs
+        :meth:`handoff_note_commits`) lists such a commit because it
+        touched the path, but it did so by removing a stale note, not by
+        writing one.
+        """
+
+        relpath = handoff_note_relpath(issue_number)
+        files = [
+            line.strip()
+            for line in self._git(
+                "diff-tree", "--no-commit-id", "--name-only", "-r", "--root", revision, "--"
+            ).splitlines()
+            if line.strip()
+        ]
+        touches_other_files = any(path != relpath for path in files)
+        if not touches_other_files:
+            return False
+        try:
+            self._git("cat-file", "-e", f"{revision}:{relpath}")
+        except GitWorkspaceError:
+            return True
+        return False
+
     def cleanup(
         self, *, base_branch: str, prepared: PreparedAttempt, retain_branch: bool = True
     ) -> None:

@@ -433,6 +433,84 @@ def test_handoff_note_commits_is_empty_without_a_note(
     )
 
 
+def test_handoff_note_commit_carries_work_is_false_for_a_note_only_commit(
+    attempt: SimpleNamespace,
+) -> None:
+    note = attempt.workspace.commit_handoff_note(24, "# Handoff note: issue #24\n")
+
+    assert attempt.workspace.handoff_note_commit_carries_work(note.revision, 24) is False
+
+
+def test_handoff_note_commit_carries_work_is_false_for_a_note_commit_with_other_files(
+    attempt: SimpleNamespace,
+) -> None:
+    """A note commit with other files swept in is still a note commit (#34)."""
+
+    if attempt.kind == "git":
+        note_path = attempt.root / ".agent" / "handoff" / "24.md"
+        note_path.parent.mkdir(parents=True, exist_ok=True)
+        note_path.write_text("# Handoff note: issue #24\n")
+        (attempt.root / "work.txt").write_text("work")
+        git(attempt.root, "add", ".agent/handoff/24.md", "work.txt")
+        git(attempt.root, "commit", "-m", "Handoff note: issue #24")
+        note = attempt.workspace.handoff_note_commit(
+            attempt.prepared, 24, attempt_id=attempt.attempt_id
+        )
+        assert note is not None
+        revision = note.revision
+    else:
+        attempt.workspace.make_dirty(".agent/handoff/24.md", "# Handoff note: issue #24\n")
+        attempt.workspace.make_dirty("work.txt", "work")
+        revision = attempt.workspace.model_commit(
+            "Handoff note: issue #24",
+            files=(".agent/handoff/24.md", "work.txt"),
+        ).revision
+
+    assert attempt.workspace.handoff_note_commit_carries_work(revision, 24) is False
+
+
+def test_handoff_note_commit_carries_work_is_false_for_a_note_only_deletion(
+    attempt: SimpleNamespace,
+) -> None:
+    """Deleting just the note carries no work, so it stays in the run."""
+
+    model_commit(attempt, ".agent/handoff/24.md", "# Handoff note: issue #24\n", "Stale note")
+    if attempt.kind == "git":
+        git(attempt.root, "rm", ".agent/handoff/24.md")
+        git(attempt.root, "commit", "-m", "Remove agent handoff note")
+        deletion = attempt.workspace.commits_added(attempt.prepared)[0].revision
+    else:
+        (attempt.root / ".agent" / "handoff" / "24.md").unlink()
+        deletion = attempt.workspace.model_commit(
+            "Remove agent handoff note", files=(".agent/handoff/24.md",)
+        ).revision
+
+    assert attempt.workspace.handoff_note_commit_carries_work(deletion, 24) is False
+
+
+def test_handoff_note_commit_carries_work_is_true_for_work_that_deletes_the_note(
+    attempt: SimpleNamespace,
+) -> None:
+    """Work that drops a stale note alongside a real change ends the run (#216)."""
+
+    model_commit(attempt, ".agent/handoff/24.md", "# Handoff note: issue #24\n", "Stale note")
+    if attempt.kind == "git":
+        (attempt.root / "work.txt").write_text("work")
+        git(attempt.root, "rm", ".agent/handoff/24.md")
+        git(attempt.root, "add", "work.txt")
+        git(attempt.root, "commit", "-m", "Do work, drop the stale handoff note")
+        work = attempt.workspace.commits_added(attempt.prepared)[0].revision
+    else:
+        attempt.workspace.make_dirty("work.txt", "work")
+        (attempt.root / ".agent" / "handoff" / "24.md").unlink()
+        work = attempt.workspace.model_commit(
+            "Do work, drop the stale handoff note",
+            files=(".agent/handoff/24.md", "work.txt"),
+        ).revision
+
+    assert attempt.workspace.handoff_note_commit_carries_work(work, 24) is True
+
+
 def test_cleanup_on_a_dirty_tree_stays_on_the_attempt_branch(
     attempt: SimpleNamespace,
 ) -> None:

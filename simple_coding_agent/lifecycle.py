@@ -4894,11 +4894,15 @@ def _this_attempt_note_commit_revisions(
     issue_number: int,
     attempt_id: str,
 ) -> frozenset[str]:
-    """Revisions of this attempt's note-touching commits for note validation.
+    """Revisions of this attempt's note-run commits for note validation.
 
-    An unreadable note history fails closed to just the newest note commit,
-    which is exactly the pre-fix strictness: validation then expects the
-    commit directly beneath the note.
+    The run is every note-touching commit of this attempt except work
+    commits that only touched the note path by deleting a stale note
+    alongside a real change: those end the run, so validation expects
+    them as ``last_work_commit`` instead of skipping past them. A
+    commit that cannot be inspected fails closed to work (it is not
+    skipped), which is exactly the pre-fix strictness: validation then
+    expects the commit directly beneath the note.
     """
 
     try:
@@ -4907,7 +4911,17 @@ def _this_attempt_note_commit_revisions(
         )
     except Exception:
         return frozenset()
-    return frozenset(commit.revision for commit in commits)
+    run: list[str] = []
+    for commit in commits:
+        try:
+            carries_work = workspace.handoff_note_commit_carries_work(
+                commit.revision, issue_number
+            )
+        except Exception:
+            continue
+        if not carries_work:
+            run.append(commit.revision)
+    return frozenset(run)
 
 
 def _validate_handoff_note(
@@ -4988,12 +5002,14 @@ def _validate_handoff_note(
     # when the note is the oldest attempt commit. When the model committed
     # the note more than once, the commits beneath the newest note commit
     # are earlier note commits of this same attempt, not work: skip the
-    # unbroken run of this attempt's note-touching commits below the note
-    # (whatever other files they also carry) and expect the first commit
-    # beneath that run. Note commits from earlier rounds of a continued
-    # branch are never in ``note_commit_revisions``, so a new round that
-    # names the previous round's note commit (HEAD at injection) still
-    # validates.
+    # unbroken run of this attempt's note-run commits below the note and
+    # expect the first commit beneath that run. A note-touching commit
+    # that deleted the note while carrying other files is work that
+    # dropped a stale note, not a note commit, so it is already excluded
+    # from ``note_commit_revisions`` and ends the run. Note commits from
+    # earlier rounds of a continued branch are never in
+    # ``note_commit_revisions``, so a new round that names the previous
+    # round's note commit (HEAD at injection) still validates.
     if note_commit_revisions is None:
         note_revisions = {note_commit.revision}
     else:
