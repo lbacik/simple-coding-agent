@@ -598,6 +598,127 @@ def test_agentctl_telemetry_times_out_after_three_seconds(
     assert elapsed < 8
 
 
+def test_telemetry_serves_remembered_publication_while_status_stays_live(
+    tmp_path: Path,
+) -> None:
+    """Telemetry shows what publication itself observed; status stays live.
+
+    After a push and a failed (unconfirmed) publication the attempt is held
+    for recovery with its checkpoint retained. Telemetry must report the
+    pull request and comment state the lifecycle itself observed — without
+    any tracker, publisher, or workspace call — while ``agentctl status``
+    keeps its live GitHub lookups and live dirty-tree check.
+    """
+
+    from types import SimpleNamespace
+
+    from simple_coding_agent.completion import AttemptOutcome
+    from simple_coding_agent.publication import PullRequest
+
+    lifecycle, _, _ = make_lifecycle(tmp_path)
+    state = AttemptStateStore(tmp_path)
+    checkpoint = state.start(issue_number=24, branch="agent/issue-24")
+    assert checkpoint is not None
+    attempt_id = checkpoint.started_at
+
+    workspace = lifecycle._workspace  # noqa: SLF001
+    workspace.make_dirty("work.txt", "uncommitted work")
+
+    live_calls: list[str] = []
+
+    class LiveTransport:
+        """Live GitHub answers that deliberately differ from memory."""
+
+        def find_attempt_comment(
+            self, repository: str, issue_number: int, marker: str
+        ) -> bool:
+            live_calls.append("find_attempt_comment")
+            assert attempt_id in marker
+            return True
+
+        def find_pull_request(self, repository: str, head: str):
+            live_calls.append("find_pull_request")
+            return PullRequest(number=9, url="https://example.test/9")
+
+    remembered_pr = PullRequest(number=7, url="https://example.test/7")
+
+    class PushThenUnconfirmedPublisher:
+        """The push succeeded (known PR) but the result comment is unconfirmed."""
+
+        _repository = "owner/repo"
+
+        def __init__(self) -> None:
+            self._github = LiveTransport()
+
+        def publish(
+            self, request: object, *, timeout: float | None = None
+        ):
+            return SimpleNamespace(
+                outcome=AttemptOutcome.COMPLETE,
+                branch_url="https://example.test/tree/agent/issue-24",
+                pull_request=remembered_pr,
+                comment_posted=False,
+            )
+
+    lifecycle._publisher = PushThenUnconfirmedPublisher()  # noqa: SLF001
+    claim = SimpleNamespace(
+        issue=SimpleNamespace(number=24, title="Implement recovery")
+    )
+    # Drive the real publication seam so the remember hook is exercised, not
+    # the remember helper directly.
+    lifecycle._publish_terminal(  # noqa: SLF001
+        claim, attempt_id, None, None, AttemptOutcome.COMPLETE
+    )
+    # The tree is clean again by the time anyone looks: the live status check
+    # must see clean while telemetry still reports what publication itself
+    # observed (dirty).
+    workspace.dirty.clear()
+
+    # From here the telemetry path must make no calls: the tracker explodes
+    # on any method, the workspace refuses any inspection, and the live
+    # transport counts every GitHub lookup.
+    lifecycle._tracker = ExplodingTracker()  # noqa: SLF001
+    original_is_clean = workspace.is_clean
+    original_dirty_paths = workspace.dirty_paths
+    workspace.is_clean = lambda: (_ for _ in ()).throw(  # noqa: SLF001
+        AssertionError("is_clean must not run on the telemetry path")
+    )
+    workspace.dirty_paths = lambda: (_ for _ in ()).throw(  # noqa: SLF001
+        AssertionError("dirty_paths must not run on the telemetry path")
+    )
+    try:
+        snapshot = lifecycle.telemetry_snapshot()
+    finally:
+        workspace.is_clean = original_is_clean  # noqa: SLF001
+        workspace.dirty_paths = original_dirty_paths  # noqa: SLF001
+
+    recovery = snapshot["control"]["recovery"]
+    assert recovery is not None
+    assert recovery["attempt_id"] == attempt_id
+    assert recovery["publication"] == {
+        "phase": checkpoint.phase.value,
+        "comment_confirmed": False,
+        "pull_request": {"number": 7, "url": "https://example.test/7"},
+    }
+    assert recovery["workspace_dirty"] is True
+    assert live_calls == []
+
+    # ``agentctl status`` keeps its live lookups: it reports what GitHub and
+    # the tree say now, not what the lifecycle remembered.
+    status = lifecycle.control_status("owner/repo")
+
+    live = status["recovery"]
+    assert live is not None
+    assert live["publication"]["comment_confirmed"] is True
+    assert live["publication"]["pull_request"] == {
+        "number": 9,
+        "url": "https://example.test/9",
+    }
+    assert live["workspace_dirty"] is False
+    assert "find_attempt_comment" in live_calls
+    assert "find_pull_request" in live_calls
+
+
 def test_telemetry_uses_a_short_timeout_while_other_commands_keep_theirs() -> None:
     import simple_coding_agent.telemetry as telemetry_module
 
