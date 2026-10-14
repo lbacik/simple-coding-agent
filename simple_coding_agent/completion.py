@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
@@ -51,6 +52,25 @@ class ReviewEvidence:
 
     findings: tuple[ReviewFinding, ...]
     repair_cycles: int
+
+
+def final_check_dirty_reason(paths: Sequence[str]) -> str:
+    """The cleanup-only reason for a final check that dirtied the workspace.
+
+    The implementation and the final check both succeeded; only the check's
+    side effects need tidying. No re-implementation is needed: a short
+    cleanup round commits the paths in the form the toolchain writes them,
+    or adds the generated ones to ``.gitignore``, then finishes.
+    """
+
+    listed = ", ".join(paths)
+    return (
+        "The implementation and the final check succeeded, but the final check"
+        f" left uncommitted changes: {listed}. No re-implementation is needed,"
+        " only a short cleanup round: commit these files in the form the"
+        " toolchain writes them, or add the generated ones to `.gitignore`,"
+        " then finish."
+    )
 
 
 @dataclass(frozen=True)
@@ -154,6 +174,7 @@ class CompletionEvaluator:
         pr_exists: bool | None = None,
         profile_error: ProfileError | None = None,
         continuation: bool = False,
+        final_check_dirty_paths: Sequence[str] | None = None,
     ) -> CompletionDecision:
         """Classify observed evidence; a local pass is eligibility, not completion."""
 
@@ -255,6 +276,12 @@ class CompletionEvaluator:
             return _decision(
                 AttemptOutcome.INCOMPLETE,
                 "Final authoritative check did not succeed.",
+                commit_count,
+            )
+        if final_check_dirty_paths:
+            return _decision(
+                AttemptOutcome.INCOMPLETE,
+                final_check_dirty_reason(tuple(sorted(final_check_dirty_paths))),
                 commit_count,
             )
 

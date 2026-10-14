@@ -46,6 +46,7 @@ from simple_coding_agent.completion import (
     ReviewEvidence,
     VerificationOrderError,
     VerificationRunner,
+    final_check_dirty_reason,
 )
 from simple_coding_agent.config import RepositoryProfile
 from simple_coding_agent.finalization import AttemptCompletionStore, CompletionStoreError
@@ -626,6 +627,57 @@ class ModelAttemptRunner:
                 self._event_log(
                     "final_check_succeeded", "", level="INFO", issue_number=claim.issue.number
                 )
+        # A check command may rewrite tracked files or generate non-ignored
+        # files (``next build`` rewrites ``tsconfig.json`` and creates
+        # ``next-env.d.ts``). The attempt work was sealed before the check, so
+        # any residue is the check's own side effect: detect it here, before
+        # any push, PR, or result comment, instead of surfacing it later as a
+        # cleanup hold after a ``complete`` publication.
+        final_check_dirty_paths: tuple[str, ...] = ()
+        preservation_commit: AttemptCommit | None = None
+        if final_check is not None and final_check.succeeded:
+            try:
+                final_check_dirty_paths = tuple(self._workspace.dirty_paths())
+            except Exception:
+                final_check_dirty_paths = ()
+            if final_check_dirty_paths:
+                dirty_reason = final_check_dirty_reason(tuple(sorted(final_check_dirty_paths)))
+                self._event_log(
+                    "final_check_dirtied_workspace",
+                    dirty_reason,
+                    level="WARNING",
+                    issue_number=claim.issue.number,
+                )
+                try:
+                    preservation_commit = self._workspace.seal(
+                        issue_number=claim.issue.number,
+                        attempt_id=attempt_id,
+                        status=execution.status,
+                    )
+                except Exception as seal_error:
+                    self._event_log(
+                        "seal_attempt_work_failed",
+                        _exception_detail(seal_error),
+                        level="ERROR",
+                        issue_number=claim.issue.number,
+                    )
+                    preservation_commit = None
+                if archive is not None:
+                    archive.write_attempt(
+                        {
+                            "final_check_dirtied_workspace": {
+                                "paths": sorted(final_check_dirty_paths),
+                                "reason": dirty_reason,
+                                "preservation_commit": (
+                                    preservation_commit.revision
+                                    if preservation_commit is not None
+                                    else None
+                                ),
+                            }
+                        }
+                    )
+                commits = self._workspace.commits_added(prepared)
+                commit_count = len(commits)
         try:
             decision = self._evaluator.evaluate(
                 setup=preparation.setup,
@@ -638,6 +690,7 @@ class ModelAttemptRunner:
                 review=review,
                 final_check=final_check,
                 continuation=continuation,
+                final_check_dirty_paths=final_check_dirty_paths,
             )
         except TypeError:
             decision = self._evaluator.evaluate(
@@ -651,6 +704,20 @@ class ModelAttemptRunner:
                 review=review,
                 final_check=final_check,
             )
+            if final_check_dirty_paths:
+                # An older evaluator without the dirtied-workspace seam: apply
+                # the same incomplete decision here so the attempt still stops
+                # before publication.
+                decision = CompletionDecision(
+                    outcome=AttemptOutcome.INCOMPLETE,
+                    publication_eligible=False,
+                    publication_path=(
+                        PublicationPath.PARTIAL if commit_count > 0 else PublicationPath.NONE
+                    ),
+                    reasons=(
+                        final_check_dirty_reason(tuple(sorted(final_check_dirty_paths))),
+                    ),
+                )
         handoff_rejection_reason: str | None = None
         if decision.outcome is AttemptOutcome.HANDOFF:
             validation = _validate_handoff_note(
@@ -711,6 +778,11 @@ class ModelAttemptRunner:
             # is the human-visible cause; the generic SDK explanation would
             # otherwise hide it behind a green check.
             details = "; ".join(decision.reasons)
+            if final_check_dirty_paths and preservation_commit is not None:
+                details = (
+                    f"{details} The check's side effects were preserved on the"
+                    f" attempt branch in commit {preservation_commit.revision}."
+                )
         return _attempt_evidence(
             decision,
             profile,
