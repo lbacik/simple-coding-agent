@@ -28,10 +28,14 @@ finalisation, and seeds it from disk at startup (the latest completed
 attempt archive record) so it survives restarts. Archives written before
 the pull-request and title fields existed seed ``pull_request: None`` and
 an ``"unknown"`` title.
+
+``recent_events`` is served from the process-local ring buffer fed by the
+JSON event logger after redaction.
 """
 
 from __future__ import annotations
 
+from collections import deque
 from collections.abc import Callable
 from datetime import UTC, datetime
 import copy
@@ -39,7 +43,7 @@ import json
 import logging
 from pathlib import Path
 import threading
-from typing import Protocol
+from typing import Any, Protocol
 
 from simple_coding_agent.observability import read_latest_completed_attempt
 
@@ -98,6 +102,69 @@ MAX_CONTEXT_SUBAGENTS = 20
 
 
 logger = logging.getLogger(__name__)
+
+
+#: How many redacted log events the process-local ``recent_events`` buffer
+#: keeps. In-memory only, so it starts empty after a restart.
+RECENT_EVENTS_LIMIT = 50
+
+#: How many characters of an event's detail survive into ``recent_events``.
+RECENT_EVENT_TEXT_LIMIT = 300
+
+#: High-volume events excluded from ``recent_events``.
+RECENT_EVENTS_EXCLUDED = frozenset({"limits_checked", "tool_call"})
+
+
+class RecentEventsBuffer:
+    """Process-local ring buffer of the last redacted log events.
+
+    Fed by the JSON event logger after redaction, so every entry has passed
+    through the redactor. Keeps the last ``max_events`` entries, newest
+    last. Thread-safe: the logger emits from several threads while the
+    snapshot reader copies concurrently.
+    """
+
+    def __init__(self, max_events: int = RECENT_EVENTS_LIMIT) -> None:
+        self._max_events = max_events
+        self._entries: deque[dict[str, Any]] = deque(maxlen=max_events)
+        self._lock = threading.Lock()
+
+    def record(self, redacted_record: dict[str, Any]) -> None:
+        """Append one redacted log record, newest last.
+
+        ``redacted_record`` is the already-redacted mapping the JSON event
+        logger emits (``timestamp``, ``level``, ``event``, ``issue_number``,
+        ``phase``, ``detail``). High-volume excluded events are dropped.
+        Never raises: telemetry must not break logging.
+        """
+
+        try:
+            event = redacted_record.get("event")
+            if event in RECENT_EVENTS_EXCLUDED:
+                return
+            detail = redacted_record.get("detail", "")
+            text = detail if isinstance(detail, str) else str(detail)
+            entry = {
+                "timestamp": redacted_record.get("timestamp"),
+                "level": redacted_record.get("level"),
+                "event": event,
+                "issue_number": redacted_record.get("issue_number"),
+                "phase": redacted_record.get("phase"),
+                "text": text[:RECENT_EVENT_TEXT_LIMIT],
+            }
+        except Exception:
+            return
+        try:
+            with self._lock:
+                self._entries.append(entry)
+        except Exception:
+            return
+
+    def snapshot(self) -> list[dict[str, Any]]:
+        """Return a copy of the buffered entries, newest last."""
+
+        with self._lock:
+            return [dict(entry) for entry in self._entries]
 
 
 class SnapshotFailedError(RuntimeError):
@@ -635,12 +702,13 @@ class TelemetryReporter:
     """Assemble schema-v1 snapshots behind the reader interface.
 
     Owns the process-local identity (recorded at startup), the process-local
-    sequence (reset with the process), the size bound, the claim-time
-    ``current_attempt`` view (set by :meth:`begin_attempt`, cleared by
-    :meth:`finish_attempt`), and the ``last_finished`` view (set by
-    :meth:`finish_attempt` with a summary, seeded from disk at startup).
-    Configured limits passed at construction are defaults; seed values from
-    the claim override them per attempt.
+    sequence (reset with the process), the process-local ``recent_events``
+    ring buffer, the size bound, the claim-time ``current_attempt`` view
+    (set by :meth:`begin_attempt`, cleared by :meth:`finish_attempt`), and
+    the ``last_finished`` view (set by :meth:`finish_attempt` with a
+    summary, seeded from disk at startup). Configured limits passed at
+    construction are defaults; seed values from the claim override them per
+    attempt.
     """
 
     def __init__(
@@ -661,6 +729,7 @@ class TelemetryReporter:
         model_timeout: int | None = None,
         max_auto_continuations: int | None = None,
         cache_min_measured_responses: int = CACHE_MIN_MEASURED_RESPONSES,
+        recent_events: RecentEventsBuffer | None = None,
     ) -> None:
         self._identity = {
             "repository": repository,
@@ -672,6 +741,9 @@ class TelemetryReporter:
         self._clock = clock or (lambda: datetime.now(UTC))
         self._sequence = 0
         self._sequence_lock = threading.Lock()
+        self._recent_events = (
+            recent_events if recent_events is not None else RecentEventsBuffer()
+        )
         self._attempt_lock = threading.Lock()
         self._configured = {
             "hard_ceiling": hard_ceiling if hard_ceiling is not None else max_budget_tokens,
@@ -827,7 +899,7 @@ class TelemetryReporter:
             "control": section,
             "current_attempt": current,
             "last_finished": last_finished,
-            "recent_events": [],
+            "recent_events": self._recent_events.snapshot(),
             "truncated": False,
         }
         return apply_size_cap(snapshot)

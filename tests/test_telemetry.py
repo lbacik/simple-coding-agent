@@ -1,14 +1,15 @@
 """Tracer bullet for agent telemetry (schema v1) over the control socket.
 
 ``agentctl telemetry --json`` returns a schema-v1 snapshot built without
-network or git I/O and without holding up other control commands. Identity
-and control are real; ``current_attempt`` and ``last_finished`` stay ``None``
-and ``recent_events`` stays empty until later tickets fill them.
+network or git I/O and without holding up other control commands. Identity,
+control, ``current_attempt``, ``last_finished`` and ``recent_events`` are
+all served from process-local state.
 """
 
 from __future__ import annotations
 
 import inspect
+import io
 import json
 import socket
 import threading
@@ -34,8 +35,10 @@ from simple_coding_agent.control import ControlStore
 from simple_coding_agent.control_server import ControlServer, send_request
 from simple_coding_agent.github_tracker import TrackerIssue
 from simple_coding_agent.lifecycle import AgentLifecycle, AttemptEvidence
+from simple_coding_agent.observability import JsonEventLogger
 from simple_coding_agent.telemetry import (
     SNAPSHOT_SIZE_LIMIT_BYTES,
+    RecentEventsBuffer,
     SnapshotFailedError,
     TelemetryReporter,
     apply_size_cap,
@@ -254,7 +257,8 @@ def test_telemetry_snapshot_matches_the_idle_example_shape(tmp_path: Path) -> No
     assert set(snapshot["identity"]) == set(example["identity"])
     assert set(snapshot["control"]) == set(example["control"])
     # Tracer values diverge from the populated example on purpose: the writer
-    # side that fills these lands in later tickets.
+    # side that fills the attempt sections lands in later tickets, and no
+    # events were emitted, so the process-local buffer is still empty.
     assert snapshot["current_attempt"] is None
     assert snapshot["last_finished"] is None
     assert snapshot["recent_events"] == []
@@ -1224,3 +1228,112 @@ def test_startup_resume_reseeds_telemetry_from_the_checkpoint(
     assert current["continuation"]["index"] == {"value": 2, "basis": "configured"}
     assert current["continuation"]["max"] == {"value": 2, "basis": "configured"}
     assert snapshot["control"]["active_attempt"]["issue_title"] == "Fix the widget"
+
+
+# ---------------------------------------------------------------------------
+# recent_events ring buffer
+# ---------------------------------------------------------------------------
+
+
+def _stub_control(section: dict | None = None):
+    class StubControl:
+        def telemetry_control_snapshot(self) -> dict:
+            return dict(
+                section if section is not None else {"control_observed_at": "2026-01-01T00:00:00Z"}
+            )
+
+    return StubControl()
+
+
+def _wired_buffer(
+    secret: str | None = None,
+) -> tuple[io.StringIO, RecentEventsBuffer, JsonEventLogger, TelemetryReporter]:
+    """One shared buffer behind both a redacting logger and a reporter."""
+
+    stream = io.StringIO()
+    buffer = RecentEventsBuffer()
+    logger = JsonEventLogger(
+        stream,
+        redactions=(secret,) if secret is not None else (),
+        recent_events=buffer,
+    )
+    return stream, buffer, logger, make_reporter(recent_events=buffer)
+
+
+def test_recent_events_buffer_starts_empty() -> None:
+    _, _, _, reporter = _wired_buffer()
+
+    snapshot = reporter.snapshot(_stub_control())
+
+    assert snapshot["recent_events"] == []
+
+
+def test_secret_in_event_detail_never_reaches_the_snapshot() -> None:
+    stream, _, logger, reporter = _wired_buffer(secret="super-secret-value")
+
+    logger.emit(
+        "attempt_claimed",
+        issue_number=977,
+        phase="claim",
+        detail="using token super-secret-value to proceed",
+    )
+
+    snapshot = reporter.snapshot(_stub_control())
+    assert len(snapshot["recent_events"]) == 1
+    entry = snapshot["recent_events"][0]
+    assert set(entry) == {
+        "timestamp",
+        "level",
+        "event",
+        "issue_number",
+        "phase",
+        "text",
+    }
+    assert entry["event"] == "attempt_claimed"
+    assert entry["issue_number"] == 977
+    assert entry["phase"] == "claim"
+    assert entry["level"] == "INFO"
+    assert isinstance(entry["timestamp"], str) and entry["timestamp"]
+    assert "super-secret-value" not in json.dumps(snapshot)
+    assert "super-secret-value" not in entry["text"]
+    assert "[REDACTED]" in entry["text"]
+    # The stdout line is redacted too: the buffer only ever saw redacted text.
+    assert "super-secret-value" not in stream.getvalue()
+
+
+def test_excluded_events_are_absent_from_recent_events() -> None:
+    _, _, logger, reporter = _wired_buffer()
+
+    logger.emit("limits_checked", detail="usage=1")
+    logger.emit("tool_call", detail="Bash ls")
+    logger.emit("attempt_claimed", issue_number=1, phase="claim", detail="kept")
+
+    snapshot = reporter.snapshot(_stub_control())
+    assert [entry["event"] for entry in snapshot["recent_events"]] == [
+        "attempt_claimed"
+    ]
+
+
+def test_recent_events_buffer_holds_at_most_fifty_newest_last() -> None:
+    _, _, logger, reporter = _wired_buffer()
+
+    for index in range(60):
+        logger.emit("attempt_claimed", detail=f"event-{index:02d}")
+
+    snapshot = reporter.snapshot(_stub_control())
+    events = snapshot["recent_events"]
+    assert len(events) == 50
+    assert events[0]["text"] == "event-10"
+    assert events[-1]["text"] == "event-59"
+    assert [entry["text"] for entry in events] == sorted(
+        entry["text"] for entry in events
+    )
+
+
+def test_recent_event_text_is_truncated_to_300_characters() -> None:
+    _, _, logger, reporter = _wired_buffer()
+
+    logger.emit("attempt_claimed", detail="x" * 500)
+
+    snapshot = reporter.snapshot(_stub_control())
+    assert len(snapshot["recent_events"][0]["text"]) == 300

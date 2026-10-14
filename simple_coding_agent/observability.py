@@ -6,9 +6,12 @@ from collections.abc import Callable, Iterable
 from datetime import UTC, datetime
 import json
 from pathlib import Path
-from typing import TextIO
+from typing import TYPE_CHECKING, TextIO
 
 from simple_coding_agent.agent_version import agent_version
+
+if TYPE_CHECKING:
+    from simple_coding_agent.telemetry import RecentEventsBuffer
 
 
 class Redactor:
@@ -40,7 +43,9 @@ class JsonEventLogger:
     Each emitted record is also mirrored into the active attempt's
     ``agent_output.json`` (when ``attempt_sink`` resolves one), so the same
     output an operator sees on stdout is durably readable next to the
-    attempt's other evidence files.
+    attempt's other evidence files. Each redacted record is also fed to the
+    telemetry ``recent_events`` ring buffer (when one is attached), so every
+    buffered entry has passed through the redactor.
     """
 
     def __init__(
@@ -49,10 +54,12 @@ class JsonEventLogger:
         *,
         redactions: Iterable[str] = (),
         attempt_sink: AttemptSink | None = None,
+        recent_events: RecentEventsBuffer | None = None,
     ) -> None:
         self._stream = stream
         self._redactor = Redactor(redactions)
         self._attempt_sink = attempt_sink
+        self._recent_events = recent_events
 
     def emit(
         self,
@@ -76,6 +83,11 @@ class JsonEventLogger:
         json.dump(record, self._stream, sort_keys=True)
         self._stream.write("\n")
         self._stream.flush()
+        if self._recent_events is not None:
+            try:
+                self._recent_events.record(record)
+            except Exception:
+                pass
         if issue_number is not None and self._attempt_sink is not None:
             archive = self._attempt_sink(issue_number)
             if archive is not None:
