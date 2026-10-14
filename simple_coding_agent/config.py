@@ -33,7 +33,14 @@ _DEFAULT_MODEL_AUTH_MODE = "auth_token"
 _MODEL_AUTH_MODES = frozenset({"auth_token", "api_key"})
 _MERGE_METHODS = frozenset({"merge", "squash", "rebase"})
 _DEFAULT_MODEL_STREAM_IDLE_TIMEOUT_MS = 60000
-_DEFAULT_CLAUDE_AGENT_SDK_VERSION = "0.2.163"
+#: The single approved agent-SDK release that provenance verification checks
+#: the installed SDK against at startup. This is defined in code, not read
+#: from the environment: the Claude Agent SDK exports ``CLAUDE_AGENT_SDK_VERSION``
+#: into every CLI process it starts, so an inherited value must never become
+#: the expectation. Bump this together with the ``claude-agent-sdk==`` pins in
+#: ``pyproject.toml`` and the ``Dockerfile`` after validating an upgrade; the
+#: ``test_expected_sdk_version_matches_dependency_pin`` test guards the drift.
+EXPECTED_CLAUDE_AGENT_SDK_VERSION = "0.2.163"
 _DEFAULT_HANDOFF_RESERVE_TURNS = 6
 _MAX_HANDOFF_RESERVE_TURNS = 20
 
@@ -88,7 +95,6 @@ class RuntimeConfig:
     profile_extra_path: str = ""
     profile_path: str = ""
     model: str = _DEFAULT_MODEL_NAME
-    claude_agent_sdk_version: str = _DEFAULT_CLAUDE_AGENT_SDK_VERSION
     max_turns: int = 60
     max_budget_usd: int = 20
     max_budget_tokens: int = 4_000_000
@@ -202,9 +208,6 @@ def load_runtime_config(environ: Mapping[str, str] | None = None) -> RuntimeConf
         profile_extra_path=values.get("PROFILE_EXTRA_PATH", ""),
         profile_path=values.get("PROFILE_PATH", ""),
         model=_non_empty(values, "MODEL_NAME", _DEFAULT_MODEL_NAME),
-        claude_agent_sdk_version=_non_empty(
-            values, "CLAUDE_AGENT_SDK_VERSION", _DEFAULT_CLAUDE_AGENT_SDK_VERSION
-        ),
         max_turns=_positive_integer(values, "MAX_TURNS", 60),
         max_budget_usd=_positive_integer(values, "MAX_BUDGET_USD", 20),
         max_budget_tokens=_positive_integer(values, "MAX_BUDGET_TOKENS", 4_000_000),
@@ -217,6 +220,7 @@ def load_runtime_config(environ: Mapping[str, str] | None = None) -> RuntimeConf
         max_auto_continuations=_non_negative_integer(values, "MAX_AUTO_CONTINUATIONS", 0),
     )
     _warn_when_claude_code_version_is_set(values)
+    _warn_when_claude_agent_sdk_version_is_set(values)
     _warn_when_usd_backstop_is_tighter(config)
     return config
 
@@ -280,6 +284,25 @@ def _warn_when_claude_code_version_is_set(values: Mapping[str, str]) -> None:
             "CLAUDE_CODE_VERSION=%s no longer has any effect; the CLI version "
             "follows CLAUDE_AGENT_SDK_VERSION and its bundled CLI",
             values.get("CLAUDE_CODE_VERSION", ""),
+        )
+
+
+def _warn_when_claude_agent_sdk_version_is_set(values: Mapping[str, str]) -> None:
+    """Warn that CLAUDE_AGENT_SDK_VERSION is ignored.
+
+    The expected SDK version is defined by the release
+    (``EXPECTED_CLAUDE_AGENT_SDK_VERSION``), never read from the environment:
+    the Claude Agent SDK exports this variable into every CLI process it
+    starts, so the value seen here may be inherited from an SDK-hosted shell
+    rather than set by the operator. It never influences provenance
+    verification and startup continues unchanged.
+    """
+
+    if "CLAUDE_AGENT_SDK_VERSION" in values:
+        logger.warning(
+            "CLAUDE_AGENT_SDK_VERSION=%s is ignored; the expected SDK version "
+            "is defined by the release",
+            values.get("CLAUDE_AGENT_SDK_VERSION", ""),
         )
 
 

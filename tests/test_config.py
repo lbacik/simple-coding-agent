@@ -5,6 +5,7 @@ import pytest
 
 from simple_coding_agent.config import (
     ConfigurationError,
+    EXPECTED_CLAUDE_AGENT_SDK_VERSION,
     ProfileError,
     effective_soft_threshold_tokens,
     load_repository_profile,
@@ -43,17 +44,42 @@ def test_loads_required_operator_settings_and_defaults(tmp_path: Path) -> None:
     assert config.handoff_reserve_turns == 6
 
 
-def test_default_runtime_versions_match_dockerfile_pins(tmp_path: Path) -> None:
-    # The provenance check compares this default with the installed SDK, so
-    # a container built without overrides only starts if it matches the image.
-    # The CLI version follows the SDK release and its bundled CLI.
+def test_expected_sdk_version_matches_dependency_pin(tmp_path: Path) -> None:
+    # The expected SDK version is defined in code, not read from the
+    # environment, so a bump must change the constant together with the pins
+    # that decide what gets installed. This test fails when they drift apart.
+    pyproject = (Path(__file__).parent.parent / "pyproject.toml").read_text()
+    dependency_pin = re.search(r'"claude-agent-sdk==([^"]+)"', pyproject)
+    assert dependency_pin, "pyproject.toml must pin the SDK"
+    assert EXPECTED_CLAUDE_AGENT_SDK_VERSION == dependency_pin.group(1)
+
     dockerfile = (Path(__file__).parent.parent / "Dockerfile").read_text()
-    sdk_pin = re.search(r'"claude-agent-sdk==([^"]+)"', dockerfile)
-    assert sdk_pin, "Dockerfile must pin the SDK"
+    image_pin = re.search(r'"claude-agent-sdk==([^"]+)"', dockerfile)
+    assert image_pin, "Dockerfile must pin the SDK"
+    assert EXPECTED_CLAUDE_AGENT_SDK_VERSION == image_pin.group(1)
 
+    # The runtime config carries no SDK version: provenance verification at
+    # startup uses the in-code constant, so no operator setting can override it.
     config = load_runtime_config(_operator_env(tmp_path))
+    assert not hasattr(config, "claude_agent_sdk_version")
 
-    assert config.claude_agent_sdk_version == sdk_pin.group(1)
+
+def test_inherited_claude_agent_sdk_version_is_ignored(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    # The SDK exports CLAUDE_AGENT_SDK_VERSION into every CLI process it
+    # starts, so a shell started from an SDK-hosted Claude Code inherits the
+    # host's version. That value must never become the expected version.
+    with caplog.at_level("WARNING", logger="simple_coding_agent.config"):
+        inherited = load_runtime_config(
+            _operator_env(tmp_path, CLAUDE_AGENT_SDK_VERSION="9.9.9")
+        )
+    with caplog.at_level("WARNING", logger="simple_coding_agent.config"):
+        clean = load_runtime_config(_operator_env(tmp_path))
+
+    assert inherited == clean
+    assert not hasattr(inherited, "claude_agent_sdk_version")
+    assert EXPECTED_CLAUDE_AGENT_SDK_VERSION != "9.9.9"
 
 
 @pytest.mark.parametrize(
@@ -123,7 +149,6 @@ def test_applies_operator_overrides_including_the_test_only_review_gate(
             "AGENT_TRUST_PROJECT_SETTINGS": "true",
             "REVIEW_BLOCKING_SEVERITIES": "",
             "MODEL_NAME": "muse-spark-2.0",
-            "CLAUDE_AGENT_SDK_VERSION": "0.3.0",
             "MAX_TURNS": "90",
             "MAX_BUDGET_USD": "10",
             "MAX_BUDGET_TOKENS": "1000000",
@@ -146,7 +171,6 @@ def test_applies_operator_overrides_including_the_test_only_review_gate(
     assert config.agent_trust_project_settings is True
     assert config.review_blocking_severities == frozenset()
     assert config.model == "muse-spark-2.0"
-    assert config.claude_agent_sdk_version == "0.3.0"
 
 
 def test_model_backend_defaults_to_meta(tmp_path: Path) -> None:
@@ -349,6 +373,39 @@ def test_no_warning_when_retired_claude_code_version_is_absent(
 
     assert all(
         "CLAUDE_CODE_VERSION" not in record.message for record in caplog.records
+    )
+
+
+def test_ignored_claude_agent_sdk_version_warns_and_has_no_effect(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    with caplog.at_level("WARNING", logger="simple_coding_agent.config"):
+        config = load_runtime_config(
+            _operator_env(tmp_path, CLAUDE_AGENT_SDK_VERSION="9.9.9")
+        )
+
+    assert not hasattr(config, "claude_agent_sdk_version")
+    warnings = [record for record in caplog.records if record.levelname == "WARNING"]
+    assert any(
+        "CLAUDE_AGENT_SDK_VERSION" in record.message
+        and "is ignored" in record.message
+        and "defined by the release" in record.message
+        for record in warnings
+    )
+    assert all(
+        "deprecated" not in record.message and "legacy" not in record.message
+        for record in warnings
+    )
+
+
+def test_no_warning_when_claude_agent_sdk_version_is_absent(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    with caplog.at_level("WARNING", logger="simple_coding_agent.config"):
+        load_runtime_config(_operator_env(tmp_path))
+
+    assert all(
+        "CLAUDE_AGENT_SDK_VERSION" not in record.message for record in caplog.records
     )
 
 
