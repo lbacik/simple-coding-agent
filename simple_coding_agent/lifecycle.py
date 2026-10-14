@@ -79,6 +79,7 @@ from simple_coding_agent.telemetry import (
     SnapshotFailedError,
     TelemetryReporter,
     format_timestamp,
+    load_last_finished,
 )
 
 
@@ -1160,6 +1161,7 @@ class AgentLifecycle:
         repository: str = "",
         clock: Callable[[], datetime] | None = None,
         telemetry: TelemetryReporter | None = None,
+        data_dir: Path | None = None,
     ) -> None:
         self._tracker = tracker
         self._attempt_state = attempt_state
@@ -1216,6 +1218,10 @@ class AgentLifecycle:
         self._startup_hold_kind: str | None = None
         self._startup_hold_reported = False
         self._telemetry = telemetry
+        self._data_dir = data_dir
+        # Seed the last-finished view from disk so it survives restarts;
+        # a failure only leaves it null, never breaks startup.
+        self._seed_telemetry_last_finished()
         # The last control section built for telemetry, with its
         # ``control_observed_at``. Served again while the control lock is
         # busy; ``None`` until the first successful build.
@@ -1749,6 +1755,31 @@ class AgentLifecycle:
         except Exception:
             return
 
+    def _archive_pull_request(
+        self, issue_number: int, started_at: str, published: object
+    ) -> None:
+        """Write the published pull request into the attempt archive; never raises.
+
+        Called at publication (in every flow that publishes), so the archive
+        record carries the PR number and URL for the telemetry seed. An
+        attempt without a pull request records an explicit ``None``.
+        """
+
+        try:
+            archive = self._archive_for(issue_number, started_at)
+            if archive is None:
+                return
+            archive.write_attempt(
+                {"pull_request": _published_pull_request_value(published)}
+            )
+        except Exception as error:
+            self._event_log(
+                "archive_pull_request_failed",
+                f"the pull request could not be archived: {error}",
+                level="WARNING",
+                issue_number=issue_number,
+            )
+
     def _remember_workspace_dirty(self, attempt_id: str, dirty: bool) -> None:
         """Remember the workspace-dirty state for telemetry (never raises)."""
 
@@ -2039,6 +2070,7 @@ class AgentLifecycle:
                 f" {hold_suffix}"
             )
         self._remember_publication_result(attempt_id, published)
+        self._archive_pull_request(claim.issue.number, attempt_id, published)
         self._observe_and_remember_workspace_dirty(attempt_id)
         outcome = published.outcome
         comment_posted = getattr(published, "comment_posted", True)
@@ -2762,15 +2794,53 @@ class AgentLifecycle:
                 issue_number=checkpoint.issue_number,
             )
 
-    def _telemetry_finish(self) -> None:
-        """Clear telemetry ``current_attempt`` at finalisation; never raises."""
+    def _seed_telemetry_last_finished(self) -> None:
+        """Seed telemetry ``last_finished`` from disk at startup; never raises.
+
+        Reads the latest completed attempt archive record (token budget and
+        pull request included). With no completed attempt on disk the view
+        stays ``None``; a failure logs once and keeps it ``None`` so
+        telemetry seeding can never break startup.
+        """
+
+        reporter = self._telemetry
+        data_dir = self._data_dir
+        if reporter is None or data_dir is None:
+            return
+        try:
+            summary = load_last_finished(data_dir)
+        except Exception as error:
+            self._event_log(
+                "telemetry_seed_failed",
+                f"telemetry last_finished could not be seeded from disk: {error}",
+                level="WARNING",
+            )
+            return
+        if summary is None:
+            return
+        self._telemetry_finish(summary)
+
+    def _telemetry_finish(self, summary: dict | None = None) -> None:
+        """Record the finished attempt in telemetry at finalisation; never raises.
+
+        Always clears ``current_attempt``; with ``summary`` also updates
+        ``last_finished``. A telemetry failure logs once and keeps the
+        previous view so it can never break the finalisation it observes.
+        """
 
         reporter = self._telemetry
         if reporter is None:
             return
         try:
             finish = getattr(reporter, "finish_attempt", None)
-            if callable(finish):
+            if not callable(finish):
+                return
+            if summary is None:
+                finish()
+                return
+            try:
+                finish(summary)
+            except TypeError:
                 finish()
         except Exception as error:
             self._event_log(
@@ -3832,8 +3902,13 @@ class AgentLifecycle:
         else:
             published = self._publisher.publish(request, timeout=budget)
         # Remember the verified result for telemetry (no extra lookup), plus
-        # the workspace state observed right after publication.
+        # the workspace state observed right after publication. The pull
+        # request is also written into the attempt's archive record here, at
+        # publication, so the telemetry seed finds it after a restart.
         self._remember_publication_result(request.started_at, published)
+        self._archive_pull_request(
+            request.issue_number, request.started_at, published
+        )
         self._observe_and_remember_workspace_dirty(request.started_at)
         return published
 
@@ -4266,7 +4341,17 @@ class AgentLifecycle:
 
         attempt_id = checkpoint.started_at
         self._record_terminal_outcome(outcome, attempt_id, issue_number=issue_number)
-        self._write_outcome(archive, outcome, attempt_id)
+        issue_title = getattr(checkpoint, "issue_title", None)
+        if not isinstance(issue_title, str) or not issue_title:
+            issue_title = None
+        completed_at = self._write_outcome(
+            archive,
+            outcome,
+            attempt_id,
+            issue_number=issue_number,
+            issue_title=issue_title,
+        )
+        self._backfill_archived_pull_request(archive, attempt_id)
         if self._completion_store is not None:
             self._completion_store.record(
                 attempt_id=attempt_id,
@@ -4276,7 +4361,94 @@ class AgentLifecycle:
             )
         self._record_control_finalization(attempt_id, outcome)
         self._attempt_state.delete()
-        self._telemetry_finish()
+        self._telemetry_finish(
+            self._last_finished_summary(
+                attempt_id,
+                issue_number,
+                issue_title,
+                outcome,
+                completed_at,
+                archive,
+            )
+        )
+
+    def _backfill_archived_pull_request(
+        self, archive: AttemptArchive | None, attempt_id: str
+    ) -> None:
+        """Ensure the archive record carries the remembered pull request.
+
+        Publication already archives the pull request; this safety net covers
+        flows whose publication result bypassed the archive write, without
+        ever clobbering a value publication recorded. Never raises.
+        """
+
+        if archive is None:
+            return
+        try:
+            remembered = self._observed_publication.get(attempt_id, {}).get(
+                "pull_request"
+            )
+            if remembered is None:
+                return
+            if archive.read_attempt().get("pull_request") is not None:
+                return
+            archive.write_attempt({"pull_request": remembered})
+        except Exception:
+            return
+
+    def _last_finished_summary(
+        self,
+        attempt_id: str,
+        issue_number: int,
+        issue_title: str | None,
+        outcome: AttemptOutcome,
+        completed_at: str,
+        archive: AttemptArchive | None,
+    ) -> dict:
+        """Build the telemetry ``last_finished`` summary for a finalized attempt.
+
+        Token budget and turns come from the attempt's archive record; the
+        pull request comes from the archive (written at publication) falling
+        back to the remembered publication result. Never raises.
+        """
+
+        record: dict = {}
+        if archive is not None:
+            try:
+                record = archive.read_attempt()
+            except Exception:
+                record = {}
+        if not isinstance(record, dict):
+            record = {}
+        title = issue_title
+        if title is None:
+            archived_title = record.get("issue_title")
+            title = (
+                archived_title
+                if isinstance(archived_title, str) and archived_title
+                else None
+            )
+        token_budget = record.get("token_budget")
+        budget_used = None
+        turns = None
+        if isinstance(token_budget, dict):
+            budget_used = token_budget.get("actual_tokens")
+            turns = token_budget.get("turns")
+        pull_request = record.get("pull_request")
+        if pull_request is None:
+            pull_request = self._observed_publication.get(attempt_id, {}).get(
+                "pull_request"
+            )
+        return {
+            "attempt_id": attempt_id,
+            "issue_number": issue_number,
+            "issue_title": title,
+            "outcome": outcome.value,
+            "finished_at": completed_at,
+            "budget_used": budget_used,
+            "turns": turns,
+            "pull_request": pull_request,
+        }
 
     def _reconcile_startup(self) -> AttemptOutcome | None:
         """Finish one durable attempt without recreating its SDK execution context."""
@@ -4723,6 +4895,7 @@ class AgentLifecycle:
         else:
             published = self._publisher.publish(request, timeout=timeout)
         self._remember_publication_result(started_at, published)
+        self._archive_pull_request(claim.issue.number, started_at, published)
         self._observe_and_remember_workspace_dirty(started_at)
         return published
 
@@ -4793,19 +4966,39 @@ class AgentLifecycle:
 
     @staticmethod
     def _write_outcome(
-        archive: AttemptArchive | None, outcome: AttemptOutcome, started_at: str
-    ) -> None:
+        archive: AttemptArchive | None,
+        outcome: AttemptOutcome,
+        started_at: str,
+        *,
+        issue_number: int | None = None,
+        issue_title: str | None = None,
+    ) -> str:
+        """Write the outcome record; return its ``completed_at`` timestamp.
+
+        The issue number and title ride along so the telemetry seed can
+        report the finished attempt after a restart without any lookup.
+        """
+
+        completed_at = datetime.now(UTC)
+        finished_at = completed_at.isoformat().replace("+00:00", "Z")
         if archive is not None:
-            completed_at = datetime.now(UTC)
             started = datetime.fromisoformat(started_at.removesuffix("Z") + "+00:00")
-            archive.write_attempt(
-                {
-                    "outcome": outcome.value,
-                    "started_at": started_at,
-                    "completed_at": completed_at.isoformat().replace("+00:00", "Z"),
-                    "duration_seconds": (completed_at - started).total_seconds(),
-                }
-            )
+            payload: dict[str, object] = {
+                "outcome": outcome.value,
+                "started_at": started_at,
+                "completed_at": finished_at,
+                "duration_seconds": (completed_at - started).total_seconds(),
+            }
+            if (
+                isinstance(issue_number, int)
+                and not isinstance(issue_number, bool)
+                and issue_number > 0
+            ):
+                payload["issue_number"] = issue_number
+            if isinstance(issue_title, str) and issue_title:
+                payload["issue_title"] = issue_title
+            archive.write_attempt(payload)
+        return finished_at
 
 
 def _final_check_was_interrupted(archive: AttemptArchive | None) -> bool:
@@ -4885,6 +5078,25 @@ def _attempt_id(checkpoint: AttemptCheckpoint | None) -> str:
     if checkpoint is None:
         return "unknown"
     return checkpoint.started_at
+
+
+def _published_pull_request_value(published: object) -> dict | None:
+    """The ``{number, url}`` pull request from a publication result, or ``None``."""
+
+    raw = getattr(published, "pull_request", None)
+    if raw is None:
+        return None
+    if isinstance(raw, dict):
+        number = raw.get("number")
+        url = raw.get("url")
+    else:
+        number = getattr(raw, "number", None)
+        url = getattr(raw, "url", None)
+    if isinstance(number, bool) or not isinstance(number, int) or number <= 0:
+        return None
+    if not isinstance(url, str) or not url:
+        return None
+    return {"number": number, "url": url}
 
 
 def _review_findings_text(review: ReviewEvidence, review_count: int) -> str:

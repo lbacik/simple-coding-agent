@@ -487,6 +487,7 @@ class PublishedAttempt:
     outcome: AttemptOutcome
     branch_url: str | None
     comment_posted: bool = True
+    pull_request: object = None
 
 
 class FakePublisher:
@@ -496,9 +497,10 @@ class FakePublisher:
     production publisher), while every other outcome publishes the example
     URL. Pass ``branch_url`` explicitly (including ``None``) or ``outcome``
     to pin publication behaviour, and ``comment_posted=False`` to simulate
-    an unconfirmed result comment. Per-call publication budgets arrive via
-    the ``timeout`` keyword (like the production publisher) and are recorded
-    on ``timeouts``.
+    an unconfirmed result comment. Pass ``pull_request`` (a ``PullRequest``)
+    to simulate a published pull request. Per-call publication budgets
+    arrive via the ``timeout`` keyword (like the production publisher) and
+    are recorded on ``timeouts``.
     """
 
     _DEFAULT_BRANCH_URL = "https://example.test/tree/agent/issue-24"
@@ -509,10 +511,12 @@ class FakePublisher:
         outcome: AttemptOutcome | None = None,
         branch_url: str | None = _DEFAULT_BRANCH_URL,
         comment_posted: bool = True,
+        pull_request: object = None,
     ) -> None:
         self._outcome = outcome
         self._branch_url = branch_url
         self._comment_posted = comment_posted
+        self._pull_request = pull_request
         self.requests: list[object] = []
         self.outcomes: list[AttemptOutcome] = []
         self.timeouts: list[float | None] = []
@@ -527,5 +531,8 @@ class FakePublisher:
         else:
             branch_url = self._branch_url
         return PublishedAttempt(
-            outcome=outcome, branch_url=branch_url, comment_posted=self._comment_posted
+            outcome=outcome,
+            branch_url=branch_url,
+            comment_posted=self._comment_posted,
+            pull_request=self._pull_request,
         )

@@ -18,6 +18,14 @@ set seed means an active attempt. Its configured limits come from the seed
 live figures stay ``unavailable`` until later tickets publish them.
 Building the section never raises into the attempt: a failure logs once
 per episode and keeps the previous view.
+
+``last_finished`` reports the last finished attempt (issue, title, outcome,
+tokens, turns, finish time and pull request) between attempts and alongside
+a running one. The lifecycle passes its summary to ``finish_attempt`` at
+finalisation, and seeds it from disk at startup (the latest completed
+attempt archive record) so it survives restarts. Archives written before
+the pull-request and title fields existed seed ``pull_request: None`` and
+an ``"unknown"`` title.
 """
 
 from __future__ import annotations
@@ -27,8 +35,11 @@ from datetime import UTC, datetime
 import copy
 import json
 import logging
+from pathlib import Path
 import threading
 from typing import Protocol
+
+from simple_coding_agent.observability import read_latest_completed_attempt
 
 
 #: Telemetry snapshot schema major version served by this process.
@@ -252,14 +263,134 @@ def _normalize_seed(seed: object) -> dict:
     }
 
 
+def _measured_figure(candidate: object) -> dict:
+    """A measured figure, or unavailable when no trustworthy value is known."""
+
+    value = candidate.get("value") if isinstance(candidate, dict) else candidate
+    if isinstance(value, bool):
+        value = None
+    elif isinstance(value, float) and value.is_integer():
+        value = int(value)
+    if not isinstance(value, int) or value < 0:
+        return {"value": None, "basis": "unavailable", "reason": "not reported"}
+    return {"value": value, "basis": "measured"}
+
+
+def _normalize_pull_request(candidate: object) -> dict | None:
+    """A ``{number, url}`` pull request, or ``None`` when there is none."""
+
+    if candidate is None:
+        return None
+    if isinstance(candidate, dict):
+        number = candidate.get("number")
+        url = candidate.get("url")
+    else:
+        number = getattr(candidate, "number", None)
+        url = getattr(candidate, "url", None)
+    if isinstance(number, bool) or not isinstance(number, int) or number <= 0:
+        return None
+    if not isinstance(url, str) or not url:
+        return None
+    return {"number": number, "url": url}
+
+
+def _normalize_last_finished(summary: object) -> dict:
+    """Normalize a ``finish_attempt`` summary to the stored ``last_finished`` view.
+
+    Accepts bare token/turn counts (or measured figure objects) plus an
+    optional ``{number, url}`` pull request. Archives written before the
+    title and pull-request fields existed normalize to an ``"unknown"``
+    title and a ``None`` pull request. Raises ``ValueError`` on a missing
+    or malformed attempt identity, outcome, or finish time.
+    """
+
+    if not isinstance(summary, dict):
+        raise ValueError("last_finished summary must be a mapping")
+    attempt_id = summary.get("attempt_id")
+    if not isinstance(attempt_id, str) or not attempt_id:
+        raise ValueError("last_finished must carry a non-empty attempt_id")
+    issue_number_raw = summary.get("issue_number")
+    if isinstance(issue_number_raw, bool) or not isinstance(issue_number_raw, int):
+        try:
+            issue_number = int(str(issue_number_raw).strip(), 10)
+        except (TypeError, ValueError) as error:
+            raise ValueError("last_finished must carry an issue_number") from error
+    else:
+        issue_number = issue_number_raw
+    if issue_number <= 0:
+        raise ValueError("last_finished must carry a positive issue_number")
+    issue_title = summary.get("issue_title")
+    if not isinstance(issue_title, str) or not issue_title:
+        issue_title = "unknown"
+    outcome = summary.get("outcome")
+    if hasattr(outcome, "value"):
+        outcome = outcome.value  # type: ignore[union-attr]
+    if not isinstance(outcome, str) or not outcome:
+        raise ValueError("last_finished must carry an outcome")
+    finished_at = summary.get("finished_at", summary.get("completed_at"))
+    if not isinstance(finished_at, str) or not finished_at:
+        raise ValueError("last_finished must carry a finished_at timestamp")
+    return {
+        "attempt_id": attempt_id,
+        "issue_number": issue_number,
+        "issue_title": issue_title,
+        "outcome": outcome,
+        "finished_at": finished_at,
+        "budget_used": _measured_figure(summary.get("budget_used")),
+        "turns": _measured_figure(summary.get("turns")),
+        "pull_request": _normalize_pull_request(summary.get("pull_request")),
+    }
+
+
+def load_last_finished(data_dir: Path) -> dict | None:
+    """Seed ``last_finished`` from disk: the latest completed attempt archive.
+
+    Returns the normalized ``last_finished`` view built from that attempt's
+    archive record (token budget and pull request included), or ``None``
+    when no completed attempt is on disk. Skips unreadable records.
+    """
+
+    found = read_latest_completed_attempt(data_dir)
+    if found is None:
+        return None
+    issue_number, record = found
+    archived_issue = record.get("issue_number")
+    if (
+        isinstance(archived_issue, int)
+        and not isinstance(archived_issue, bool)
+        and archived_issue > 0
+    ):
+        issue_number = archived_issue
+    token_budget = record.get("token_budget")
+    budget_used = None
+    turns = None
+    if isinstance(token_budget, dict):
+        budget_used = token_budget.get("actual_tokens")
+        turns = token_budget.get("turns")
+    return _normalize_last_finished(
+        {
+            "attempt_id": record.get("started_at"),
+            "issue_number": issue_number,
+            "issue_title": record.get("issue_title"),
+            "outcome": record.get("outcome"),
+            "finished_at": record.get("completed_at"),
+            "budget_used": budget_used,
+            "turns": turns,
+            "pull_request": record.get("pull_request"),
+        }
+    )
+
+
 class TelemetryReporter:
     """Assemble schema-v1 snapshots behind the reader interface.
 
     Owns the process-local identity (recorded at startup), the process-local
-    sequence (reset with the process), the size bound, and the claim-time
+    sequence (reset with the process), the size bound, the claim-time
     ``current_attempt`` view (set by :meth:`begin_attempt`, cleared by
-    :meth:`finish_attempt`). Configured limits passed at construction are
-    defaults; seed values from the claim override them per attempt.
+    :meth:`finish_attempt`), and the ``last_finished`` view (set by
+    :meth:`finish_attempt` with a summary, seeded from disk at startup).
+    Configured limits passed at construction are defaults; seed values from
+    the claim override them per attempt.
     """
 
     def __init__(
@@ -301,6 +432,7 @@ class TelemetryReporter:
         }
         self._current_seed: dict | None = None
         self._last_good_current: dict | None = None
+        self._last_finished: dict | None = None
         self._build_failed_logged = False
 
     def begin_attempt(self, seed: dict) -> None:
@@ -322,13 +454,36 @@ class TelemetryReporter:
             self._current_seed = normalized
             self._build_failed_logged = False
 
-    def finish_attempt(self) -> None:
-        """Clear the ``current_attempt`` view at finalisation; never raises."""
+    def finish_attempt(self, summary: dict | None = None) -> None:
+        """Record the last finished attempt at finalisation; never raises.
 
+        Always clears the ``current_attempt`` view. When ``summary`` carries
+        the finished attempt (attempt id, issue, title, outcome, finish time,
+        token budget, turns, pull request) it is normalized and stored as
+        ``last_finished``; without one the previous ``last_finished`` is
+        kept (so the startup-leftover path never wipes the disk seed). A
+        malformed summary logs once and keeps the previous view.
+        """
+
+        try:
+            normalized = (
+                _normalize_last_finished(summary) if summary is not None else None
+            )
+        except Exception as error:
+            with self._attempt_lock:
+                if not self._build_failed_logged:
+                    self._build_failed_logged = True
+                    logger.warning(
+                        "telemetry finish_attempt failed: %s; keeping previous view",
+                        error,
+                    )
+            return
         try:
             with self._attempt_lock:
                 self._current_seed = None
                 self._last_good_current = None
+                if normalized is not None:
+                    self._last_finished = normalized
                 self._build_failed_logged = False
         except Exception as error:  # pragma: no cover - lock failure
             logger.warning("telemetry finish_attempt failed: %s", error)
@@ -364,6 +519,12 @@ class TelemetryReporter:
             with self._attempt_lock:
                 self._build_failed_logged = False
                 self._last_good_current = copy.deepcopy(current) if current is not None else None
+        with self._attempt_lock:
+            last_finished = (
+                copy.deepcopy(self._last_finished)
+                if self._last_finished is not None
+                else None
+            )
         snapshot = {
             "schema_version": SCHEMA_VERSION,
             "generated_at": _format_timestamp(self._clock()),
@@ -371,7 +532,7 @@ class TelemetryReporter:
             "identity": dict(self._identity),
             "control": section,
             "current_attempt": current,
-            "last_finished": None,
+            "last_finished": last_finished,
             "recent_events": [],
             "truncated": False,
         }

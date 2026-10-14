@@ -38,7 +38,7 @@
     "finished_at": "2026-09-29T15:40:00Z",
     "budget_used": {
       "value": 812345,
-      "basis": "estimated"
+      "basis": "measured"
     },
     "turns": {
       "value": 23,

@@ -144,6 +144,7 @@ def main() -> None:
         control_store=ControlStore(config.data_dir),
         repository=config.target_repo,
         telemetry=telemetry,
+        data_dir=config.data_dir,
     )
     interruption_handler = AttemptInterruptionHandler(
         event_log=lambda event, detail="", level="INFO", issue_number=None: logger.emit(
