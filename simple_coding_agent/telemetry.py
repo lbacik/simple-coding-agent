@@ -102,6 +102,9 @@ class TelemetryReporter:
         so the socket handler can answer ``snapshot_failed``.
         """
 
+        # The control section first: only a snapshot that is actually served
+        # consumes a sequence number.
+        section = control.telemetry_control_snapshot()
         with self._sequence_lock:
             self._sequence += 1
             sequence = self._sequence
@@ -110,7 +113,7 @@ class TelemetryReporter:
             "generated_at": _format_timestamp(self._clock()),
             "sequence": sequence,
             "identity": dict(self._identity),
-            "control": control.telemetry_control_snapshot(),
+            "control": section,
             "current_attempt": None,
             "last_finished": None,
             "recent_events": [],

@@ -467,6 +467,22 @@ class ControlServer:
                 },
             )
             return
+        try:
+            json.dumps(snapshot)
+        except (TypeError, ValueError) as error:
+            self._log_telemetry_failed(
+                f"telemetry snapshot is not JSON-serialisable: {error}",
+                cooldown=TELEMETRY_FAILURE_COOLDOWN_SECONDS,
+            )
+            _send(
+                connection,
+                {
+                    "ok": False,
+                    "repository": self._safe_repository(),
+                    "error": f"Telemetry snapshot failed: {error}",
+                },
+            )
+            return
         _send(connection, {"ok": True, "telemetry": snapshot})
 
     def _log_telemetry_failed(self, detail: str, *, cooldown: float) -> None:

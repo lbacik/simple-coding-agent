@@ -24,6 +24,7 @@ from simple_coding_agent.control_server import ControlServer, send_request
 from simple_coding_agent.lifecycle import AgentLifecycle
 from simple_coding_agent.telemetry import (
     SNAPSHOT_SIZE_LIMIT_BYTES,
+    SnapshotFailedError,
     TelemetryReporter,
     apply_size_cap,
 )
@@ -207,6 +208,24 @@ def test_telemetry_sequence_increments_per_snapshot(tmp_path: Path) -> None:
     assert second["telemetry"]["sequence"] == 2
 
 
+def test_telemetry_failed_build_does_not_consume_sequence() -> None:
+    attempts = {"count": 0}
+
+    class FlakyControl:
+        def telemetry_control_snapshot(self) -> dict:
+            attempts["count"] += 1
+            if attempts["count"] == 1:
+                raise SnapshotFailedError("no control section has been built yet")
+            return {"control_observed_at": "2026-01-01T00:00:00Z"}
+
+    reporter = make_reporter()
+    with pytest.raises(SnapshotFailedError):
+        reporter.snapshot(FlakyControl())
+    snapshot = reporter.snapshot(FlakyControl())
+
+    assert snapshot["sequence"] == 1
+
+
 def test_telemetry_snapshot_matches_the_idle_example_shape(tmp_path: Path) -> None:
     example = json.loads(
         (Path(__file__).parent.parent / "examples" / "telemetry"
@@ -222,6 +241,12 @@ def test_telemetry_snapshot_matches_the_idle_example_shape(tmp_path: Path) -> No
     assert set(snapshot) == set(example)
     assert set(snapshot["identity"]) == set(example["identity"])
     assert set(snapshot["control"]) == set(example["control"])
+    # Tracer values diverge from the populated example on purpose: the writer
+    # side that fills these lands in later tickets.
+    assert snapshot["current_attempt"] is None
+    assert snapshot["last_finished"] is None
+    assert snapshot["recent_events"] == []
+    assert snapshot["truncated"] is False
 
 
 def test_telemetry_serves_cached_control_while_the_lock_is_busy(tmp_path: Path) -> None:
@@ -464,6 +489,34 @@ def test_agentctl_telemetry_reports_snapshot_failed(
     assert reply["error"]["code"] == "snapshot_failed"
     assert [event for event, _, _ in first_events] == ["telemetry_failed"]
     assert second_events == first_events
+
+
+def test_telemetry_non_serialisable_snapshot_answers_snapshot_failed(tmp_path: Path) -> None:
+    class UnserialisableControl:
+        repository = "owner/repo"
+
+        def __init__(self) -> None:
+            self.events: list[tuple] = []
+
+        def telemetry_snapshot(self) -> dict:
+            return {"not": "a snapshot", "unserialisable": object()}
+
+        def _log(self, event: str, detail: str = "", level: str = "INFO") -> None:
+            self.events.append((event, detail, level))
+
+    control = UnserialisableControl()
+    socket_path = tmp_path / "state" / "unserialisable.sock"
+    server = ControlServer(socket_path, control, event_log=control._log)  # noqa: SLF001
+    server.start()
+    try:
+        reply = send(socket_path, {"op": "telemetry"})
+        assert server._thread is not None and server._thread.is_alive()  # noqa: SLF001
+    finally:
+        server.stop()
+
+    assert reply["ok"] is False
+    assert "snapshot failed" in reply["error"].lower()
+    assert [event for event, _, _ in control.events] == ["telemetry_failed"]
 
 
 @pytest.mark.parametrize(
