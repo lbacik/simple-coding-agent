@@ -331,3 +331,101 @@ def test_clean_final_check_leaves_the_existing_contract_unchanged() -> None:
     assert evaluator.evaluate(**arguments, final_check_dirty_paths=()).publication_eligible is True
     assert evaluator.evaluate(**arguments, final_check_dirty_paths=None).publication_eligible is True
     assert evaluator.evaluate(**arguments).publication_eligible is True
+
+
+def _red_baseline() -> CommandResult:
+    return CommandResult(
+        CommandStatus.FAILED,
+        (CommandExecution("pytest", 1, "1 failed", "assertion error", False),),
+        0.1,
+    )
+
+
+def _succeeded_arguments(**overrides: object) -> dict:
+    # Deferred preparation always runs as a continuation (the branch is
+    # retained), so the red baseline is tolerated there and reaches the
+    # deferred-baseline branch instead of the pre-model early return.
+    arguments: dict = dict(
+        setup=command_result(), baseline=_red_baseline(),
+        model_status=ModelExecutionStatus.SUCCEEDED, commit_count=2,
+        acceptance_criteria_satisfied=True, review=ReviewEvidence((), 0),
+        final_check=None, continuation=True,
+    )
+    arguments.update(overrides)
+    return arguments
+
+
+def test_deferred_baseline_failure_after_conflict_resolution_is_incomplete() -> None:
+    evaluator = CompletionEvaluator({"must-fix"})
+    decision = evaluator.evaluate(**_succeeded_arguments(deferred_baseline_failed=True))
+
+    assert decision.outcome is AttemptOutcome.INCOMPLETE
+    assert decision.publication_eligible is False
+    assert decision.publication_path is PublicationPath.PARTIAL
+    reason = "; ".join(decision.reasons)
+    assert "conflicts were resolved" in reason
+    assert "must start by making the check pass" in reason
+    assert "Baseline check failure" in reason
+    assert "pytest" in reason
+    assert "exit 1" in reason
+    assert "1 failed" in reason
+    assert "assertion error" in reason
+
+
+def test_deferred_baseline_reason_differs_from_final_check_and_acceptance_reasons() -> None:
+    evaluator = CompletionEvaluator({"must-fix"})
+    decision = evaluator.evaluate(**_succeeded_arguments(deferred_baseline_failed=True))
+
+    assert decision.reasons != ("Final authoritative check did not succeed.",)
+    assert decision.reasons != ("Acceptance criteria are not satisfied.",)
+    assert decision.reasons != ("Baseline check failed before model execution.",)
+
+
+def test_deferred_baseline_failure_wins_over_missing_acceptance_criteria() -> None:
+    evaluator = CompletionEvaluator({"must-fix"})
+    decision = evaluator.evaluate(
+        **_succeeded_arguments(
+            deferred_baseline_failed=True, acceptance_criteria_satisfied=False
+        )
+    )
+
+    assert decision.outcome is AttemptOutcome.INCOMPLETE
+    assert "conflicts were resolved" in "; ".join(decision.reasons)
+
+
+def test_deferred_baseline_flag_leaves_other_model_statuses_unchanged() -> None:
+    evaluator = CompletionEvaluator({"must-fix"})
+
+    handoff = evaluator.evaluate(
+        **_succeeded_arguments(
+            deferred_baseline_failed=True,
+            model_status=ModelExecutionStatus.HANDOFF_REQUESTED,
+        )
+    )
+    assert handoff.outcome is AttemptOutcome.HANDOFF
+
+    limited = evaluator.evaluate(
+        **_succeeded_arguments(
+            deferred_baseline_failed=True,
+            model_status=ModelExecutionStatus.MODEL_LIMIT_REACHED,
+        )
+    )
+    assert limited.reasons == ("Model execution reached its limit.",)
+
+    unchanged = evaluator.evaluate(
+        **_succeeded_arguments(deferred_baseline_failed=True, commit_count=0)
+    )
+    assert unchanged.outcome is AttemptOutcome.NO_CHANGES
+
+
+def test_deferred_baseline_flag_defaults_to_the_existing_contract() -> None:
+    evaluator = CompletionEvaluator({"must-fix"})
+    arguments = dict(
+        setup=command_result(), baseline=command_result(),
+        model_status=ModelExecutionStatus.SUCCEEDED, commit_count=1,
+        acceptance_criteria_satisfied=True, review=ReviewEvidence((), 0),
+        final_check=command_result(),
+    )
+
+    assert evaluator.evaluate(**arguments, deferred_baseline_failed=False).publication_eligible is True
+    assert evaluator.evaluate(**arguments).publication_eligible is True
