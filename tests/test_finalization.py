@@ -9,6 +9,11 @@ import pytest
 
 from simple_coding_agent.attempt_state import AttemptPhase, AttemptStateStore
 from simple_coding_agent.completion import AttemptOutcome, CompletionDecision, PublicationPath
+from simple_coding_agent.control import (
+    CommandAcknowledgement,
+    ControlStore,
+    ResumeBlockedError,
+)
 from simple_coding_agent.finalization import AttemptCompletionStore
 from simple_coding_agent.git_workspace import DirtyWorkspaceError, PreparedAttempt
 from simple_coding_agent.github_tracker import Assignment, Claim, TrackerIssue
@@ -189,12 +194,18 @@ def test_comment_failure_holds_without_ledger_then_recovers_once(
 def test_dirty_worktree_during_startup_holds_without_publishing(
     tmp_path: Path, publisher: FakePublisher
 ) -> None:
-    """Unexplained dirty work keeps the checkpoint, branch, and tree for inspection."""
+    """Unexplained dirty work keeps the checkpoint, branch, and tree for inspection.
+
+    The process stays up (no ``SystemExit``): the attempt is held with
+    everything preserved, and the next poll holds on the retained attempt
+    instead of claiming new work.
+    """
     state = _state_at(tmp_path, AttemptPhase.MODEL_RUNNING)
     completions = AttemptCompletionStore(tmp_path)
     tracker = FakeTracker({24: _issue(24)})
     workspace = DirtyStartupWorkspace(tmp_path / "repo")
     workspace.make_dirty("work.txt", "uncommitted work")
+    events: list[str] = []
     lifecycle = AgentLifecycle(
         tracker=tracker,
         attempt_state=state,
@@ -202,15 +213,29 @@ def test_dirty_worktree_during_startup_holds_without_publishing(
         profile_loader=lambda _: _profile(),
         publisher=publisher,
         completion_store=completions,
+        control_store=ControlStore(tmp_path),
+        event_log=lambda event, detail="", level="INFO", issue_number=None: events.append(event),
+        sleeper=lambda seconds: None,
     )
 
-    with pytest.raises(SystemExit):
-        lifecycle.run_once()
+    result = lifecycle.run_once()
 
+    assert result.status is LifecycleStatus.ATTEMPTED
     assert state.read() is not None
     assert publisher.requests == []
     assert tracker.cleanup == []
     assert completions.read_all() == {}
+    assert "workspace_hold" in events
+    assert "attempt_finalization_held" in events
+
+    # The next poll holds on the retained attempt instead of claiming new work.
+    tracker.next_claim = Claim(_issue(25), Assignment("issue-25", "agent-id"))
+    followup = lifecycle.run_once()
+
+    assert followup.status is LifecycleStatus.IDLE
+    assert tracker.claimed == []
+    assert "intake_held_for_recovery" in events
+    assert state.read() is not None
 
 
 def test_malformed_checkpoint_holds_intake_without_claiming(
@@ -220,6 +245,7 @@ def test_malformed_checkpoint_holds_intake_without_claiming(
     path.parent.mkdir(parents=True)
     path.write_text("{not JSON")
     tracker = FakeTracker(next_claim=Claim(_issue(25), Assignment("issue-25", "agent-id")))
+    events: list[str] = []
     lifecycle = AgentLifecycle(
         tracker=tracker,
         attempt_state=AttemptStateStore(tmp_path),
@@ -227,12 +253,38 @@ def test_malformed_checkpoint_holds_intake_without_claiming(
         profile_loader=lambda _: _profile(),
         publisher=publisher,
         completion_store=AttemptCompletionStore(tmp_path),
+        control_store=ControlStore(tmp_path),
+        event_log=lambda event, detail="", level="INFO", issue_number=None: events.append(event),
+        sleeper=lambda seconds: None,
     )
 
-    with pytest.raises(SystemExit):
-        lifecycle.run_once()
+    result = lifecycle.run_once()
+
+    # The process stays up (no ``SystemExit``) and claims nothing: startup
+    # reconciliation holds on the unreadable checkpoint.
+    assert result.status is LifecycleStatus.IDLE
+    assert tracker.claimed == []
+    assert "attempt_checkpoint_unusable" in events
+
+    # A repeated poll stays held without spamming the hold event again.
+    lifecycle.run_once()
 
     assert tracker.claimed == []
+    assert events.count("attempt_checkpoint_unusable") == 1
+
+    # The operator-visible state names the hold for repair.
+    snapshot = lifecycle.control_status("owner/repo")
+    assert snapshot["recovery"] is not None
+    assert "checkpoint" in snapshot["recovery"]["hold_reason"]
+    assert snapshot["recovery"]["next_action"]
+
+    # Removing the unreadable checkpoint clears the hold and intake resumes.
+    path.unlink()
+    resumed = lifecycle.run_once()
+
+    assert resumed.status is LifecycleStatus.ATTEMPTED
+    assert tracker.claimed == [25]
+    assert "startup_hold_cleared" in events
 
 
 def test_dirty_tree_without_checkpoint_holds_intake(
@@ -344,11 +396,14 @@ def test_live_dirty_worktree_holds_without_publishing(
     """Dirty work found while preparing a live attempt holds like recovery does.
 
     No result comment, no issue release, no ledger entry: the branch,
-    checkpoint, and working tree stay available for inspection.
+    checkpoint, and working tree stay available for inspection, the process
+    stays up (no ``SystemExit``), and the next poll holds on the retained
+    attempt instead of claiming new work.
     """
     claim = Claim(_issue(24), Assignment("issue-24", "agent-id"))
     tracker = FakeTracker(next_claim=claim)
     completions = AttemptCompletionStore(tmp_path)
+    events: list[str] = []
     lifecycle = AgentLifecycle(
         tracker=tracker,
         attempt_state=AttemptStateStore(tmp_path),
@@ -357,14 +412,27 @@ def test_live_dirty_worktree_holds_without_publishing(
         publisher=publisher,
         attempt_runner=_evidence_runner(AttemptOutcome.INCOMPLETE),
         completion_store=completions,
+        control_store=ControlStore(tmp_path),
+        event_log=lambda event, detail="", level="INFO", issue_number=None: events.append(event),
+        sleeper=lambda seconds: None,
     )
 
-    with pytest.raises(SystemExit):
-        lifecycle.run_once()
+    result = lifecycle.run_once()
 
+    assert result.status is LifecycleStatus.ATTEMPTED
     assert publisher.requests == []
     assert tracker.cleanup == []
     assert completions.read_all() == {}
+    assert AttemptStateStore(tmp_path).read() is not None
+    assert "workspace_hold" in events
+    assert "attempt_finalization_held" in events
+
+    tracker.next_claim = Claim(_issue(25), Assignment("issue-25", "agent-id"))
+    followup = lifecycle.run_once()
+
+    assert followup.status is LifecycleStatus.IDLE
+    assert tracker.claimed == [24]
+    assert "intake_held_for_recovery" in events
     assert AttemptStateStore(tmp_path).read() is not None
 
 
@@ -411,14 +479,36 @@ def test_malformed_completion_ledger_holds_intake_without_claiming(
         publisher=publisher,
         event_log=lambda event, detail="", level="INFO", issue_number=None: events.append(event),
         completion_store=AttemptCompletionStore(tmp_path),
+        control_store=ControlStore(tmp_path),
+        sleeper=lambda seconds: None,
     )
 
-    with pytest.raises(SystemExit):
-        lifecycle.run_once()
+    result = lifecycle.run_once()
 
+    # The process stays up (no ``SystemExit``) and claims nothing: startup
+    # reconciliation holds on the unreadable ledger with the checkpoint kept.
+    assert result.status is LifecycleStatus.IDLE
     assert "attempt_completion_unusable" in events
     assert tracker.claimed == []
     assert AttemptStateStore(tmp_path).read() is not None
+
+    snapshot = lifecycle.control_status("owner/repo")
+    assert snapshot["recovery"] is not None
+    assert "ledger" in snapshot["recovery"]["hold_reason"]
+
+    # Repairing only the checkpoint file never drops the ledger hold, and
+    # repairing the ledger lets the retained attempt surface for recovery.
+    path.unlink()
+    followup = lifecycle.run_once()
+
+    assert followup.status is LifecycleStatus.IDLE
+    assert "startup_hold_cleared" in events
+    assert "intake_held_for_recovery" in events
+    assert tracker.claimed == []
+    assert AttemptStateStore(tmp_path).read() is not None
+    recovered = lifecycle.control_status("owner/repo")
+    assert recovered["recovery"] is not None
+    assert recovered["recovery"]["issue_number"] == 24
 
 
 # --- Failure-injection doubles (single-method subclasses of shared doubles) ---
@@ -476,7 +566,7 @@ def _state_at(tmp_path: Path, phase: AttemptPhase) -> AttemptStateStore:
     return state
 
 
-def _issue(number: int) -> TrackerIssue:
+def _issue(number: int, assignees: tuple[str, ...] = ()) -> TrackerIssue:
     return TrackerIssue(
         id=f"issue-{number}",
         number=number,
@@ -485,7 +575,150 @@ def _issue(number: int) -> TrackerIssue:
         created_at=datetime(2026, 9, 20, tzinfo=UTC),
         state="OPEN",
         labels=frozenset({"ready-for-agent"}),
-        assignee_logins=(),
+        assignee_logins=assignees,
         blocked_by=0,
         author_login="reporter",
     )
+
+
+def test_restart_with_held_workspace_stays_held_without_exiting(
+    tmp_path: Path, publisher: FakePublisher
+) -> None:
+    """A restart over a held workspace re-enters the hold instead of crash-looping.
+
+    The issue scenario: cleanup held on a dirty tree, the process restarts,
+    and startup reconciliation re-detects the same hold. Every restart must
+    stay up (no ``SystemExit``) with the checkpoint, branch, and tree
+    preserved.
+    """
+    state = _state_at(tmp_path, AttemptPhase.PUBLISHING)
+    completions = AttemptCompletionStore(tmp_path)
+
+    def build(events: list[str], tracker: FakeTracker) -> AgentLifecycle:
+        return AgentLifecycle(
+            tracker=tracker,
+            attempt_state=state,
+            workspace=DirtyStartupWorkspace(tmp_path / "repo"),
+            profile_loader=lambda _: _profile(),
+            publisher=publisher,
+            completion_store=completions,
+            control_store=ControlStore(tmp_path),
+            event_log=lambda event, detail="", level="INFO", issue_number=None: events.append(event),
+            sleeper=lambda seconds: None,
+        )
+
+    first_events: list[str] = []
+    first = build(first_events, FakeTracker({24: _issue(24)}))
+    first_result = first.run_once()
+
+    assert first_result.status is LifecycleStatus.ATTEMPTED
+    assert state.read() is not None
+    assert "workspace_hold" in first_events
+
+    # Simulated restart: a brand-new lifecycle over the same state.
+    second_events: list[str] = []
+    second = build(second_events, FakeTracker({24: _issue(24)}))
+    second_result = second.run_once()
+
+    assert second_result.status is LifecycleStatus.ATTEMPTED
+    assert publisher.requests == []
+    assert state.read() is not None
+    assert completions.read_all() == {}
+    assert "workspace_hold" in second_events
+    assert "attempt_finalization_held" in second_events
+
+    # A further poll on the restarted process holds quietly on the retained
+    # attempt instead of claiming new work.
+    third = second.run_once()
+
+    assert third.status is LifecycleStatus.IDLE
+    assert second_events.count("workspace_hold") == 1
+
+
+def test_cleanup_hold_recovers_through_recovery_retry_after_repair(
+    tmp_path: Path,
+) -> None:
+    """Repairing a cleanup hold lets ``recovery retry`` clear it and intake resume."""
+    issue_24 = _issue(24, assignees=("agent",))
+    tracker = FakeTracker(
+        issues={24: issue_24, 25: _issue(25, assignees=("agent",))},
+        next_claim=Claim(issue_24, Assignment("issue-24", "agent-id")),
+    )
+    workspace = InMemoryWorkspace(tmp_path / "repo", issue_number=24)
+    state = AttemptStateStore(tmp_path)
+    completions = AttemptCompletionStore(tmp_path)
+    publisher = FakePublisher()
+    events: list[str] = []
+
+    def run_workflow(claim: Claim, profile: object, prepared: object):
+        if claim.issue.number == 24:
+            workspace.make_dirty("uncommitted.py", "leftover work")
+        return _evidence_runner(AttemptOutcome.COMPLETE)(claim, profile, prepared)
+
+    lifecycle = AgentLifecycle(
+        tracker=tracker,
+        attempt_state=state,
+        workspace=workspace,
+        profile_loader=lambda _: _profile(),
+        publisher=publisher,
+        attempt_runner=run_workflow,
+        completion_store=completions,
+        control_store=ControlStore(tmp_path),
+        event_log=lambda event, detail="", level="INFO", issue_number=None: events.append(event),
+        sleeper=lambda seconds: None,
+    )
+
+    held = lifecycle.run_once()
+
+    assert held.status is LifecycleStatus.ATTEMPTED
+    checkpoint = state.read()
+    assert checkpoint is not None
+    assert "workspace_hold" in events
+
+    # The operator repairs the tree; the hold still needs its recovery step.
+    workspace.dirty.clear()
+    assert lifecycle.run_once().status is LifecycleStatus.IDLE
+    assert state.read() is not None
+
+    record = lifecycle.submit_recovery_retry("req-retry", checkpoint.started_at)
+
+    assert record.acknowledgement is CommandAcknowledgement.COMPLETED
+    assert state.read() is None
+    assert completions.is_finalized(checkpoint.started_at)
+
+    # Intake resumes with the next issue.
+    tracker.next_claim = Claim(_issue(25), Assignment("issue-25", "agent-id"))
+    resumed = lifecycle.run_once()
+
+    assert resumed.status is LifecycleStatus.ATTEMPTED
+    assert tracker.claimed == [24, 25]
+
+
+def test_resume_is_rejected_while_the_startup_hold_is_active(
+    tmp_path: Path, workspace: InMemoryWorkspace, publisher: FakePublisher
+) -> None:
+    """``resume`` names the startup hold instead of raising while held."""
+    path = tmp_path / "state" / "attempt.json"
+    path.parent.mkdir(parents=True)
+    path.write_text("{not JSON")
+    lifecycle = AgentLifecycle(
+        tracker=FakeTracker(next_claim=Claim(_issue(25), Assignment("issue-25", "agent-id"))),
+        attempt_state=AttemptStateStore(tmp_path),
+        workspace=workspace,
+        profile_loader=lambda _: _profile(),
+        publisher=publisher,
+        completion_store=AttemptCompletionStore(tmp_path),
+        control_store=ControlStore(tmp_path),
+        sleeper=lambda seconds: None,
+    )
+
+    assert lifecycle.run_once().status is LifecycleStatus.IDLE
+
+    with pytest.raises(ResumeBlockedError, match="checkpoint"):
+        lifecycle.submit_resume("req-resume")
+
+    # Repairing the checkpoint lets resume succeed and intake proceed.
+    path.unlink()
+    resumed = lifecycle.submit_resume("req-resume-2")
+
+    assert resumed.acknowledgement is CommandAcknowledgement.COMPLETED

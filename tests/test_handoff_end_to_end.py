@@ -27,8 +27,6 @@ from pathlib import Path
 import os
 import subprocess
 
-import pytest
-
 from simple_coding_agent.attempt_state import AttemptPhase, AttemptStateStore
 from simple_coding_agent.command_runner import CommandRunner
 from simple_coding_agent.completion import AttemptOutcome, CompletionEvaluator, VerificationRunner
@@ -972,9 +970,12 @@ def test_handoff_holds_for_the_operator_when_the_seal_commit_fails(tmp_path: Pat
     executor = FakeModelExecutor(actions=[do_handoff], handoff=True)
     lifecycle = build_lifecycle(remote, clone_dir, tmp_path / "data", github, executor)
 
-    with pytest.raises(SystemExit):
-        lifecycle.run_once()
+    # The seal failure leaves the tree dirty, so cleanup holds the attempt
+    # for the operator without exiting the process.
+    result = lifecycle.run_once()
 
+    assert result.status is LifecycleStatus.ATTEMPTED
+    assert result.outcome is AttemptOutcome.INFRASTRUCTURE_ERROR
     assert not remote_has_branch(remote, "agent/issue-24")
     assert github.added_labels == []
     # The local branch is retained (not deleted) so the evidence stays inspectable,
