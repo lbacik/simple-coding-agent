@@ -120,9 +120,14 @@ class AttemptWorkspace(Protocol):
     ) -> None:
         """Best-effort abort of an unresolved rebase and switch to base_branch.
 
-        Never delete files or branches. Never switch to the base branch
-        while the tree is dirty: the workspace stays on the attempt branch
-        so the caller can hold intake for operator inspection.
+        Never delete branches. Never switch to the base branch while the tree
+        is dirty: the workspace stays on the attempt branch so the caller can
+        hold intake for operator inspection. The one deliberate file deletion
+        is scoped to reproducible artifacts: files ignored on the attempt
+        branch but exposed as untracked on the base branch are removed after
+        the checkout, so intake does not hold on them; anything still ignored
+        on the base branch is kept, and any unexplained path aborts the whole
+        sweep with everything preserved.
         """
         ...
 

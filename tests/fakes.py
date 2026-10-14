@@ -15,6 +15,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 from pathlib import Path
+import shutil
 import subprocess
 
 from simple_coding_agent.attempt_workspace import (
@@ -130,6 +131,11 @@ class InMemoryWorkspace:
         self._model_finished = False
         self.current_branch = self._branch
         self.dirty: set[str] = set()
+        # Artifacts ignored on the attempt branch but exposed as untracked on
+        # the base branch (removed by cleanup, like the production sweep);
+        # and artifacts ignored on both branches (invisible, always kept).
+        self.ignored: set[str] = set()
+        self.base_ignored: set[str] = set()
         self._commits: list[_RecordedCommit] = []
         self._sequence = 0
         self._conflict = ConflictState(in_progress=False)
@@ -151,6 +157,29 @@ class InMemoryWorkspace:
         self.dirty.add(name)
         return path
 
+    def make_ignored(self, name: str, contents: str = "generated") -> Path:
+        """Leave a branch-ignored artifact: invisible to ``is_clean``.
+
+        Mirrors a generated file the attempt branch gitignores but the base
+        branch does not: ``cleanup`` removes it after switching to the base
+        instead of holding intake on it.
+        """
+
+        path = self.make_dirty(name, contents)
+        self.ignored.add(name)
+        return path
+
+    def make_base_ignored(self, name: str, contents: str = "cached") -> Path:
+        """Leave an artifact ignored on both branches: invisible, always kept.
+
+        Mirrors dependency installs and virtualenvs: ``cleanup`` never
+        removes these because they stay ignored after the switch to base.
+        """
+
+        path = self.make_dirty(name, contents)
+        self.base_ignored.add(name)
+        return path
+
     # -- AttemptWorkspace ----------------------------------------------------
 
     def prepare_for_profile_read(self, *, base_branch: str = "main") -> str:
@@ -164,10 +193,10 @@ class InMemoryWorkspace:
         return PreparedAttempt(branch=self._branch, base_revision=self._base_revision)
 
     def is_clean(self) -> bool:
-        return not self.dirty
+        return not (self.dirty - self.ignored - self.base_ignored)
 
     def dirty_paths(self) -> tuple[str, ...]:
-        return tuple(sorted(self.dirty))
+        return tuple(sorted(self.dirty - self.ignored - self.base_ignored))
 
     def commits_added(self, prepared: PreparedAttempt) -> tuple[AttemptCommit, ...]:
         return tuple(
@@ -299,11 +328,33 @@ class InMemoryWorkspace:
     ) -> None:
         self.cleanup_calls.append((base_branch, retain_branch))
         self._conflict = ConflictState(in_progress=False)
-        if self.dirty:
+        if self.dirty - self.ignored - self.base_ignored:
             raise DirtyWorkspaceError(
                 "Repository working tree contains uncommitted or untracked changes; "
                 "leaving the workspace on the attempt branch for operator inspection."
             )
+        # The base branch exposes branch-ignored artifacts as untracked, so
+        # they are removed instead of holding intake; base-ignored paths stay
+        # ignored after the switch and are kept. Anything unremovable stops
+        # counting as ignored, so it holds intake like the production sweep.
+        removed: set[str] = set()
+        for name in sorted(self.dirty & self.ignored):
+            path = self.working_directory / name
+            removable = path.is_symlink() or path.is_file() or path.is_dir()
+            if removable:
+                try:
+                    if path.is_symlink() or path.is_file():
+                        path.unlink(missing_ok=True)
+                    else:
+                        shutil.rmtree(path)
+                except OSError:
+                    removable = False
+            if not removable:
+                self.ignored.discard(name)
+                continue
+            removed.add(name)
+        self.dirty -= removed
+        self.ignored -= removed
         self.current_branch = base_branch
 
     # -- internals ------------------------------------------------------------

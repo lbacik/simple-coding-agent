@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from datetime import datetime
 import os
 from pathlib import Path
+import shutil
 import stat
 import subprocess
 import tempfile
@@ -478,13 +479,22 @@ class GitWorkspace:
     ) -> None:
         """Best-effort abort of an unresolved rebase and switch to base_branch.
 
-        Never delete files or branches: uncommitted/untracked files and attempt
-        branches are preserved as-is for human operator inspection and cleanup.
-
-        Never switch to the base branch while the tree is dirty: the
-        workspace stays on the attempt branch and raises
+        Never delete branches, and never switch to the base branch while the
+        tree is dirty: the workspace stays on the attempt branch and raises
         ``DirtyWorkspaceError`` so the caller can hold intake for operator
         inspection instead of carrying uncommitted work onto the base.
+
+        The one deliberate file deletion is scoped to reproducible artifacts:
+        files ignored on the attempt branch survive ``git checkout`` and read
+        as untracked on the base branch (whose ignore rules lack the attempt
+        branch's entries), which would otherwise hold intake with
+        ``working_tree_dirty`` for nothing unexplained. After the checkout,
+        paths that are dirty under the base branch's rules but were ignored
+        under the attempt branch's rules are removed. Anything still ignored
+        on the base branch (dependency installs, virtualenvs) is never dirty
+        after the switch and is therefore kept; if any offending path was not
+        ignored on the attempt branch, nothing is removed and the unexplained
+        work is preserved for operator inspection as before.
         """
 
         try:
@@ -496,10 +506,71 @@ class GitWorkspace:
                 "Repository working tree contains uncommitted or untracked changes; "
                 "leaving the workspace on the attempt branch for operator inspection."
             )
+        ignored_snapshot = self._ignored_files_snapshot()
         try:
             self._git("checkout", base_branch)
         except GitWorkspaceError:
             pass
+        self._remove_branch_ignored_leftovers(ignored_snapshot)
+
+    def _ignored_files_snapshot(self) -> tuple[str, ...]:
+        """Ignored untracked paths under the currently checked-out ignore rules.
+
+        Best-effort: an unreadable snapshot fails closed as empty, so the
+        post-checkout sweep removes nothing.
+        """
+
+        try:
+            output = self._git("ls-files", "--others", "--ignored", "--exclude-standard")
+        except GitWorkspaceError:
+            return ()
+        return tuple(line for line in output.splitlines() if line.strip())
+
+    def _remove_branch_ignored_leftovers(self, ignored: tuple[str, ...]) -> None:
+        """Remove attempt-branch-ignored files the checkout to base exposed.
+
+        Git leaves ignored files in place on checkout, so artifacts the
+        attempt branch ignores read as untracked on the base branch. Every
+        dirty path must be covered by the pre-checkout ignored snapshot or
+        nothing is removed: a single unexplained path aborts the whole sweep.
+        Paths escaping the clone directory abort it too.
+
+        Deleting a whole collapsed directory on the strength of ignored
+        children is safe by construction, not by trust: the clean-tree check
+        in ``cleanup`` guarantees every untracked file is ignored (hence in
+        the snapshot), and the intervening checkout preserves untracked files
+        without creating any, so a dirty-after directory can only contain
+        snapshot files. The bidirectional match in ``_covered_by_ignored``
+        only bridges porcelain's ``dir/`` collapsing against ``ls-files``'
+        per-file listing.
+        """
+
+        if not ignored:
+            return
+        try:
+            dirty = self.dirty_paths()
+        except GitWorkspaceError:
+            return
+        if not dirty:
+            return
+        if not _covered_by_ignored(dirty, ignored):
+            return
+        targets: list[Path] = []
+        for relpath in dirty:
+            candidate = Path(relpath)
+            if candidate.is_absolute() or ".." in candidate.parts:
+                return
+            targets.append(self._clone_dir / candidate)
+        for target in targets:
+            try:
+                if target.is_symlink() or target.is_file():
+                    target.unlink()
+                elif target.is_dir():
+                    shutil.rmtree(target)
+                # A path that is already gone needs no removal; anything else
+                # unremovable (sockets, devices) stays dirty and holds intake.
+            except OSError:
+                continue
 
     def push_attempt_branch(
         self, branch: str, *, max_retries: int, deadline: float | None = None
@@ -786,6 +857,30 @@ def _porcelain_path(line: str) -> str:
     path = line[3:] if len(line) > 3 else line.strip()
     _, separator, destination = path.rpartition(" -> ")
     return destination.strip() if separator else path.strip()
+
+
+def _covered_by_ignored(dirty: tuple[str, ...], ignored: tuple[str, ...]) -> bool:
+    """Whether every dirty path was ignored under the attempt branch's rules.
+
+    Porcelain collapses an untracked directory to ``dir/`` while ``ls-files``
+    lists the files inside it, so coverage compares in both directions with a
+    segment boundary: ``a/b`` covers ``a/b/c`` and vice versa, but never a
+    sibling such as ``a/b-other``.
+    """
+
+    candidates = {path.strip().rstrip("/") for path in ignored if path.strip()}
+    for relpath in dirty:
+        normalized = relpath.strip().rstrip("/")
+        if not normalized or not candidates:
+            return False
+        if not any(
+            normalized == candidate
+            or normalized.startswith(candidate + "/")
+            or candidate.startswith(normalized + "/")
+            for candidate in candidates
+        ):
+            return False
+    return True
 
 
 def _attempt_branch(issue_number: int) -> str:

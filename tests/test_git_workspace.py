@@ -469,6 +469,93 @@ def test_cleanup_preserves_untracked_files_and_attempt_branch(tmp_path: Path) ->
         workspace.prepare_attempt(base_branch="main", issue_number=20)
 
 
+def test_cleanup_removes_branch_ignored_artifacts_before_switching_to_base(
+    tmp_path: Path,
+) -> None:
+    """Ignored build artifacts must not hold intake after the checkout to base.
+
+    Regression test: an attempt branch that gitignores a generated directory
+    looks clean to ``is_clean()`` while checked out, but ``git checkout``
+    leaves ignored files in place, so the same tree reads dirty on the base
+    branch (which lacks the ignore entry) and intake holds with
+    ``working_tree_dirty`` until an operator removes the directory by hand.
+    """
+
+    remote, _ = repository_with_main(tmp_path)
+    clone = tmp_path / "clone"
+    workspace = GitWorkspace(clone, str(remote), token_provider=lambda: "secret-token")
+    prepared = workspace.prepare_attempt(base_branch="main", issue_number=19)
+    git(clone, "config", "user.name", "Test User")
+    git(clone, "config", "user.email", "test@example.com")
+    ignore_contents = (clone / ".gitignore").read_text() + "tests/e2e/.tmp-scenarios/\n"
+    write_and_commit(clone, ".gitignore", ignore_contents, "Ignore generated scenarios")
+    scenarios = clone / "tests" / "e2e" / ".tmp-scenarios"
+    scenarios.mkdir(parents=True)
+    (scenarios / "case.json").write_text("{}")
+    # Ignored on the base branch too (seed .gitignore): must be kept, not swept.
+    (clone / ".venv").mkdir()
+    (clone / ".venv" / "marker").write_text("keep")
+    assert workspace.is_clean()
+
+    workspace.cleanup(base_branch="main", prepared=prepared, retain_branch=True)
+
+    assert git(clone, "branch", "--show-current") == "main"
+    assert workspace.is_clean()
+    assert workspace.dirty_paths() == ()
+    assert not scenarios.exists()
+    assert (clone / ".venv" / "marker").read_text() == "keep"
+    assert "agent/issue-19" in git(clone, "branch", "--format=%(refname:short)").splitlines()
+
+
+def test_cleanup_with_genuine_dirt_preserves_branch_ignored_artifacts(
+    tmp_path: Path,
+) -> None:
+    """The ignored-artifact sweep must not run when the tree is genuinely dirty.
+
+    ``is_clean()`` fails first, so cleanup raises ``DirtyWorkspaceError`` and
+    leaves the workspace on the attempt branch with every file (ignored
+    artifacts and unexplained work alike) preserved for operator inspection.
+    """
+
+    remote, _ = repository_with_main(tmp_path)
+    clone = tmp_path / "clone"
+    workspace = GitWorkspace(clone, str(remote), token_provider=lambda: "secret-token")
+    prepared = workspace.prepare_attempt(base_branch="main", issue_number=19)
+    git(clone, "config", "user.name", "Test User")
+    git(clone, "config", "user.email", "test@example.com")
+    ignore_contents = (clone / ".gitignore").read_text() + "tests/e2e/.tmp-scenarios/\n"
+    write_and_commit(clone, ".gitignore", ignore_contents, "Ignore generated scenarios")
+    scenarios = clone / "tests" / "e2e" / ".tmp-scenarios"
+    scenarios.mkdir(parents=True)
+    (scenarios / "case.json").write_text("{}")
+    (clone / "untracked.txt").write_text("preserve")
+
+    with pytest.raises(DirtyWorkspaceError):
+        workspace.cleanup(base_branch="main", prepared=prepared, retain_branch=True)
+
+    assert git(clone, "branch", "--show-current") == "agent/issue-19"
+    assert (scenarios / "case.json").exists()
+    assert (clone / "untracked.txt").exists()
+
+
+def test_covered_by_ignored_requires_a_segment_boundary() -> None:
+    """The post-checkout sweep must never match sibling paths by prefix."""
+
+    from simple_coding_agent.git_workspace import _covered_by_ignored
+
+    # Porcelain reports the directory, ls-files the files inside it.
+    assert _covered_by_ignored(("tests/e2e/.tmp-scenarios/",), ("tests/e2e/.tmp-scenarios/case.json",))
+    # ... and the other way round.
+    assert _covered_by_ignored(("tests/e2e/.tmp-scenarios/case.json",), ("tests/e2e/.tmp-scenarios/",))
+    assert _covered_by_ignored(("a/b",), ("a/b",))
+    # Siblings share a string prefix but no segment: never covered.
+    assert not _covered_by_ignored(("a/b-other",), ("a/b",))
+    assert not _covered_by_ignored(("a/b",), ("a/b-other/c",))
+    # Fail closed: an empty snapshot or an uncovered path removes nothing.
+    assert not _covered_by_ignored(("a/b",), ())
+    assert not _covered_by_ignored(("a/b", "a/c"), ("a/b",))
+
+
 def test_cleanup_retains_unpublished_commits_when_requested(tmp_path: Path) -> None:
     remote, _ = repository_with_main(tmp_path)
     clone = tmp_path / "clone"
