@@ -33,6 +33,11 @@ from claude_agent_sdk import (
 )
 
 from simple_coding_agent.config import RuntimeConfig
+from simple_coding_agent.telemetry import CONTEXT_WINDOW_BASES
+from simple_coding_agent.telemetry import (
+    MAX_CONTEXT_SUBAGENTS as _MAX_CONTEXT_SUBAGENTS,
+)
+from simple_coding_agent.telemetry import _as_int as _telemetry_as_int
 from simple_coding_agent.telemetry import format_timestamp as _format_timestamp
 from simple_coding_agent.token_ledger import (
     USAGE_CATEGORIES,
@@ -67,10 +72,9 @@ _OPERATOR_HANDOFF_MODEL_DEADLINE_SECONDS = 240
 #: basis is ``configured`` instead of ``sdk_assumed``.
 CONTEXT_WINDOW_OVERRIDE_ENV_VAR = "CLAUDE_CODE_MAX_CONTEXT_TOKENS"
 
-#: Upper bound of telemetry subagent entries in one published view; the
-#: reporter enforces the same cap, so an oversized view never reaches the
-#: snapshot.
-MAX_TELEMETRY_SUBAGENTS = 20
+#: Upper bound of telemetry subagent entries in one published view, shared
+#: with the reporter so both caps stay a single source of truth.
+MAX_TELEMETRY_SUBAGENTS = _MAX_CONTEXT_SUBAGENTS
 
 
 def _context_window_configured() -> bool:
@@ -88,13 +92,8 @@ def _context_window_basis() -> str:
 def _as_non_negative_int(value: object) -> int | None:
     """An int figure from an SDK payload, or ``None`` when untrustworthy."""
 
-    if isinstance(value, bool):
-        return None
-    if isinstance(value, int):
-        return value if value >= 0 else None
-    if isinstance(value, float) and value.is_integer() and value >= 0:
-        return int(value)
-    return None
+    coerced = _telemetry_as_int(value)
+    return coerced if coerced is not None and coerced >= 0 else None
 
 def _handoff_target(issue_number: int | None) -> str:
     """Name the issue and the exact note path every handoff instruction must carry."""
@@ -789,14 +788,20 @@ class ModelExecutor:
             self._compaction_last["post_tokens"] = total
 
     def _mark_context_usage_unavailable(self, reason: str) -> None:
-        """Mark the window and threshold unavailable without touching the attempt."""
+        """Mark the window and threshold unavailable without touching the attempt.
 
-        self._context_window = None
-        self._context_window_basis = "unavailable"
-        self._context_window_reason = reason
-        self._auto_compact_threshold = None
-        self._auto_compact_threshold_basis = "unavailable"
-        self._auto_compact_threshold_reason = reason
+        A previous successful reading is kept: a failed re-read after a
+        compaction must not discard the window the session start observed.
+        """
+
+        if self._context_window_basis not in CONTEXT_WINDOW_BASES:
+            self._context_window = None
+            self._context_window_basis = "unavailable"
+            self._context_window_reason = reason
+        if self._auto_compact_threshold_basis not in CONTEXT_WINDOW_BASES:
+            self._auto_compact_threshold = None
+            self._auto_compact_threshold_basis = "unavailable"
+            self._auto_compact_threshold_reason = reason
 
     def _record_cli_session_id(self, message: object) -> None:
         """Latch the CLI session id from the init message or any sessioned message.
@@ -2175,6 +2180,7 @@ class ModelExecutor:
             "main_context_basis": self._ledger.main_context_basis(),
             "main_context_tokens": self._latest_main_context_tokens(),
             "main_peak_context_tokens": float(self._ledger.peak_main_context_tokens),
+            "main_peak_context_basis": self._ledger.peak_main_context_basis(),
             "tokens_by_category": MappingProxyType(dict(self._ledger.measured_by_category)),
             "turns": (
                 self._ledger.response_count("main")

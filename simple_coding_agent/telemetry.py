@@ -410,11 +410,8 @@ def _context_window_figure(view: dict, prefix: str) -> dict:
     basis = view.get(f"{prefix}_basis", "unavailable")
     reason = view.get(f"{prefix}_reason")
     if basis in CONTEXT_WINDOW_BASES:
-        if isinstance(value, bool):
-            raise ValueError(f"published attempt view {prefix} must be an integer or None")
-        if isinstance(value, float) and value.is_integer():
-            value = int(value)
-        if not isinstance(value, int) or value < 0:
+        value = _as_int(value)
+        if value is None or value < 0:
             raise ValueError(f"published attempt view {prefix} must be a non-negative integer")
         return {"value": value, "basis": basis}
     if basis != "unavailable":
@@ -431,11 +428,8 @@ def _context_window_figure(view: dict, prefix: str) -> dict:
 def _compaction_token_figure(value: object) -> dict:
     """One compaction pre/post figure (measured when present)."""
 
-    if isinstance(value, bool):
-        value = None
-    elif isinstance(value, float) and value.is_integer():
-        value = int(value)
-    if isinstance(value, int) and value >= 0:
+    value = _as_int(value)
+    if value is not None and value >= 0:
         return {"value": value, "basis": "measured"}
     return {"value": None, "basis": "unavailable", "reason": "not reported"}
 
@@ -470,6 +464,20 @@ def _build_compactions(view: dict) -> dict:
             "post_tokens": _compaction_token_figure(raw_last.get("post_tokens")),
         },
     }
+
+
+def _view_peak_basis(view: dict, main_basis: str) -> str:
+    """Basis of the peak main-thread context from a published view.
+
+    Views published before the peak basis landed fall back to the current
+    main basis; a present-but-unknown basis raises ``ValueError`` so the
+    caller keeps the last good section.
+    """
+
+    peak_basis = view.get("main_peak_context_basis", main_basis)
+    if peak_basis not in ("measured", "estimated"):
+        raise ValueError("published attempt view main_peak_context_basis must be measured or estimated")
+    return peak_basis
 
 
 def _build_subagents(view: dict) -> list[dict]:
@@ -1074,7 +1082,7 @@ class TelemetryReporter:
                 },
                 "main_peak": {
                     "value": _view_main_peak_context(view),
-                    "basis": main_basis,
+                    "basis": _view_peak_basis(view, main_basis),
                 },
                 "window": _context_window_figure(view, "context_window"),
                 "auto_compact_threshold": _context_window_figure(
@@ -1101,7 +1109,8 @@ def apply_size_cap(snapshot: dict) -> dict:
     """Trim an assembled snapshot to the serialised size bound, in place.
 
     Over the cap the snapshot drops ``recent_events`` oldest first, then
-    ``current_attempt.context.subagents`` oldest first, and reports
+    ``current_attempt.context.subagents`` from the tail (the list is
+    running-first, so the tail is the oldest finished entry), and reports
     ``truncated: true``. Under the cap the snapshot is returned untouched.
     """
 
@@ -1125,7 +1134,7 @@ def apply_size_cap(snapshot: dict) -> dict:
         subagents = context.get("subagents")
         if not isinstance(subagents, list) or not subagents:
             break
-        subagents.pop(0)
+        subagents.pop()
     return snapshot
 
 

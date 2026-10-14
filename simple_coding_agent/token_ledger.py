@@ -264,6 +264,7 @@ class TokenLedger:
         self._first_settled_without_usage: DegradedNotice | None = None
         self._settled_readings: dict[tuple[str, str], SettledReading] = {}
         self._peak_main_context_tokens = 0.0
+        self._peak_main_context_basis = "estimated"
         self._compaction_pending: set[str] = set()
 
     # -- events ----------------------------------------------------------
@@ -353,7 +354,7 @@ class TokenLedger:
             + response.usage["cache_creation_input_tokens"]
             + response.usage["output_tokens"]
         )
-        self._track_peak(thread)
+        self._track_peak(thread, basis="measured")
 
     def observe_input(self, thread_id: str, chars: int) -> None:
         """Grow a thread's context with a tool result or user message."""
@@ -624,6 +625,16 @@ class TokenLedger:
 
         return self._peak_main_context_tokens
 
+    def peak_main_context_basis(self) -> str:
+        """Basis of the peak main-thread context for telemetry.
+
+        ``"measured"`` when the response holding the peak reported usage;
+        ``"estimated"`` otherwise. Tracked at peak-set time because the
+        current reading's basis may differ from the peak's.
+        """
+
+        return self._peak_main_context_basis
+
     @property
     def first_settled_without_usage(self) -> DegradedNotice | None:
         """First response that settled without reported usage, if any."""
@@ -757,6 +768,22 @@ class TokenLedger:
             return None
         return max(0, _total_input_of(previous.usage) - response.usage["cache_read_input_tokens"])
 
-    def _track_peak(self, thread: _Thread) -> None:
+    def _track_peak(self, thread: _Thread, *, basis: str | None = None) -> None:
+        """Record a new main-thread peak with the basis of the reading behind it.
+
+        Usage merges pass ``"measured"`` explicitly: the merged response may
+        not be the latest one (late usage for an older response), so the
+        latest response's basis can differ from the peak's. Other call sites
+        derive the basis from the latest response.
+        """
+
         if thread.kind == "main" and thread.context > self._peak_main_context_tokens:
             self._peak_main_context_tokens = thread.context
+            if basis is None:
+                latest = thread.responses[-1] if thread.responses else None
+                basis = (
+                    "measured"
+                    if latest is not None and latest.usage is not None
+                    else "estimated"
+                )
+            self._peak_main_context_basis = basis

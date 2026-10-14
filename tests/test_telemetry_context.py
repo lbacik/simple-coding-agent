@@ -9,6 +9,7 @@ events, and ``subagents`` from ledger threads with running flags.
 from __future__ import annotations
 
 import asyncio
+import json
 from pathlib import Path
 from types import MappingProxyType
 
@@ -16,6 +17,8 @@ from claude_agent_sdk import AssistantMessage, SystemMessage
 
 from simple_coding_agent.config import RuntimeConfig
 from simple_coding_agent.model_execution import ModelExecutor
+from simple_coding_agent.telemetry import SNAPSHOT_SIZE_LIMIT_BYTES, apply_size_cap
+from simple_coding_agent.token_ledger import TokenLedger
 from tests.test_telemetry_live_figures import (
     claim_seed,
     make_reporter,
@@ -147,6 +150,7 @@ def context_view(**overrides: object) -> dict:
         {
             "main_context_tokens": 148000.0,
             "main_peak_context_tokens": 151200.0,
+            "main_peak_context_basis": "measured",
             "context_window": 200000,
             "context_window_basis": "sdk_assumed",
             "context_window_reason": None,
@@ -402,3 +406,107 @@ def test_subagent_view_capped_at_20(tmp_path: Path) -> None:
 
     ordered = executor._telemetry_subagents()  # noqa: SLF001
     assert len(ordered) == 20
+
+
+def test_reporter_peak_uses_own_basis() -> None:
+    """A measured peak keeps its basis when the current reading is estimated."""
+
+    reporter = make_reporter()
+    reporter.begin_attempt(claim_seed())
+    reporter.publish_attempt_view(
+        context_view(main_context_basis="estimated", main_peak_context_basis="measured")
+    )
+
+    current = reporter.snapshot(StubControl())["current_attempt"]
+
+    assert current is not None
+    assert current["context"]["main"] == {"value": 148000, "basis": "estimated"}
+    assert current["context"]["main_peak"] == {"value": 151200, "basis": "measured"}
+
+
+def test_reporter_peak_basis_falls_back_to_main_basis() -> None:
+    """Views published before the peak basis landed reuse the main basis."""
+
+    reporter = make_reporter()
+    reporter.begin_attempt(claim_seed())
+    view = context_view(main_context_basis="estimated")
+    del view["main_peak_context_basis"]
+    reporter.publish_attempt_view(view)
+
+    current = reporter.snapshot(StubControl())["current_attempt"]
+
+    assert current is not None
+    assert current["context"]["main_peak"] == {"value": 151200, "basis": "estimated"}
+
+
+def test_ledger_peak_basis_tracks_peak_response() -> None:
+    """Late usage for an older response sets a measured peak under an estimated current."""
+
+    ledger = TokenLedger()
+    ledger.start_thread("main", kind="main", prompt_chars=0)
+    assert ledger.peak_main_context_basis() == "estimated"
+    ledger.observe_response("main", "r1", visible_chars=300)
+    ledger.observe_response("main", "r2", visible_chars=300)
+    assert ledger.main_context_basis() == "estimated"
+
+    ledger.observe_usage(
+        "main",
+        "r1",
+        {"input_tokens": 200_000, "cache_read_input_tokens": 0, "output_tokens": 100},
+    )
+
+    assert ledger.peak_main_context_tokens == 200_100
+    assert ledger.peak_main_context_basis() == "measured"
+    assert ledger.main_context_basis() == "estimated"
+
+
+def test_failed_reread_keeps_last_good_window(tmp_path: Path, monkeypatch) -> None:
+    """A failed post-compaction re-read keeps the session-start window."""
+
+    monkeypatch.delenv("CLAUDE_CODE_MAX_CONTEXT_TOKENS", raising=False)
+    executor, _client = run_execute(tmp_path, [usage_message(0, 1000), terminal_result()])
+
+    class FailingUsageClient:
+        async def get_context_usage(self) -> dict:
+            raise RuntimeError("boom")
+
+    asyncio.run(executor._refresh_context_usage(FailingUsageClient(), reason="compaction"))  # noqa: SLF001
+
+    view = dict(executor._live_attempt_view())  # noqa: SLF001
+    assert view["context_window"] == 200000
+    assert view["context_window_basis"] == "sdk_assumed"
+    assert view["context_window_reason"] is None
+    assert view["auto_compact_threshold"] == 190000
+    assert view["auto_compact_threshold_basis"] == "sdk_assumed"
+
+
+def test_size_cap_drops_tail_subagents_and_keeps_running() -> None:
+    """Over the cap, trimming drops the oldest finished entries, never running ones."""
+
+    subagents = [
+        {"id": "running-new", "type": "Explore", "context": {"value": 10, "basis": "estimated"}, "running": True},
+        {"id": "running-old", "type": "Plan", "context": {"value": 20, "basis": "estimated"}, "running": True},
+    ] + [
+        {
+            "id": f"finished-{index:03d}",
+            "type": "Explore",
+            "context": {"value": 30, "basis": "estimated"},
+            "running": False,
+            "pad": "z" * 5000,
+        }
+        for index in range(60)
+    ]
+    snapshot: dict = {
+        "recent_events": [],
+        "current_attempt": {"context": {"subagents": subagents}},
+        "truncated": False,
+    }
+
+    trimmed = apply_size_cap(snapshot)
+
+    assert trimmed["truncated"] is True
+    assert len(json.dumps(trimmed).encode("utf-8")) <= SNAPSHOT_SIZE_LIMIT_BYTES
+    remaining = trimmed["current_attempt"]["context"]["subagents"]
+    assert [entry["id"] for entry in remaining[:2]] == ["running-new", "running-old"]
+    assert all(entry["running"] or entry["id"].startswith("finished-") for entry in remaining)
+    assert remaining[-1]["id"] != "finished-059"
