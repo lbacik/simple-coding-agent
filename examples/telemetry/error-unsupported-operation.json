@@ -1,0 +1,7 @@
+{
+  "ok": false,
+  "error": {
+    "code": "unsupported_operation",
+    "message": "agent answered \"Unknown operation\": this agent version does not serve telemetry"
+  }
+}

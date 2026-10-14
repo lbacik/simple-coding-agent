@@ -7,6 +7,13 @@
 
 FROM python:3.12-slim
 
+# Fleet-dashboard discovery: every container built from this image carries
+# this label (set in the image, not in compose) so a dashboard can list
+# managed instances without operator configuration:
+#   docker ps --filter "label=io.github.lbacik.simple-coding-agent.role=agent"
+# Visible with `docker inspect` on any container built from the image.
+LABEL io.github.lbacik.simple-coding-agent.role="agent"
+
 # ---------------------------------------------------------------------------
 # System packages
 # ---------------------------------------------------------------------------

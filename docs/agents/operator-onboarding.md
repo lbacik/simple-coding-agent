@@ -410,6 +410,28 @@ startup reconciliation is still running, live status reports `recovering`.
 When the agent process cannot be reached at all, the CLI reports a
 connection error rather than a saved snapshot.
 
+### Fleet dashboard discovery
+
+Every container built from the agent image carries the label
+`io.github.lbacik.simple-coding-agent.role="agent"`. The label is set in the
+image (`Dockerfile`), not in compose, so any container built from the image
+is discoverable without operator configuration — visible with `docker
+inspect` on the container. A fleet dashboard lists managed instances with:
+
+```shell
+docker ps --filter "label=io.github.lbacik.simple-coding-agent.role=agent"
+```
+
+and reads one instance's telemetry snapshot with:
+
+```shell
+docker exec --user agent <container-id> /usr/local/bin/agentctl telemetry --json
+```
+
+No port is published and no token is needed. The snapshot contract (schema
+v1) is published in [telemetry-snapshot.md](telemetry-snapshot.md); its
+synthetic examples live under `examples/telemetry/`.
+
 ### Retained-attempt recovery hold
 
 When an attempt cannot finish its completion boundary (confirmed result

@@ -1,0 +1,71 @@
+{
+  "schema_version": 1,
+  "generated_at": "2026-09-30T09:00:00Z",
+  "sequence": 41,
+  "identity": {
+    "repository": "example-owner/example-repo",
+    "agent_version": "0.4.5",
+    "sdk_version": "0.2.163",
+    "cli_version": "2.1.286",
+    "process_started_at": "2026-09-30T08:00:00Z"
+  },
+  "control": {
+    "agent_version": "0.4.5",
+    "repository": "example-owner/example-repo",
+    "intake": "running",
+    "recovering": false,
+    "active_attempt": null,
+    "pending_command": null,
+    "pending_next_issue": null,
+    "stop_plan": null,
+    "recovery": null,
+    "handoff": null,
+    "consecutive_errors": {
+      "count": 0,
+      "max_consecutive_errors": 3,
+      "last_attempt_id": "2026-09-29T15-10-00-attempt-0961",
+      "last_success_at": "2026-09-29T15:40:00Z"
+    },
+    "commands": {},
+    "control_observed_at": "2026-09-30T09:00:00Z"
+  },
+  "current_attempt": null,
+  "last_finished": {
+    "attempt_id": "2026-09-29T15-10-00-attempt-0961",
+    "issue_number": 961,
+    "issue_title": "Example: refresh the synthetic status copy",
+    "outcome": "complete",
+    "finished_at": "2026-09-29T15:40:00Z",
+    "budget_used": {
+      "value": 812345,
+      "basis": "estimated"
+    },
+    "turns": {
+      "value": 23,
+      "basis": "measured"
+    },
+    "pull_request": {
+      "number": 962,
+      "url": "https://example.invalid/example-owner/example-repo/pull/962"
+    }
+  },
+  "recent_events": [
+    {
+      "timestamp": "2026-09-29T15:40:01Z",
+      "level": "INFO",
+      "event": "attempt_finalized",
+      "issue_number": 961,
+      "phase": "publication",
+      "text": "attempt 2026-09-29T15-10-00-attempt-0961 finalized with outcome complete"
+    },
+    {
+      "timestamp": "2026-09-30T08:00:00Z",
+      "level": "INFO",
+      "event": "process_started",
+      "issue_number": null,
+      "phase": "startup",
+      "text": "agent process started; last_finished seeded from disk"
+    }
+  ],
+  "truncated": false
+}

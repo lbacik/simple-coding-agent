@@ -1,0 +1,255 @@
+{
+  "schema_version": 1,
+  "generated_at": "2026-09-30T12:05:00Z",
+  "sequence": 305,
+  "identity": {
+    "repository": "example-owner/example-repo",
+    "agent_version": "0.4.5",
+    "sdk_version": "0.2.163",
+    "cli_version": "2.1.286",
+    "process_started_at": "2026-09-30T08:00:00Z"
+  },
+  "control": {
+    "agent_version": "0.4.5",
+    "repository": "example-owner/example-repo",
+    "intake": "stopping",
+    "recovering": false,
+    "active_attempt": {
+      "issue_number": 981,
+      "branch": "agent/issue-981",
+      "phase": "model_execution",
+      "started_at": "2026-09-30T09:00:00Z",
+      "issue_title": "Example: migrate the synthetic report layout"
+    },
+    "pending_command": {
+      "request_id": "req-handoff7f3a1c",
+      "sequence": 12,
+      "kind": "handoff",
+      "acknowledgement": "accepted",
+      "detail": "handoff requested; delivers at the next safe model boundary or its single fallback",
+      "created_at": "2026-09-30T11:58:00Z",
+      "updated_at": "2026-09-30T11:58:00Z"
+    },
+    "pending_next_issue": null,
+    "stop_plan": null,
+    "recovery": null,
+    "handoff": {
+      "request_id": "req-handoff7f3a1c",
+      "accepted_at": "2026-09-30T11:58:00Z",
+      "begun": true,
+      "phase": "model_work",
+      "acknowledgement": "accepted",
+      "detail": "handoff requested; delivers at the next safe model boundary or its single fallback",
+      "model_deadline_at": "2026-09-30T12:02:00Z",
+      "publication_deadline_at": "2026-09-30T12:04:00Z"
+    },
+    "consecutive_errors": {
+      "count": 0,
+      "max_consecutive_errors": 3,
+      "last_attempt_id": "2026-09-29T15-10-00-attempt-0961",
+      "last_success_at": "2026-09-29T15:40:00Z"
+    },
+    "commands": {
+      "req-handoff7f3a1c": {
+        "request_id": "req-handoff7f3a1c",
+        "sequence": 12,
+        "kind": "handoff",
+        "acknowledgement": "accepted",
+        "detail": "handoff requested; delivers at the next safe model boundary or its single fallback",
+        "created_at": "2026-09-30T11:58:00Z",
+        "updated_at": "2026-09-30T12:00:00Z"
+      }
+    },
+    "control_observed_at": "2026-09-30T12:05:00Z"
+  },
+  "current_attempt": {
+    "attempt_id": "2026-09-30T09-00-00-attempt-0981",
+    "issue_number": 981,
+    "issue_title": "Example: migrate the synthetic report layout",
+    "observed_at": "2026-09-30T12:04:10Z",
+    "budget": {
+      "used": {
+        "value": 3050000,
+        "basis": "estimated"
+      },
+      "measured": {
+        "value": 2900000,
+        "basis": "measured"
+      },
+      "estimated": {
+        "value": 150000,
+        "basis": "estimated"
+      },
+      "hard_ceiling": {
+        "value": 4000000,
+        "basis": "configured"
+      },
+      "soft_threshold": {
+        "value": 2950000,
+        "basis": "estimated",
+        "rule": "reserve",
+        "percentage": 0.2,
+        "reserve_turns": 6,
+        "crossed": true,
+        "crossed_at_tokens": 2960000,
+        "crossed_at": "2026-09-30T11:55:00Z"
+      },
+      "hard_ceiling_reached": false
+    },
+    "tokens_by_category": {
+      "input_tokens": {
+        "value": 700000,
+        "basis": "measured"
+      },
+      "cache_read_input_tokens": {
+        "value": 1950000,
+        "basis": "measured"
+      },
+      "cache_creation_input_tokens": {
+        "value": 0,
+        "basis": "measured"
+      },
+      "output_tokens": {
+        "value": 250000,
+        "basis": "measured"
+      }
+    },
+    "turns": {
+      "value": 47,
+      "basis": "measured",
+      "max": {
+        "value": 60,
+        "basis": "configured"
+      }
+    },
+    "continuation": {
+      "index": {
+        "value": 1,
+        "basis": "measured"
+      },
+      "max": {
+        "value": 2,
+        "basis": "configured"
+      }
+    },
+    "cache": {
+      "main_hit_rate": {
+        "value": 0.91,
+        "basis": "measured",
+        "counted": 47
+      }
+    },
+    "context": {
+      "main": {
+        "value": 150000,
+        "basis": "estimated"
+      },
+      "main_peak": {
+        "value": 178000,
+        "basis": "estimated"
+      },
+      "window": {
+        "value": 200000,
+        "basis": "configured"
+      },
+      "auto_compact_threshold": {
+        "value": 190000,
+        "basis": "configured"
+      },
+      "compactions": {
+        "count": 2,
+        "last": {
+          "at": "2026-09-30T11:40:00Z",
+          "trigger": "auto",
+          "pre_tokens": {
+            "value": 185000,
+            "basis": "measured"
+          },
+          "post_tokens": {
+            "value": 62000,
+            "basis": "measured"
+          }
+        }
+      },
+      "subagents": [
+        {
+          "id": "sub-b2",
+          "type": "Explore",
+          "context": {
+            "value": 30000,
+            "basis": "estimated"
+          },
+          "running": true
+        },
+        {
+          "id": "sub-b1",
+          "type": "Plan",
+          "context": {
+            "value": 12000,
+            "basis": "estimated"
+          },
+          "running": false
+        }
+      ]
+    },
+    "provider_rate_limit": {
+      "value": null,
+      "basis": "unavailable",
+      "reason": "not exposed through the gateway"
+    },
+    "elapsed_seconds": {
+      "value": 10500,
+      "basis": "measured"
+    },
+    "timeout_seconds": {
+      "value": 3600,
+      "basis": "configured"
+    }
+  },
+  "last_finished": {
+    "attempt_id": "2026-09-29T15-10-00-attempt-0961",
+    "issue_number": 961,
+    "issue_title": "Example: refresh the synthetic status copy",
+    "outcome": "complete",
+    "finished_at": "2026-09-29T15:40:00Z",
+    "budget_used": {
+      "value": 812345,
+      "basis": "estimated"
+    },
+    "turns": {
+      "value": 23,
+      "basis": "measured"
+    },
+    "pull_request": {
+      "number": 962,
+      "url": "https://example.invalid/example-owner/example-repo/pull/962"
+    }
+  },
+  "recent_events": [
+    {
+      "timestamp": "2026-09-30T11:55:00Z",
+      "level": "WARN",
+      "event": "soft_threshold_crossed",
+      "issue_number": 981,
+      "phase": "model_execution",
+      "text": "soft threshold crossed at 2960000 tokens (rule reserve); handoff reserve engaged"
+    },
+    {
+      "timestamp": "2026-09-30T11:58:00Z",
+      "level": "INFO",
+      "event": "handoff_accepted",
+      "issue_number": 981,
+      "phase": "model_execution",
+      "text": "operator handoff req-handoff7f3a1c accepted; model deadline 2026-09-30T12:02:00Z"
+    },
+    {
+      "timestamp": "2026-09-30T12:00:00Z",
+      "level": "INFO",
+      "event": "handoff_begun",
+      "issue_number": 981,
+      "phase": "model_execution",
+      "text": "model began the handoff skill for req-handoff7f3a1c"
+    }
+  ],
+  "truncated": false
+}

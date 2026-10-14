@@ -1,0 +1,7 @@
+{
+  "ok": false,
+  "error": {
+    "code": "agent_unreachable",
+    "message": "cannot connect to the agent process: socket /run/simple-coding-agent/control.sock is missing or refused the connection"
+  }
+}
