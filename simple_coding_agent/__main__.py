@@ -20,7 +20,10 @@ from simple_coding_agent.finalization import AttemptCompletionStore
 from simple_coding_agent.git_workspace import GitWorkspace
 from simple_coding_agent.github_tracker import GitHubGraphQLTransport, GitHubTracker
 from simple_coding_agent.lifecycle import AgentLifecycle, AttemptInterruptionHandler, ModelAttemptRunner
-from simple_coding_agent.model_execution import ModelExecutor
+from simple_coding_agent.model_execution import (
+    PROMPT_CACHE_MIN_MEASURED_RESPONSES,
+    ModelExecutor,
+)
 from simple_coding_agent.observability import AttemptArchive, JsonEventLogger
 from simple_coding_agent.operating import ConsecutiveErrorStore
 from simple_coding_agent.publication import Publisher
@@ -110,6 +113,10 @@ def main() -> None:
         turns_max=config.max_turns,
         timeout_seconds=config.model_timeout,
         continuation_max=config.max_auto_continuations,
+        # Single source of truth with the executor's prompt-cache warning:
+        # the served hit rate stays unavailable below this many measured
+        # main-thread responses.
+        cache_min_measured_responses=PROMPT_CACHE_MIN_MEASURED_RESPONSES,
     )
     lifecycle = AgentLifecycle(
         tracker=tracker,

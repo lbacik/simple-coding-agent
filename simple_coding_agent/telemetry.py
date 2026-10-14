@@ -15,7 +15,9 @@ restart) and ``finish`` at every finalization boundary (including the
 startup-leftover path), so the stored seed alone decides the section: a
 set seed means an active attempt. Its configured limits come from the seed
 (claim-time values) falling back to the reporter construction defaults;
-live figures stay ``unavailable`` until later tickets publish them.
+its live budget, token, turn and cache figures come from the immutable
+attempt views the executor publishes via ``publish_attempt_view`` after
+every limit check. Until the first view arrives they stay ``unavailable``.
 Building the section never raises into the attempt: a failure logs once
 per episode and keeps the previous view.
 
@@ -63,6 +65,27 @@ TELEMETRY_TIMEOUT_SECONDS = 3.0
 #: failing snapshotter must not flood the log.
 TELEMETRY_FAILURE_COOLDOWN_SECONDS = 60.0
 
+#: Minimum measured main-thread responses before the prompt-cache hit rate
+#: is reported as ``measured``; below it the figure is ``unavailable``
+#: (never zero) while ``counted`` still reports the responses seen so far.
+#: Mirrors ``model_execution.PROMPT_CACHE_MIN_MEASURED_RESPONSES`` without
+#: importing the SDK-bound executor module on the listener thread.
+CACHE_MIN_MEASURED_RESPONSES = 20
+
+#: Reason carried by a hit-rate figure with too few measured responses.
+CACHE_NOT_ENOUGH_RESPONSES_REASON = "not enough measured responses"
+
+#: Reason carried by a hit-rate figure with no measured input to score.
+CACHE_NO_MEASURED_INPUT_REASON = "no measured input to score"
+
+#: Token categories published under ``tokens_by_category`` (measured only).
+TOKEN_CATEGORIES = (
+    "input_tokens",
+    "cache_read_input_tokens",
+    "cache_creation_input_tokens",
+    "output_tokens",
+)
+
 
 logger = logging.getLogger(__name__)
 
@@ -98,6 +121,71 @@ def _figure_unavailable(reason: str = "not yet published") -> dict:
     """An explicitly unavailable figure (never zero)."""
 
     return {"value": None, "basis": "unavailable", "reason": reason}
+
+
+def _plain_dict(view: object) -> dict:
+    """Copy a published attempt view into plain JSON-safe containers.
+
+    The executor publishes an immutable mapping; the copy detaches the
+    stored view from whatever the publisher holds so later mutation on
+    either side cannot leak into the served snapshot. Raises ``ValueError``
+    when the view is not a mapping.
+    """
+
+    if not isinstance(view, dict):
+        from collections.abc import Mapping as _Mapping
+
+        if not isinstance(view, _Mapping):
+            raise ValueError("published attempt view must be a mapping")
+        view = dict(view)
+    plain = _plain_value(view)
+    if not isinstance(plain, dict):
+        raise ValueError("published attempt view must be a mapping")
+    return plain
+
+
+def _plain_value(value: object) -> object:
+    from collections.abc import Mapping as _Mapping
+
+    if isinstance(value, _Mapping):
+        return {key: _plain_value(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_plain_value(item) for item in value]
+    return value
+
+
+def _view_tokens(view: dict, key: str) -> int:
+    """A rounded token total from a published view (never negative)."""
+
+    value = view.get(key)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"published attempt view {key} must be a number")
+    rounded = int(round(value))
+    if rounded < 0:
+        raise ValueError(f"published attempt view {key} must be non-negative")
+    return rounded
+
+
+def _view_int(view: dict, key: str) -> int:
+    """A non-negative integer from a published view."""
+
+    value = view.get(key)
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"published attempt view {key} must be an integer")
+    if value < 0:
+        raise ValueError(f"published attempt view {key} must be non-negative")
+    return value
+
+
+def _view_category(categories: dict, category: str) -> int:
+    """One measured token category from a published view."""
+
+    value = categories.get(category)
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(
+            f"published attempt view tokens_by_category[{category}] must be a non-negative integer"
+        )
+    return value
 
 
 def _as_int(value: object) -> int | None:
@@ -410,6 +498,7 @@ class TelemetryReporter:
         max_turns: int | None = None,
         model_timeout: int | None = None,
         max_auto_continuations: int | None = None,
+        cache_min_measured_responses: int = CACHE_MIN_MEASURED_RESPONSES,
     ) -> None:
         self._identity = {
             "repository": repository,
@@ -434,6 +523,13 @@ class TelemetryReporter:
         self._last_good_current: dict | None = None
         self._last_finished: dict | None = None
         self._build_failed_logged = False
+        self._cache_min_measured_responses = cache_min_measured_responses
+        # The latest immutable live attempt view published by the executor.
+        # Swapped by reference under ``_attempt_view_lock`` (held only for
+        # the swap); the listener thread serves this copy and never reads
+        # the token ledger.
+        self._attempt_view: dict | None = None
+        self._attempt_view_lock = threading.Lock()
 
     def begin_attempt(self, seed: dict) -> None:
         """Seed the ``current_attempt`` view at claim; never raises.
@@ -453,6 +549,13 @@ class TelemetryReporter:
         with self._attempt_lock:
             self._current_seed = normalized
             self._build_failed_logged = False
+        # A new attempt starts with no live figures until the executor
+        # publishes its first view after a limit check.
+        try:
+            with self._attempt_view_lock:
+                self._attempt_view = None
+        except Exception as error:  # pragma: no cover - lock failure
+            logger.warning("telemetry begin_attempt failed: %s", error)
 
     def finish_attempt(self, summary: dict | None = None) -> None:
         """Record the last finished attempt at finalisation; never raises.
@@ -487,6 +590,35 @@ class TelemetryReporter:
                 self._build_failed_logged = False
         except Exception as error:  # pragma: no cover - lock failure
             logger.warning("telemetry finish_attempt failed: %s", error)
+        try:
+            with self._attempt_view_lock:
+                self._attempt_view = None
+        except Exception as error:  # pragma: no cover - lock failure
+            logger.warning("telemetry finish_attempt failed: %s", error)
+
+    def publish_attempt_view(self, view: object) -> None:
+        """Store one immutable live attempt view from the executor; never raises.
+
+        The view carries the executor's raw live readings (budget totals,
+        threshold state, measured categories, turns, cache and elapsed
+        figures); this method stamps ``observed_at`` and swaps the stored
+        reference. Only the swap holds ``_attempt_view_lock``: the copy and
+        the timestamp are prepared outside it, and the listener thread later
+        serves the stored copy without ever reading the token ledger.
+        After model execution ends no further view arrives, so the served
+        figures — including ``observed_at`` — stay frozen until
+        :meth:`finish_attempt`.
+        """
+
+        try:
+            staged = _plain_dict(view)
+            staged["observed_at"] = _format_timestamp(self._clock())
+            with self._attempt_view_lock:
+                self._attempt_view = staged
+        except Exception as error:
+            logger.warning(
+                "telemetry publish_attempt_view failed: %s; keeping previous view", error
+            )
 
     def snapshot(self, control: TelemetryControl) -> dict:
         """Build one schema-v1 snapshot; raise when the control section is missing.
@@ -544,6 +676,13 @@ class TelemetryReporter:
             configured = dict(self._configured)
         if seed is None:
             return None
+        with self._attempt_view_lock:
+            view = copy.deepcopy(self._attempt_view) if self._attempt_view is not None else None
+        if view is None:
+            return self._tracer_attempt(seed, configured)
+        return self._live_attempt(seed, configured, view)
+
+    def _tracer_attempt(self, seed: dict, configured: dict) -> dict:
         continuation_index = seed.get("continuation_index")
         continuation_max = _seed_or_configured(seed, configured, "continuation_max")
         hard_ceiling = _seed_or_configured(seed, configured, "hard_ceiling")
@@ -608,6 +747,171 @@ class TelemetryReporter:
             ),
             "elapsed_seconds": _figure_unavailable(),
             "provider_rate_limit": _figure_unavailable("not exposed through the gateway"),
+        }
+        issue_title = seed.get("issue_title")
+        if issue_title is not None:
+            attempt["issue_title"] = issue_title
+        return attempt
+
+    def _live_attempt(self, seed: dict, configured: dict, view: dict) -> dict:
+        """Build the ``current_attempt`` section from a published live view.
+
+        The seed still owns identity and configured limits; the view owns
+        every live figure and ``observed_at`` (stamped at publication, so a
+        frozen view stays frozen). Raises ``ValueError`` on a malformed
+        view so the caller keeps the last good section.
+        """
+
+        continuation_index = seed.get("continuation_index")
+        continuation_max = _seed_or_configured(seed, configured, "continuation_max")
+        hard_ceiling = _seed_or_configured(seed, configured, "hard_ceiling")
+        turns_max = _seed_or_configured(seed, configured, "turns_max")
+        timeout_seconds = _seed_or_configured(seed, configured, "timeout_seconds")
+        for name, value in (
+            ("continuation_max", continuation_max),
+            ("hard_ceiling", hard_ceiling),
+            ("turns_max", turns_max),
+            ("timeout_seconds", timeout_seconds),
+        ):
+            if value is not None and (
+                isinstance(value, bool) or not isinstance(value, int) or value < 0
+            ):
+                raise ValueError(f"stored {name} is invalid")
+
+        observed_at = view.get("observed_at")
+        if not isinstance(observed_at, str) or not observed_at:
+            raise ValueError("published attempt view must carry observed_at")
+        used = _view_tokens(view, "budget_tokens")
+        measured = _view_tokens(view, "measured_tokens")
+        estimated = _view_tokens(view, "estimated_tokens")
+        hard_ceiling_reached = view.get("hard_ceiling_reached")
+        if not isinstance(hard_ceiling_reached, bool):
+            raise ValueError("published attempt view hard_ceiling_reached must be a boolean")
+
+        soft_value = _view_int(view, "soft_threshold_value")
+        rule = view.get("soft_threshold_rule")
+        if rule not in ("percentage", "reserve"):
+            raise ValueError("published attempt view soft_threshold_rule must be percentage or reserve")
+        percentage = view.get("soft_threshold_percentage")
+        if isinstance(percentage, bool) or not isinstance(percentage, (int, float)):
+            raise ValueError("published attempt view soft_threshold_percentage must be a number")
+        reserve_turns = _view_int(view, "soft_threshold_reserve_turns")
+        crossed = view.get("soft_threshold_crossed")
+        if not isinstance(crossed, bool):
+            raise ValueError("published attempt view soft_threshold_crossed must be a boolean")
+        crossed_at_tokens = view.get("soft_threshold_crossed_at_tokens")
+        if crossed_at_tokens is not None and (
+            isinstance(crossed_at_tokens, bool) or not isinstance(crossed_at_tokens, int)
+        ):
+            raise ValueError("published attempt view soft_threshold_crossed_at_tokens must be an integer or None")
+        crossed_at = view.get("soft_threshold_crossed_at")
+        if crossed_at is not None and not isinstance(crossed_at, str):
+            raise ValueError("published attempt view soft_threshold_crossed_at must be a string or None")
+        main_basis = view.get("main_context_basis")
+        if main_basis not in ("measured", "estimated"):
+            main_basis = "estimated"
+        soft_basis = "configured" if rule == "percentage" else main_basis
+
+        categories = view.get("tokens_by_category")
+        if not isinstance(categories, dict):
+            raise ValueError("published attempt view tokens_by_category must be a mapping")
+        tokens_by_category = {}
+        for category in TOKEN_CATEGORIES:
+            tokens_by_category[category] = {
+                "value": _view_category(categories, category),
+                "basis": "measured",
+            }
+
+        turns = _view_int(view, "turns")
+        hit_rate = view.get("cache_hit_rate")
+        if hit_rate is not None and (
+            isinstance(hit_rate, bool) or not isinstance(hit_rate, (int, float))
+        ):
+            raise ValueError("published attempt view cache_hit_rate must be a number or None")
+        counted = _view_int(view, "cache_counted")
+        elapsed_seconds = _view_int(view, "elapsed_seconds")
+        if counted < 0 or elapsed_seconds < 0 or turns < 0:
+            raise ValueError("published attempt view counts must be non-negative")
+
+        if counted >= self._cache_min_measured_responses and hit_rate is not None:
+            main_hit_rate: dict = {
+                "value": float(hit_rate),
+                "basis": "measured",
+                "counted": counted,
+            }
+        elif hit_rate is None and counted >= self._cache_min_measured_responses:
+            main_hit_rate = {
+                "value": None,
+                "basis": "unavailable",
+                "reason": CACHE_NO_MEASURED_INPUT_REASON,
+                "counted": counted,
+            }
+        else:
+            main_hit_rate = {
+                "value": None,
+                "basis": "unavailable",
+                "reason": CACHE_NOT_ENOUGH_RESPONSES_REASON,
+                "counted": counted,
+            }
+
+        attempt: dict = {
+            "attempt_id": seed["attempt_id"],
+            "issue_number": seed["issue_number"],
+            "observed_at": observed_at,
+            "budget": {
+                "used": {
+                    "value": used,
+                    "basis": "measured" if estimated == 0 else "estimated",
+                },
+                "measured": {"value": measured, "basis": "measured"},
+                "estimated": {"value": estimated, "basis": "estimated"},
+                "hard_ceiling": (
+                    _figure_configured(hard_ceiling)
+                    if hard_ceiling is not None
+                    else _figure_unavailable()
+                ),
+                "soft_threshold": {
+                    "value": soft_value,
+                    "basis": soft_basis,
+                    "rule": rule,
+                    "percentage": percentage,
+                    "reserve_turns": reserve_turns,
+                    "crossed": crossed,
+                    "crossed_at_tokens": crossed_at_tokens,
+                    "crossed_at": crossed_at,
+                },
+                "hard_ceiling_reached": hard_ceiling_reached,
+            },
+            "tokens_by_category": tokens_by_category,
+            "turns": {
+                "value": turns,
+                "basis": "measured",
+                "max": (
+                    _figure_configured(turns_max)
+                    if turns_max is not None
+                    else _figure_unavailable()
+                ),
+            },
+            "continuation": {
+                "index": (
+                    _figure_configured(continuation_index)
+                    if continuation_index is not None
+                    else _figure_unavailable()
+                ),
+                "max": (
+                    _figure_configured(continuation_max)
+                    if continuation_max is not None
+                    else _figure_unavailable()
+                ),
+            },
+            "cache": {"main_hit_rate": main_hit_rate},
+            "provider_rate_limit": _figure_unavailable("not exposed through the gateway"),
+            "elapsed_seconds": {"value": elapsed_seconds, "basis": "measured"},
+            "timeout_seconds": (
+                _figure_configured(timeout_seconds)
+                if timeout_seconds is not None
+                else _figure_unavailable()
+            ),
         }
         issue_title = seed.get("issue_title")
         if issue_title is not None:
