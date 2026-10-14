@@ -381,7 +381,7 @@ def test_deferred_baseline_reason_differs_from_final_check_and_acceptance_reason
     assert decision.reasons != ("Baseline check failed before model execution.",)
 
 
-def test_deferred_baseline_win_over_missing_acceptance_criteria() -> None:
+def test_deferred_baseline_failure_wins_over_missing_acceptance_criteria() -> None:
     evaluator = CompletionEvaluator({"must-fix"})
     decision = evaluator.evaluate(
         **_succeeded_arguments(
