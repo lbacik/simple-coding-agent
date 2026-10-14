@@ -9,12 +9,15 @@ bound, and ``agentctl telemetry --json`` mechanics) is published in
 socket, not HTTP) is ADR 0006.
 
 ``current_attempt`` is present from claim (``begin_attempt``) until the
-attempt is finalised (``finish_attempt`` or, equivalently, a snapshot whose
-control section shows no active attempt). Its configured limits come from
-the seed (claim-time values) falling back to the reporter construction
-defaults; live figures stay ``unavailable`` until later tickets publish
-them. Building the section never raises into the attempt: a failure logs
-once and keeps the previous view.
+attempt is finalised (``finish_attempt``). The lifecycle calls ``begin`` at
+every claim boundary (including resuming a retained attempt after a
+restart) and ``finish`` at every finalization boundary (including the
+startup-leftover path), so the stored seed alone decides the section: a
+set seed means an active attempt. Its configured limits come from the seed
+(claim-time values) falling back to the reporter construction defaults;
+live figures stay ``unavailable`` until later tickets publish them.
+Building the section never raises into the attempt: a failure logs once
+per episode and keeps the previous view.
 """
 
 from __future__ import annotations
@@ -109,6 +112,15 @@ def _seed_str(candidate: object) -> str | None:
         inner = candidate.get("value")
         return inner if isinstance(inner, str) else None
     return candidate if isinstance(candidate, str) else None
+
+
+def _seed_or_configured(seed: dict, configured: dict, key: str) -> int | None:
+    """A claim-time seed value falling back to the construction default."""
+
+    value = seed.get(key)
+    if value is None:
+        value = configured.get(key)
+    return value  # type: ignore[return-value]
 
 
 def _normalize_seed(seed: object) -> dict:
@@ -372,18 +384,10 @@ class TelemetryReporter:
         if seed is None:
             return None
         continuation_index = seed.get("continuation_index")
-        continuation_max = seed.get("continuation_max")
-        if continuation_max is None:
-            continuation_max = configured.get("continuation_max")
-        hard_ceiling = seed.get("hard_ceiling")
-        if hard_ceiling is None:
-            hard_ceiling = configured.get("hard_ceiling")
-        turns_max = seed.get("turns_max")
-        if turns_max is None:
-            turns_max = configured.get("turns_max")
-        timeout_seconds = seed.get("timeout_seconds")
-        if timeout_seconds is None:
-            timeout_seconds = configured.get("timeout_seconds")
+        continuation_max = _seed_or_configured(seed, configured, "continuation_max")
+        hard_ceiling = _seed_or_configured(seed, configured, "hard_ceiling")
+        turns_max = _seed_or_configured(seed, configured, "turns_max")
+        timeout_seconds = _seed_or_configured(seed, configured, "timeout_seconds")
 
         if continuation_index is not None and (
             isinstance(continuation_index, bool)

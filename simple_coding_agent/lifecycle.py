@@ -2749,8 +2749,8 @@ class AgentLifecycle:
                 {
                     "attempt_id": checkpoint.started_at,
                     "issue_number": checkpoint.issue_number,
-                    "issue_title": getattr(checkpoint, "issue_title", None),
-                    "continuation_index": getattr(checkpoint, "continuation_index", None),
+                    "issue_title": checkpoint.issue_title,
+                    "continuation_index": checkpoint.continuation_index,
                     "continuation_max": self._max_auto_continuations,
                 }
             )
@@ -2942,7 +2942,7 @@ class AgentLifecycle:
                     branch=checkpoint.branch,
                     phase=checkpoint.phase.value,
                     started_at=checkpoint.started_at,
-                    issue_title=getattr(checkpoint, "issue_title", None),
+                    issue_title=checkpoint.issue_title,
                 )
                 if checkpoint is not None
                 else None
@@ -3029,7 +3029,7 @@ class AgentLifecycle:
                 branch=checkpoint.branch,
                 phase=checkpoint.phase.value,
                 started_at=checkpoint.started_at,
-                issue_title=getattr(checkpoint, "issue_title", None),
+                issue_title=checkpoint.issue_title,
             )
             if checkpoint is not None
             else None
@@ -4382,6 +4382,10 @@ class AgentLifecycle:
             # workspace repair that could progress it.
             raise RuntimeError("Interrupted attempt issue is unavailable for recovery")
         self._active_issue_number = claim.issue.number
+        # The attempt survived a restart: re-seed the claim-time view from
+        # the checkpoint (no tracker lookup) so telemetry covers the attempt
+        # from its original claim until its eventual finalisation.
+        self._telemetry_begin_for_checkpoint(checkpoint)
         with self._control_lock:
             self._attempt_processing = True
             if self._control_store is not None:

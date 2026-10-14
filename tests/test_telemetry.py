@@ -13,15 +13,27 @@ import json
 import socket
 import threading
 import time
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
 
 from simple_coding_agent.agentctl import main as agentctl_main
-from simple_coding_agent.attempt_state import AttemptStateStore
+from simple_coding_agent.attempt_state import (
+    AttemptCheckpoint,
+    AttemptPhase,
+    AttemptStateError,
+    AttemptStateStore,
+)
+from simple_coding_agent.completion import (
+    AttemptOutcome,
+    CompletionDecision,
+    PublicationPath,
+)
 from simple_coding_agent.control import ControlStore
 from simple_coding_agent.control_server import ControlServer, send_request
-from simple_coding_agent.lifecycle import AgentLifecycle
+from simple_coding_agent.github_tracker import TrackerIssue
+from simple_coding_agent.lifecycle import AgentLifecycle, AttemptEvidence
 from simple_coding_agent.telemetry import (
     SNAPSHOT_SIZE_LIMIT_BYTES,
     SnapshotFailedError,
@@ -786,3 +798,427 @@ def test_size_cap_drops_subagents_after_events_are_empty() -> None:
     assert remaining
     assert remaining[0]["id"] != "agent-000"
     assert remaining[-1]["id"] == "agent-059"
+
+
+# ---------------------------------------------------------------------------
+# claim-to-finalisation current_attempt (issue #242)
+# ---------------------------------------------------------------------------
+
+
+class _StubControl:
+    """A control reader with a fixed section for reporter-level tests."""
+
+    def __init__(self, section: dict | None = None) -> None:
+        self._section = dict(
+            section or {"control_observed_at": "2026-10-14T12:00:00Z"}
+        )
+
+    def telemetry_control_snapshot(self) -> dict:
+        return dict(self._section)
+
+
+def make_attempt_reporter(**overrides: object) -> TelemetryReporter:
+    values: dict[str, object] = {
+        "repository": "owner/repo",
+        "agent_version": "0.0-test",
+        "sdk_version": "0.2.163-test",
+        "cli_version": "2.1.286-test",
+        "process_started_at": "2026-01-01T00:00:00Z",
+        "hard_ceiling": 1000,
+        "turns_max": 50,
+        "timeout_seconds": 600,
+        "continuation_max": 2,
+    }
+    values.update(overrides)
+    return TelemetryReporter(**values)  # type: ignore[arg-type]
+
+
+def claim_seed(**overrides: object) -> dict:
+    seed: dict[str, object] = {
+        "attempt_id": "2026-10-14T12:00:00.000001Z",
+        "issue_number": 7,
+        "issue_title": "Fix the widget",
+        "continuation_index": 0,
+    }
+    seed.update(overrides)
+    return seed
+
+
+def without_observed_at(current: dict) -> dict:
+    rest = dict(current)
+    rest.pop("observed_at", None)
+    return rest
+
+
+def test_snapshot_without_an_attempt_reports_null_current_attempt() -> None:
+    reporter = make_attempt_reporter()
+
+    assert reporter.snapshot(_StubControl())["current_attempt"] is None
+
+
+def test_begin_attempt_publishes_seeded_values_with_configured_limits() -> None:
+    reporter = make_attempt_reporter()
+    reporter.begin_attempt(claim_seed(continuation_index=1))
+
+    current = reporter.snapshot(_StubControl())["current_attempt"]
+
+    assert current is not None
+    assert current["attempt_id"] == "2026-10-14T12:00:00.000001Z"
+    assert current["issue_number"] == 7
+    assert current["issue_title"] == "Fix the widget"
+    assert isinstance(current["observed_at"], str) and current["observed_at"]
+    assert current["continuation"]["index"] == {"value": 1, "basis": "configured"}
+    assert current["continuation"]["max"] == {"value": 2, "basis": "configured"}
+    assert current["budget"]["hard_ceiling"] == {"value": 1000, "basis": "configured"}
+    assert current["turns"]["max"] == {"value": 50, "basis": "configured"}
+    assert current["timeout_seconds"] == {"value": 600, "basis": "configured"}
+    # Live figures stay unavailable until later tickets publish them.
+    assert current["budget"]["used"]["value"] is None
+    assert current["budget"]["used"]["basis"] == "unavailable"
+    assert current["turns"]["value"] is None
+    assert current["elapsed_seconds"]["value"] is None
+    assert current["elapsed_seconds"]["basis"] == "unavailable"
+
+
+def test_seed_limits_override_the_reporter_defaults() -> None:
+    reporter = make_attempt_reporter()
+    reporter.begin_attempt(
+        claim_seed(
+            continuation_index=2,
+            continuation_max=5,
+            hard_ceiling=4000,
+            turns_max=25,
+            timeout_seconds=120,
+        )
+    )
+
+    current = reporter.snapshot(_StubControl())["current_attempt"]
+
+    assert current is not None
+    assert current["continuation"]["index"] == {"value": 2, "basis": "configured"}
+    assert current["continuation"]["max"] == {"value": 5, "basis": "configured"}
+    assert current["budget"]["hard_ceiling"]["value"] == 4000
+    assert current["turns"]["max"]["value"] == 25
+    assert current["timeout_seconds"]["value"] == 120
+
+
+def test_unconfigured_limits_report_unavailable_never_zero() -> None:
+    reporter = make_reporter()
+    reporter.begin_attempt(
+        {
+            "attempt_id": "2026-10-14T12:00:00.000001Z",
+            "issue_number": 7,
+        }
+    )
+
+    current = reporter.snapshot(_StubControl())["current_attempt"]
+
+    assert current is not None
+    for figure in (
+        current["continuation"]["index"],
+        current["continuation"]["max"],
+        current["budget"]["hard_ceiling"],
+        current["turns"]["max"],
+        current["timeout_seconds"],
+        current["budget"]["used"],
+        current["elapsed_seconds"],
+    ):
+        assert figure["value"] is None
+        assert figure["basis"] == "unavailable"
+    assert "issue_title" not in current
+
+
+def test_begin_attempt_accepts_nested_and_figure_shaped_seeds() -> None:
+    reporter = make_attempt_reporter()
+    reporter.begin_attempt(
+        {
+            "attempt_id": "2026-10-14T12:00:00.000001Z",
+            "issue_number": "7",
+            "continuation": {
+                "index": {"value": 1, "basis": "estimated"},
+                "max": {"value": 3, "basis": "configured"},
+            },
+            "budget": {"hard_ceiling": {"value": 2000, "basis": "configured"}},
+            "turns": {"max": 40},
+            # Integral floats are accepted as limits, not rejected.
+            "timeout_seconds": 300.0,
+        }
+    )
+
+    current = reporter.snapshot(_StubControl())["current_attempt"]
+
+    assert current is not None
+    assert current["issue_number"] == 7
+    assert current["continuation"]["index"] == {"value": 1, "basis": "configured"}
+    assert current["continuation"]["max"] == {"value": 3, "basis": "configured"}
+    assert current["budget"]["hard_ceiling"] == {"value": 2000, "basis": "configured"}
+    assert current["turns"]["max"] == {"value": 40, "basis": "configured"}
+    assert current["timeout_seconds"] == {"value": 300, "basis": "configured"}
+
+
+def test_finish_attempt_clears_current_attempt() -> None:
+    reporter = make_attempt_reporter()
+    reporter.begin_attempt(claim_seed())
+
+    assert reporter.snapshot(_StubControl())["current_attempt"] is not None
+
+    reporter.finish_attempt()
+
+    assert reporter.snapshot(_StubControl())["current_attempt"] is None
+
+
+def test_malformed_seed_keeps_the_previous_view_and_logs_once(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    reporter = make_attempt_reporter()
+    reporter.begin_attempt(claim_seed())
+    before = without_observed_at(
+        reporter.snapshot(_StubControl())["current_attempt"]
+    )
+
+    with caplog.at_level("WARNING", logger="simple_coding_agent.telemetry"):
+        reporter.begin_attempt({})
+        reporter.begin_attempt({"attempt_id": "", "issue_number": -1})
+
+    after = without_observed_at(
+        reporter.snapshot(_StubControl())["current_attempt"]
+    )
+    assert after == before
+    kept = [
+        record
+        for record in caplog.records
+        if "keeping previous view" in record.getMessage()
+    ]
+    assert len(kept) == 1
+
+
+def test_malformed_seed_on_a_fresh_reporter_stays_null() -> None:
+    reporter = make_attempt_reporter()
+
+    reporter.begin_attempt({})
+
+    assert reporter.snapshot(_StubControl())["current_attempt"] is None
+
+
+def test_current_attempt_build_failure_keeps_the_last_good_view(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    reporter = make_attempt_reporter()
+    reporter.begin_attempt(claim_seed())
+    good = reporter.snapshot(_StubControl())["current_attempt"]
+    assert good is not None
+    # Corrupt the stored claim-time view behind the reporter's back: the
+    # next build must not raise into the attempt.
+    assert reporter._current_seed is not None
+    reporter._current_seed["continuation_index"] = -1
+
+    with caplog.at_level("WARNING", logger="simple_coding_agent.telemetry"):
+        snapshot = reporter.snapshot(_StubControl())
+
+    assert snapshot["current_attempt"] == good
+    kept = [
+        record
+        for record in caplog.records
+        if "keeping previous view" in record.getMessage()
+    ]
+    assert len(kept) == 1
+
+
+def test_checkpoint_stores_the_claim_time_telemetry_fields(tmp_path: Path) -> None:
+    store = AttemptStateStore(tmp_path)
+
+    checkpoint = store.start(
+        issue_number=7,
+        branch="agent/issue-7",
+        issue_title="Fix the widget",
+        continuation_index=2,
+    )
+
+    assert checkpoint.issue_title == "Fix the widget"
+    assert checkpoint.continuation_index == 2
+    reread = store.read()
+    assert reread is not None
+    assert reread.issue_title == "Fix the widget"
+    assert reread.continuation_index == 2
+    # The values ride along untouched through phase transitions.
+    assert store.transition(AttemptPhase.SETUP).continuation_index == 2
+
+    with pytest.raises(AttemptStateError):
+        AttemptStateStore(tmp_path / "other").start(
+            issue_number=9, branch="agent/issue-9", continuation_index=-1
+        )
+
+
+def test_legacy_checkpoint_without_telemetry_fields_loads_as_unknown(
+    tmp_path: Path,
+) -> None:
+    state_dir = tmp_path / "state"
+    state_dir.mkdir(parents=True, exist_ok=True)
+    (state_dir / "attempt.json").write_text(
+        json.dumps(
+            {
+                "issue_number": 7,
+                "branch": "agent/issue-7",
+                "phase": "claimed",
+                "started_at": "2026-10-14T12:00:00Z",
+                "updated_at": "2026-10-14T12:00:00Z",
+                "auto_merge_opt_in": False,
+                "requeue_source": "human",
+            }
+        )
+    )
+
+    checkpoint = AttemptStateStore(tmp_path).read()
+
+    assert checkpoint is not None
+    assert checkpoint.issue_title is None
+    assert checkpoint.continuation_index is None
+
+
+_CREATED_BASE = datetime(2026, 10, 14, 12, 0, tzinfo=UTC)
+
+
+def tracked_issue(number: int, **overrides: object) -> TrackerIssue:
+    base: dict[str, object] = {
+        "id": f"issue-{number}",
+        "number": number,
+        "title": f"Issue {number}",
+        "body": f"Implement {number}.",
+        "created_at": _CREATED_BASE + timedelta(seconds=number),
+        "state": "OPEN",
+        "labels": frozenset({"ready-for-agent"}),
+        "assignee_logins": (),
+        "blocked_by": 0,
+        "author_login": "reporter",
+    }
+    base.update(overrides)
+    return TrackerIssue(**base)  # type: ignore[arg-type]
+
+
+def complete_attempt_evidence() -> AttemptEvidence:
+    return AttemptEvidence(
+        decision=CompletionDecision(
+            AttemptOutcome.COMPLETE, True, PublicationPath.COMPLETE, ("ready",)
+        ),
+        check_command="pytest",
+        check_exit_code=0,
+        review_cycles=1,
+        review_findings="all clear",
+        details="Implemented.",
+    )
+
+
+def test_claim_seeds_telemetry_and_finalization_clears_it(tmp_path: Path) -> None:
+    from tests.fakes import FakePublisher, FakeTracker, InMemoryWorkspace
+
+    reporter = make_attempt_reporter()
+    tracker = FakeTracker({7: tracked_issue(7, title="Fix the widget")}, fifo=[7])
+    state = AttemptStateStore(tmp_path)
+    lifecycle = AgentLifecycle(
+        tracker=tracker,
+        attempt_state=state,
+        workspace=InMemoryWorkspace(tmp_path / "repo"),
+        profile_loader=lambda _: type("Profile", (), {"base_branch": "main"})(),
+        publisher=FakePublisher(),
+        attempt_runner=lambda claim, profile, prepared: complete_attempt_evidence(),
+        control_store=ControlStore(tmp_path),
+        repository="owner/repo",
+        telemetry=reporter,
+        sleeper=lambda seconds: None,
+        max_auto_continuations=2,
+    )
+
+    assert lifecycle.telemetry_snapshot()["current_attempt"] is None
+
+    mid_run: list[dict] = []
+    mid_checkpoint: list[AttemptCheckpoint | None] = []
+
+    def capturing_runner(
+        claim: object, profile: object, prepared: object
+    ) -> AttemptEvidence:
+        mid_run.append(lifecycle.telemetry_snapshot())
+        mid_checkpoint.append(state.read())
+        return complete_attempt_evidence()
+
+    lifecycle.set_attempt_runner(capturing_runner)
+    result = lifecycle.run_once()
+
+    assert result.status.value == "attempted"
+    assert len(mid_run) == 1
+    current = mid_run[0]["current_attempt"]
+    assert current is not None
+    assert current["issue_number"] == 7
+    assert current["continuation"]["index"] == {"value": 0, "basis": "configured"}
+    assert current["continuation"]["max"] == {"value": 2, "basis": "configured"}
+    assert current["budget"]["hard_ceiling"] == {"value": 1000, "basis": "configured"}
+    assert current["turns"]["max"] == {"value": 50, "basis": "configured"}
+    assert current["timeout_seconds"] == {"value": 600, "basis": "configured"}
+    assert mid_run[0]["control"]["active_attempt"]["issue_number"] == 7
+    assert mid_run[0]["control"]["active_attempt"]["issue_title"] == "Fix the widget"
+    # The checkpoint captured the claim-time values once, so telemetry
+    # needs no tracker lookup for them.
+    checkpoint = mid_checkpoint[0]
+    assert checkpoint is not None
+    assert checkpoint.issue_title == "Fix the widget"
+    assert checkpoint.continuation_index == 0
+    # Finalisation clears the attempt view again.
+    assert lifecycle.telemetry_snapshot()["current_attempt"] is None
+
+
+def test_startup_resume_reseeds_telemetry_from_the_checkpoint(
+    tmp_path: Path,
+) -> None:
+    """A restart mid-attempt restores the claim-time view without a lookup.
+
+    The checkpoint already carries the issue title and continuation index,
+    so resuming a retained attempt re-seeds telemetry from disk: the
+    attempt stays visible from its original claim until finalisation even
+    though this process never claimed it.
+    """
+
+    from simple_coding_agent.git_workspace import DirtyWorkspaceError
+    from tests.fakes import FakePublisher, FakeTracker
+
+    class DirtyWorkspace:
+        def __init__(self, root: Path) -> None:
+            self.working_directory = root
+
+        def prepare_for_profile_read(self) -> None:
+            raise DirtyWorkspaceError("tree holds unexplained work")
+
+    reporter = make_attempt_reporter()
+    state = AttemptStateStore(tmp_path)
+    checkpoint = state.start(
+        issue_number=7,
+        branch="agent/issue-7",
+        issue_title="Fix the widget",
+        continuation_index=2,
+    )
+    lifecycle = AgentLifecycle(
+        tracker=FakeTracker({7: tracked_issue(7, title="Fix the widget")}),
+        attempt_state=state,
+        workspace=DirtyWorkspace(tmp_path / "repo"),  # type: ignore[arg-type]
+        profile_loader=lambda _: type("Profile", (), {"base_branch": "main"})(),
+        publisher=FakePublisher(),
+        control_store=ControlStore(tmp_path),
+        repository="owner/repo",
+        telemetry=reporter,
+        sleeper=lambda seconds: None,
+        max_auto_continuations=2,
+    )
+
+    assert lifecycle.telemetry_snapshot()["current_attempt"] is None
+
+    # The dirty tree holds the resume for the operator, but telemetry
+    # already covers the retained attempt.
+    assert lifecycle.run_once().status.value == "attempted"
+    assert state.read() is not None
+
+    snapshot = lifecycle.telemetry_snapshot()
+    current = snapshot["current_attempt"]
+    assert current is not None
+    assert current["attempt_id"] == checkpoint.started_at
+    assert current["issue_number"] == 7
+    assert current["continuation"]["index"] == {"value": 2, "basis": "configured"}
+    assert current["continuation"]["max"] == {"value": 2, "basis": "configured"}
+    assert snapshot["control"]["active_attempt"]["issue_title"] == "Fix the widget"
