@@ -307,3 +307,90 @@ def test_failed_resume_keeps_its_request_id_for_retry(
     err = capsys.readouterr().err
     assert "req-retry-r" in err
     assert "--request-id req-retry-r" in err
+
+
+# ---------------------------------------------------------------------------
+# listener resilience (unexpected handler failures never stop the listener)
+# ---------------------------------------------------------------------------
+
+
+class _FailingControl:
+    """Control surface whose handlers raise outside the expected categories."""
+
+    def __init__(self) -> None:
+        self.events: list[tuple[str, str, str]] = []
+        self.repository = "owner/repo"
+
+    def _log(self, event: str, detail: str = "", level: str = "INFO") -> None:
+        self.events.append((event, detail, level))
+
+    def control_status(self, repository: str | None = None):
+        raise KeyError("boom-checkpoint")
+
+    def get_command(self, request_id: str):
+        raise TypeError("boom-lookup")
+
+    def submit_stop(self, request_id: str, *, has_active_attempt: bool = False):
+        raise KeyError("boom-submit")
+
+
+def test_unexpected_status_failure_replies_false_and_keeps_serving(
+    tmp_path: Path,
+) -> None:
+    from simple_coding_agent.control_server import ControlServer, send_request
+
+    control = _FailingControl()
+    socket_path = tmp_path / "state" / "agentctl.sock"
+    server = ControlServer(socket_path, control, event_log=control._log)  # noqa: SLF001
+    server.start()
+    try:
+        reply = send_request(socket_path, {"op": "status"})
+        assert reply["ok"] is False
+        assert "boom-checkpoint" in reply["error"]
+
+        assert server._thread is not None and server._thread.is_alive()  # noqa: SLF001
+
+        second = send_request(socket_path, {"op": "stop", "request_id": "req-1"})
+        assert second["ok"] is False
+        assert "boom-submit" in second["error"]
+
+        assert server._thread is not None and server._thread.is_alive()  # noqa: SLF001
+        assert [event for event, _, _ in control.events] == [
+            "control_request_failed",
+            "control_request_failed",
+        ]
+        assert all(level == "ERROR" for _, _, level in control.events)
+    finally:
+        server.stop()
+
+
+def test_oversized_reply_surfaces_as_a_control_error(tmp_path: Path) -> None:
+    import threading
+
+    from simple_coding_agent.control_server import send_request
+
+    socket_path = tmp_path / "state" / "agentctl.sock"
+    socket_path.parent.mkdir(parents=True, exist_ok=True)
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    listener.bind(str(socket_path))
+    listener.listen(1)
+
+    def serve_once() -> None:
+        connection, _ = listener.accept()
+        with connection:
+            data = b""
+            while not data.endswith(b"\n"):
+                chunk = connection.recv(65536)
+                if not chunk:
+                    break
+                data += chunk
+            connection.sendall(b'{"ok": true, "pad": "' + b"x" * (2**20) + b'"}\n')
+
+    thread = threading.Thread(target=serve_once, daemon=True)
+    thread.start()
+    try:
+        with pytest.raises(ControlUnavailableError):
+            send_request(socket_path, {"op": "status"})
+    finally:
+        listener.close()
+        thread.join(timeout=10)

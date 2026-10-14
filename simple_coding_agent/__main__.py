@@ -137,7 +137,13 @@ def main() -> None:
         issue_number_provider=lambda: lifecycle.active_issue_number,
     )
     restore_interruption_handler = interruption_handler.install()
-    control_server = ControlServer(socket_path_for(config.data_dir), lifecycle)
+    control_server = ControlServer(
+        socket_path_for(config.data_dir),
+        lifecycle,
+        event_log=lambda event, detail="", level="INFO", issue_number=None: logger.emit(
+            event, phase="control", detail=detail, level=level, issue_number=issue_number
+        ),
+    )
     _start_control_endpoint(logger, control_server)
     try:
         lifecycle.run_forever(stop=lambda: False)
