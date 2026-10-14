@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sys
+from datetime import UTC, datetime
 from pathlib import Path
 
 from simple_coding_agent.attempt_state import AttemptStateStore
@@ -24,6 +25,7 @@ from simple_coding_agent.observability import AttemptArchive, JsonEventLogger
 from simple_coding_agent.operating import ConsecutiveErrorStore
 from simple_coding_agent.publication import Publisher
 from simple_coding_agent.provenance import ProvenanceError, ProvenanceVerifier
+from simple_coding_agent.telemetry import TelemetryReporter, format_timestamp
 from dotenv import load_dotenv
 
 
@@ -31,6 +33,7 @@ def main() -> None:
     """Run sequential attempts forever for the one operator-configured repository."""
 
     load_dotenv(override=False)
+    process_started_at = format_timestamp(datetime.now(UTC))
     config = load_runtime_config()
     attempt_state = AttemptStateStore(config.data_dir)
     archive_factory = lambda issue_number, started_at: AttemptArchive(
@@ -97,6 +100,13 @@ def main() -> None:
             event, phase="setup", detail=detail, level=level, issue_number=issue_number
         ),
     )
+    telemetry = TelemetryReporter(
+        repository=config.target_repo,
+        agent_version=provenance.agent_version,
+        sdk_version=provenance.sdk_version,
+        cli_version=provenance.cli_version,
+        process_started_at=process_started_at,
+    )
     lifecycle = AgentLifecycle(
         tracker=tracker,
         attempt_state=attempt_state,
@@ -129,6 +139,7 @@ def main() -> None:
         completion_store=AttemptCompletionStore(config.data_dir),
         control_store=ControlStore(config.data_dir),
         repository=config.target_repo,
+        telemetry=telemetry,
     )
     interruption_handler = AttemptInterruptionHandler(
         event_log=lambda event, detail="", level="INFO", issue_number=None: logger.emit(

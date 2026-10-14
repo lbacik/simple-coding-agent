@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable, Collection, Mapping, Sequence
+import copy
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -73,6 +74,12 @@ from simple_coding_agent.observability import AttemptArchive, Redactor
 from simple_coding_agent.operating import ConsecutiveErrorStore
 from simple_coding_agent.publication import AUTO_MERGE_LABEL, PublicationRequest
 from simple_coding_agent.recovery import REQUEUE_SOURCE_AUTOMATIC, requeue_source_for_labels
+from simple_coding_agent.telemetry import (
+    CONTROL_LOCK_TIMEOUT_SECONDS,
+    SnapshotFailedError,
+    TelemetryReporter,
+    format_timestamp,
+)
 
 
 class AttemptInterruptionHandler:
@@ -1152,6 +1159,7 @@ class AgentLifecycle:
         control_store: ControlStore | None = None,
         repository: str = "",
         clock: Callable[[], datetime] | None = None,
+        telemetry: TelemetryReporter | None = None,
     ) -> None:
         self._tracker = tracker
         self._attempt_state = attempt_state
@@ -1207,6 +1215,11 @@ class AgentLifecycle:
         self._startup_hold_detail: str | None = None
         self._startup_hold_kind: str | None = None
         self._startup_hold_reported = False
+        self._telemetry = telemetry
+        # The last control section built for telemetry, with its
+        # ``control_observed_at``. Served again while the control lock is
+        # busy; ``None`` until the first successful build.
+        self._telemetry_control: dict | None = None
 
     @property
     def active_issue_number(self) -> int | None:
@@ -2791,6 +2804,241 @@ class AgentLifecycle:
                 handoff=store.handoff_snapshot(),
                 consecutive_errors=self._consecutive_errors_snapshot_locked(),
             )
+
+    def telemetry_snapshot(self) -> dict:
+        """Serve one telemetry snapshot for the ``telemetry`` socket operation.
+
+        Read-only: assembly goes through the telemetry reporter with this
+        lifecycle as the control reader. Raises :class:`SnapshotFailedError`
+        when telemetry is not configured or no control section can be built.
+        """
+
+        reporter = self._telemetry
+        if reporter is None:
+            raise SnapshotFailedError("telemetry is not configured for this process")
+        return reporter.snapshot(self)
+
+    def telemetry_control_snapshot(self) -> dict:
+        """Return the network-free control section for one telemetry snapshot.
+
+        The same payload :meth:`control_status` builds, but without workspace
+        or GitHub I/O: no dirty-tree check runs, no tracker or publisher call
+        is made, and publication fields that would need a lookup stay ``None``
+        ("not known yet"). The section carries ``control_observed_at`` saying
+        when it was built.
+
+        Waits at most ``CONTROL_LOCK_TIMEOUT_SECONDS`` for the control lock so
+        telemetry never holds up other control commands. While the lock is
+        busy the last built section is reused; when none has been built yet
+        this raises :class:`SnapshotFailedError`.
+        """
+
+        if self._control_store is None:
+            raise SnapshotFailedError("operator control is not configured")
+        if not self._control_lock.acquire(timeout=CONTROL_LOCK_TIMEOUT_SECONDS):
+            cached = self._telemetry_control
+            if cached is None:
+                raise SnapshotFailedError(
+                    "the control lock is busy and no control section has been built yet"
+                )
+            # A copy: the served snapshot must never alias the cache, or a
+            # consumer mutating it would corrupt later reuses.
+            return copy.deepcopy(cached)
+        try:
+            section = self._build_telemetry_control_section()
+        finally:
+            self._control_lock.release()
+        self._telemetry_control = section
+        return copy.deepcopy(section)
+
+    def _build_telemetry_control_section(self) -> dict:
+        """Build a fresh network-free control section (caller holds the lock)."""
+
+        store = self._control_store
+        assert store is not None  # checked by telemetry_control_snapshot
+        try:
+            checkpoint = self._attempt_state.read()
+        except AttemptStateError as error:
+            # Read-only, as in control_status: record the startup hold
+            # silently (no event) so the operator still sees the hold reason.
+            if self._startup_hold_detail is None:
+                self._startup_hold_kind = "checkpoint"
+                self._startup_hold_detail = _checkpoint_hold_detail(error)
+            checkpoint = None
+        active = (
+            ActiveAttemptInfo(
+                issue_number=checkpoint.issue_number,
+                branch=checkpoint.branch,
+                phase=checkpoint.phase.value,
+                started_at=checkpoint.started_at,
+            )
+            if checkpoint is not None
+            else None
+        )
+        section = build_status(
+            repository=self._repository,
+            intake=store.intake_state(),
+            recovering=self._recovering,
+            active_attempt=active,
+            pending_command_id=store.pending_command_id(),
+            get_command=store.get_command,
+            recent_commands=store.recent_commands,
+            next_issue=store.next_issue_snapshot(),
+            stop_plan=store.stop_plan_snapshot(),
+            recovery=self._recovery_snapshot_network_free(checkpoint),
+            handoff=store.handoff_snapshot(),
+            consecutive_errors=self._consecutive_errors_snapshot_locked(),
+        )
+        section["control_observed_at"] = format_timestamp(self._clock())
+        return section
+
+    def _recovery_hold_network_free(
+        self, checkpoint: AttemptCheckpoint | None
+    ) -> RecoveryHold | None:
+        """Return the hold blocking ``resume``, without workspace I/O.
+
+        Mirrors :meth:`_recovery_hold_locked` minus the dirty-tree check: the
+        tree is never inspected, so a dirty tree alone never appears here and
+        no workspace call is made. Never touches the tracker or publisher.
+        """
+
+        if self._recovering:
+            if checkpoint is not None:
+                return RecoveryHold(
+                    issue_number=checkpoint.issue_number,
+                    attempt_id=checkpoint.started_at,
+                    branch=checkpoint.branch,
+                    phase=checkpoint.phase.value,
+                    reason=(
+                        "startup reconciliation is still running for"
+                        f" issue #{checkpoint.issue_number}; intake is held"
+                        " until its outcome, publication, release, cleanup,"
+                        " and accounting are durable"
+                    ),
+                )
+            return RecoveryHold(
+                issue_number=None,
+                attempt_id=None,
+                branch=None,
+                phase=None,
+                reason="startup reconciliation is still running",
+            )
+        if checkpoint is not None and not self._attempt_processing:
+            reason = self._startup_hold_detail or (
+                "attempt finalization is unresolved; the branch,"
+                " checkpoint, and working tree are preserved for recovery"
+            )
+            return RecoveryHold(
+                issue_number=checkpoint.issue_number,
+                attempt_id=checkpoint.started_at,
+                branch=checkpoint.branch,
+                phase=checkpoint.phase.value,
+                reason=reason,
+            )
+        if checkpoint is not None and self._recovery_executing:
+            return RecoveryHold(
+                issue_number=checkpoint.issue_number,
+                attempt_id=checkpoint.started_at,
+                branch=checkpoint.branch,
+                phase=checkpoint.phase.value,
+                reason=(
+                    "a recovery command is running for the retained attempt;"
+                    " the branch, checkpoint, and working tree are preserved"
+                    " until it finishes"
+                ),
+            )
+        return None
+
+    def _recovery_snapshot_network_free(
+        self, checkpoint: AttemptCheckpoint | None
+    ) -> dict | None:
+        """Build the status ``recovery`` section without network or git I/O.
+
+        Mirrors :meth:`_recovery_snapshot_locked`: the workspace dirty check
+        is skipped (a dirty tree alone never produces a section here) and the
+        publication progress stays ``None`` ("not known yet") because the
+        GitHub lookups never run. Never touches the tracker, publisher, or
+        workspace methods. Caller holds the control lock.
+        """
+
+        from simple_coding_agent.recovery import (
+            describe_hold,
+            release_next_action,
+            retry_next_action,
+        )
+
+        if checkpoint is None:
+            if self._startup_hold_detail is None:
+                return None
+            return {
+                "attempt_id": None,
+                "issue_number": None,
+                "phase": None,
+                "outcome": None,
+                "branch": None,
+                "workspace": str(self._workspace.working_directory),
+                "checkpoint": False,
+                "publication": {
+                    "phase": None,
+                    "comment_confirmed": None,
+                    "pull_request": None,
+                },
+                "hold_reason": self._startup_hold_detail,
+                "next_action": (
+                    "Repair or remove the unreadable state file described"
+                    " in the hold reason; intake resumes automatically"
+                    " once it reads cleanly."
+                ),
+            }
+        hold = self._recovery_hold_network_free(checkpoint)
+        if hold is None and not self._recovering:
+            return None
+        reason = hold.reason if hold is not None else "startup reconciliation is still running"
+        outcome: str | None = None
+        if self._completion_store is not None:
+            try:
+                completions = self._completion_store.read_all()
+                terminal = completions.get(checkpoint.started_at)
+                if terminal is not None:
+                    outcome = terminal.outcome.value
+            except Exception:
+                outcome = None
+        publication = {
+            "phase": checkpoint.phase.value,
+            "comment_confirmed": None,
+            "pull_request": None,
+        }
+        if self._recovering:
+            next_action = (
+                "Wait for startup reconciliation to finish; do not run recovery"
+                " commands while it is still running."
+            )
+        elif outcome is not None:
+            next_action = (
+                "The attempt is finalized in the ledger; wait for the leftover"
+                " checkpoint to be removed on the next intake cycle."
+            )
+        else:
+            next_action = retry_next_action(checkpoint.started_at)
+        return {
+            "attempt_id": checkpoint.started_at,
+            "issue_number": checkpoint.issue_number,
+            "phase": checkpoint.phase.value,
+            "outcome": outcome,
+            "branch": checkpoint.branch,
+            "workspace": str(self._workspace.working_directory),
+            "checkpoint": True,
+            "publication": publication,
+            "hold_reason": describe_hold(
+                issue_number=checkpoint.issue_number,
+                attempt_id=checkpoint.started_at,
+                phase=checkpoint.phase.value,
+                reason=reason,
+            ),
+            "next_action": next_action
+            if self._recovering or outcome is not None
+            else f"{next_action} {release_next_action()}",
+        }
 
     def run_once(self) -> LifecycleResult:
         """Claim and process one issue, or sleep once when the queue is empty.
