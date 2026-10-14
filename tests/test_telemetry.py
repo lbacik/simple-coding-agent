@@ -796,8 +796,10 @@ def test_size_cap_drops_subagents_after_events_are_empty() -> None:
     assert len(json.dumps(trimmed).encode("utf-8")) <= SNAPSHOT_SIZE_LIMIT_BYTES
     remaining = trimmed["current_attempt"]["context"]["subagents"]
     assert remaining
-    assert remaining[0]["id"] != "agent-000"
-    assert remaining[-1]["id"] == "agent-059"
+    # The list is running-first, so trimming drops the tail (oldest
+    # finished) and preserves the head (newest running).
+    assert remaining[0]["id"] == "agent-000"
+    assert remaining[-1]["id"] != "agent-059"
 
 
 # ---------------------------------------------------------------------------

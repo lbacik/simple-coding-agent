@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
 import json
+import os
 from pathlib import Path
 import re
 import shlex
@@ -32,6 +33,11 @@ from claude_agent_sdk import (
 )
 
 from simple_coding_agent.config import RuntimeConfig
+from simple_coding_agent.telemetry import CONTEXT_WINDOW_BASES
+from simple_coding_agent.telemetry import (
+    MAX_CONTEXT_SUBAGENTS as _MAX_CONTEXT_SUBAGENTS,
+)
+from simple_coding_agent.telemetry import _as_int as _telemetry_as_int
 from simple_coding_agent.telemetry import format_timestamp as _format_timestamp
 from simple_coding_agent.token_ledger import (
     USAGE_CATEGORIES,
@@ -60,6 +66,34 @@ PROMPT_CACHE_HIT_RATE_THRESHOLD = 0.5
 
 _OPERATOR_HANDOFF_DELIVERY_WINDOW_SECONDS = 60
 _OPERATOR_HANDOFF_MODEL_DEADLINE_SECONDS = 240
+
+#: Operator override that marks the telemetry context window as configured.
+#: When set, the CLI uses it as the context window, so the SDK reading's
+#: basis is ``configured`` instead of ``sdk_assumed``.
+CONTEXT_WINDOW_OVERRIDE_ENV_VAR = "CLAUDE_CODE_MAX_CONTEXT_TOKENS"
+
+#: Upper bound of telemetry subagent entries in one published view, shared
+#: with the reporter so both caps stay a single source of truth.
+MAX_TELEMETRY_SUBAGENTS = _MAX_CONTEXT_SUBAGENTS
+
+
+def _context_window_configured() -> bool:
+    """Whether the operator overrode the context window for this process."""
+
+    return bool(os.environ.get(CONTEXT_WINDOW_OVERRIDE_ENV_VAR, "").strip())
+
+
+def _context_window_basis() -> str:
+    """Basis for a successful context-usage window reading."""
+
+    return "configured" if _context_window_configured() else "sdk_assumed"
+
+
+def _as_non_negative_int(value: object) -> int | None:
+    """An int figure from an SDK payload, or ``None`` when untrustworthy."""
+
+    coerced = _telemetry_as_int(value)
+    return coerced if coerced is not None and coerced >= 0 else None
 
 def _handoff_target(issue_number: int | None) -> str:
     """Name the issue and the exact note path every handoff instruction must carry."""
@@ -577,6 +611,25 @@ class ModelExecutor:
         self._degraded_logged = False
         self._cache_warning_evaluated = False
         self._auto_response_seq = 0
+        self._reset_context_state()
+
+    def _reset_context_state(self) -> None:
+        """Start fresh per-attempt telemetry context figures.
+
+        The window/threshold stay ``unavailable`` until the session-start
+        context-usage reading lands; compactions and subagents start empty.
+        """
+
+        self._context_window: int | None = None
+        self._context_window_basis: str = "unavailable"
+        self._context_window_reason: str | None = "not yet read"
+        self._auto_compact_threshold: int | None = None
+        self._auto_compact_threshold_basis: str = "unavailable"
+        self._auto_compact_threshold_reason: str | None = "not yet read"
+        self._compaction_count = 0
+        self._compaction_last: dict[str, Any] | None = None
+        self._subagent_info: dict[str, dict[str, Any]] = {}
+        self._subagent_order: list[str] = []
 
     def set_operator_handoff_provider(
         self, provider: OperatorHandoffProvider | None
@@ -649,7 +702,10 @@ class ModelExecutor:
         The budget is left alone; the ledger only learns of the compaction so
         the next response is excluded from cache-miss accounting. SDK 0.2.163
         has no typed message for it and ``compact_metadata`` is unverified,
-        so ``trigger`` and ``pre_tokens`` are read best-effort.
+        so ``trigger`` and ``pre_tokens`` are read best-effort. The telemetry
+        compaction count and last-compaction record are updated here; the
+        post-compaction tokens are filled from the next context-usage
+        reading (or from ``post_tokens`` metadata when the CLI provides it).
         """
 
         data = getattr(message, "data", None)
@@ -663,6 +719,89 @@ class ModelExecutor:
             f"thread={thread}; trigger={metadata.get('trigger')}; "
             f"pre_tokens={metadata.get('pre_tokens')}",
         )
+        trigger = metadata.get("trigger")
+        trigger = trigger if isinstance(trigger, str) and trigger else "unknown"
+        pre_tokens = _as_non_negative_int(metadata.get("pre_tokens"))
+        post_tokens = _as_non_negative_int(metadata.get("post_tokens"))
+        self._compaction_count += 1
+        self._compaction_last = {
+            "at": _format_timestamp(self._clock()),
+            "trigger": trigger,
+            "pre_tokens": pre_tokens,
+            "post_tokens": post_tokens,
+        }
+
+    async def _refresh_context_usage(self, client: Any, *, reason: str) -> None:
+        """Refresh the telemetry window from the SDK's context-usage call.
+
+        Runs only at session start and after each compaction, on the
+        attempt's event loop — never per turn. A failure marks the window
+        and threshold ``unavailable`` with a reason and never affects the
+        attempt. A successful reading also fills a pending compaction
+        post-tokens value from the live total.
+        """
+
+        read = getattr(client, "get_context_usage", None)
+        if not callable(read):
+            self._mark_context_usage_unavailable("context usage not supported")
+            return
+        try:
+            usage = await read()
+        except Exception as error:
+            self._mark_context_usage_unavailable(f"context usage failed: {type(error).__name__}")
+            self._log(
+                "telemetry_context_usage_failed",
+                f"reason={reason}; error={type(error).__name__}",
+                level="WARNING",
+            )
+            return
+        if not isinstance(usage, Mapping):
+            self._mark_context_usage_unavailable("context usage failed: bad response")
+            return
+        basis = _context_window_basis()
+        raw_max = _as_non_negative_int(usage.get("rawMaxTokens"))
+        max_tokens = _as_non_negative_int(usage.get("maxTokens"))
+        window = raw_max if raw_max is not None else max_tokens
+        threshold = _as_non_negative_int(usage.get("autoCompactThreshold"))
+        if window is None:
+            self._context_window = None
+            self._context_window_basis = "unavailable"
+            self._context_window_reason = "context usage missing window"
+        else:
+            self._context_window = window
+            self._context_window_basis = basis
+            self._context_window_reason = None
+        if threshold is None:
+            self._auto_compact_threshold = None
+            self._auto_compact_threshold_basis = "unavailable"
+            self._auto_compact_threshold_reason = "context usage missing threshold"
+        else:
+            self._auto_compact_threshold = threshold
+            self._auto_compact_threshold_basis = basis
+            self._auto_compact_threshold_reason = None
+        total = _as_non_negative_int(usage.get("totalTokens"))
+        if (
+            total is not None
+            and self._compaction_last is not None
+            and self._compaction_last.get("post_tokens") is None
+        ):
+            self._compaction_last["post_tokens"] = total
+
+    def _mark_context_usage_unavailable(self, reason: str) -> None:
+        """Mark the window and threshold unavailable without touching the attempt.
+
+        A previous successful reading is kept: a failed re-read after a
+        compaction must not discard the window the session start observed.
+        """
+
+        if self._context_window_basis not in CONTEXT_WINDOW_BASES:
+            self._context_window = None
+            self._context_window_basis = "unavailable"
+            self._context_window_reason = reason
+        if self._auto_compact_threshold_basis not in CONTEXT_WINDOW_BASES:
+            self._auto_compact_threshold = None
+            self._auto_compact_threshold_basis = "unavailable"
+            self._auto_compact_threshold_reason = reason
 
     def _record_cli_session_id(self, message: object) -> None:
         """Latch the CLI session id from the init message or any sessioned message.
@@ -927,6 +1066,17 @@ class ModelExecutor:
         self._ensure_ledger_thread(
             tool_use_id, subagent_type=subagent_type, prompt_chars=len(prompt)
         )
+        info = self._subagent_info.get(tool_use_id)
+        if info is None:
+            self._subagent_info[tool_use_id] = {
+                "type": subagent_type if isinstance(subagent_type, str) and subagent_type else "unknown",
+                "running": True,
+            }
+            self._subagent_order.append(tool_use_id)
+        else:
+            info["running"] = True
+            if isinstance(subagent_type, str) and subagent_type:
+                info["type"] = subagent_type
 
     def _track_subagent_seen(self, hook_input: Any) -> None:
         """Remember a subagent id seen before the soft-threshold crossing.
@@ -1049,6 +1199,7 @@ class ModelExecutor:
         try:
             async with client:
                 await client.connect(f"/implement\n\n{issue_body}")
+                await self._refresh_context_usage(client, reason="session_start")
                 try:
                     async with asyncio.timeout(self._config.model_timeout):
                         terminal, observed_models = await self._receive_terminal(client)
@@ -1550,6 +1701,8 @@ class ModelExecutor:
                 if isinstance(message, SystemMessage) and message.subtype == "compact_boundary":
                     self._log_context_compacted(message)
                     self._arm_handoff_reinject_after_compaction()
+                    await self._refresh_context_usage(client, reason="compaction")
+                    self._publish_attempt_view()
                 had_pending_background = bool(background_pending)
                 if self._observe_background_task(
                     message, background_pending, background_finished
@@ -1806,6 +1959,9 @@ class ModelExecutor:
             # with its own reading.
             if tool_use_id != thread_id and self._ledger.has_thread(tool_use_id):
                 self._settle_thread_and_log(tool_use_id)
+            info = self._subagent_info.get(tool_use_id)
+            if info is not None:
+                info["running"] = False
         self._ledger.observe_input(thread_id, _content_chars(getattr(message, "content", "")))
         self._after_ledger_update(thread_id)
 
@@ -1995,9 +2151,9 @@ class ModelExecutor:
         the effective soft threshold at the main thread's latest context,
         measured per-category tokens over all threads, main-thread turns,
         the main-thread cache hit rate with its measured-response count,
-        and elapsed seconds. No USD figure is included. The result is
-        deeply immutable: the nested ``tokens_by_category`` mapping is
-        frozen too, so the caller only needs the top-level
+        context-window/compaction/subagent figures, and elapsed seconds.
+        No USD figure is included. The result is deeply immutable: nested
+        mappings are frozen too, so the caller only needs the top-level
         ``MappingProxyType`` wrap before publishing.
         """
 
@@ -2022,6 +2178,9 @@ class ModelExecutor:
                 None if crossed_at is None else _format_timestamp(crossed_at)
             ),
             "main_context_basis": self._ledger.main_context_basis(),
+            "main_context_tokens": self._latest_main_context_tokens(),
+            "main_peak_context_tokens": float(self._ledger.peak_main_context_tokens),
+            "main_peak_context_basis": self._ledger.peak_main_context_basis(),
             "tokens_by_category": MappingProxyType(dict(self._ledger.measured_by_category)),
             "turns": (
                 self._ledger.response_count("main")
@@ -2031,7 +2190,52 @@ class ModelExecutor:
             "cache_hit_rate": self._ledger.main_hit_rate(),
             "cache_counted": self._ledger.main_measured_response_count,
             "elapsed_seconds": self._elapsed_seconds(),
+            "context_window": self._context_window,
+            "context_window_basis": self._context_window_basis,
+            "context_window_reason": self._context_window_reason,
+            "auto_compact_threshold": self._auto_compact_threshold,
+            "auto_compact_threshold_basis": self._auto_compact_threshold_basis,
+            "auto_compact_threshold_reason": self._auto_compact_threshold_reason,
+            "compaction_count": self._compaction_count,
+            "compaction_last": (
+                None
+                if self._compaction_last is None
+                else MappingProxyType(dict(self._compaction_last))
+            ),
+            "subagents": tuple(
+                MappingProxyType(dict(entry)) for entry in self._telemetry_subagents()
+            ),
         }
+
+    def _telemetry_subagents(self) -> list[dict[str, Any]]:
+        """Live subagent readings for one telemetry publication, running first.
+
+        Each entry carries the ledger thread's current context with its
+        running flag; the reporter tags the context ``estimated`` and caps
+        the list at 20. Newest launches come first within each running
+        group so a fresh running subagent is never trimmed before an old
+        finished one.
+        """
+
+        try:
+            contexts = self._ledger.thread_contexts()
+        except Exception:
+            contexts = {}
+        running: list[dict[str, Any]] = []
+        finished: list[dict[str, Any]] = []
+        for thread_id in reversed(self._subagent_order):
+            info = self._subagent_info.get(thread_id)
+            if info is None:
+                continue
+            entry = {
+                "id": thread_id,
+                "type": info.get("type", "unknown"),
+                "context": float(contexts.get(thread_id, 0.0)),
+                "running": bool(info.get("running", False)),
+            }
+            (running if entry["running"] else finished).append(entry)
+        ordered = running + finished
+        return ordered[:MAX_TELEMETRY_SUBAGENTS]
 
     def _publish_attempt_view(self) -> None:
         """Publish one immutable attempt view; a failure never affects the attempt.
