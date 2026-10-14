@@ -46,6 +46,9 @@ from simple_coding_agent.completion import (
     ReviewEvidence,
     VerificationOrderError,
     VerificationRunner,
+    _build_baseline_failure_section,
+    _select_failed_command,
+    deferred_baseline_failed_reason,
     final_check_dirty_reason,
 )
 from simple_coding_agent.config import RepositoryProfile
@@ -589,6 +592,36 @@ class ModelAttemptRunner:
                 commits = self._workspace.commits_added(prepared)
             execution = replace(execution, status=ModelExecutionStatus.HANDOFF_REQUESTED)
         commit_count = len(commits)
+        # A red deferred baseline means the same gate the final check runs
+        # already failed on this tree after conflict resolution, with no new
+        # work in between: running the final check would only fail the same
+        # way. The attempt ends incomplete with a named reason instead, and
+        # the next round starts by making the check pass. This applies only
+        # when model execution succeeded with commits (when the final check
+        # would have run); handoff, limit, setup-failure, and no-change paths
+        # keep their current behavior.
+        deferred_baseline: object | None = None
+        if (
+            setup_deferred
+            and preparation is not None
+            and preparation.baseline is not None
+            and not preparation.baseline.succeeded
+            and execution.status is ModelExecutionStatus.SUCCEEDED
+            and commits
+        ):
+            deferred_baseline = preparation.baseline
+        if deferred_baseline is not None:
+            deferred_reason = deferred_baseline_failed_reason(deferred_baseline)
+            self._event_log(
+                "deferred_baseline_failed",
+                deferred_reason,
+                level="ERROR",
+                issue_number=claim.issue.number,
+            )
+            if archive is not None:
+                archive.write_attempt(
+                    {"deferred_baseline_failed": {"reason": deferred_reason}}
+                )
         review_count = sum(
             event.name == "code-review" and event.phase == "PreToolUse"
             for event in execution.skill_events
@@ -596,7 +629,7 @@ class ModelAttemptRunner:
         review_cycles = max(0, review_count - 1)
         review = ReviewEvidence((), review_cycles)
         final_check = None
-        if execution.status is ModelExecutionStatus.SUCCEEDED and commits:
+        if execution.status is ModelExecutionStatus.SUCCEEDED and commits and deferred_baseline is None:
             try:
                 self._verifier.mark_review_complete(
                     model_status=execution.status, commit_count=len(commits), review=review
@@ -691,6 +724,7 @@ class ModelAttemptRunner:
                 final_check=final_check,
                 continuation=continuation,
                 final_check_dirty_paths=final_check_dirty_paths,
+                deferred_baseline_failed=deferred_baseline is not None,
             )
         except TypeError:
             decision = self._evaluator.evaluate(
@@ -704,7 +738,21 @@ class ModelAttemptRunner:
                 review=review,
                 final_check=final_check,
             )
-            if final_check_dirty_paths:
+            if deferred_baseline is not None:
+                # An older evaluator without the deferred-baseline seam: apply
+                # the same incomplete decision here so the attempt still ends
+                # with the named reason instead of the generic final-check one.
+                decision = CompletionDecision(
+                    outcome=AttemptOutcome.INCOMPLETE,
+                    publication_eligible=False,
+                    publication_path=(
+                        PublicationPath.PARTIAL if commit_count > 0 else PublicationPath.NONE
+                    ),
+                    reasons=(
+                        deferred_baseline_failed_reason(deferred_baseline),
+                    ),
+                )
+            elif final_check_dirty_paths:
                 # An older evaluator without the dirtied-workspace seam: apply
                 # the same incomplete decision here so the attempt still stops
                 # before publication.
@@ -4510,21 +4558,6 @@ def _log_completion_decision(
     )
 
 
-def _select_failed_command(result: object):
-    """Return the command execution the failure detail blames.
-
-    The first command with a non-zero exit wins; when every command exited
-    cleanly (a timeout leaves the trailing command with ``exit_code None``)
-    the last command is blamed instead. ``None`` means no command ran.
-    """
-
-    commands = getattr(result, "commands", ())
-    failed = next((command for command in commands if getattr(command, "exit_code", 0) != 0), None)
-    if failed is None and commands:
-        failed = commands[-1]
-    return failed
-
-
 def _command_failure_detail(result: object, *, limit: int = 4000) -> str:
     """Surface the failing command and its stderr for the live event stream."""
 
@@ -4623,62 +4656,6 @@ def _gate_section(profile: RepositoryProfile, redactions: Sequence[str]) -> str:
             str(redacted_instructions),
         ]
     return "\n".join(lines)
-
-
-#: Per-stream cap for baseline failure output quoted in the model starting
-#: prompt. Matches the scale of the event-detail limit: bounded, but enough
-#: for the model to diagnose the failure. Output is cut from the front so the
-#: tail (usually the summary a linter prints last) survives.
-_BASELINE_PROMPT_STREAM_LIMIT = 4000
-
-
-def _tail_stream(output: object, *, limit: int = _BASELINE_PROMPT_STREAM_LIMIT) -> str:
-    """Keep the end of a command stream, marking front-truncation visibly."""
-
-    text = output if isinstance(output, str) else (output or "")
-    if not text.strip():
-        return "(no output)"
-    if len(text) <= limit:
-        return text
-    return f"...[truncated; showing the last {limit} characters]\n{text[-limit:]}"
-
-
-def _build_baseline_failure_section(baseline: object) -> str:
-    """Render a red pre-model baseline for the continuation starting prompt.
-
-    The baseline output is already credential-scrubbed by the command runner;
-    this only selects and bounds what the model sees. Both streams are quoted:
-    linters such as ``php-cs-fixer --dry-run --diff`` report on stdout, so
-    stderr alone is not enough to diagnose the failure.
-    """
-
-    header = (
-        "## Baseline check failure (fix before finishing)\n\n"
-        "The baseline check — the same gate the final check uses — failed on the "
-        "current branch before this attempt started"
-    )
-    instruction = (
-        "This failure most likely comes from the earlier attempt's own commits on "
-        "this branch. You must pass this check before the work is considered done: "
-        "fix the underlying failure as part of this attempt rather than working "
-        "around it."
-    )
-    failed = _select_failed_command(baseline)
-    if failed is None:
-        return f"{header} (it timed out before any command ran).\n\n{instruction}"
-    command = getattr(failed, "command", "")
-    if getattr(failed, "timed_out", False) or getattr(failed, "exit_code", None) is None:
-        result = "timed out"
-    else:
-        result = f"exit {getattr(failed, 'exit_code', None)}"
-    return (
-        f"{header}: `{command}` ({result}).\n\n"
-        f"{instruction}\n\n"
-        "Failing command stdout (tail):\n"
-        f"```\n{_tail_stream(getattr(failed, 'stdout', ''))}\n```\n\n"
-        "Failing command stderr (tail):\n"
-        f"```\n{_tail_stream(getattr(failed, 'stderr', ''))}\n```"
-    )
 
 
 def _build_starting_prompt(

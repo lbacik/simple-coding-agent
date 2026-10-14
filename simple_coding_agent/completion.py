@@ -73,6 +73,115 @@ def final_check_dirty_reason(paths: Sequence[str]) -> str:
     )
 
 
+def deferred_baseline_failed_reason(baseline: object | None) -> str:
+    """The incomplete reason for a baseline that stayed red after conflict resolution.
+
+    When setup was deferred past unresolved rebase conflicts, the baseline
+    check runs only after the model resolved them and its session has ended.
+    A red deferred baseline ends the attempt ``incomplete`` (the final check
+    would rerun the same gate on the same tree), and the next round must
+    start by making the check pass on the resolved branch. The failure detail
+    keeps the same form as the pre-model baseline-failure prompt section, so
+    the two read consistently when both reach the next round.
+    """
+
+    return (
+        "The rebase conflicts were resolved, but the baseline check run after"
+        " the resolution failed; the next round must start by making the check"
+        " pass on the resolved branch.\n\n"
+        + _build_baseline_failure_section(baseline, after_conflict_resolution=True)
+    )
+
+
+def _select_failed_command(result: object):
+    """Return the command execution the failure detail blames.
+
+    The first command with a non-zero exit wins; when every command exited
+    cleanly (a timeout leaves the trailing command with ``exit_code None``)
+    the last command is blamed instead. ``None`` means no command ran.
+    """
+
+    commands = getattr(result, "commands", ())
+    failed = next((command for command in commands if getattr(command, "exit_code", 0) != 0), None)
+    if failed is None and commands:
+        failed = commands[-1]
+    return failed
+
+
+#: Per-stream cap for baseline failure output quoted in the model starting
+#: prompt. Matches the scale of the event-detail limit: bounded, but enough
+#: for the model to diagnose the failure. Output is cut from the front so the
+#: tail (usually the summary a linter prints last) survives.
+_BASELINE_PROMPT_STREAM_LIMIT = 4000
+
+
+def _tail_stream(output: object, *, limit: int = _BASELINE_PROMPT_STREAM_LIMIT) -> str:
+    """Keep the end of a command stream, marking front-truncation visibly."""
+
+    text = output if isinstance(output, str) else (output or "")
+    if not text.strip():
+        return "(no output)"
+    if len(text) <= limit:
+        return text
+    return f"...[truncated; showing the last {limit} characters]\n{text[-limit:]}"
+
+
+def _build_baseline_failure_section(
+    baseline: object, *, after_conflict_resolution: bool = False
+) -> str:
+    """Render a red baseline for the continuation starting prompt.
+
+    The baseline output is already credential-scrubbed by the command runner;
+    this only selects and bounds what the model sees. Both streams are quoted:
+    linters such as ``php-cs-fixer --dry-run --diff`` report on stdout, so
+    stderr alone is not enough to diagnose the failure.
+
+    The ``after_conflict_resolution`` form describes a deferred baseline that
+    failed on the resolved branch (used by
+    :func:`deferred_baseline_failed_reason`); the default form describes a
+    pre-model baseline that failed before the attempt started.
+    """
+
+    header = "## Baseline check failure (fix before finishing)\n\n"
+    if after_conflict_resolution:
+        header += (
+            "The baseline check — the same gate the final check uses — failed"
+            " on the resolved branch after the rebase conflicts were resolved"
+        )
+        instruction = (
+            "The conflicts are resolved, so the next round must start by making"
+            " this check pass on the resolved branch: fix the underlying"
+            " failure as part of that attempt rather than working around it."
+        )
+    else:
+        header += (
+            "The baseline check — the same gate the final check uses — failed on the "
+            "current branch before this attempt started"
+        )
+        instruction = (
+            "This failure most likely comes from the earlier attempt's own commits on "
+            "this branch. You must pass this check before the work is considered done: "
+            "fix the underlying failure as part of this attempt rather than working "
+            "around it."
+        )
+    failed = _select_failed_command(baseline)
+    if failed is None:
+        return f"{header} (it timed out before any command ran).\n\n{instruction}"
+    command = getattr(failed, "command", "")
+    if getattr(failed, "timed_out", False) or getattr(failed, "exit_code", None) is None:
+        result = "timed out"
+    else:
+        result = f"exit {getattr(failed, 'exit_code', None)}"
+    return (
+        f"{header}: `{command}` ({result}).\n\n"
+        f"{instruction}\n\n"
+        "Failing command stdout (tail):\n"
+        f"```\n{_tail_stream(getattr(failed, 'stdout', ''))}\n```\n\n"
+        "Failing command stderr (tail):\n"
+        f"```\n{_tail_stream(getattr(failed, 'stderr', ''))}\n```"
+    )
+
+
 @dataclass(frozen=True)
 class CompletionDecision:
     """Outcome or eligibility evidence for the publisher-owned final operations."""
@@ -175,6 +284,7 @@ class CompletionEvaluator:
         profile_error: ProfileError | None = None,
         continuation: bool = False,
         final_check_dirty_paths: Sequence[str] | None = None,
+        deferred_baseline_failed: bool = False,
     ) -> CompletionDecision:
         """Classify observed evidence; a local pass is eligibility, not completion."""
 
@@ -254,6 +364,20 @@ class CompletionEvaluator:
         if commit_count < 0:
             return _decision(
                 AttemptOutcome.INFRASTRUCTURE_ERROR, "Commit count is invalid.", commit_count
+            )
+        if (
+            deferred_baseline_failed
+            and model_status is ModelExecutionStatus.SUCCEEDED
+            and commit_count > 0
+        ):
+            # Setup was deferred past unresolved rebase conflicts, so the
+            # baseline ran only after the model resolved them: the final check
+            # would rerun the same gate on the same tree, and the next round
+            # must start by making it pass.
+            return _decision(
+                AttemptOutcome.INCOMPLETE,
+                deferred_baseline_failed_reason(baseline),
+                commit_count,
             )
         if not acceptance_criteria_satisfied:
             return _decision(
