@@ -58,7 +58,10 @@ synthetic examples under `examples/telemetry/` are the conformance target.
   `finished_at`, `budget_used`, `turns`, `pull_request: {number, url} |
   null`) is held in memory, updated at finalisation, and seeded at startup
   from disk, so it survives restarts. It is shown alongside `current_attempt`
-  too.
+  too. Its `budget_used` and `turns` figures use the `measured` basis (or
+  `unavailable` when no token budget was reported); archives written before
+  the title and pull-request fields existed seed an `"unknown"` title and a
+  null pull request.
 - `recent_events` is the last up to 50 redacted log events, newest last, each
   `{timestamp, level, event, issue_number, phase, text}` with `text` truncated
   to 300 characters. High-volume `limits_checked` and `tool_call` events are
