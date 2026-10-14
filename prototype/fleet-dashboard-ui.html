@@ -1,0 +1,570 @@
+<!doctype html>
+<!--
+  PROTOTYPE, throw away. Answers map #222 ticket #227:
+  "What should the fleet overview and the single-instance detail look like,
+   and which signals deserve prominence?"
+
+  Three structurally different variants of the agent fleet dashboard,
+  switchable via ?variant=A|B|C and the floating bottom bar (or the arrow keys).
+  All data is mocked in memory; a 3 s timer simulates the dashboard's poll of
+  `docker exec <id> agentctl telemetry --json`. Nothing here is the real
+  snapshot contract: the mock shape is a strawman for
+  "Define the telemetry snapshot contract" (#224). Fields the agent does not
+  expose today are listed in the "contract notes" panel (button in the bar).
+
+  Run: open prototype/fleet-dashboard-ui.html in a browser.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Fleet Dashboard Prototype</title>
+<style>
+  :root {
+    --bg: #f6f7f9; --panel: #ffffff; --ink: #1d2330; --muted: #6b7385; --line: #e2e5ea;
+    --ok: #1f9d55; --warn: #c98a00; --bad: #d64545; --info: #2f6fd6; --idle: #8a93a6;
+    --soft: #c98a00; --hard: #d64545; --track: #eceef2;
+    --mono: ui-monospace, SFMono-Regular, Menlo, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #12151b; --panel: #1a1f27; --ink: #e6e9ef; --muted: #8d96a8; --line: #2a313c;
+      --track: #262c36;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--ink); font: 14px/1.4 system-ui, -apple-system, sans-serif; padding-bottom: 80px; }
+  h1, h2, h3 { margin: 0; font-weight: 600; }
+  .mono { font-family: var(--mono); }
+  .muted { color: var(--muted); }
+  .small { font-size: 12px; }
+  .pill { display: inline-block; padding: 1px 8px; border-radius: 999px; font-size: 12px; font-weight: 600; white-space: nowrap; }
+  .pill.ok { background: color-mix(in srgb, var(--ok) 15%, transparent); color: var(--ok); }
+  .pill.warn { background: color-mix(in srgb, var(--warn) 18%, transparent); color: var(--warn); }
+  .pill.bad { background: color-mix(in srgb, var(--bad) 15%, transparent); color: var(--bad); }
+  .pill.info { background: color-mix(in srgb, var(--info) 15%, transparent); color: var(--info); }
+  .pill.idle { background: color-mix(in srgb, var(--idle) 18%, transparent); color: var(--idle); }
+  .prov { font-size: 10px; font-weight: 700; vertical-align: super; margin-left: 2px; color: var(--muted); cursor: help; }
+  .prov.E { color: var(--warn); }
+  .unavail { color: var(--muted); font-style: italic; }
+  .bar { position: relative; height: 10px; background: var(--track); border-radius: 5px; overflow: visible; }
+  .bar .fill { position: absolute; left: 0; top: 0; bottom: 0; border-radius: 5px; }
+  .bar .fill.est { background-image: repeating-linear-gradient(45deg, transparent 0 4px, rgba(255,255,255,.35) 4px 8px); }
+  .bar .tick { position: absolute; top: -3px; bottom: -3px; width: 2px; }
+  .bar .tick.soft { background: var(--soft); }
+  .bar .tick.hard { background: var(--hard); right: 0; }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; }
+  button { font: inherit; }
+
+  /* ---------- floating switcher (not part of the design under test) ---------- */
+  #switcher { position: fixed; left: 50%; bottom: 16px; transform: translateX(-50%); z-index: 100;
+    display: flex; align-items: center; gap: 6px; padding: 6px 8px; border-radius: 999px;
+    background: #111; color: #fff; box-shadow: 0 6px 24px rgba(0,0,0,.35); font: 13px system-ui; }
+  #switcher button { background: #333; color: #fff; border: 0; border-radius: 999px; padding: 4px 10px; cursor: pointer; }
+  #switcher button:hover { background: #555; }
+  #switcher .label { padding: 0 8px; min-width: 210px; text-align: center; }
+  #overlay { position: fixed; right: 16px; bottom: 70px; width: min(560px, calc(100vw - 32px)); max-height: 70vh; overflow: auto;
+    z-index: 99; background: #111; color: #e8e8e8; border-radius: 10px; padding: 12px 14px; font: 12px/1.45 var(--mono);
+    box-shadow: 0 6px 24px rgba(0,0,0,.35); display: none; white-space: pre-wrap; }
+  #overlay.open { display: block; }
+  #overlay h4 { margin: 0 0 6px; font: 600 13px system-ui; color: #fff; }
+
+  /* ---------- Variant A: ops table + detail drawer ---------- */
+  .A-wrap { display: grid; grid-template-columns: 1fr; }
+  .A-wrap.with-drawer { grid-template-columns: 1fr 460px; }
+  .A-head { display: flex; align-items: baseline; gap: 16px; padding: 14px 20px; border-bottom: 1px solid var(--line); background: var(--panel); }
+  .A-table { width: 100%; border-collapse: collapse; background: var(--panel); }
+  .A-table th { text-align: left; font-size: 11px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); padding: 8px 10px; border-bottom: 1px solid var(--line); position: sticky; top: 0; background: var(--panel); }
+  .A-table td { padding: 8px 10px; border-bottom: 1px solid var(--line); vertical-align: middle; }
+  .A-table tr { cursor: pointer; }
+  .A-table tr:hover td { background: color-mix(in srgb, var(--info) 6%, transparent); }
+  .A-table tr.sel td { background: color-mix(in srgb, var(--info) 12%, transparent); }
+  .A-table tr.offline td { opacity: .6; }
+  .A-drawer { border-left: 1px solid var(--line); background: var(--panel); padding: 16px 18px; min-height: calc(100vh - 50px); position: sticky; top: 0; align-self: start; max-height: 100vh; overflow: auto; }
+  .A-drawer section { margin-top: 16px; }
+  .A-drawer h3 { font-size: 12px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); margin-bottom: 6px; }
+  .kv { display: grid; grid-template-columns: 150px 1fr; gap: 3px 10px; font-size: 13px; }
+  .kv dt { color: var(--muted); }
+  .kv dd { margin: 0; }
+  .ev { font-size: 12px; display: grid; grid-template-columns: 62px 1fr; gap: 6px; padding: 3px 0; border-bottom: 1px dashed var(--line); }
+  .ev .lvl-warning { color: var(--warn); }
+  .ev .lvl-error { color: var(--bad); }
+
+  /* ---------- Variant B: attention-sorted budget lanes ---------- */
+  .B-wrap { max-width: 1200px; margin: 0 auto; padding: 18px 20px; }
+  .B-group { margin-top: 22px; }
+  .B-group > h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); margin-bottom: 8px; }
+  .B-lane { display: grid; grid-template-columns: 230px 1fr 170px; gap: 18px; align-items: center; padding: 14px 16px; margin-bottom: 8px; cursor: pointer; border-left: 4px solid var(--idle); }
+  .B-lane.attn-bad { border-left-color: var(--bad); }
+  .B-lane.attn-warn { border-left-color: var(--warn); }
+  .B-lane.attn-ok { border-left-color: var(--ok); }
+  .B-track { position: relative; height: 26px; background: var(--track); border-radius: 6px; }
+  .B-track .fill { position: absolute; left: 0; top: 0; bottom: 0; border-radius: 6px; }
+  .B-track .soft { position: absolute; top: -5px; bottom: -5px; width: 2px; background: var(--soft); }
+  .B-track .soft::after { content: 'soft'; position: absolute; top: -14px; left: -10px; font-size: 10px; color: var(--soft); }
+  .B-track .lbl { position: absolute; left: 8px; top: 4px; font-size: 12px; font-weight: 600; color: var(--ink); mix-blend-mode: normal; }
+  .B-ctx { margin-top: 6px; }
+  .B-phases { display: flex; gap: 4px; margin-top: 8px; font-size: 11px; color: var(--muted); }
+  .B-phases span { padding: 1px 6px; border-radius: 4px; border: 1px solid var(--line); }
+  .B-phases span.done { color: var(--ink); }
+  .B-phases span.cur { background: var(--info); color: #fff; border-color: var(--info); }
+  .B-expand { grid-column: 1 / -1; display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 18px; border-top: 1px solid var(--line); padding-top: 12px; margin-top: 4px; }
+  .B-reason { font-size: 13px; font-weight: 600; }
+
+  /* ---------- Variant C: inbox + focus cockpit ---------- */
+  .C-wrap { display: grid; grid-template-columns: 290px 1fr; min-height: 100vh; }
+  .C-side { border-right: 1px solid var(--line); background: var(--panel); overflow: auto; }
+  .C-summary { display: flex; gap: 6px; flex-wrap: wrap; padding: 12px; border-bottom: 1px solid var(--line); }
+  .C-item { padding: 10px 12px; border-bottom: 1px solid var(--line); cursor: pointer; display: grid; grid-template-columns: 14px 1fr; gap: 8px; }
+  .C-item.sel { background: color-mix(in srgb, var(--info) 12%, transparent); }
+  .C-dot { width: 10px; height: 10px; border-radius: 50%; margin-top: 4px; }
+  .C-main { padding: 18px 24px; overflow: auto; }
+  .C-big { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin-top: 14px; }
+  .C-big .card { padding: 12px 14px; }
+  .C-big .num { font-size: 26px; font-weight: 700; }
+  .C-grid { display: grid; grid-template-columns: 1.4fr 1fr; gap: 14px; margin-top: 14px; }
+  .C-grid .card { padding: 14px; }
+  .C-grid h3 { font-size: 12px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); margin-bottom: 8px; }
+  .C-tl { border-left: 2px solid var(--line); margin-left: 6px; padding-left: 12px; }
+  .C-tl .e { position: relative; padding: 4px 0 8px; font-size: 13px; }
+  .C-tl .e::before { content: ''; position: absolute; left: -18px; top: 9px; width: 10px; height: 10px; border-radius: 50%; background: var(--idle); }
+  .C-tl .e.warning::before { background: var(--warn); }
+  .C-tl .e.error::before { background: var(--bad); }
+  .C-ctrl button { margin: 0 6px 6px 0; padding: 5px 10px; border-radius: 6px; border: 1px solid var(--line); background: var(--panel); color: var(--muted); cursor: not-allowed; }
+  svg.spark { width: 100%; height: 110px; display: block; }
+</style>
+</head>
+<body>
+<div id="app"></div>
+<div id="overlay"></div>
+<div id="switcher">
+  <button id="prev" title="previous variant (←)">◀</button>
+  <span class="label" id="vlabel"></span>
+  <button id="next" title="next variant (→)">▶</button>
+  <button id="btn-snap" title="raw mock snapshot of the selected instance">{ } snapshot</button>
+  <button id="btn-notes" title="fields this mock assumes that the agent does not expose today">contract notes</button>
+</div>
+
+<script>
+// ---------------------------------------------------------------------------
+// Mock fleet. Shape = strawman telemetry snapshot (see contract notes).
+// ---------------------------------------------------------------------------
+const MAX_BUDGET = 4_000_000;
+const WINDOW = 1_048_576;          // configured, not measured (research #223)
+const PHASES = ['claimed', 'setup', 'model_running', 'pushing', 'publishing'];
+const now = () => Date.now();
+const iso = (msAgo) => new Date(now() - msAgo).toISOString();
+
+function telemetry({ budget, measuredShare = 0.92, ctx, peak, subagents = [], turns, hit, softRule = 'percentage', softAt = null, cont = 0 }) {
+  const soft = softRule === 'percentage' ? 3_200_000 : MAX_BUDGET - 4 * ctx;
+  const measured = Math.round(budget * measuredShare);
+  return {
+    attempt_id: 'att-' + Math.random().toString(16).slice(2, 10),
+    continuation: cont,
+    budget: {
+      used_tokens: budget, measured_tokens: measured, estimated_tokens: budget - measured,
+      provenance: measuredShare >= 1 ? 'measured' : 'mixed',
+      max_budget_tokens: MAX_BUDGET, hard_ceiling_tokens: MAX_BUDGET,
+      soft_threshold_tokens: soft, soft_threshold_rule: softRule, soft_threshold_crossed_at: softAt,
+      max_budget_usd: 20, cost_usd_estimate: +(budget * 0.0000021).toFixed(2),
+    },
+    tokens_by_category: {
+      provenance: 'measured',
+      input_tokens: Math.round(measured * 0.04), cache_read_input_tokens: Math.round(measured * hit * 0.9),
+      cache_creation_input_tokens: Math.round(measured * (1 - hit) * 0.85), output_tokens: Math.round(measured * 0.03),
+    },
+    context: {
+      main_tokens: ctx, main_provenance: 'measured', peak_main_tokens: peak,
+      window_tokens: WINDOW, window_provenance: 'configured',
+      subagents: subagents.map(([type, tokens]) => ({ type, tokens, provenance: 'estimated' })),
+    },
+    turns, cache_hit_rate: hit,
+  };
+}
+
+const FLEET = [
+  { name: 'sca-billing', id: 'c1a9e0f2b7d4', running: true, fetch: { ok: true, age: 1 },
+    snap: { agent_version: '0.4.4', repository: 'acme/billing-service', intake: 'running',
+      active_attempt: { issue_number: 318, issue_title: 'Split invoice renderer per locale', branch: 'agent/issue-318', phase: 'model_running', started_at: iso(52 * 60e3) },
+      handoff: { phase: 'delivering', model_deadline_at: iso(-180e3) }, stop_plan: null, recovery: null, consecutive_errors: { count: 0, max: 3 },
+      telemetry: telemetry({ budget: 3_310_000, ctx: 412_000, peak: 455_000, subagents: [], turns: 141, hit: 0.88, softAt: iso(4 * 60e3) }),
+      events: [['warning', 'token_soft_threshold_crossed', 'soft threshold crossed at 3.20M; handoff context injected', 4], ['info', 'token_soft_threshold_subagents_stopped', '2 subagents stopped', 4], ['info', 'compact_boundary', 'auto compaction 702K → 188K', 19], ['info', 'limits_checked', 'budget 2.71M / soft 3.20M', 21], ['info', 'attempt_phase_transitioned', 'setup → model_running', 51]],
+      last_finished: { issue_number: 301, outcome: 'pr_opened', tokens: 2_140_000, finished_at: iso(140 * 60e3), pr: 'acme/billing-service#305' } } },
+
+  { name: 'sca-webshop', id: '7e33d1aa0c19', running: true, fetch: { ok: true, age: 2 },
+    snap: { agent_version: '0.4.4', repository: 'acme/webshop', intake: 'running',
+      active_attempt: { issue_number: 412, issue_title: 'Add cart expiry after 30 days of inactivity', branch: 'agent/issue-412', phase: 'model_running', started_at: iso(23 * 60e3) },
+      handoff: null, stop_plan: null, recovery: null, consecutive_errors: { count: 0, max: 3 },
+      telemetry: telemetry({ budget: 1_460_000, measuredShare: 0.81, ctx: 168_000, peak: 171_000, subagents: [['Explore', 46_000], ['general-purpose', 23_500]], turns: 58, hit: 0.93 }),
+      events: [['info', 'limits_checked', 'budget 1.43M / soft 3.20M', 0], ['info', 'model_response', 'Task → Explore (subagent started)', 2], ['info', 'attempt_phase_transitioned', 'setup → model_running', 22], ['info', 'issue_claimed', '#412 claimed', 23]],
+      last_finished: { issue_number: 405, outcome: 'merged', tokens: 980_000, finished_at: iso(70 * 60e3), pr: 'acme/webshop#409' } } },
+
+  { name: 'sca-infra', id: '55b0c7e9a812', running: true, fetch: { ok: true, age: 0 },
+    snap: { agent_version: '0.4.4', repository: 'acme/infra', intake: 'stopping',
+      active_attempt: { issue_number: 77, issue_title: 'Pin terraform provider versions', branch: 'agent/issue-77', phase: 'publishing', started_at: iso(31 * 60e3) },
+      handoff: null, stop_plan: { kind: 'stop_after', requested: 2, remaining: 1, includes_active_attempt: true }, recovery: null, consecutive_errors: { count: 0, max: 3 },
+      telemetry: telemetry({ budget: 890_000, measuredShare: 1, ctx: 96_000, peak: 121_000, turns: 37, hit: 0.95 }),
+      events: [['info', 'attempt_phase_transitioned', 'pushing → publishing', 0], ['info', 'model_execution_finished', 'completed, 37 turns', 1], ['info', 'command', 'stop --after 2 accepted (1 remaining)', 44]],
+      last_finished: { issue_number: 75, outcome: 'merged', tokens: 610_000, finished_at: iso(36 * 60e3), pr: 'acme/infra#76' } } },
+
+  { name: 'sca-mobile', id: '0d4f2b6c9e71', running: true, fetch: { ok: true, age: 2 },
+    snap: { agent_version: '0.4.4', repository: 'acme/mobile-app', intake: 'recovering',
+      active_attempt: null, handoff: null, stop_plan: null, consecutive_errors: { count: 1, max: 3 },
+      recovery: { issue_number: 233, attempt_id: 'att-9f02c1de', phase: 'pushing', reason: 'push rejected: remote branch moved', next_action: 'agentctl recovery retry att-9f02c1de' },
+      telemetry: null,
+      events: [['error', 'attempt_finalization_held', 'push rejected: remote branch moved', 12], ['info', 'model_execution_finished', 'completed, 88 turns', 13]],
+      last_finished: { issue_number: 233, outcome: 'held_for_recovery', tokens: 2_020_000, finished_at: iso(12 * 60e3), pr: null } } },
+
+  { name: 'sca-analytics', id: 'b2e8a4f61c03', running: true, fetch: { ok: true, age: 1 },
+    snap: { agent_version: '0.4.4', repository: 'acme/analytics', intake: 'running',
+      active_attempt: null, handoff: null, stop_plan: null, recovery: null, consecutive_errors: { count: 2, max: 3 },
+      telemetry: null,
+      events: [['info', 'polling_for_issue', 'no ready issue; next poll in 60 s', 0], ['error', 'attempt_exception', 'gateway 502 from LiteLLM', 6], ['error', 'attempt_exception', 'gateway 502 from LiteLLM', 9]],
+      last_finished: { issue_number: 58, outcome: 'infrastructure_error', tokens: 12_000, finished_at: iso(6 * 60e3), pr: null } } },
+
+  { name: 'sca-docs', id: '9a7c3e10f5b2', running: true, fetch: { ok: true, age: 2 },
+    snap: { agent_version: '0.4.4', repository: 'acme/docs', intake: 'running',
+      active_attempt: null, handoff: null, stop_plan: null, recovery: null, consecutive_errors: { count: 0, max: 3 },
+      telemetry: null,
+      events: [['info', 'polling_for_issue', 'no ready issue; next poll in 60 s', 0]],
+      last_finished: { issue_number: 140, outcome: 'merged', tokens: 430_000, finished_at: iso(5 * 3600e3), pr: 'acme/docs#141' } } },
+
+  { name: 'sca-legacy', id: '3c19ff0a7d55', running: true, fetch: { ok: true, age: 1 },
+    snap: { agent_version: '0.4.1', repository: 'acme/legacy-erp', intake: 'stopped',
+      active_attempt: null, handoff: null, stop_plan: null, recovery: null, consecutive_errors: null,
+      telemetry: undefined, events: undefined, last_finished: undefined } },   // older agent: no telemetry fields at all (version skew)
+
+  { name: 'sca-search', id: 'e40b6d2c8f17', running: true, fetch: { ok: false, age: 214, error: 'docker exec timed out after 5 s' },
+    snap: { agent_version: '0.4.4', repository: 'acme/search', intake: 'running',
+      active_attempt: { issue_number: 96, issue_title: 'Reindex on schema change', branch: 'agent/issue-96', phase: 'model_running', started_at: iso(41 * 60e3) },
+      handoff: null, stop_plan: null, recovery: null, consecutive_errors: { count: 0, max: 3 },
+      telemetry: telemetry({ budget: 2_050_000, ctx: 240_000, peak: 266_000, turns: 90, hit: 0.9 }),
+      events: [['info', 'limits_checked', 'budget 2.05M / soft 3.20M', 4]],
+      last_finished: null } },
+
+  { name: 'sca-sandbox', id: 'f81e2a9b0c44', running: false, exited: 'Exited (137) 2 hours ago', fetch: null, snap: null },
+];
+
+// in-memory history for sparklines (fog: real history/trends are out of v1)
+for (const f of FLEET) {
+  f.hist = [];
+  const t = f.snap && f.snap.telemetry;
+  if (t) for (let i = 30; i >= 0; i--) {
+    f.hist.push({ ctx: Math.max(30000, t.context.main_tokens - i * (t.context.main_tokens / 40) + (i % 7 === 0 ? 60000 : 0)), budget: Math.max(0, t.budget.used_tokens - i * 30000) });
+  }
+}
+
+// simulated poll every 3 s
+setInterval(() => {
+  for (const f of FLEET) {
+    if (!f.fetch) continue;
+    f.fetch.age += 3;
+    if (!f.fetch.ok) continue;
+    f.fetch.age = Math.floor(Math.random() * 3);
+    const t = f.snap.telemetry;
+    if (t && f.snap.active_attempt && f.snap.active_attempt.phase === 'model_running') {
+      const step = 6000 + Math.random() * 14000;
+      t.budget.used_tokens = Math.min(MAX_BUDGET, t.budget.used_tokens + step + t.context.main_tokens * 0.08);
+      t.budget.measured_tokens = Math.round(t.budget.used_tokens * 0.9);
+      t.budget.estimated_tokens = t.budget.used_tokens - t.budget.measured_tokens;
+      t.context.main_tokens += step * 0.4;
+      t.context.peak_main_tokens = Math.max(t.context.peak_main_tokens, t.context.main_tokens);
+      t.turns += Math.random() < 0.6 ? 1 : 0;
+      f.hist.push({ ctx: t.context.main_tokens, budget: t.budget.used_tokens });
+      if (f.hist.length > 60) f.hist.shift();
+    }
+  }
+  render();
+}, 3000);
+
+// ---------------------------------------------------------------------------
+// Derived signals shared by all variants
+// ---------------------------------------------------------------------------
+const k = (n) => n == null ? '—' : n >= 1e6 ? (n / 1e6).toFixed(2) + 'M' : n >= 1e3 ? Math.round(n / 1e3) + 'K' : String(Math.round(n));
+const pct = (x) => x == null ? '—' : Math.round(x * 100) + '%';
+const ago = (isoStr) => { const s = (now() - new Date(isoStr)) / 1000; return s < 0 ? 'in ' + fmtDur(-s) : fmtDur(s) + ' ago'; };
+const fmtDur = (s) => s < 90 ? Math.round(s) + 's' : s < 5400 ? Math.round(s / 60) + 'm' : (s / 3600).toFixed(1) + 'h';
+const prov = (p) => p ? `<span class="prov ${p[0].toUpperCase()}" title="${p}">${p[0].toUpperCase()}</span>` : '';
+const evAgo = (min) => min === 0 ? 'now' : min + 'm';
+
+function reach(f) {
+  if (!f.running) return { key: 'exited', label: 'not running', cls: 'idle', detail: f.exited };
+  if (!f.fetch.ok) return { key: 'unreachable', label: 'unreachable', cls: 'bad', detail: f.fetch.error + ' · showing snapshot from ' + fmtDur(f.fetch.age) + ' ago' };
+  if (f.fetch.age > 15) return { key: 'stale', label: 'stale', cls: 'warn', detail: 'snapshot ' + fmtDur(f.fetch.age) + ' old' };
+  return { key: 'live', label: 'live', cls: 'ok', detail: 'snapshot ' + f.fetch.age + 's old' };
+}
+
+// One line "what is it doing / why should I care", and an attention rank.
+function headline(f) {
+  const r = reach(f);
+  if (r.key === 'exited') return { rank: 5, cls: 'idle', group: 'Offline', text: 'Container ' + f.exited.toLowerCase() };
+  const s = f.snap;
+  if (r.key === 'unreachable') return { rank: 0, cls: 'bad', group: 'Needs attention', text: 'Unreachable: ' + f.fetch.error };
+  if (s.recovery) return { rank: 0, cls: 'bad', group: 'Needs attention', text: 'Recovery hold on #' + s.recovery.issue_number + ': ' + s.recovery.reason };
+  if (s.consecutive_errors && s.consecutive_errors.count > 0 && !s.active_attempt)
+    return { rank: 1, cls: 'warn', group: 'Needs attention', text: `${s.consecutive_errors.count}/${s.consecutive_errors.max} consecutive infrastructure errors` };
+  if (s.handoff) return { rank: 1, cls: 'warn', group: 'Needs attention', text: 'Soft threshold crossed, handoff ' + s.handoff.phase + ' on #' + s.active_attempt.issue_number };
+  const t = s.telemetry;
+  if (s.active_attempt && t && t.budget.used_tokens > t.budget.soft_threshold_tokens * 0.85)
+    return { rank: 2, cls: 'warn', group: 'Working', text: 'Approaching soft threshold on #' + s.active_attempt.issue_number };
+  if (s.active_attempt) return { rank: 3, cls: 'ok', group: 'Working', text: '#' + s.active_attempt.issue_number + ' ' + s.active_attempt.phase.replace('_', ' ') + (s.intake === 'stopping' ? ' · stopping after this' : '') };
+  if (s.intake === 'stopped') return { rank: 4, cls: 'idle', group: 'Idle', text: 'Intake stopped' };
+  return { rank: 4, cls: 'idle', group: 'Idle', text: 'Waiting for a ready issue' };
+}
+
+function budgetColor(t) {
+  const u = t.budget.used_tokens;
+  return u >= t.budget.soft_threshold_tokens ? 'var(--bad)' : u >= t.budget.soft_threshold_tokens * 0.85 ? 'var(--warn)' : 'var(--ok)';
+}
+function budgetBar(t, h) {
+  const b = t.budget, w = (x) => (100 * x / b.hard_ceiling_tokens).toFixed(1) + '%';
+  return `<div class="bar" style="height:${h || 10}px" title="${k(b.used_tokens)} used · soft ${k(b.soft_threshold_tokens)} (${b.soft_threshold_rule}) · hard ${k(b.hard_ceiling_tokens)}">
+    <div class="fill ${b.provenance !== 'measured' ? 'est' : ''}" style="width:${w(b.used_tokens)};background:${budgetColor(t)}"></div>
+    <div class="tick soft" style="left:${w(b.soft_threshold_tokens)}"></div><div class="tick hard"></div></div>`;
+}
+function ctxBar(tokens, window, color) {
+  return `<div class="bar" style="height:6px"><div class="fill" style="width:${Math.min(100, 100 * tokens / window).toFixed(1)}%;background:${color || 'var(--info)'}"></div></div>`;
+}
+const intakePill = (s) => `<span class="pill ${s.intake === 'running' ? 'ok' : s.intake === 'recovering' ? 'bad' : 'warn'}">${s.intake}</span>`;
+const noTelemetry = (f) => f.snap && f.snap.telemetry === undefined
+  ? `<span class="unavail">unavailable: agent ${f.snap.agent_version} has no telemetry</span>`
+  : `<span class="unavail">no active attempt</span>`;
+const events = (s) => s.events
+  ? s.events.map(([lvl, ev, txt, m]) => `<div class="ev"><span class="muted mono">${evAgo(m)}</span><span class="lvl-${lvl}"><span class="mono small">${ev}</span><br>${txt}</span></div>`).join('')
+  : '<span class="unavail">unavailable (agent too old)</span>';
+
+function lastFinished(s) {
+  const l = s.last_finished;
+  if (l === undefined) return '<span class="unavail">unavailable</span>';
+  if (!l) return '<span class="unavail">none since start</span>';
+  return `#${l.issue_number} · <b>${l.outcome}</b> · ${k(l.tokens)} tokens · ${ago(l.finished_at)}${l.pr ? ' · ' + l.pr : ''}`;
+}
+
+function telemetryDetail(f) {
+  const t = f.snap.telemetry;
+  if (!t) return noTelemetry(f);
+  const c = t.tokens_by_category, x = t.context;
+  return `
+    <dl class="kv">
+      <dt>budget used</dt><dd>${k(t.budget.used_tokens)}${prov(t.budget.provenance)} <span class="muted small">(${k(t.budget.measured_tokens)} measured + ${k(t.budget.estimated_tokens)} est.)</span></dd>
+      <dt>soft threshold</dt><dd>${k(t.budget.soft_threshold_tokens)} <span class="muted small">${t.budget.soft_threshold_rule} rule${t.budget.soft_threshold_crossed_at ? ' · crossed ' + ago(t.budget.soft_threshold_crossed_at) : ''}</span></dd>
+      <dt>hard ceiling</dt><dd>${k(t.budget.hard_ceiling_tokens)}</dd>
+      <dt>USD (estimate)</dt><dd>$${t.budget.cost_usd_estimate}${prov('estimated')} <span class="muted small">of $${t.budget.max_budget_usd} backstop</span></dd>
+      <dt>turns</dt><dd>${t.turns}${t.continuation ? ' <span class="muted small">(continuation ' + t.continuation + ')</span>' : ''}</dd>
+      <dt>cache hit rate</dt><dd>${pct(t.cache_hit_rate)}${prov('measured')}</dd>
+    </dl>
+    <div style="margin-top:8px">${budgetBar(t, 12)}</div>
+    <h3 style="margin-top:14px">tokens by category${prov(c.provenance)}</h3>
+    <dl class="kv"><dt>input</dt><dd>${k(c.input_tokens)}</dd><dt>cache read</dt><dd>${k(c.cache_read_input_tokens)}</dd>
+      <dt>cache creation</dt><dd>${k(c.cache_creation_input_tokens)}</dd><dt>output</dt><dd>${k(c.output_tokens)}</dd></dl>
+    <h3 style="margin-top:14px">context</h3>
+    <dl class="kv">
+      <dt>main</dt><dd>${k(x.main_tokens)}${prov(x.main_provenance)} / ${k(x.window_tokens)}${prov(x.window_provenance)} <span class="muted small">peak ${k(x.peak_main_tokens)}</span>${ctxBar(x.main_tokens, x.window_tokens)}</dd>
+      ${x.subagents.map((s) => `<dt>${s.type}</dt><dd>${k(s.tokens)}${prov(s.provenance)}${ctxBar(s.tokens, x.window_tokens, 'var(--idle)')}</dd>`).join('') || '<dt>subagents</dt><dd class="muted">none running</dd>'}
+    </dl>
+    <p class="small muted">provider rate-limit headroom: <span class="unavail">unavailable in v1</span></p>`;
+}
+
+function controlDetail(s) {
+  const a = s.active_attempt;
+  return `<dl class="kv">
+    <dt>repository</dt><dd class="mono">${s.repository}</dd>
+    <dt>agent version</dt><dd class="mono">${s.agent_version}</dd>
+    <dt>intake</dt><dd>${intakePill(s)}</dd>
+    <dt>active attempt</dt><dd>${a ? `#${a.issue_number} ${a.issue_title ? '<b>' + a.issue_title + '</b>' : ''}<br><span class="mono small">${a.branch}</span> · ${a.phase} · started ${ago(a.started_at)}` : '<span class="muted">none</span>'}</dd>
+    ${s.stop_plan ? `<dt>stop plan</dt><dd>stop after ${s.stop_plan.requested} · ${s.stop_plan.remaining} remaining</dd>` : ''}
+    ${s.handoff ? `<dt>handoff</dt><dd><span class="pill warn">${s.handoff.phase}</span> model deadline ${ago(s.handoff.model_deadline_at)}</dd>` : ''}
+    ${s.recovery ? `<dt>recovery</dt><dd><span class="pill bad">held</span> #${s.recovery.issue_number} at ${s.recovery.phase}: ${s.recovery.reason}<br><span class="mono small">${s.recovery.next_action}</span></dd>` : ''}
+    <dt>consecutive errors</dt><dd>${s.consecutive_errors ? s.consecutive_errors.count + ' / ' + s.consecutive_errors.max : '<span class="unavail">guard not configured</span>'}</dd>
+    <dt>last finished</dt><dd>${lastFinished(s)}</dd>
+  </dl>`;
+}
+
+// ---------------------------------------------------------------------------
+// Variant A: ops console, dense table + right-hand detail drawer
+// ---------------------------------------------------------------------------
+function VariantA() {
+  const rows = FLEET.map((f) => {
+    const r = reach(f), s = f.snap, t = s && s.telemetry, a = s && s.active_attempt;
+    return `<tr data-sel="${f.name}" class="${selected === f.name ? 'sel' : ''} ${r.key === 'exited' ? 'offline' : ''}">
+      <td><b>${f.name}</b><br><span class="muted small mono">${s ? s.repository : f.id}</span></td>
+      <td><span class="pill ${r.cls}" title="${r.detail}">${r.label}</span>${r.key === 'unreachable' || r.key === 'stale' ? '<br><span class="small muted">' + fmtDur(f.fetch.age) + ' old</span>' : ''}</td>
+      <td>${s ? intakePill(s) : '—'}</td>
+      <td>${a ? `#${a.issue_number} <span class="muted small">${a.phase}</span>` : s && s.recovery ? `<span class="pill bad">recovery #${s.recovery.issue_number}</span>` : '<span class="muted">—</span>'}</td>
+      <td style="min-width:180px">${t ? budgetBar(t) + `<span class="small">${k(t.budget.used_tokens)}</span> <span class="small muted">/ ${k(t.budget.hard_ceiling_tokens)}</span>` : '<span class="muted">—</span>'}</td>
+      <td>${t ? k(t.context.main_tokens) + (t.context.subagents.length ? ` <span class="muted small">+${t.context.subagents.length} sub</span>` : '') : '—'}</td>
+      <td>${t ? t.turns : '—'}</td>
+      <td>${t ? pct(t.cache_hit_rate) : '—'}</td>
+      <td>${s && s.consecutive_errors ? (s.consecutive_errors.count ? `<span class="pill ${s.consecutive_errors.count + 1 >= s.consecutive_errors.max ? 'bad' : 'warn'}">${s.consecutive_errors.count}/${s.consecutive_errors.max}</span>` : '0') : '—'}</td>
+    </tr>`;
+  }).join('');
+  const f = FLEET.find((x) => x.name === selected);
+  const drawer = f ? `<aside class="A-drawer">
+      <div style="display:flex;justify-content:space-between;align-items:center"><h2>${f.name}</h2><button data-close>✕</button></div>
+      <div class="small muted mono">container ${f.id} · ${reach(f).detail || ''}</div>
+      ${f.snap ? `<section><h3>control</h3>${controlDetail(f.snap)}</section>
+      <section><h3>current attempt</h3>${telemetryDetail(f)}</section>
+      <section><h3>recent events</h3>${events(f.snap)}</section>` : '<section class="muted">No snapshot: the container is not running, so it is never exec\'d.</section>'}
+    </aside>` : '';
+  return `<div class="A-wrap ${f ? 'with-drawer' : ''}">
+    <div>
+      <div class="A-head"><h1 style="font-size:16px">Agent fleet</h1><span class="muted small">${FLEET.length} managed instances on this host · polled every 3 s</span></div>
+      <table class="A-table"><thead><tr><th>instance</th><th>reach</th><th>intake</th><th>attempt</th><th>budget</th><th>main ctx</th><th>turns</th><th>cache</th><th>errors</th></tr></thead><tbody>${rows}</tbody></table>
+    </div>${drawer}</div>`;
+}
+VariantA.title = 'Ops table + detail drawer';
+
+// ---------------------------------------------------------------------------
+// Variant B: attention-sorted lanes, budget track is the hero signal
+// ---------------------------------------------------------------------------
+function VariantB() {
+  const groups = ['Needs attention', 'Working', 'Idle', 'Offline'];
+  const sorted = [...FLEET].sort((a, b) => headline(a).rank - headline(b).rank);
+  const lane = (f) => {
+    const h = headline(f), s = f.snap, t = s && s.telemetry, a = s && s.active_attempt, r = reach(f);
+    const open = selected === f.name;
+    let track;
+    if (t) {
+      const w = (x) => (100 * x / t.budget.hard_ceiling_tokens).toFixed(1) + '%';
+      track = `<div class="B-track" title="hard ceiling at the right edge">
+          <div class="fill" style="width:${w(t.budget.used_tokens)};background:${budgetColor(t)};opacity:.85"></div>
+          <div class="soft" style="left:${w(t.budget.soft_threshold_tokens)}"></div>
+          <div class="lbl">${k(t.budget.used_tokens)} of ${k(t.budget.hard_ceiling_tokens)}${prov(t.budget.provenance)}</div></div>
+        <div class="B-ctx small muted">main context ${k(t.context.main_tokens)} / ${k(t.context.window_tokens)}${prov('configured')}${t.context.subagents.map((x) => ` · ${x.type} ${k(x.tokens)}${prov('estimated')}`).join('')}</div>
+        ${ctxBar(t.context.main_tokens, t.context.window_tokens)}`;
+    } else {
+      track = `<div class="small">${s ? noTelemetry(f) : '<span class="unavail">not running</span>'}</div>
+        ${s && s.last_finished !== undefined ? `<div class="small muted" style="margin-top:4px">last: ${lastFinished(s)}</div>` : ''}`;
+    }
+    const phases = a ? `<div class="B-phases">${PHASES.map((p, i) => `<span class="${p === a.phase ? 'cur' : i < PHASES.indexOf(a.phase) ? 'done' : ''}">${p.replace('_', ' ')}</span>`).join('')}</div>` : '';
+    return `<div class="card B-lane attn-${h.cls}" data-sel="${f.name}">
+      <div><div style="font-weight:700">${f.name}</div><div class="small muted mono">${s ? s.repository : f.id}</div>
+        <div style="margin-top:6px">${s ? intakePill(s) : ''} <span class="pill ${r.cls}" title="${r.detail || ''}">${r.label}</span></div></div>
+      <div><div class="B-reason" style="margin-bottom:8px">${h.text}${a && a.issue_title ? ` <span class="muted" style="font-weight:400">· ${a.issue_title}</span>` : ''}</div>${track}${phases}</div>
+      <div class="small">${t ? `<div>${t.turns} turns</div><div>cache ${pct(t.cache_hit_rate)}</div><div class="muted">peak ctx ${k(t.context.peak_main_tokens)}</div>` : ''}
+        ${a ? `<div class="muted">started ${ago(a.started_at)}</div>` : ''}${r.key !== 'live' && f.fetch ? `<div style="color:var(--bad)">${fmtDur(f.fetch.age)} old</div>` : ''}</div>
+      ${open && s ? `<div class="B-expand"><div><h3 class="small muted">control</h3>${controlDetail(s)}</div><div><h3 class="small muted">attempt</h3>${telemetryDetail(f)}</div><div><h3 class="small muted">recent events</h3>${events(s)}</div></div>` : ''}
+    </div>`;
+  };
+  return `<div class="B-wrap"><h1 style="font-size:18px">Agent fleet <span class="muted small" style="font-weight:400">sorted by what needs you first · click a lane to expand</span></h1>
+    ${groups.map((g) => { const items = sorted.filter((f) => headline(f).group === g); return items.length ? `<div class="B-group"><h2>${g} · ${items.length}</h2>${items.map(lane).join('')}</div>` : ''; }).join('')}</div>`;
+}
+VariantB.title = 'Attention lanes, budget-first';
+
+// ---------------------------------------------------------------------------
+// Variant C: inbox list on the left, one instance as a full cockpit
+// ---------------------------------------------------------------------------
+function spark(hist, key, soft, max, color) {
+  if (!hist.length) return '<span class="unavail">no history yet</span>';
+  const W = 600, H = 110, xs = (i) => (i / Math.max(1, hist.length - 1)) * W, ys = (v) => H - (v / max) * H;
+  const d = hist.map((p, i) => `${i ? 'L' : 'M'}${xs(i).toFixed(1)},${ys(p[key]).toFixed(1)}`).join('');
+  return `<svg class="spark" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none">
+    ${soft ? `<line x1="0" x2="${W}" y1="${ys(soft)}" y2="${ys(soft)}" stroke="var(--soft)" stroke-dasharray="4 4"/>` : ''}
+    <path d="${d}" fill="none" stroke="${color}" stroke-width="2" vector-effect="non-scaling-stroke"/></svg>`;
+}
+function VariantC() {
+  const sorted = [...FLEET].sort((a, b) => headline(a).rank - headline(b).rank);
+  const counts = {}; FLEET.forEach((f) => { const g = headline(f).group; counts[g] = (counts[g] || 0) + 1; });
+  const dotColor = { bad: 'var(--bad)', warn: 'var(--warn)', ok: 'var(--ok)', idle: 'var(--idle)' };
+  const list = sorted.map((f) => { const h = headline(f); return `<div class="C-item ${selected === f.name ? 'sel' : ''}" data-sel="${f.name}">
+      <div class="C-dot" style="background:${dotColor[h.cls]}"></div>
+      <div><div style="font-weight:600">${f.name}</div><div class="small muted">${h.text}</div></div></div>`; }).join('');
+  const f = FLEET.find((x) => x.name === selected) || sorted[0];
+  const s = f.snap, t = s && s.telemetry, a = s && s.active_attempt, r = reach(f), h = headline(f);
+  let main;
+  if (!s) main = `<h1>${f.name}</h1><p class="muted">${f.exited}. The dashboard does not exec into stopped containers.</p>`;
+  else main = `
+    <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:12px">
+      <div><h1 style="font-size:22px">${f.name} <span class="muted" style="font-weight:400;font-size:15px">${s.repository}</span></h1>
+        <div style="margin-top:4px">${intakePill(s)} <span class="pill ${r.cls}">${r.label}</span> <span class="small muted">${r.detail || ''} · agent ${s.agent_version}</span></div>
+        <div style="margin-top:10px;font-size:16px;font-weight:600;color:${dotColor[h.cls]}">${h.text}</div>
+        ${a ? `<div class="muted">${a.issue_title || ''} · <span class="mono small">${a.branch}</span> · ${a.phase} · started ${ago(a.started_at)}</div>` : ''}</div>
+    </div>
+    ${t ? `<div class="C-big">
+      <div class="card"><div class="small muted">budget used${prov(t.budget.provenance)}</div><div class="num" style="color:${budgetColor(t)}">${pct(t.budget.used_tokens / t.budget.hard_ceiling_tokens)}</div><div class="small muted">${k(t.budget.used_tokens)} · soft ${k(t.budget.soft_threshold_tokens)} · hard ${k(t.budget.hard_ceiling_tokens)}</div></div>
+      <div class="card"><div class="small muted">main context${prov('measured')}</div><div class="num">${k(t.context.main_tokens)}</div><div class="small muted">of ${k(t.context.window_tokens)}${prov('configured')} · peak ${k(t.context.peak_main_tokens)}</div></div>
+      <div class="card"><div class="small muted">turns</div><div class="num">${t.turns}</div><div class="small muted">${t.context.subagents.length} subagents running</div></div>
+      <div class="card"><div class="small muted">cache hit rate</div><div class="num">${pct(t.cache_hit_rate)}</div><div class="small muted">≈ $${t.budget.cost_usd_estimate}${prov('estimated')} of $${t.budget.max_budget_usd}</div></div>
+    </div>` : `<div class="card" style="padding:14px;margin-top:14px">${noTelemetry(f)}<div class="small" style="margin-top:6px">last finished: ${lastFinished(s)}</div></div>`}
+    <div class="C-grid">
+      <div>
+        ${t ? `<div class="card"><h3>budget over this attempt <span class="muted" style="text-transform:none">(in-memory, since dashboard start; dashed = soft threshold)</span></h3>${spark(f.hist, 'budget', t.budget.soft_threshold_tokens, t.budget.hard_ceiling_tokens, budgetColor(t))}
+          <h3 style="margin-top:12px">main context</h3>${spark(f.hist, 'ctx', null, t.context.window_tokens, 'var(--info)')}</div>
+        <div class="card" style="margin-top:14px">${telemetryDetail(f)}</div>` : ''}
+        <div class="card" style="margin-top:14px"><h3>control</h3>${controlDetail(s)}</div>
+      </div>
+      <div>
+        <div class="card"><h3>timeline</h3><div class="C-tl">${s.events ? s.events.map(([lvl, ev, txt, m]) => `<div class="e ${lvl}"><span class="muted small">${evAgo(m)} · <span class="mono">${ev}</span></span><br>${txt}</div>`).join('') : '<span class="unavail">unavailable (agent too old)</span>'}</div></div>
+        <div class="card C-ctrl" style="margin-top:14px"><h3>control <span class="pill idle">v2</span></h3>
+          <button disabled>stop</button><button disabled>stop --after…</button><button disabled>resume</button><button disabled>handoff</button><button disabled>next issue…</button>
+          <div class="small muted">Read-only in v1. Shown only to judge where v2 controls would live.</div></div>
+      </div>
+    </div>`;
+  return `<div class="C-wrap"><aside class="C-side">
+      <div class="C-summary">${['Needs attention', 'Working', 'Idle', 'Offline'].map((g) => counts[g] ? `<span class="pill ${g === 'Needs attention' ? 'bad' : g === 'Working' ? 'ok' : 'idle'}">${counts[g]} ${g.toLowerCase()}</span>` : '').join('')}</div>
+      ${list}</aside><main class="C-main">${main}</main></div>`;
+}
+VariantC.title = 'Inbox + instance cockpit';
+
+// ---------------------------------------------------------------------------
+// Switcher, selection, overlays
+// ---------------------------------------------------------------------------
+const VARIANTS = { A: VariantA, B: VariantB, C: VariantC };
+const KEYS = Object.keys(VARIANTS);
+const params = new URLSearchParams(location.search);
+let variant = KEYS.includes(params.get('variant')) ? params.get('variant') : 'A';
+let selected = params.get('instance') || null;
+let overlay = null;
+
+function setVariant(v) {
+  variant = v; params.set('variant', v); history.replaceState(null, '', '?' + params);
+  if (v === 'C' && !selected) selected = [...FLEET].sort((a, b) => headline(a).rank - headline(b).rank)[0].name;
+  render();
+}
+function cycle(d) { setVariant(KEYS[(KEYS.indexOf(variant) + d + KEYS.length) % KEYS.length]); }
+
+const NOTES = `<h4>Contract notes (what this mock assumes)</h4>Fields the mock shows that today's "agentctl status" does NOT carry:
+• schema_version, taken_at (snapshot age is measured dashboard-side here)
+• active_attempt.issue_title (status has issue_number + branch only)
+• telemetry.* : budget used/measured/estimated, soft threshold
+  value + rule + crossed_at, hard ceiling, USD estimate, tokens by
+  category, main/subagent context, peak, window (configured),
+  turns, cache hit rate, continuation index
+• per-figure provenance: measured / estimated / configured
+• recent_events (last N log events with level + one-line text)
+• last_finished attempt (issue, outcome, tokens, finished_at, PR)
+• recovery.next_action as a ready-to-copy command
+Dashboard-side (not in the snapshot): container name/id, running/exited,
+fetch ok/error, snapshot age, in-memory history for sparklines.
+Version skew demo: sca-legacy (agent 0.4.1) has no telemetry, events
+or last_finished, so they render as "unavailable".`;
+
+function render() {
+  document.getElementById('app').innerHTML = VARIANTS[variant]();
+  document.getElementById('vlabel').textContent = `${variant} (${VARIANTS[variant].title})`;
+  if (overlay === 'snap') {
+    const f = FLEET.find((x) => x.name === selected) || FLEET[0];
+    const { hist, ...rest } = f;
+    document.getElementById('overlay').innerHTML = `<h4>Mock data for ${f.name} (click an instance to change)</h4>` + JSON.stringify(rest, null, 2).replace(/</g, '&lt;');
+  } else if (overlay === 'notes') document.getElementById('overlay').innerHTML = NOTES;
+  document.getElementById('overlay').className = overlay ? 'open' : '';
+}
+
+document.addEventListener('click', (e) => {
+  if (e.target.closest('[data-close]')) { selected = null; render(); return; }
+  const el = e.target.closest('[data-sel]');
+  if (el) { const n = el.dataset.sel; selected = (variant === 'B' && selected === n) ? null : n; params.set('instance', selected || ''); history.replaceState(null, '', '?' + params); render(); }
+});
+document.getElementById('prev').onclick = (e) => { e.stopPropagation(); cycle(-1); };
+document.getElementById('next').onclick = (e) => { e.stopPropagation(); cycle(1); };
+document.getElementById('btn-snap').onclick = (e) => { e.stopPropagation(); overlay = overlay === 'snap' ? null : 'snap'; render(); };
+document.getElementById('btn-notes').onclick = (e) => { e.stopPropagation(); overlay = overlay === 'notes' ? null : 'notes'; render(); };
+document.addEventListener('keydown', (e) => {
+  if (e.target.closest('input, textarea, [contenteditable]')) return;
+  if (e.key === 'ArrowLeft') cycle(-1);
+  if (e.key === 'ArrowRight') cycle(1);
+});
+setVariant(variant);
+</script>
+</body>
+</html>
