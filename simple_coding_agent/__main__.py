@@ -28,7 +28,7 @@ from simple_coding_agent.observability import AttemptArchive, JsonEventLogger
 from simple_coding_agent.operating import ConsecutiveErrorStore
 from simple_coding_agent.publication import Publisher
 from simple_coding_agent.provenance import ProvenanceError, ProvenanceVerifier
-from simple_coding_agent.telemetry import TelemetryReporter, format_timestamp
+from simple_coding_agent.telemetry import RecentEventsBuffer, TelemetryReporter, format_timestamp
 from dotenv import load_dotenv
 
 
@@ -52,10 +52,12 @@ def main() -> None:
             return None
         return archive_factory(issue_number, checkpoint.started_at)
 
+    recent_events = RecentEventsBuffer()
     logger = JsonEventLogger(
         sys.stdout,
         redactions=config.credential_redactions,
         attempt_sink=_attempt_sink,
+        recent_events=recent_events,
     )
     try:
         provenance = ProvenanceVerifier(
@@ -117,6 +119,7 @@ def main() -> None:
         # the served hit rate stays unavailable below this many measured
         # main-thread responses.
         cache_min_measured_responses=PROMPT_CACHE_MIN_MEASURED_RESPONSES,
+        recent_events=recent_events,
     )
     lifecycle = AgentLifecycle(
         tracker=tracker,
