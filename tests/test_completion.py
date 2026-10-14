@@ -280,3 +280,54 @@ def test_model_and_publication_infrastructure_errors_are_not_reported_complete()
 
     assert model_error.outcome is AttemptOutcome.INFRASTRUCTURE_ERROR
     assert push_error.outcome is AttemptOutcome.INFRASTRUCTURE_ERROR
+
+
+def test_dirtied_workspace_after_a_successful_final_check_is_incomplete() -> None:
+    evaluator = CompletionEvaluator({"must-fix"})
+    common = dict(
+        setup=command_result(), baseline=command_result(), commit_count=2,
+        acceptance_criteria_satisfied=True, review=ReviewEvidence((), 0), final_check=command_result(),
+    )
+
+    decision = evaluator.evaluate(
+        **common,
+        model_status=ModelExecutionStatus.SUCCEEDED,
+        final_check_dirty_paths=("next-env.d.ts", "tsconfig.json"),
+    )
+
+    assert decision.outcome is AttemptOutcome.INCOMPLETE
+    assert decision.publication_eligible is False
+    assert decision.publication_path is PublicationPath.PARTIAL
+    reason = "; ".join(decision.reasons)
+    assert "next-env.d.ts" in reason
+    assert "tsconfig.json" in reason
+    assert "No re-implementation is needed" in reason
+    # Paths are reported in a stable order regardless of input order.
+    assert reason.index("next-env.d.ts") < reason.index("tsconfig.json")
+
+
+def test_failed_final_check_keeps_its_reason_when_the_tree_is_also_dirty() -> None:
+    evaluator = CompletionEvaluator({"must-fix"})
+    decision = evaluator.evaluate(
+        setup=command_result(), baseline=command_result(), commit_count=1,
+        acceptance_criteria_satisfied=True, review=ReviewEvidence((), 0),
+        final_check=command_result(CommandStatus.FAILED),
+        model_status=ModelExecutionStatus.SUCCEEDED,
+        final_check_dirty_paths=("tsconfig.json",),
+    )
+
+    assert decision.outcome is AttemptOutcome.INCOMPLETE
+    assert decision.reasons == ("Final authoritative check did not succeed.",)
+
+
+def test_clean_final_check_leaves_the_existing_contract_unchanged() -> None:
+    evaluator = CompletionEvaluator({"must-fix"})
+    arguments = dict(
+        setup=command_result(), baseline=command_result(), model_status=ModelExecutionStatus.SUCCEEDED,
+        commit_count=1, acceptance_criteria_satisfied=True, review=ReviewEvidence((), 0),
+        final_check=command_result(),
+    )
+
+    assert evaluator.evaluate(**arguments, final_check_dirty_paths=()).publication_eligible is True
+    assert evaluator.evaluate(**arguments, final_check_dirty_paths=None).publication_eligible is True
+    assert evaluator.evaluate(**arguments).publication_eligible is True
