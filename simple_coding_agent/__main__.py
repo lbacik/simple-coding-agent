@@ -8,7 +8,11 @@ from pathlib import Path
 from simple_coding_agent.attempt_state import AttemptStateStore
 from simple_coding_agent.command_runner import CommandRunner
 from simple_coding_agent.completion import CompletionEvaluator, VerificationRunner
-from simple_coding_agent.config import load_repository_profile, load_runtime_config
+from simple_coding_agent.config import (
+    EXPECTED_CLAUDE_AGENT_SDK_VERSION,
+    load_repository_profile,
+    load_runtime_config,
+)
 from simple_coding_agent.control import ControlStore
 from simple_coding_agent.control_server import ControlServer, socket_path_for
 from simple_coding_agent.finalization import AttemptCompletionStore
@@ -50,7 +54,7 @@ def main() -> None:
     try:
         provenance = ProvenanceVerifier(
             home=Path.home(),
-            expected_sdk_version=config.claude_agent_sdk_version,
+            expected_sdk_version=EXPECTED_CLAUDE_AGENT_SDK_VERSION,
         ).verify()
     except ProvenanceError as error:
         logger.emit("provenance_verification_failed", phase="startup", detail=str(error), level="ERROR")
