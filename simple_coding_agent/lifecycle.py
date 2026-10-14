@@ -1220,6 +1220,16 @@ class AgentLifecycle:
         # ``control_observed_at``. Served again while the control lock is
         # busy; ``None`` until the first successful build.
         self._telemetry_control: dict | None = None
+        # Last publication progress and workspace-dirty state the lifecycle
+        # itself observed, keyed by stable attempt ID. Publication flows
+        # (live attempts, startup reconciliation, recovery retry) record the
+        # publisher's verified result here; dirty handlers and cleanup
+        # outcomes record the workspace state. Telemetry serves these
+        # remembered values without network or git I/O; they stay absent
+        # (``None``) until something is observed in this process. ``status``
+        # keeps its live lookups and never reads these.
+        self._observed_publication: dict[str, dict] = {}
+        self._observed_workspace_dirty: dict[str, bool] = {}
 
     @property
     def active_issue_number(self) -> int | None:
@@ -1687,6 +1697,84 @@ class AgentLifecycle:
         except Exception:
             return True
 
+    def _remember_publication_result(
+        self, attempt_id: str, published: object, phase: str | None = None
+    ) -> None:
+        """Remember the publisher's verified result for telemetry.
+
+        Records ``comment_confirmed`` from ``comment_posted`` and the pull
+        request number/url when the publisher returns one. Called in the
+        publication flows (live attempts, startup reconciliation, recovery
+        retry) where the lifecycle already holds the verified result, so
+        telemetry can later serve it without network I/O. Never raises.
+        """
+
+        if not isinstance(attempt_id, str) or not attempt_id:
+            return
+        try:
+            if hasattr(published, "comment_posted"):
+                comment_confirmed: bool | None = bool(
+                    getattr(published, "comment_posted")
+                )
+            else:
+                comment_confirmed = None
+            raw_pr = getattr(published, "pull_request", None)
+            pull_request: dict | None = None
+            if raw_pr is not None:
+                if isinstance(raw_pr, dict):
+                    number = raw_pr.get("number")
+                    url = raw_pr.get("url")
+                else:
+                    number = getattr(raw_pr, "number", None)
+                    url = getattr(raw_pr, "url", None)
+                # A publisher that returns a PR object without a number still
+                # counts as an observation (known, but unnumbered).
+                pull_request = {"number": number, "url": url}
+            resolved_phase = phase
+            if resolved_phase is None:
+                try:
+                    checkpoint = self._attempt_state.read()
+                    if (
+                        checkpoint is not None
+                        and checkpoint.started_at == attempt_id
+                    ):
+                        resolved_phase = checkpoint.phase.value
+                except Exception:
+                    resolved_phase = None
+            self._observed_publication[attempt_id] = {
+                "phase": resolved_phase,
+                "comment_confirmed": comment_confirmed,
+                "pull_request": copy.deepcopy(pull_request)
+                if pull_request is not None
+                else None,
+            }
+        except Exception:
+            return
+
+    def _remember_workspace_dirty(self, attempt_id: str, dirty: bool) -> None:
+        """Remember the workspace-dirty state for telemetry (never raises)."""
+
+        if not isinstance(attempt_id, str) or not attempt_id:
+            return
+        try:
+            self._observed_workspace_dirty[attempt_id] = bool(dirty)
+        except Exception:
+            return
+
+    def _observe_and_remember_workspace_dirty(self, attempt_id: str) -> None:
+        """Best-effort dirty check after publication; telemetry remembers it.
+
+        Runs only in publication flows (which already perform git I/O), never
+        on the telemetry path. An unreadable tree records nothing, leaving
+        the remembered value ``None`` (not known yet).
+        """
+
+        try:
+            dirty = not self._workspace.is_clean()
+        except Exception:
+            return
+        self._remember_workspace_dirty(attempt_id, dirty)
+
     def _dirty_tree_hold_locked(self) -> bool:
         """Block the claim while the tree holds unexplained work (no exit).
 
@@ -1895,6 +1983,7 @@ class AgentLifecycle:
                 base_branch=profile.base_branch, issue_number=claim.issue.number
             )
         except DirtyWorkspaceError as error:
+            self._remember_workspace_dirty(attempt_id, True)
             return False, (
                 f"recovery retry for attempt {attempt_id} not fulfilled:"
                 f" {_exception_detail(error)} The branch, checkpoint, and"
@@ -1951,6 +2040,8 @@ class AgentLifecycle:
                 " the hold remains."
                 f" {hold_suffix}"
             )
+        self._remember_publication_result(attempt_id, published)
+        self._observe_and_remember_workspace_dirty(attempt_id)
         outcome = published.outcome
         comment_posted = getattr(published, "comment_posted", True)
         if not comment_posted:
@@ -1987,6 +2078,7 @@ class AgentLifecycle:
                 # above), so only genuinely unpublished work retains.
                 retain_branch=bool(retain_branch),
             )
+            self._observe_and_remember_workspace_dirty(attempt_id)
         except DirtyWorkspaceError as error:
             # Cleanup refused to leave the attempt branch while the tree is
             # dirty: the hold remains with everything preserved for
@@ -2083,6 +2175,7 @@ class AgentLifecycle:
                 base_branch=profile.base_branch, issue_number=claim.issue.number
             )
         except DirtyWorkspaceError as error:
+            self._remember_workspace_dirty(attempt_id, True)
             return False, (
                 f"recovery release for attempt {attempt_id} not fulfilled:"
                 f" {_exception_detail(error)} The branch, checkpoint, and"
@@ -3176,6 +3269,7 @@ class AgentLifecycle:
             # the finally boundary below logs ``attempt_finalization_held``
             # and retains the checkpoint, so the next poll holds on the
             # retained attempt instead of claiming new work.
+            self._remember_workspace_dirty(checkpoint.started_at, True)
             self._event_log(
                 "workspace_hold",
                 f"{_exception_detail(error)} The branch, checkpoint, and working tree "
@@ -3277,6 +3371,9 @@ class AgentLifecycle:
                             retain_branch=retain_branch or not comment_posted,
                         )
                         cleanup_ok = True
+                        self._observe_and_remember_workspace_dirty(
+                            checkpoint.started_at
+                        )
                 except DirtyWorkspaceError as error:
                     # Cleanup refused to leave the attempt branch while the
                     # tree is dirty: hold intake with everything preserved
@@ -3631,9 +3728,18 @@ class AgentLifecycle:
         """Publish, bounding the call by the pending handoff's remaining budget."""
 
         budget = self._handoff_publish_budget()
-        if budget is None:
-            return self._publisher.publish(request)
-        return self._publisher.publish(request, timeout=budget)
+        try:
+            if budget is None:
+                published = self._publisher.publish(request)
+            else:
+                published = self._publisher.publish(request, timeout=budget)
+        except Exception:
+            raise
+        # Remember the verified result for telemetry (no extra lookup), plus
+        # the workspace state observed right after publication.
+        self._remember_publication_result(request.started_at, published)
+        self._observe_and_remember_workspace_dirty(request.started_at)
+        return published
 
     def _handoff_completion_cause(
         self,
@@ -4004,6 +4110,11 @@ class AgentLifecycle:
         inspection.
         """
 
+        try:
+            attempt_id = _attempt_id(self._attempt_state.read())
+            self._remember_workspace_dirty(attempt_id, True)
+        except Exception:
+            pass
         self._emit_workspace_hold(issue_number, error)
 
     def _emit_workspace_hold(self, issue_number: int, error: DirtyWorkspaceError) -> None:
@@ -4014,6 +4125,11 @@ class AgentLifecycle:
         best-effort from the tree.
         """
 
+        try:
+            attempt_id = _attempt_id(self._attempt_state.read())
+            self._remember_workspace_dirty(attempt_id, True)
+        except Exception:
+            pass
         detail = (
             f"{_exception_detail(error)} The branch, checkpoint, and working tree "
             "are preserved for inspection; issue intake is held until the "
@@ -4318,6 +4434,7 @@ class AgentLifecycle:
             # the finally boundary below logs ``attempt_finalization_held``
             # and retains the checkpoint, so the next poll holds on the
             # retained attempt instead of claiming new work.
+            self._remember_workspace_dirty(checkpoint.started_at, True)
             self._event_log(
                 "workspace_hold",
                 f"{_exception_detail(error)} The branch, checkpoint, and working tree "
@@ -4411,6 +4528,9 @@ class AgentLifecycle:
                             retain_branch=retain_branch or not comment_posted,
                         )
                         cleanup_ok = True
+                        self._observe_and_remember_workspace_dirty(
+                            checkpoint.started_at
+                        )
                 except DirtyWorkspaceError as error:
                     # Cleanup refused to leave the attempt branch while the
                     # tree is dirty: hold intake with everything preserved
@@ -4496,9 +4616,16 @@ class AgentLifecycle:
             auto_merge_opt_in=auto_merge_opt_in,
             requeue_source=requeue_source,
         )
-        if timeout is None:
-            return self._publisher.publish(request)
-        return self._publisher.publish(request, timeout=timeout)
+        try:
+            if timeout is None:
+                published = self._publisher.publish(request)
+            else:
+                published = self._publisher.publish(request, timeout=timeout)
+        except Exception:
+            raise
+        self._remember_publication_result(started_at, published)
+        self._observe_and_remember_workspace_dirty(started_at)
+        return published
 
     def _publish_rebase_conflict(
         self,
