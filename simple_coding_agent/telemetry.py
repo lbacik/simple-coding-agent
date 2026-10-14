@@ -95,12 +95,6 @@ class TelemetryReporter:
         self._sequence = 0
         self._sequence_lock = threading.Lock()
 
-    @property
-    def identity(self) -> dict:
-        """The process identity carried by every snapshot (a copy)."""
-
-        return dict(self._identity)
-
     def snapshot(self, control: TelemetryControl) -> dict:
         """Build one schema-v1 snapshot; raise when the control section is missing.
 

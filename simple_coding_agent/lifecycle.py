@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable, Collection, Mapping, Sequence
+import copy
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -2840,13 +2841,15 @@ class AgentLifecycle:
                 raise SnapshotFailedError(
                     "the control lock is busy and no control section has been built yet"
                 )
-            return cached
+            # A copy: the served snapshot must never alias the cache, or a
+            # consumer mutating it would corrupt later reuses.
+            return copy.deepcopy(cached)
         try:
             section = self._build_telemetry_control_section()
         finally:
             self._control_lock.release()
         self._telemetry_control = section
-        return section
+        return copy.deepcopy(section)
 
     def _build_telemetry_control_section(self) -> dict:
         """Build a fresh network-free control section (caller holds the lock)."""

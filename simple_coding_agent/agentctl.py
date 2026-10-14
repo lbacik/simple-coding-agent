@@ -580,6 +580,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "telemetry":
             try:
                 snapshot = run_telemetry(socket_path)
+                print(json.dumps(snapshot, sort_keys=True))
             except TelemetryError as error:
                 print(format_telemetry_error(error))
                 return 2 if error.code == "agent_unreachable" else 1
@@ -596,7 +597,6 @@ def main(argv: list[str] | None = None) -> int:
                     )
                 )
                 return 1
-            print(json.dumps(snapshot, sort_keys=True))
             return 0
         if args.command == "command":
             record = run_command_lookup(socket_path, args.request_id)
