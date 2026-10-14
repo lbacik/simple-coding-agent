@@ -12,6 +12,7 @@ connection error instead of a saved snapshot.
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 import uuid
 from collections.abc import Callable
@@ -24,6 +25,10 @@ from simple_coding_agent.control_server import (
     send_request,
 )
 from simple_coding_agent.control import StopAfterRejectedError, parse_stop_after
+from simple_coding_agent.telemetry import (
+    SNAPSHOT_SIZE_LIMIT_BYTES,
+    TELEMETRY_TIMEOUT_SECONDS,
+)
 
 
 def default_socket_path() -> Path:
@@ -117,6 +122,75 @@ def run_status(socket_path: Path) -> dict:
     if not reply.get("ok"):
         raise ControlUnavailableError(reply.get("error", "Status is unavailable."))
     return reply["status"]
+
+
+class TelemetryError(Exception):
+    """A machine-readable ``agentctl telemetry`` failure with its error code."""
+
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+        self.message = message
+
+
+def run_telemetry(socket_path: Path) -> dict:
+    """Read one telemetry snapshot; raise a coded error when it cannot be served.
+
+    Uses the short telemetry timeout so the call always answers inside the
+    dashboard's per-instance budget. ``agent_unreachable`` covers a missing,
+    refused, or timed-out socket; ``unsupported_operation`` covers an agent
+    that answers ``Unknown operation``; ``snapshot_failed`` covers an agent
+    that could not build the snapshot and replies that are unparsable,
+    oversized, or malformed.
+    """
+
+    from simple_coding_agent.control_server import UnreadableReplyError
+
+    try:
+        reply = send_request(
+            socket_path, {"op": "telemetry"}, timeout=TELEMETRY_TIMEOUT_SECONDS
+        )
+    except UnreadableReplyError as error:
+        raise TelemetryError(
+            "snapshot_failed",
+            f"agent answered but the reply was unparsable or oversized: {error}",
+        ) from error
+    except ControlUnavailableError as error:
+        raise TelemetryError(
+            "agent_unreachable",
+            f"cannot connect to the agent process: {error}",
+        ) from error
+    if not reply.get("ok"):
+        message = str(reply.get("error", "unknown error"))
+        if "Unknown operation" in message:
+            raise TelemetryError(
+                "unsupported_operation",
+                'agent answered "Unknown operation":'
+                " this agent version does not serve telemetry",
+            )
+        raise TelemetryError(
+            "snapshot_failed",
+            "agent answered but the telemetry snapshot could not be built:"
+            f" {message}",
+        )
+    snapshot = reply.get("telemetry")
+    if not isinstance(snapshot, dict):
+        raise TelemetryError(
+            "snapshot_failed",
+            "agent answered but the telemetry snapshot was missing or malformed",
+        )
+    if len(json.dumps(snapshot).encode("utf-8")) > SNAPSHOT_SIZE_LIMIT_BYTES:
+        raise TelemetryError(
+            "snapshot_failed",
+            "agent answered but the telemetry snapshot exceeded the 256 KiB size bound",
+        )
+    return snapshot
+
+
+def format_telemetry_error(error: TelemetryError) -> str:
+    """Render a telemetry failure as the machine-readable stdout envelope."""
+
+    return json.dumps({"ok": False, "error": {"code": error.code, "message": error.message}})
 
 
 def run_command_lookup(socket_path: Path, request_id: str) -> dict | None:
@@ -382,6 +456,16 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     subparsers.add_parser("status", help="Show one consistent live status snapshot.")
+    telemetry_parser = subparsers.add_parser(
+        "telemetry", help="Print the agent telemetry snapshot as JSON."
+    )
+    telemetry_parser.add_argument(
+        "--json",
+        dest="json",
+        action="store_true",
+        required=True,
+        help="Print the bare telemetry snapshot object (the only v1 format).",
+    )
     command_parser = subparsers.add_parser(
         "command", help="Show one command's current durable acknowledgement."
     )
@@ -492,6 +576,27 @@ def main(argv: list[str] | None = None) -> int:
             )
         if args.command == "status":
             print(format_status(run_status(socket_path)))
+            return 0
+        if args.command == "telemetry":
+            try:
+                snapshot = run_telemetry(socket_path)
+            except TelemetryError as error:
+                print(format_telemetry_error(error))
+                return 2 if error.code == "agent_unreachable" else 1
+            except Exception as error:
+                # No traceback ever escapes: an unexpected failure is still a
+                # machine-readable snapshot failure on stdout.
+                print(
+                    format_telemetry_error(
+                        TelemetryError(
+                            "snapshot_failed",
+                            "agent telemetry could not be read:"
+                            f" {type(error).__name__}: {error}",
+                        )
+                    )
+                )
+                return 1
+            print(json.dumps(snapshot, sort_keys=True))
             return 0
         if args.command == "command":
             record = run_command_lookup(socket_path, args.request_id)

@@ -15,6 +15,7 @@ import os
 import socket
 import stat
 import threading
+import time
 from pathlib import Path
 from typing import Callable, Protocol
 
@@ -47,9 +48,22 @@ class ControlSurface(Protocol):
 
     def control_status(self, repository: str | None = ...) -> dict: ...
 
+    def telemetry_snapshot(self) -> dict:
+        """Build one telemetry snapshot for the ``telemetry`` operation."""
+        ...
+
 
 class ControlUnavailableError(ConnectionError):
     """Raised when the agent process cannot be reached."""
+
+
+class UnreadableReplyError(ControlUnavailableError):
+    """Raised when the agent answered but the reply cannot be used.
+
+    A subclass of :class:`ControlUnavailableError` so existing callers keep
+    reporting it as a connection problem; ``agentctl telemetry`` distinguishes
+    it to report ``snapshot_failed`` instead of ``agent_unreachable``.
+    """
 
 
 _SOCKET_BACKLOG = 16
@@ -84,6 +98,7 @@ class ControlServer:
         self._listener: socket.socket | None = None
         self._thread: threading.Thread | None = None
         self._stopped = threading.Event()
+        self._telemetry_failed_at: float | None = None
 
     @property
     def socket_path(self) -> Path:
@@ -253,6 +268,8 @@ class ControlServer:
                 self._reply_status(connection)
             elif operation == "command":
                 self._reply_command(connection, request)
+            elif operation == "telemetry":
+                self._reply_telemetry(connection)
             else:
                 _send(
                     connection,
@@ -398,6 +415,76 @@ class ControlServer:
             return
         _send(connection, {"ok": True, "status": snapshot})
 
+    def _reply_telemetry(self, connection: socket.socket) -> None:
+        """Answer one telemetry request without ever raising out of the listener.
+
+        Controls without a telemetry reader (older agent versions) answer
+        ``Unknown operation`` so ``agentctl`` can report
+        ``unsupported_operation``. Any other failure answers
+        ``snapshot_failed`` with a rate-limited ``telemetry_failed`` event.
+        """
+
+        from simple_coding_agent.telemetry import TELEMETRY_FAILURE_COOLDOWN_SECONDS
+
+        snapshotter = getattr(self._control, "telemetry_snapshot", None)
+        if not callable(snapshotter):
+            _send(
+                connection,
+                {
+                    "ok": False,
+                    "repository": self._safe_repository(),
+                    "error": "Unknown operation: 'telemetry'.",
+                },
+            )
+            return
+        try:
+            snapshot = snapshotter()
+        except Exception as error:
+            self._log_telemetry_failed(
+                f"{type(error).__name__}: {error}",
+                cooldown=TELEMETRY_FAILURE_COOLDOWN_SECONDS,
+            )
+            _send(
+                connection,
+                {
+                    "ok": False,
+                    "repository": self._safe_repository(),
+                    "error": f"Telemetry snapshot failed: {error}",
+                },
+            )
+            return
+        if not isinstance(snapshot, dict):
+            self._log_telemetry_failed(
+                "telemetry reader returned a non-object snapshot",
+                cooldown=TELEMETRY_FAILURE_COOLDOWN_SECONDS,
+            )
+            _send(
+                connection,
+                {
+                    "ok": False,
+                    "repository": self._safe_repository(),
+                    "error": "Telemetry snapshot failed: the snapshot was not a JSON object.",
+                },
+            )
+            return
+        _send(connection, {"ok": True, "telemetry": snapshot})
+
+    def _log_telemetry_failed(self, detail: str, *, cooldown: float) -> None:
+        """Record a failed telemetry build, at most once per cooldown window."""
+
+        now = time.monotonic()
+        previous = self._telemetry_failed_at
+        if previous is not None and now - previous < cooldown:
+            return
+        self._telemetry_failed_at = now
+        event_log = self._event_log
+        if event_log is None:
+            return
+        try:
+            event_log("telemetry_failed", detail=detail, level="ERROR")
+        except Exception:
+            pass
+
     def _reply_command(self, connection: socket.socket, request: dict) -> None:
         from simple_coding_agent.control import ControlStoreError, command_to_json
 
@@ -523,8 +610,13 @@ def _reply_mutating(
     _send(connection, {"ok": True, "repository": repository, **command_to_json(record)})
 
 
-def send_request(socket_path: Path, request: dict) -> dict:
-    """Send one request to the live agent; raise when it cannot be reached."""
+def send_request(socket_path: Path, request: dict, *, timeout: float = 10.0) -> dict:
+    """Send one request to the live agent; raise when it cannot be reached.
+
+    ``timeout`` covers the connect and the read. Unreadable or oversized
+    replies raise :class:`UnreadableReplyError`; every other failure raises
+    :class:`ControlUnavailableError`.
+    """
 
     try:
         client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -533,7 +625,7 @@ def send_request(socket_path: Path, request: dict) -> dict:
             f"Cannot connect to the agent process at {socket_path}: {error}"
         ) from error
     try:
-        client.settimeout(10)
+        client.settimeout(timeout)
         try:
             client.connect(str(socket_path))
         except OSError as error:
@@ -550,8 +642,8 @@ def send_request(socket_path: Path, request: dict) -> dict:
                 f"Lost connection to the agent process at {socket_path}: {error}"
             ) from error
         except ValueError as error:
-            raise ControlUnavailableError(
-                f"Agent process at {socket_path} returned an unreadable reply."
+            raise UnreadableReplyError(
+                f"Agent process at {socket_path} returned an oversized reply: {error}."
             ) from error
     finally:
         try:
@@ -561,11 +653,11 @@ def send_request(socket_path: Path, request: dict) -> dict:
     try:
         reply = json.loads(raw)
     except ValueError as error:
-        raise ControlUnavailableError(
+        raise UnreadableReplyError(
             f"Agent process at {socket_path} returned an unreadable reply."
         ) from error
     if not isinstance(reply, dict):
-        raise ControlUnavailableError(
+        raise UnreadableReplyError(
             f"Agent process at {socket_path} returned an unreadable reply."
         )
     return reply
