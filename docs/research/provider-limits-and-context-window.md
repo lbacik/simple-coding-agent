@@ -129,3 +129,66 @@ The ledger's reconciliation mode (`measured` / `mixed` / `estimated`, in `token_
 3. Capture raw response headers from the gateway for `/v1/messages` (`x-ratelimit-*`, `llm_provider-*`, `x-litellm-*`) with plain `curl`.
 4. Confirm `compact_metadata` fields at runtime from a forced `/compact`.
 5. Measure the request cost of `get_context_usage()` against the 150 RPM Contributor limit.
+
+## Live check results (2026-10-14)
+
+Run for "Run the live checks from the provider-limits research" (map "Agent fleet dashboard: map"). Each check ran in a throwaway container from the agent image (`claude-agent-sdk==0.2.163`, CLI 2.1.286, `/etc/claude-code/managed-settings.json` present), never inside a running agent. The SDK checks sent the CLI's traffic through an in-container logging proxy that recorded paths, response headers and usage, never request headers. Scripts: `docs/research/provider-limits-live-checks/sdk_probe.py` and `gateway_probe.py`. Total spend about $1.7, mostly the two large window probes.
+
+### 1. SDK window, output and cost fields
+
+| Field | Default (no override) | `CLAUDE_CODE_MAX_CONTEXT_TOKENS=1048576` |
+|---|---|---|
+| `model_usage[m].contextWindow` | 200000 | 1048576 |
+| `model_usage[m].maxOutputTokens` | 32000 | 32000 |
+| `model_usage[m].costBasis` | `managed` | `managed` |
+| `get_context_usage()` `maxTokens` / `rawMaxTokens` | 200000 / 200000 | 1048576 / 1048576 |
+| `autoCompactThreshold` | 167000 | 1015576 |
+| `isAutoCompactEnabled` | true | true |
+
+- The CLI 2.1.286 still assumes a 200,000-token window for `muse-spark-1.3-contributor`; the override changes every window figure, and auto-compaction moves with it (threshold = window minus a 33,000-token "Autocompact buffer" category).
+- `costBasis` is `managed`, and `total_cost_usd` matches the `managed-settings.json` prices exactly (16,053 input × $1.25/M + 44 output × $4.25/M = $0.02025325). Still an estimate of Meta's invoice, but a deterministic one.
+- `get_context_usage()` also returns keys the SDK `TypedDict` does not declare: `agents`, `apiUsage`, `autocompactSource`, `gridRows`, `mcpTools`, `messageBreakdown`, `skills`, `slashCommands`.
+
+### 2. Meta context window for the Contributor variant
+
+Confirmed at 1,048,576 within the probe's resolution. `GET /v1/models/muse-spark-1.3-contributor` returns only `{id, object, created: 0, owned_by: "meta"}`, so the window was bounded empirically with `max_tokens: 16`:
+
+| Input (Meta `usage.input_tokens` or `count_tokens`) | Result |
+|---|---|
+| 249,324 | 200, accepted |
+| 1,037,161 | 200, accepted |
+| 1,052,279 (`count_tokens`) | 400 |
+| 1,097,153 (`count_tokens`) | 400 |
+
+The window (input plus `max_tokens`) lies between 1,037,177 and 1,052,295 tokens, consistent with 1,048,576. Overflow is **not** reported as a context-length error: Meta returns a generic `400 invalid_request_error` "The request contains invalid parameters. Check the request body for any errors or inconsistencies." without `x-ratelimit-*` headers. A caller cannot tell an overflow from any other invalid request by the message. Meta also rejects `max_tokens` below 16.
+
+### 3. Rate-limit and gateway response headers
+
+- **Direct to Meta** (`api.meta.ai`): every `/v1/messages` and `/v1/messages/count_tokens` response carries `x-ratelimit-limit-requests: 150`, `x-ratelimit-remaining-requests`, `x-ratelimit-limit-tokens: 3000000`, `x-ratelimit-remaining-tokens` and `x-request-id`. The remaining counters lag and are team-wide (other instances shared the team during the run), so they describe fleet headroom, not the instance's.
+- **Through the LiteLLM gateway** (`v1.104.0`, the model routed as `openai/muse-spark-1.3-contributor`): `/v1/messages`, streaming or not, returns **no** `x-ratelimit-*` and **no** `llm_provider-*` headers; only `x-litellm-*` (`call-id`, `model-id`, `model-name`, `model-group`, `version`, `response-duration-ms`, `overhead-duration-ms`, `attempted-retries`, `attempted-fallbacks`) and cost headers that are all `0.0` because no price is configured for the model. `count_tokens` returns no `x-litellm-*` headers at all.
+- **Gateway endpoints**: `GET /model/info` answers, but every limit and cost field in `model_info` is `null` (`max_tokens`, `max_input_tokens`, `max_output_tokens`, the cost fields); `GET /key/info` returns 404 with the instance's key.
+- Conclusion: provider rate-limit headroom cannot appear in the v1 snapshot from either the agent or the gateway as deployed. Only a direct-to-Meta instance sees the headers on the wire, and the CLI does not expose them to the agent.
+
+### 4. `compact_metadata` at runtime
+
+A forced `/compact` produced, in order: `SystemMessage` `status` (`status: "compacting"`), one `/v1/messages` call (17,389 input, 2,783 output tokens), `status` (`compact_result: "success"`), a fresh `init`, then `compact_boundary` with
+
+```json
+{"trigger": "manual", "pre_tokens": 16098, "post_tokens": 3102, "cumulative_dropped_tokens": 12996, "duration_ms": 11548}
+```
+
+and `logical_parent_uuid` next to it. This matches the CLI schema plus one field the schema did not list (`duration_ms`). The compaction call's tokens appear in the following `ResultMessage.model_usage` (cumulative per session) while that result's `usage` is all zeros and `num_turns` is 0.
+
+### 5. Request cost of `get_context_usage()`
+
+| Call | Requests | Latency |
+|---|---|---|
+| First call in a session | 5 × `POST /v1/messages/count_tokens` | ~1.7 s |
+| Any later call, including after new turns (3 turns measured) | 0 | ~10 ms |
+| First call after a compaction | 2 × `count_tokens` | ~1.3 s |
+
+After new turns `totalTokens` follows the latest response's `input_tokens` without new requests, so the CLI recomputes only cached categories when they change. The `count_tokens` calls lowered `x-ratelimit-remaining-requests` but not `x-ratelimit-remaining-tokens`, so they count against the 150 RPM request limit only. Polling every 5 s therefore costs about 5 requests per session plus 2 per compaction: negligible against 150 RPM. The values it adds over the ledger are the CLI's window, `autoCompactThreshold` and the category breakdown; `totalTokens` equals the main thread's last measured input.
+
+### Side observation
+
+In one session the CLI sent an extra `/v1/messages` call (1 message, no tools, 797 input, 2,814 output tokens of which 2,797 thinking, ~20 s) that finished after the session's `ResultMessage` and was not part of its `model_usage`. It did not recur in the second session. Its purpose was not identified; it is noted only because such calls spend team quota outside the attempt's accounting.
