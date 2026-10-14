@@ -578,6 +578,26 @@ class TokenLedger:
         )
 
     @property
+    def main_measured_response_count(self) -> int:
+        """Number of measured main-thread responses (hit-rate denominator count)."""
+
+        return len(self._measured_main_responses(None))
+
+    def main_context_basis(self) -> str:
+        """Basis of the main thread's current context for telemetry.
+
+        ``"measured"`` when the main thread's latest response reported usage
+        (the context is anchored to that measurement); ``"estimated"``
+        otherwise (no main thread yet, no response yet, or the latest
+        response is still an estimate).
+        """
+
+        thread = self._threads.get("main")
+        if thread is None or not thread.responses:
+            return "estimated"
+        return "measured" if thread.responses[-1].usage is not None else "estimated"
+
+    @property
     def main_measured_settled_count(self) -> int:
         """Settled measured responses on the main thread (warning trigger)."""
 

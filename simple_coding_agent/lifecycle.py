@@ -3379,6 +3379,7 @@ class AgentLifecycle:
                 comment_posted = getattr(published, "comment_posted", True)
             else:
                 self._wire_attempt_runner_handoff()
+                self._wire_attempt_telemetry_publisher()
                 evidence = self._attempt_runner(claim, profile, prepared)
                 publication_started_at = self._clock()
                 published = self._publish_bounded(
@@ -3866,6 +3867,32 @@ class AgentLifecycle:
             setter(None)
             return
         setter(_ControlOperatorHandoff(self._control_store, self._event_log))
+
+    def _wire_attempt_telemetry_publisher(self) -> None:
+        """Attach the telemetry reporter to the executor that publishes live figures.
+
+        The executor publishes an immutable attempt view after every limit
+        check; the reporter swaps the reference under a lock held only for
+        the swap, so the listener thread serves live figures without ever
+        reading the token ledger. Runners and executors without the seam
+        (older test doubles) are left alone. Never raises.
+        """
+
+        try:
+            reporter = self._telemetry
+            if reporter is None:
+                return
+            executor = getattr(self._attempt_runner, "_model_executor", None)
+            setter = getattr(executor, "set_attempt_publisher", None)
+            if not callable(setter):
+                return
+            setter(reporter.publish_attempt_view)
+        except Exception as error:
+            self._event_log(
+                "telemetry_publish_failed",
+                f"telemetry publisher wiring failed: {error}; continuing without live figures",
+                level="WARNING",
+            )
 
     def _handoff_publish_budget(self) -> float | None:
         """Bound one publication call by the pending handoff's remaining budget.

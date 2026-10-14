@@ -12,6 +12,7 @@ from pathlib import Path
 import re
 import shlex
 import subprocess
+from types import MappingProxyType
 from typing import Any, Protocol
 
 from claude_agent_sdk import (
@@ -31,6 +32,7 @@ from claude_agent_sdk import (
 )
 
 from simple_coding_agent.config import RuntimeConfig
+from simple_coding_agent.telemetry import format_timestamp as _format_timestamp
 from simple_coding_agent.token_ledger import (
     USAGE_CATEGORIES,
     TokenLedger,
@@ -455,6 +457,13 @@ ClientFactory = Callable[[ClaudeAgentOptions], SDKClient]
 Clock = Callable[[], datetime]
 EventLog = Callable[..., None]
 
+#: Live attempt figures published for telemetry after every limit check.
+#: The mapping is immutable; a raising publisher must not affect the
+#: attempt, so the executor logs ``telemetry_publish_failed`` and carries
+#: on. The driving process wires this to the telemetry reporter before
+#: dispatch (like ``event_log``); ``None`` disables publication.
+AttemptPublisher = Callable[[Mapping[str, Any]], None]
+
 _MAX_LOG_DETAIL = 2000
 # Bounded in-memory activity record for the emergency handoff note: the
 # recent tool trail keeps the last 15 calls, Bash history keeps the last 50
@@ -502,12 +511,14 @@ class ModelExecutor:
         clock: Clock = lambda: datetime.now(UTC),
         event_log: EventLog = lambda event, detail="", level="INFO", issue_number=None: None,
         cli_path: str | Path | None = None,
+        attempt_publisher: AttemptPublisher | None = None,
     ) -> None:
         self._config = config
         self._cli_path = Path(cli_path).expanduser() if cli_path is not None else None
         self._client_factory = client_factory
         self._clock = clock
         self._event_log = event_log
+        self._attempt_publisher = attempt_publisher
         self._skill_events: list[SkillEvent] = []
         self._review_count = 0
         self._review_nudge_sent = False
@@ -519,6 +530,7 @@ class ModelExecutor:
         self._started_at = self._clock()
         self._soft_threshold_crossed = False
         self._soft_threshold_crossed_at_tokens: float | None = None
+        self._soft_threshold_crossed_at: datetime | None = None
         self._soft_threshold_rule: str | None = None
         self._soft_threshold_effective_tokens: int | None = None
         self._total_cost_usd: float | None = None
@@ -588,6 +600,16 @@ class ModelExecutor:
         """
 
         self._new_commits_provider = provider
+
+    def set_attempt_publisher(self, publisher: AttemptPublisher | None) -> None:
+        """Publish immutable live attempt views for telemetry after every limit check.
+
+        The driving process wires this before dispatch (and only real
+        executors carry the seam; older fakes are left alone). ``None``
+        clears the publisher and disables publication.
+        """
+
+        self._attempt_publisher = publisher
 
     @property
     def review_nudge_sent(self) -> bool:
@@ -975,6 +997,7 @@ class ModelExecutor:
         self._started_at = self._clock()
         self._soft_threshold_crossed = False
         self._soft_threshold_crossed_at_tokens = None
+        self._soft_threshold_crossed_at = None
         self._soft_threshold_rule = None
         self._soft_threshold_effective_tokens = None
         self._total_cost_usd = None
@@ -1939,6 +1962,7 @@ class ModelExecutor:
         if not self._soft_threshold_crossed and budget >= threshold:
             self._soft_threshold_crossed = True
             self._soft_threshold_crossed_at_tokens = budget
+            self._soft_threshold_crossed_at = self._clock()
             self._soft_threshold_rule = rule
             self._soft_threshold_effective_tokens = threshold
             self._log(
@@ -1960,6 +1984,70 @@ class ModelExecutor:
                 f"budget_tokens={budget:.0f}; max_budget_tokens={ceiling}; "
                 f"thread={thread_id}; "
                 f"in_flight_estimated_tokens={self._ledger.estimated_tokens:.0f}",
+                level="WARNING",
+            )
+        self._publish_attempt_view()
+
+    def _live_attempt_view(self) -> dict[str, Any]:
+        """Raw live readings for one telemetry publication (JSON-safe).
+
+        Built from the token ledger without mutating it: budget totals,
+        the effective soft threshold at the main thread's latest context,
+        measured per-category tokens over all threads, main-thread turns,
+        the main-thread cache hit rate with its measured-response count,
+        and elapsed seconds. No USD figure is included. The caller wraps
+        the result as immutable before publishing.
+        """
+
+        threshold, rule, _reserve_tokens = self._effective_threshold()
+        crossed_at = self._soft_threshold_crossed_at
+        return {
+            "budget_tokens": self._ledger.budget_tokens,
+            "measured_tokens": self._ledger.measured_tokens,
+            "estimated_tokens": self._ledger.estimated_tokens,
+            "hard_ceiling_reached": self._token_hard_ceiling_reached,
+            "soft_threshold_value": threshold,
+            "soft_threshold_rule": rule,
+            "soft_threshold_percentage": self._config.soft_threshold_percentage,
+            "soft_threshold_reserve_turns": self._config.handoff_reserve_turns,
+            "soft_threshold_crossed": self._soft_threshold_crossed,
+            "soft_threshold_crossed_at_tokens": (
+                None
+                if self._soft_threshold_crossed_at_tokens is None
+                else int(round(self._soft_threshold_crossed_at_tokens))
+            ),
+            "soft_threshold_crossed_at": (
+                None if crossed_at is None else _format_timestamp(crossed_at)
+            ),
+            "main_context_basis": self._ledger.main_context_basis(),
+            "tokens_by_category": dict(self._ledger.measured_by_category),
+            "turns": (
+                self._ledger.response_count("main")
+                if self._ledger.has_thread("main")
+                else 0
+            ),
+            "cache_hit_rate": self._ledger.main_hit_rate(),
+            "cache_counted": self._ledger.main_measured_response_count,
+            "elapsed_seconds": self._elapsed_seconds(),
+        }
+
+    def _publish_attempt_view(self) -> None:
+        """Publish one immutable attempt view; a failure never affects the attempt.
+
+        Only the executor thread builds the view (the listener thread never
+        reads the ledger); the reporter swaps the reference under a lock
+        held just for the swap.
+        """
+
+        publisher = self._attempt_publisher
+        if publisher is None:
+            return
+        try:
+            publisher(MappingProxyType(self._live_attempt_view()))
+        except Exception as error:
+            self._log(
+                "telemetry_publish_failed",
+                f"attempt view publish failed: {error}; continuing without telemetry",
                 level="WARNING",
             )
 
