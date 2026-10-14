@@ -86,6 +86,16 @@ TOKEN_CATEGORIES = (
     "output_tokens",
 )
 
+#: Bases a successful context-usage window reading may carry. Anything else
+#: on the view is treated as ``unavailable`` so a malformed publisher can
+#: never smuggle an unknown basis into the snapshot.
+CONTEXT_WINDOW_BASES = ("sdk_assumed", "configured")
+
+#: Maximum telemetry subagent entries in one snapshot section (running
+#: first). The executor caps its views at the same size; the reporter
+#: re-enforces it so an oversized view never reaches the socket.
+MAX_CONTEXT_SUBAGENTS = 20
+
 
 logger = logging.getLogger(__name__)
 
@@ -186,6 +196,28 @@ def _view_category(categories: dict, category: str) -> int:
             f"published attempt view tokens_by_category[{category}] must be a non-negative integer"
         )
     return value
+
+
+def _view_main_context(view: dict) -> int:
+    """Main-thread context from a published view (ledger reading, rounded).
+
+    Missing keys (views published before context landed) read as zero so
+    older publishers still build; a malformed value raises ``ValueError``.
+    """
+
+    if "main_context_tokens" not in view:
+        return 0
+    return _view_tokens(view, "main_context_tokens")
+
+
+def _view_main_peak_context(view: dict) -> int:
+    """Peak main-thread context from a published view (rounded)."""
+
+    if "main_peak_context_tokens" not in view:
+        # Views published before the peak landed carry no peak; fall back to
+        # the current main reading so the section stays consistent.
+        return _view_main_context(view)
+    return _view_tokens(view, "main_peak_context_tokens")
 
 
 def _as_int(value: object) -> int | None:
@@ -362,6 +394,128 @@ def _measured_figure(candidate: object) -> dict:
     if not isinstance(value, int) or value < 0:
         return {"value": None, "basis": "unavailable", "reason": "not reported"}
     return {"value": value, "basis": "measured"}
+
+
+def _context_window_figure(view: dict, prefix: str) -> dict:
+    """One window/threshold figure from a published view.
+
+    A present non-negative integer with an ``sdk_assumed``/``configured``
+    basis passes through; anything else (missing value, unknown basis, or
+    an explicit ``unavailable`` basis) is ``unavailable`` with the view's
+    reason (or a default). Raises ``ValueError`` on a malformed basis or
+    reason so the caller keeps the last good section.
+    """
+
+    value = view.get(prefix)
+    basis = view.get(f"{prefix}_basis", "unavailable")
+    reason = view.get(f"{prefix}_reason")
+    if basis in CONTEXT_WINDOW_BASES:
+        if isinstance(value, bool):
+            raise ValueError(f"published attempt view {prefix} must be an integer or None")
+        if isinstance(value, float) and value.is_integer():
+            value = int(value)
+        if not isinstance(value, int) or value < 0:
+            raise ValueError(f"published attempt view {prefix} must be a non-negative integer")
+        return {"value": value, "basis": basis}
+    if basis != "unavailable":
+        raise ValueError(f"published attempt view {prefix}_basis must be sdk_assumed, configured or unavailable")
+    if reason is not None and not isinstance(reason, str):
+        raise ValueError(f"published attempt view {prefix}_reason must be a string or None")
+    return {
+        "value": None,
+        "basis": "unavailable",
+        "reason": reason if isinstance(reason, str) and reason else "not yet published",
+    }
+
+
+def _compaction_token_figure(value: object) -> dict:
+    """One compaction pre/post figure (measured when present)."""
+
+    if isinstance(value, bool):
+        value = None
+    elif isinstance(value, float) and value.is_integer():
+        value = int(value)
+    if isinstance(value, int) and value >= 0:
+        return {"value": value, "basis": "measured"}
+    return {"value": None, "basis": "unavailable", "reason": "not reported"}
+
+
+def _build_compactions(view: dict) -> dict:
+    """The ``context.compactions`` section from a published view.
+
+    Missing keys (views published before context landed) read as zero
+    compactions; a malformed count or entry raises ``ValueError``.
+    """
+
+    count = view.get("compaction_count", 0)
+    if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+        raise ValueError("published attempt view compaction_count must be a non-negative integer")
+    raw_last = view.get("compaction_last")
+    if raw_last is None:
+        return {"count": count, "last": None}
+    if not isinstance(raw_last, dict):
+        raise ValueError("published attempt view compaction_last must be a mapping or None")
+    at = raw_last.get("at")
+    trigger = raw_last.get("trigger")
+    if not isinstance(at, str) or not at:
+        raise ValueError("published attempt view compaction_last.at must be a non-empty string")
+    if not isinstance(trigger, str) or not trigger:
+        raise ValueError("published attempt view compaction_last.trigger must be a non-empty string")
+    return {
+        "count": count,
+        "last": {
+            "at": at,
+            "trigger": trigger,
+            "pre_tokens": _compaction_token_figure(raw_last.get("pre_tokens")),
+            "post_tokens": _compaction_token_figure(raw_last.get("post_tokens")),
+        },
+    }
+
+
+def _build_subagents(view: dict) -> list[dict]:
+    """The ``context.subagents`` list from a published view, running first.
+
+    Each entry is ``{id, type, context (estimated), running}``; the list is
+    capped at 20 with running entries first (stable within each group).
+    Missing views read as empty; malformed entries raise ``ValueError``.
+    """
+
+    raw = view.get("subagents", [])
+    if raw is None:
+        return []
+    if not isinstance(raw, (list, tuple)):
+        raise ValueError("published attempt view subagents must be a list")
+    entries: list[dict] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            raise ValueError("published attempt view subagents entries must be mappings")
+        agent_id = item.get("id")
+        agent_type = item.get("type", "unknown")
+        running = item.get("running")
+        if not isinstance(agent_id, str) or not agent_id:
+            raise ValueError("published attempt view subagents id must be a non-empty string")
+        if not isinstance(agent_type, str) or not agent_type:
+            agent_type = "unknown"
+        if not isinstance(running, bool):
+            raise ValueError("published attempt view subagents running must be a boolean")
+        context_value = item.get("context", 0)
+        if isinstance(context_value, bool):
+            raise ValueError("published attempt view subagents context must be a number")
+        if isinstance(context_value, float):
+            context_value = int(round(context_value))
+        if not isinstance(context_value, int) or context_value < 0:
+            raise ValueError("published attempt view subagents context must be non-negative")
+        entries.append(
+            {
+                "id": agent_id,
+                "type": agent_type,
+                "context": {"value": context_value, "basis": "estimated"},
+                "running": running,
+            }
+        )
+    running_first = [entry for entry in entries if entry["running"]]
+    finished = [entry for entry in entries if not entry["running"]]
+    return (running_first + finished)[:MAX_CONTEXT_SUBAGENTS]
 
 
 def _normalize_pull_request(candidate: object) -> dict | None:
@@ -746,6 +900,14 @@ class TelemetryReporter:
                 else _figure_unavailable()
             ),
             "elapsed_seconds": _figure_unavailable(),
+            "context": {
+                "main": _figure_unavailable(),
+                "main_peak": _figure_unavailable(),
+                "window": _figure_unavailable(),
+                "auto_compact_threshold": _figure_unavailable(),
+                "compactions": {"count": 0, "last": None},
+                "subagents": [],
+            },
             "provider_rate_limit": _figure_unavailable("not exposed through the gateway"),
         }
         issue_title = seed.get("issue_title")
@@ -905,6 +1067,22 @@ class TelemetryReporter:
                 ),
             },
             "cache": {"main_hit_rate": main_hit_rate},
+            "context": {
+                "main": {
+                    "value": _view_main_context(view),
+                    "basis": main_basis,
+                },
+                "main_peak": {
+                    "value": _view_main_peak_context(view),
+                    "basis": main_basis,
+                },
+                "window": _context_window_figure(view, "context_window"),
+                "auto_compact_threshold": _context_window_figure(
+                    view, "auto_compact_threshold"
+                ),
+                "compactions": _build_compactions(view),
+                "subagents": _build_subagents(view),
+            },
             "provider_rate_limit": _figure_unavailable("not exposed through the gateway"),
             "elapsed_seconds": {"value": elapsed_seconds, "basis": "measured"},
             "timeout_seconds": (
