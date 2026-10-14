@@ -47,6 +47,8 @@ class AttemptCheckpoint:
     updated_at: str
     auto_merge_opt_in: bool = False
     requeue_source: str = "human"
+    issue_title: str | None = None
+    continuation_index: int | None = None
 
 
 class AttemptStateStore:
@@ -83,6 +85,8 @@ class AttemptStateStore:
         branch: str,
         auto_merge_opt_in: bool = False,
         requeue_source: str = "human",
+        issue_title: str | None = None,
+        continuation_index: int | None = None,
     ) -> AttemptCheckpoint:
         """Record the initial claimed phase for a new implementation attempt.
 
@@ -93,6 +97,9 @@ class AttemptStateStore:
         when the issue carried ``ready-for-agent`` at claim time, otherwise
         ``automatic``), so every attempt-result comment records the actual
         reason for the claim even across recovery.
+        ``issue_title`` and ``continuation_index`` are computed once at claim
+        so telemetry needs no tracker lookup for them; ``None`` means unknown
+        (including checkpoints written before this change).
         """
 
         if self.read() is not None:
@@ -105,6 +112,14 @@ class AttemptStateStore:
             raise AttemptStateError("Auto-merge opt-in must be a boolean")
         if requeue_source not in ("human", "automatic"):
             raise AttemptStateError("Requeue source must be 'human' or 'automatic'")
+        if issue_title is not None and not isinstance(issue_title, str):
+            raise AttemptStateError("Issue title must be a string or None")
+        if continuation_index is not None and (
+            isinstance(continuation_index, bool)
+            or not isinstance(continuation_index, int)
+            or continuation_index < 0
+        ):
+            raise AttemptStateError("Continuation index must be a non-negative integer or None")
 
         timestamp = self._next_timestamp()
         checkpoint = AttemptCheckpoint(
@@ -115,6 +130,8 @@ class AttemptStateStore:
             updated_at=timestamp,
             auto_merge_opt_in=auto_merge_opt_in,
             requeue_source=requeue_source,
+            issue_title=issue_title,
+            continuation_index=continuation_index,
         )
         self._write(checkpoint)
         return checkpoint
@@ -139,6 +156,8 @@ class AttemptStateStore:
             updated_at=self._next_timestamp(),
             auto_merge_opt_in=checkpoint.auto_merge_opt_in,
             requeue_source=checkpoint.requeue_source,
+            issue_title=checkpoint.issue_title,
+            continuation_index=checkpoint.continuation_index,
         )
         self._write(transitioned)
         return transitioned
@@ -196,7 +215,7 @@ def _as_utc(value: datetime) -> datetime:
     return value.astimezone(UTC)
 
 
-def _checkpoint_to_json(checkpoint: AttemptCheckpoint) -> dict[str, bool | int | str]:
+def _checkpoint_to_json(checkpoint: AttemptCheckpoint) -> dict[str, bool | int | str | None]:
     return {
         "issue_number": checkpoint.issue_number,
         "branch": checkpoint.branch,
@@ -205,44 +224,18 @@ def _checkpoint_to_json(checkpoint: AttemptCheckpoint) -> dict[str, bool | int |
         "updated_at": checkpoint.updated_at,
         "auto_merge_opt_in": checkpoint.auto_merge_opt_in,
         "requeue_source": checkpoint.requeue_source,
+        "issue_title": checkpoint.issue_title,
+        "continuation_index": checkpoint.continuation_index,
     }
 
 
 def _checkpoint_from_json(value: object) -> AttemptCheckpoint:
-    if not isinstance(value, dict) or set(value) not in (
-        {
-            "issue_number",
-            "branch",
-            "phase",
-            "started_at",
-            "updated_at",
-        },
-        {
-            "issue_number",
-            "branch",
-            "phase",
-            "started_at",
-            "updated_at",
-            "auto_merge_opt_in",
-        },
-        {
-            "issue_number",
-            "branch",
-            "phase",
-            "started_at",
-            "updated_at",
-            "requeue_source",
-        },
-        {
-            "issue_number",
-            "branch",
-            "phase",
-            "started_at",
-            "updated_at",
-            "auto_merge_opt_in",
-            "requeue_source",
-        },
-    ):
+    _required = {"issue_number", "branch", "phase", "started_at", "updated_at"}
+    _optional = {"auto_merge_opt_in", "requeue_source", "issue_title", "continuation_index"}
+    if not isinstance(value, dict):
+        raise ValueError("invalid checkpoint shape")
+    keys = set(value)
+    if not _required <= keys <= (_required | _optional):
         raise ValueError("invalid checkpoint shape")
 
     issue_number = value["issue_number"]
@@ -252,6 +245,8 @@ def _checkpoint_from_json(value: object) -> AttemptCheckpoint:
     updated_at = value["updated_at"]
     auto_merge_opt_in = value.get("auto_merge_opt_in", False)
     requeue_source = value.get("requeue_source", "human")
+    issue_title = value.get("issue_title", None)
+    continuation_index = value.get("continuation_index", None)
     if isinstance(issue_number, bool) or not isinstance(issue_number, int) or issue_number <= 0:
         raise ValueError("invalid issue number")
     if not isinstance(branch, str) or not branch.strip():
@@ -264,6 +259,14 @@ def _checkpoint_from_json(value: object) -> AttemptCheckpoint:
         raise ValueError("invalid auto-merge opt-in")
     if requeue_source not in ("human", "automatic"):
         raise ValueError("invalid requeue source")
+    if issue_title is not None and not isinstance(issue_title, str):
+        raise ValueError("invalid issue title")
+    if continuation_index is not None and (
+        isinstance(continuation_index, bool)
+        or not isinstance(continuation_index, int)
+        or continuation_index < 0
+    ):
+        raise ValueError("invalid continuation index")
     _parse_timestamp(started_at)
     _parse_timestamp(updated_at)
     return AttemptCheckpoint(
@@ -274,6 +277,8 @@ def _checkpoint_from_json(value: object) -> AttemptCheckpoint:
         updated_at=updated_at,
         auto_merge_opt_in=auto_merge_opt_in,
         requeue_source=requeue_source,
+        issue_title=issue_title,
+        continuation_index=continuation_index,
     )
 
 
