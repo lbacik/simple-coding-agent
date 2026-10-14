@@ -93,7 +93,11 @@ fields (ids, timestamps, enums, booleans) are bare values, not figures.
   `last_finished: null` is no finished attempt known. Likewise a null
   `pull_request` inside `last_finished` means no PR, and null
   `comment_confirmed`/`pull_request` inside `control.recovery.publication`
-  mean "not known yet" (the snapshot performs no network I/O).
+  or null `workspace_dirty` inside `control.recovery` mean "not observed
+  yet in this process": while an attempt is publishing or held in recovery,
+  telemetry carries the publication progress and workspace-dirty state the
+  lifecycle itself last observed (no network or git I/O on the telemetry
+  path), and `agentctl status` keeps its live lookups for the same fields.
 
 ## Versioning rules
 

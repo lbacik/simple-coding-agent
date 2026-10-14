@@ -1712,11 +1712,9 @@ class AgentLifecycle:
         if not isinstance(attempt_id, str) or not attempt_id:
             return
         try:
-            if hasattr(published, "comment_posted"):
-                comment_confirmed: bool | None = bool(
-                    getattr(published, "comment_posted")
-                )
-            else:
+            try:
+                comment_confirmed: bool | None = bool(published.comment_posted)
+            except AttributeError:
                 comment_confirmed = None
             raw_pr = getattr(published, "pull_request", None)
             pull_request: dict | None = None
@@ -2550,7 +2548,8 @@ class AgentLifecycle:
                 # the startup hold (read-only; never logs from status) with
                 # the dirty paths when the tree is dirty too.
                 reason = self._startup_hold_detail
-                if self._workspace_is_dirty():
+                workspace_dirty = self._workspace_is_dirty()
+                if workspace_dirty:
                     suffix = self._dirty_paths_suffix()
                     reason += " The working tree is also dirty" + (
                         suffix if suffix else "."
@@ -2562,6 +2561,7 @@ class AgentLifecycle:
                     "outcome": None,
                     "branch": None,
                     "workspace": str(self._workspace.working_directory),
+                    "workspace_dirty": workspace_dirty,
                     "checkpoint": False,
                     "publication": {
                         "phase": None,
@@ -2585,6 +2585,7 @@ class AgentLifecycle:
                 "outcome": None,
                 "branch": None,
                 "workspace": str(self._workspace.working_directory),
+                "workspace_dirty": True,
                 "checkpoint": False,
                 "publication": {
                     "phase": None,
@@ -2630,6 +2631,7 @@ class AgentLifecycle:
             "outcome": outcome,
             "branch": checkpoint.branch,
             "workspace": str(self._workspace.working_directory),
+            "workspace_dirty": self._workspace_is_dirty(),
             "checkpoint": True,
             "publication": publication,
             "hold_reason": describe_hold(
@@ -2916,9 +2918,10 @@ class AgentLifecycle:
 
         The same payload :meth:`control_status` builds, but without workspace
         or GitHub I/O: no dirty-tree check runs, no tracker or publisher call
-        is made, and publication fields that would need a lookup stay ``None``
-        ("not known yet"). The section carries ``control_observed_at`` saying
-        when it was built.
+        is made, and the publication progress and workspace-dirty state are
+        served from what the lifecycle itself last observed (``None``/"not
+        known yet" until something is observed in this process). The section
+        carries ``control_observed_at`` saying when it was built.
 
         Waits at most ``CONTROL_LOCK_TIMEOUT_SECONDS`` for the control lock so
         telemetry never holds up other control commands. While the lock is
@@ -3049,9 +3052,11 @@ class AgentLifecycle:
 
         Mirrors :meth:`_recovery_snapshot_locked`: the workspace dirty check
         is skipped (a dirty tree alone never produces a section here) and the
-        publication progress stays ``None`` ("not known yet") because the
-        GitHub lookups never run. Never touches the tracker, publisher, or
-        workspace methods. Caller holds the control lock.
+        publication progress and workspace-dirty state are served from what
+        the lifecycle itself last observed (``None``/"not known yet" until
+        something is observed in this process) because the GitHub lookups
+        never run. Never touches the tracker, publisher, or workspace
+        methods. Caller holds the control lock.
         """
 
         from simple_coding_agent.recovery import (
@@ -3070,6 +3075,7 @@ class AgentLifecycle:
                 "outcome": None,
                 "branch": None,
                 "workspace": str(self._workspace.working_directory),
+                "workspace_dirty": None,
                 "checkpoint": False,
                 "publication": {
                     "phase": None,
@@ -3096,11 +3102,24 @@ class AgentLifecycle:
                     outcome = terminal.outcome.value
             except Exception:
                 outcome = None
-        publication = {
-            "phase": checkpoint.phase.value,
-            "comment_confirmed": None,
-            "pull_request": None,
-        }
+        remembered = self._observed_publication.get(checkpoint.started_at)
+        if remembered is not None:
+            publication = {
+                "phase": remembered.get("phase")
+                if remembered.get("phase") is not None
+                else checkpoint.phase.value,
+                "comment_confirmed": remembered.get("comment_confirmed"),
+                "pull_request": copy.deepcopy(remembered.get("pull_request"))
+                if remembered.get("pull_request") is not None
+                else None,
+            }
+        else:
+            publication = {
+                "phase": checkpoint.phase.value,
+                "comment_confirmed": None,
+                "pull_request": None,
+            }
+        workspace_dirty = self._observed_workspace_dirty.get(checkpoint.started_at)
         if self._recovering:
             next_action = (
                 "Wait for startup reconciliation to finish; do not run recovery"
@@ -3120,6 +3139,7 @@ class AgentLifecycle:
             "outcome": outcome,
             "branch": checkpoint.branch,
             "workspace": str(self._workspace.working_directory),
+            "workspace_dirty": workspace_dirty,
             "checkpoint": True,
             "publication": publication,
             "hold_reason": describe_hold(
@@ -3728,13 +3748,10 @@ class AgentLifecycle:
         """Publish, bounding the call by the pending handoff's remaining budget."""
 
         budget = self._handoff_publish_budget()
-        try:
-            if budget is None:
-                published = self._publisher.publish(request)
-            else:
-                published = self._publisher.publish(request, timeout=budget)
-        except Exception:
-            raise
+        if budget is None:
+            published = self._publisher.publish(request)
+        else:
+            published = self._publisher.publish(request, timeout=budget)
         # Remember the verified result for telemetry (no extra lookup), plus
         # the workspace state observed right after publication.
         self._remember_publication_result(request.started_at, published)
@@ -4616,13 +4633,10 @@ class AgentLifecycle:
             auto_merge_opt_in=auto_merge_opt_in,
             requeue_source=requeue_source,
         )
-        try:
-            if timeout is None:
-                published = self._publisher.publish(request)
-            else:
-                published = self._publisher.publish(request, timeout=timeout)
-        except Exception:
-            raise
+        if timeout is None:
+            published = self._publisher.publish(request)
+        else:
+            published = self._publisher.publish(request, timeout=timeout)
         self._remember_publication_result(started_at, published)
         self._observe_and_remember_workspace_dirty(started_at)
         return published
