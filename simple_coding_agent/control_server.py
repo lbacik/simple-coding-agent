@@ -71,9 +71,16 @@ SOCKET_ENV_VAR = "AGENTCTL_SOCKET"
 class ControlServer:
     """Serve one agent instance's control surface on a Unix domain socket."""
 
-    def __init__(self, socket_path: Path, control: ControlSurface) -> None:
+    def __init__(
+        self,
+        socket_path: Path,
+        control: ControlSurface,
+        *,
+        event_log: Callable[..., None] | None = None,
+    ) -> None:
         self._socket_path = socket_path
         self._control = control
+        self._event_log = event_log
         self._listener: socket.socket | None = None
         self._thread: threading.Thread | None = None
         self._stopped = threading.Event()
@@ -140,6 +147,38 @@ class ControlServer:
         except OSError:
             pass
 
+    def _log_control_error(self, detail: str) -> None:
+        """Record one failed control request as a structured event, if wired."""
+
+        event_log = self._event_log
+        if event_log is None:
+            return
+        try:
+            event_log("control_request_failed", detail=detail, level="ERROR")
+        except Exception:
+            pass
+
+    def _safe_repository(self) -> str:
+        try:
+            return self._repository()
+        except Exception:
+            return "unknown"
+
+    def _send_failure(self, connection: socket.socket, error: object) -> None:
+        """Answer one failed request without ever raising out of the listener."""
+
+        try:
+            _send(
+                connection,
+                {
+                    "ok": False,
+                    "repository": self._safe_repository(),
+                    "error": f"Control request failed: {error}",
+                },
+            )
+        except Exception:
+            pass
+
     def _serve(self) -> None:
         listener = self._listener
         if listener is None:
@@ -153,7 +192,14 @@ class ControlServer:
             except OSError:
                 return
             try:
-                self._handle(connection)
+                try:
+                    self._handle(connection)
+                except Exception as error:
+                    # One failing request must never stop the listener: log
+                    # the failure and answer on the same connection when it
+                    # is still writable, then accept the next connection.
+                    self._log_control_error(f"{type(error).__name__}: {error}")
+                    self._send_failure(connection, error)
             finally:
                 try:
                     connection.close()
@@ -170,7 +216,7 @@ class ControlServer:
                 connection,
                 {
                     "ok": False,
-                    "repository": self._repository(),
+                    "repository": self._safe_repository(),
                     "error": "Request must be one JSON object per line.",
                 },
             )
@@ -180,41 +226,45 @@ class ControlServer:
                 connection,
                 {
                     "ok": False,
-                    "repository": self._repository(),
+                    "repository": self._safe_repository(),
                     "error": "Request must be a JSON object.",
                 },
             )
             return
         operation = request.get("op")
-        if operation == "stop":
-            self._reply_stop(connection, request)
-        elif operation == "stop_after":
-            self._reply_stop_after(connection, request)
-        elif operation == "next_issue":
-            self._reply_next_issue(connection, request)
-        elif operation == "resume":
-            self._reply_resume(connection, request)
-        elif operation == "handoff":
-            self._reply_handoff(connection, request)
-        elif operation == "recovery_retry":
-            self._reply_recovery_retry(connection, request)
-        elif operation == "recovery_release":
-            self._reply_recovery_release(connection, request)
-        elif operation == "errors_reset":
-            self._reply_errors_reset(connection, request)
-        elif operation == "status":
-            self._reply_status(connection)
-        elif operation == "command":
-            self._reply_command(connection, request)
-        else:
-            _send(
-                connection,
-                {
-                    "ok": False,
-                    "repository": self._repository(),
-                    "error": f"Unknown operation: {operation!r}.",
-                },
-            )
+        try:
+            if operation == "stop":
+                self._reply_stop(connection, request)
+            elif operation == "stop_after":
+                self._reply_stop_after(connection, request)
+            elif operation == "next_issue":
+                self._reply_next_issue(connection, request)
+            elif operation == "resume":
+                self._reply_resume(connection, request)
+            elif operation == "handoff":
+                self._reply_handoff(connection, request)
+            elif operation == "recovery_retry":
+                self._reply_recovery_retry(connection, request)
+            elif operation == "recovery_release":
+                self._reply_recovery_release(connection, request)
+            elif operation == "errors_reset":
+                self._reply_errors_reset(connection, request)
+            elif operation == "status":
+                self._reply_status(connection)
+            elif operation == "command":
+                self._reply_command(connection, request)
+            else:
+                _send(
+                    connection,
+                    {
+                        "ok": False,
+                        "repository": self._safe_repository(),
+                        "error": f"Unknown operation: {operation!r}.",
+                    },
+                )
+        except Exception as error:
+            self._log_control_error(f"{operation}: {type(error).__name__}: {error}")
+            self._send_failure(connection, error)
 
     def _reply_stop(self, connection: socket.socket, request: dict) -> None:
         from simple_coding_agent.control import PayloadMismatchError, RequestIdError
@@ -491,12 +541,17 @@ def send_request(socket_path: Path, request: dict) -> dict:
                 f"Cannot connect to the agent process at {socket_path}: {error}. "
                 "The agent may not be running in this instance."
             ) from error
+        encoded = (json.dumps(request) + "\n").encode()
         try:
-            client.sendall((json.dumps(request) + "\n").encode())
+            client.sendall(encoded)
             raw = _read_line(client)
         except OSError as error:
             raise ControlUnavailableError(
                 f"Lost connection to the agent process at {socket_path}: {error}"
+            ) from error
+        except ValueError as error:
+            raise ControlUnavailableError(
+                f"Agent process at {socket_path} returned an unreadable reply."
             ) from error
     finally:
         try:
