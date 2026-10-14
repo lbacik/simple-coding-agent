@@ -2707,7 +2707,9 @@ class AgentLifecycle:
             # released, and local cleanup is durable. Anything short of that
             # keeps the checkpoint, branch, and entire working tree —
             # including dirty and untracked work — for recovery or inspection.
-            # Cleanup itself never deletes files or branches.
+            # Cleanup itself never deletes branches, and deletes files only
+            # for reproducible artifacts the attempt branch ignored but the
+            # base branch exposes as untracked; unexplained work is preserved.
             # A failed operator handoff holds the same boundary: the result
             # comment is already published truthfully, but the issue stays
             # assigned and the checkpoint, branch, and working tree stay

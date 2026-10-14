@@ -533,3 +533,78 @@ def test_cleanup_on_a_clean_tree_returns_to_the_base_branch(
     )
 
     assert current_branch(attempt) == "main"
+
+
+_GENERATED_ARTIFACT = "tests/e2e/.tmp-scenarios/case.json"
+
+
+def leave_branch_ignored_artifact(attempt: SimpleNamespace) -> None:
+    """A generated file the attempt branch ignores but the base branch does not."""
+
+    if attempt.kind == "git":
+        ignore_file = attempt.root / ".gitignore"
+        ignore_file.write_text(ignore_file.read_text() + "tests/e2e/.tmp-scenarios/\n")
+        write_and_commit(
+            attempt.root,
+            ".gitignore",
+            ignore_file.read_text(),
+            "Ignore generated scenarios",
+        )
+        generated = attempt.root / _GENERATED_ARTIFACT
+        generated.parent.mkdir(parents=True, exist_ok=True)
+        generated.write_text("{}")
+    else:
+        attempt.workspace.make_ignored(_GENERATED_ARTIFACT, "{}")
+
+
+def leave_base_ignored_artifact(attempt: SimpleNamespace) -> None:
+    """A cached file ignored on both branches (the seed .gitignore covers .venv/)."""
+
+    if attempt.kind == "git":
+        marker = attempt.root / ".venv" / "marker"
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text("keep")
+    else:
+        attempt.workspace.make_base_ignored(".venv/marker", "keep")
+
+
+def test_cleanup_removes_branch_ignored_artifacts_leaving_a_clean_base(
+    attempt: SimpleNamespace,
+) -> None:
+    """Branch-ignored artifacts must not read as untracked on the base.
+
+    ``git checkout`` leaves ignored files in place, so without the sweep the
+    same tree reads dirty on the base branch and intake holds with
+    ``working_tree_dirty``. Paths still ignored on the base are kept.
+    """
+
+    leave_branch_ignored_artifact(attempt)
+    leave_base_ignored_artifact(attempt)
+    assert attempt.workspace.is_clean()
+
+    attempt.workspace.cleanup(
+        base_branch="main", prepared=attempt.prepared, retain_branch=True
+    )
+
+    assert current_branch(attempt) == "main"
+    assert attempt.workspace.is_clean()
+    assert not (attempt.root / _GENERATED_ARTIFACT).exists()
+    assert (attempt.root / ".venv" / "marker").read_text() == "keep"
+
+
+def test_cleanup_with_genuine_dirt_preserves_branch_ignored_artifacts(
+    attempt: SimpleNamespace,
+) -> None:
+    """The ignored-artifact sweep never runs on a genuinely dirty tree."""
+
+    leave_branch_ignored_artifact(attempt)
+    dirty_file(attempt, "untracked.txt", "preserve")
+
+    with pytest.raises(DirtyWorkspaceError, match="uncommitted or untracked"):
+        attempt.workspace.cleanup(
+            base_branch="main", prepared=attempt.prepared, retain_branch=True
+        )
+
+    assert current_branch(attempt) == "agent/issue-24"
+    assert (attempt.root / _GENERATED_ARTIFACT).exists()
+    assert (attempt.root / "untracked.txt").exists()
