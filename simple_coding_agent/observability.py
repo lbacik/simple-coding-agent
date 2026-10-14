@@ -235,3 +235,57 @@ class AttemptArchive:
     def _write_json(self, name: str, value: dict[str, object]) -> None:
         self.directory.mkdir(parents=True, exist_ok=True)
         (self.directory / name).write_text(json.dumps(self._redactor.redact(value), sort_keys=True))
+
+
+def read_latest_completed_attempt(data_dir: Path) -> tuple[int, dict[str, object]] | None:
+    """Return the latest completed attempt's archive record, or ``None``.
+
+    Scans ``data_dir/logs/<issue>/<started>/attempt.json`` and returns the
+    ``(issue_number, record)`` pair whose record carries an outcome with the
+    latest completion timestamp. Records that are missing, unreadable, or
+    not completed (no ``outcome``) are skipped, so telemetry seeding never
+    breaks startup; ``None`` means no completed attempt is on disk.
+    """
+
+    try:
+        issue_dirs = sorted(path for path in (data_dir / "logs").iterdir() if path.is_dir())
+    except OSError:
+        return None
+    best: tuple[tuple[str, str], int, dict[str, object]] | None = None
+    for issue_dir in issue_dirs:
+        try:
+            issue_number = int(issue_dir.name)
+        except ValueError:
+            continue
+        if issue_number <= 0:
+            continue
+        try:
+            run_dirs = sorted(path for path in issue_dir.iterdir() if path.is_dir())
+        except OSError:
+            continue
+        for run_dir in run_dirs:
+            record = _read_completed_record(run_dir / "attempt.json")
+            if record is None:
+                continue
+            key = (str(record["completed_at"]), str(record["started_at"]))
+            if best is None or key > best[0]:
+                best = (key, issue_number, record)
+    if best is None:
+        return None
+    return (best[1], dict(best[2]))
+
+
+def _read_completed_record(path: Path) -> dict[str, object] | None:
+    """Return the completed attempt record at ``path``, or ``None`` to skip it."""
+
+    try:
+        value = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(value, dict):
+        return None
+    for key in ("outcome", "started_at", "completed_at"):
+        field = value.get(key)
+        if not isinstance(field, str) or not field:
+            return None
+    return value
