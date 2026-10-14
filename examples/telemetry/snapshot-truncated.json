@@ -1,0 +1,203 @@
+{
+  "schema_version": 1,
+  "generated_at": "2026-09-30T14:00:00Z",
+  "sequence": 512,
+  "identity": {
+    "repository": "example-owner/example-repo",
+    "agent_version": "0.4.5",
+    "sdk_version": "0.2.163",
+    "cli_version": "2.1.286",
+    "process_started_at": "2026-09-30T08:00:00Z"
+  },
+  "control": {
+    "agent_version": "0.4.5",
+    "repository": "example-owner/example-repo",
+    "intake": "running",
+    "recovering": false,
+    "active_attempt": {
+      "issue_number": 985,
+      "branch": "agent/issue-985",
+      "phase": "model_execution",
+      "started_at": "2026-09-30T10:00:00Z",
+      "issue_title": "Example: catalogue the synthetic inventory"
+    },
+    "pending_command": null,
+    "pending_next_issue": null,
+    "stop_plan": null,
+    "recovery": null,
+    "handoff": null,
+    "consecutive_errors": {
+      "count": 1,
+      "max_consecutive_errors": 3,
+      "last_attempt_id": "2026-09-30T09-00-00-attempt-0981",
+      "last_success_at": "2026-09-29T15:40:00Z"
+    },
+    "commands": {},
+    "control_observed_at": "2026-09-30T14:00:00Z"
+  },
+  "current_attempt": {
+    "attempt_id": "2026-09-30T10-00-00-attempt-0985",
+    "issue_number": 985,
+    "issue_title": "Example: catalogue the synthetic inventory",
+    "observed_at": "2026-09-30T13:59:40Z",
+    "budget": {
+      "used": {
+        "value": 1500000,
+        "basis": "measured"
+      },
+      "measured": {
+        "value": 1500000,
+        "basis": "measured"
+      },
+      "estimated": {
+        "value": 0,
+        "basis": "estimated"
+      },
+      "hard_ceiling": {
+        "value": 4000000,
+        "basis": "configured"
+      },
+      "soft_threshold": {
+        "value": 3200000,
+        "basis": "configured",
+        "rule": "percentage",
+        "percentage": 0.2,
+        "reserve_turns": 6,
+        "crossed": false,
+        "crossed_at_tokens": null,
+        "crossed_at": null
+      },
+      "hard_ceiling_reached": false
+    },
+    "tokens_by_category": {
+      "input_tokens": {
+        "value": 400000,
+        "basis": "measured"
+      },
+      "cache_read_input_tokens": {
+        "value": 950000,
+        "basis": "measured"
+      },
+      "cache_creation_input_tokens": {
+        "value": 0,
+        "basis": "measured"
+      },
+      "output_tokens": {
+        "value": 150000,
+        "basis": "measured"
+      }
+    },
+    "turns": {
+      "value": 35,
+      "basis": "measured",
+      "max": {
+        "value": 60,
+        "basis": "configured"
+      }
+    },
+    "continuation": {
+      "index": {
+        "value": 0,
+        "basis": "measured"
+      },
+      "max": {
+        "value": 0,
+        "basis": "configured"
+      }
+    },
+    "cache": {
+      "main_hit_rate": {
+        "value": null,
+        "basis": "unavailable",
+        "reason": "fewer than the minimum measured responses"
+      }
+    },
+    "context": {
+      "main": {
+        "value": 120000,
+        "basis": "measured"
+      },
+      "main_peak": {
+        "value": 165000,
+        "basis": "measured"
+      },
+      "window": {
+        "value": 200000,
+        "basis": "sdk_assumed"
+      },
+      "auto_compact_threshold": {
+        "value": 190000,
+        "basis": "sdk_assumed"
+      },
+      "compactions": {
+        "count": 1,
+        "last": {
+          "at": "2026-09-30T13:00:00Z",
+          "trigger": "auto",
+          "pre_tokens": {
+            "value": 188000,
+            "basis": "measured"
+          },
+          "post_tokens": {
+            "value": 55000,
+            "basis": "measured"
+          }
+        }
+      },
+      "subagents": [
+        {
+          "id": "sub-c9",
+          "type": "Explore",
+          "context": {
+            "value": 25000,
+            "basis": "estimated"
+          },
+          "running": true
+        }
+      ]
+    },
+    "provider_rate_limit": {
+      "value": null,
+      "basis": "unavailable",
+      "reason": "not exposed through the gateway"
+    },
+    "elapsed_seconds": {
+      "value": 14000,
+      "basis": "measured"
+    },
+    "timeout_seconds": {
+      "value": 3600,
+      "basis": "configured"
+    }
+  },
+  "last_finished": {
+    "attempt_id": "2026-09-29T15-10-00-attempt-0961",
+    "issue_number": 961,
+    "issue_title": "Example: refresh the synthetic status copy",
+    "outcome": "complete",
+    "finished_at": "2026-09-29T15:40:00Z",
+    "budget_used": {
+      "value": 812345,
+      "basis": "estimated"
+    },
+    "turns": {
+      "value": 23,
+      "basis": "measured"
+    },
+    "pull_request": {
+      "number": 962,
+      "url": "https://example.invalid/example-owner/example-repo/pull/962"
+    }
+  },
+  "recent_events": [
+    {
+      "timestamp": "2026-09-30T13:59:40Z",
+      "level": "INFO",
+      "event": "token_budget_reconciled",
+      "issue_number": 985,
+      "phase": "model_execution",
+      "text": "reconciled token budget: measured 1500000, no estimated remainder (older events trimmed: truncated snapshot)"
+    }
+  ],
+  "truncated": true
+}

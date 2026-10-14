@@ -1,0 +1,226 @@
+{
+  "schema_version": 1,
+  "generated_at": "2026-09-30T10:15:00Z",
+  "sequence": 128,
+  "identity": {
+    "repository": "example-owner/example-repo",
+    "agent_version": "0.4.5",
+    "sdk_version": "0.2.163",
+    "cli_version": "2.1.286",
+    "process_started_at": "2026-09-30T08:00:00Z"
+  },
+  "control": {
+    "agent_version": "0.4.5",
+    "repository": "example-owner/example-repo",
+    "intake": "running",
+    "recovering": false,
+    "active_attempt": {
+      "issue_number": 977,
+      "branch": "agent/issue-977",
+      "phase": "model_execution",
+      "started_at": "2026-09-30T09:30:00Z",
+      "issue_title": "Example: add a synthetic widget panel"
+    },
+    "pending_command": null,
+    "pending_next_issue": null,
+    "stop_plan": null,
+    "recovery": null,
+    "handoff": null,
+    "consecutive_errors": {
+      "count": 0,
+      "max_consecutive_errors": 3,
+      "last_attempt_id": "2026-09-29T15-10-00-attempt-0961",
+      "last_success_at": "2026-09-29T15:40:00Z"
+    },
+    "commands": {},
+    "control_observed_at": "2026-09-30T10:15:00Z"
+  },
+  "current_attempt": {
+    "attempt_id": "2026-09-30T09-30-00-attempt-0977",
+    "issue_number": 977,
+    "issue_title": "Example: add a synthetic widget panel",
+    "observed_at": "2026-09-30T10:14:52Z",
+    "budget": {
+      "used": {
+        "value": 640000,
+        "basis": "estimated"
+      },
+      "measured": {
+        "value": 512000,
+        "basis": "measured"
+      },
+      "estimated": {
+        "value": 128000,
+        "basis": "estimated"
+      },
+      "hard_ceiling": {
+        "value": 4000000,
+        "basis": "configured"
+      },
+      "soft_threshold": {
+        "value": 3200000,
+        "basis": "configured",
+        "rule": "percentage",
+        "percentage": 0.2,
+        "reserve_turns": 6,
+        "crossed": false,
+        "crossed_at_tokens": null,
+        "crossed_at": null
+      },
+      "hard_ceiling_reached": false
+    },
+    "tokens_by_category": {
+      "input_tokens": {
+        "value": 120000,
+        "basis": "measured"
+      },
+      "cache_read_input_tokens": {
+        "value": 350000,
+        "basis": "measured"
+      },
+      "cache_creation_input_tokens": {
+        "value": 0,
+        "basis": "measured"
+      },
+      "output_tokens": {
+        "value": 42000,
+        "basis": "measured"
+      }
+    },
+    "turns": {
+      "value": 18,
+      "basis": "measured",
+      "max": {
+        "value": 60,
+        "basis": "configured"
+      }
+    },
+    "continuation": {
+      "index": {
+        "value": 0,
+        "basis": "measured"
+      },
+      "max": {
+        "value": 0,
+        "basis": "configured"
+      }
+    },
+    "cache": {
+      "main_hit_rate": {
+        "value": 0.86,
+        "basis": "measured",
+        "counted": 18
+      }
+    },
+    "context": {
+      "main": {
+        "value": 148000,
+        "basis": "measured"
+      },
+      "main_peak": {
+        "value": 151200,
+        "basis": "measured"
+      },
+      "window": {
+        "value": 200000,
+        "basis": "sdk_assumed"
+      },
+      "auto_compact_threshold": {
+        "value": 190000,
+        "basis": "sdk_assumed"
+      },
+      "compactions": {
+        "count": 0,
+        "last": null
+      },
+      "subagents": [
+        {
+          "id": "sub-a1",
+          "type": "Explore",
+          "context": {
+            "value": 42000,
+            "basis": "estimated"
+          },
+          "running": true
+        },
+        {
+          "id": "sub-a2",
+          "type": "Plan",
+          "context": {
+            "value": 18500,
+            "basis": "estimated"
+          },
+          "running": true
+        },
+        {
+          "id": "sub-a0",
+          "type": "Explore",
+          "context": {
+            "value": 9600,
+            "basis": "estimated"
+          },
+          "running": false
+        }
+      ]
+    },
+    "provider_rate_limit": {
+      "value": null,
+      "basis": "unavailable",
+      "reason": "not exposed through the gateway"
+    },
+    "elapsed_seconds": {
+      "value": 2700,
+      "basis": "measured"
+    },
+    "timeout_seconds": {
+      "value": 3600,
+      "basis": "configured"
+    }
+  },
+  "last_finished": {
+    "attempt_id": "2026-09-29T15-10-00-attempt-0961",
+    "issue_number": 961,
+    "issue_title": "Example: refresh the synthetic status copy",
+    "outcome": "complete",
+    "finished_at": "2026-09-29T15:40:00Z",
+    "budget_used": {
+      "value": 812345,
+      "basis": "estimated"
+    },
+    "turns": {
+      "value": 23,
+      "basis": "measured"
+    },
+    "pull_request": {
+      "number": 962,
+      "url": "https://example.invalid/example-owner/example-repo/pull/962"
+    }
+  },
+  "recent_events": [
+    {
+      "timestamp": "2026-09-30T09:30:00Z",
+      "level": "INFO",
+      "event": "attempt_claimed",
+      "issue_number": 977,
+      "phase": "claim",
+      "text": "claimed issue #977 for the next permitted attempt"
+    },
+    {
+      "timestamp": "2026-09-30T10:10:00Z",
+      "level": "INFO",
+      "event": "subagent_started",
+      "issue_number": 977,
+      "phase": "model_execution",
+      "text": "subagent sub-a1 (Explore) started"
+    },
+    {
+      "timestamp": "2026-09-30T10:14:52Z",
+      "level": "INFO",
+      "event": "token_budget_reconciled",
+      "issue_number": 977,
+      "phase": "model_execution",
+      "text": "reconciled token budget: measured 512000, estimated remainder 128000"
+    }
+  ],
+  "truncated": false
+}

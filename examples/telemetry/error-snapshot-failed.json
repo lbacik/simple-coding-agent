@@ -1,0 +1,7 @@
+{
+  "ok": false,
+  "error": {
+    "code": "snapshot_failed",
+    "message": "agent answered but the telemetry snapshot could not be built"
+  }
+}
