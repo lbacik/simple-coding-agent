@@ -27,8 +27,6 @@ from pathlib import Path
 import os
 import subprocess
 
-import pytest
-
 from simple_coding_agent.attempt_state import AttemptPhase, AttemptStateStore
 from simple_coding_agent.command_runner import CommandRunner
 from simple_coding_agent.completion import AttemptOutcome, CompletionEvaluator, VerificationRunner

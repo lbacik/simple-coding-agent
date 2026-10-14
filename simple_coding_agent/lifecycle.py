@@ -1165,7 +1165,10 @@ class AgentLifecycle:
                 # safe intake state: reject with the startup hold instead of
                 # raising, keeping the control socket usable while held.
                 self._enter_checkpoint_hold_locked(error)
-                assert self._startup_hold_detail is not None
+                # Bound locally: the control path must not depend on an
+                # assert (which vanishes under -O and would crash the
+                # socket it is meant to keep serving if it ever fired).
+                detail = self._startup_hold_detail or _checkpoint_hold_detail(error)
                 return self._control_store.submit_resume(
                     request_id,
                     has_active_attempt=True,
@@ -1174,7 +1177,7 @@ class AgentLifecycle:
                         attempt_id=None,
                         branch=None,
                         phase=None,
-                        reason=self._startup_hold_detail,
+                        reason=detail,
                     ),
                 )
             return self._control_store.submit_resume(
@@ -1493,7 +1496,7 @@ class AgentLifecycle:
                 reason="startup reconciliation is still running",
             )
         if checkpoint is not None and not self._attempt_processing:
-            reason = (
+            reason = self._startup_hold_detail or (
                 "attempt finalization is unresolved; the branch,"
                 " checkpoint, and working tree are preserved for recovery"
             )
@@ -1651,11 +1654,7 @@ class AgentLifecycle:
 
         if self._startup_hold_detail is None:
             self._startup_hold_kind = "checkpoint"
-            self._startup_hold_detail = (
-                f"{_exception_detail(error)} The checkpoint is preserved for"
-                " inspection; issue intake is held until it is repaired or"
-                " removed by an operator."
-            )
+            self._startup_hold_detail = _checkpoint_hold_detail(error)
             self._event_log(
                 "attempt_checkpoint_unusable",
                 self._startup_hold_detail,
@@ -2646,11 +2645,7 @@ class AgentLifecycle:
                 # of an error while the process stays up.
                 if self._startup_hold_detail is None:
                     self._startup_hold_kind = "checkpoint"
-                    self._startup_hold_detail = (
-                        f"{_exception_detail(error)} The checkpoint is preserved for"
-                        " inspection; issue intake is held until it is repaired or"
-                        " removed by an operator."
-                    )
+                    self._startup_hold_detail = _checkpoint_hold_detail(error)
                 checkpoint = None
             active = (
                 ActiveAttemptInfo(
@@ -3654,11 +3649,9 @@ class AgentLifecycle:
         detail = (
             f"{_exception_detail(error)} The branch, checkpoint, and working tree "
             "are preserved for inspection; issue intake is held until the "
-            "workspace is repaired by an operator."
+            "workspace is repaired by an operator"
         )
-        listed = self._dirty_path_list()
-        if listed:
-            detail += f" Offending paths: {listed}."
+        detail += self._dirty_paths_suffix() or "."
         self._event_log(
             "workspace_hold",
             detail,
@@ -3714,18 +3707,17 @@ class AgentLifecycle:
             # remove the file), not a fatal error: hold intake without
             # exiting, keeping the process polling and the control socket
             # serving until the state reads cleanly again.
-            detail = (
-                f"{_exception_detail(error)} The checkpoint is preserved for inspection; "
-                "issue intake is held until it is repaired or removed by an operator."
-            )
+            detail = _checkpoint_hold_detail(error)
             self._event_log(
                 "attempt_checkpoint_unusable",
                 detail,
                 level="ERROR",
             )
-            if self._startup_hold_detail is None:
-                self._startup_hold_kind = "checkpoint"
-                self._startup_hold_detail = detail
+            # Refresh unconditionally (reconcile runs once per process):
+            # the served reason always matches the logged event, while
+            # the once-per-episode gating lives in the heartbeat below.
+            self._startup_hold_kind = "checkpoint"
+            self._startup_hold_detail = detail
             self._note_startup_hold_locked(detail)
             self._active_issue_number = None
             return None
@@ -3750,9 +3742,9 @@ class AgentLifecycle:
                 detail,
                 level="ERROR",
             )
-            if self._startup_hold_detail is None:
-                self._startup_hold_kind = "completion"
-                self._startup_hold_detail = detail
+            # Refresh unconditionally, as for the checkpoint hold above.
+            self._startup_hold_kind = "completion"
+            self._startup_hold_detail = detail
             self._note_startup_hold_locked(
                 detail, issue_number=checkpoint.issue_number
             )
@@ -3802,6 +3794,10 @@ class AgentLifecycle:
             return None
         claim = self._tracker.recover_claim(checkpoint.issue_number)
         if claim is None:
+            # Recorded decision for #219: a retained checkpoint whose issue
+            # is gone entirely is a genuine fatal error, not a workspace
+            # hold — there is no issue to hold intake for and no operator
+            # workspace repair that could progress it.
             raise RuntimeError("Interrupted attempt issue is unavailable for recovery")
         self._active_issue_number = claim.issue.number
         with self._control_lock:
@@ -5309,6 +5305,16 @@ def _infrastructure_decision(reason: str) -> CompletionDecision:
 
 def _exception_detail(error: Exception) -> str:
     return f"{type(error).__name__}: {error}"
+
+
+def _checkpoint_hold_detail(error: Exception) -> str:
+    """Operator-facing hold reason for an unreadable attempt checkpoint."""
+
+    return (
+        f"{_exception_detail(error)} The checkpoint is preserved for"
+        " inspection; issue intake is held until it is repaired or"
+        " removed by an operator."
+    )
 
 
 def _check_recovery_request_id(request_id: object) -> None:
