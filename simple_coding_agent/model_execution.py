@@ -1995,8 +1995,10 @@ class ModelExecutor:
         the effective soft threshold at the main thread's latest context,
         measured per-category tokens over all threads, main-thread turns,
         the main-thread cache hit rate with its measured-response count,
-        and elapsed seconds. No USD figure is included. The caller wraps
-        the result as immutable before publishing.
+        and elapsed seconds. No USD figure is included. The result is
+        deeply immutable: the nested ``tokens_by_category`` mapping is
+        frozen too, so the caller only needs the top-level
+        ``MappingProxyType`` wrap before publishing.
         """
 
         threshold, rule, _reserve_tokens = self._effective_threshold()
@@ -2020,7 +2022,7 @@ class ModelExecutor:
                 None if crossed_at is None else _format_timestamp(crossed_at)
             ),
             "main_context_basis": self._ledger.main_context_basis(),
-            "tokens_by_category": dict(self._ledger.measured_by_category),
+            "tokens_by_category": MappingProxyType(dict(self._ledger.measured_by_category)),
             "turns": (
                 self._ledger.response_count("main")
                 if self._ledger.has_thread("main")

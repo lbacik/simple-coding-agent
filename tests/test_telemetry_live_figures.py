@@ -338,6 +338,14 @@ def test_executor_publishes_an_immutable_view_after_every_limit_check(
     assert len(published) == 2
     for view in published:
         assert isinstance(view, MappingProxyType)
+        # The nested category mapping is frozen too, not just the top level.
+        assert isinstance(view["tokens_by_category"], MappingProxyType)  # type: ignore[index]
+        try:
+            view["tokens_by_category"]["input_tokens"] = 0  # type: ignore[index]
+        except TypeError:
+            pass
+        else:
+            raise AssertionError("nested tokens_by_category must be immutable")
     first = dict(published[0])  # type: ignore[arg-type]
     second = dict(published[1])  # type: ignore[arg-type]
     # The second publication carries the later readings; the first is untouched.
