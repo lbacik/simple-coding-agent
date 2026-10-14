@@ -14,7 +14,7 @@ import signal
 import subprocess
 import threading
 import time
-from typing import Any, NoReturn, Protocol
+from typing import Any, Protocol
 
 from simple_coding_agent.attempt_state import (
     AttemptCheckpoint,
@@ -1077,6 +1077,16 @@ class AgentLifecycle:
         # once (naming the first offending paths) instead of on every poll,
         # and resets when the tree reads clean again.
         self._dirty_tree_reported = False
+        # A startup hold entered when the attempt checkpoint or the
+        # completion ledger cannot be read (``attempt_checkpoint_unusable`` /
+        # ``attempt_completion_unusable``). While set, intake stays held
+        # without exiting: the process keeps polling and serving the
+        # control socket until the unreadable state is repaired or removed.
+        # ``_startup_hold_reported`` rate-limits the intake heartbeat to
+        # once per episode, mirroring the dirty-tree hold.
+        self._startup_hold_detail: str | None = None
+        self._startup_hold_kind: str | None = None
+        self._startup_hold_reported = False
 
     @property
     def active_issue_number(self) -> int | None:
@@ -1148,7 +1158,25 @@ class AgentLifecycle:
         if self._control_store is None:
             raise ControlStoreError("Operator control is not configured")
         with self._control_lock:
-            checkpoint = self._attempt_state.read()
+            try:
+                checkpoint = self._attempt_state.read()
+            except AttemptStateError as error:
+                # The checkpoint cannot be read, so resume cannot verify a
+                # safe intake state: reject with the startup hold instead of
+                # raising, keeping the control socket usable while held.
+                self._enter_checkpoint_hold_locked(error)
+                assert self._startup_hold_detail is not None
+                return self._control_store.submit_resume(
+                    request_id,
+                    has_active_attempt=True,
+                    recovery_hold=RecoveryHold(
+                        issue_number=None,
+                        attempt_id=None,
+                        branch=None,
+                        phase=None,
+                        reason=self._startup_hold_detail,
+                    ),
+                )
             return self._control_store.submit_resume(
                 request_id,
                 has_active_attempt=checkpoint is not None,
@@ -1465,15 +1493,21 @@ class AgentLifecycle:
                 reason="startup reconciliation is still running",
             )
         if checkpoint is not None and not self._attempt_processing:
+            reason = (
+                "attempt finalization is unresolved; the branch,"
+                " checkpoint, and working tree are preserved for recovery"
+            )
+            if self._workspace_is_dirty():
+                # Name the offending paths, as the intake dirty-tree hold
+                # does, so the operator sees what blocks the hold.
+                suffix = self._dirty_paths_suffix()
+                reason += " The working tree is also dirty" + (suffix if suffix else ".")
             return RecoveryHold(
                 issue_number=checkpoint.issue_number,
                 attempt_id=checkpoint.started_at,
                 branch=checkpoint.branch,
                 phase=checkpoint.phase.value,
-                reason=(
-                    "attempt finalization is unresolved; the branch,"
-                    " checkpoint, and working tree are preserved for recovery"
-                ),
+                reason=reason,
             )
         if checkpoint is not None and self._recovery_executing:
             # A recovery command owns the retained attempt right now (it
@@ -1577,13 +1611,110 @@ class AgentLifecycle:
             " work with no active attempt; manual repair is required before"
             " intake"
         )
+        suffix = self._dirty_paths_suffix()
+        if not suffix:
+            return base + "."
+        return base + suffix
+
+    def _dirty_paths_suffix(self) -> str:
+        """Best-effort ``; offending paths: ...`` suffix for hold details.
+
+        Returns ``""`` when the tree reads clean or its paths cannot be
+        read, so callers fail closed on the base message. Shared by the
+        intake dirty-tree hold, the workspace-hold event, and the retained
+        recovery hold, so every dirty-tree hold names the same paths.
+        """
+
+        listed = self._dirty_path_list()
+        if not listed:
+            return ""
+        return f"; offending paths: {listed}."
+
+    def _dirty_path_list(self) -> str:
+        """Best-effort ``a, b (and N more)`` dirty-path list, or ``""``."""
+
         paths = self._dirty_tree_paths_locked()
         if not paths:
-            return base + "."
+            return ""
         shown = ", ".join(paths[:_DIRTY_PATH_DISPLAY_LIMIT])
         extra = len(paths) - _DIRTY_PATH_DISPLAY_LIMIT
-        suffix = shown + (f" (and {extra} more)" if extra > 0 else "")
-        return base + f"; offending paths: {suffix}."
+        return shown + (f" (and {extra} more)" if extra > 0 else "")
+
+    def _enter_checkpoint_hold_locked(self, error: AttemptStateError) -> None:
+        """Enter the startup hold for an unreadable checkpoint (caller holds the lock).
+
+        Logs ``attempt_checkpoint_unusable`` once (when the hold is first
+        entered) and the ``intake_held_for_recovery`` heartbeat once per
+        episode, mirroring the dirty-tree hold. Later polls stay silent
+        until the state reads cleanly again.
+        """
+
+        if self._startup_hold_detail is None:
+            self._startup_hold_kind = "checkpoint"
+            self._startup_hold_detail = (
+                f"{_exception_detail(error)} The checkpoint is preserved for"
+                " inspection; issue intake is held until it is repaired or"
+                " removed by an operator."
+            )
+            self._event_log(
+                "attempt_checkpoint_unusable",
+                self._startup_hold_detail,
+                level="ERROR",
+            )
+        self._note_startup_hold_locked(self._startup_hold_detail)
+
+    def _note_startup_hold_locked(self, detail: str, issue_number: int | None = None) -> None:
+        """Log the startup-hold heartbeat once per episode (caller holds the lock)."""
+
+        if self._startup_hold_reported:
+            return
+        self._startup_hold_reported = True
+        self._event_log(
+            "intake_held_for_recovery",
+            f"{detail} sleeping {self._poll_interval}s",
+            level="WARNING",
+            issue_number=issue_number,
+        )
+
+    def _reread_after_startup_hold(self) -> tuple[bool, AttemptCheckpoint | None]:
+        """Probe whether a startup hold cleared; return ``(cleared, checkpoint)``.
+
+        A checkpoint hold clears once the checkpoint reads again; a
+        completion-ledger hold additionally requires the ledger to read, so
+        repairing only the checkpoint never drops a ledger hold. Any read
+        failure keeps the hold (fails closed). Never raises.
+        """
+
+        try:
+            checkpoint = self._attempt_state.read()
+            if self._startup_hold_kind == "completion" and self._completion_store is not None:
+                self._completion_store.read_all()
+        except Exception:
+            return (False, None)
+        return (True, checkpoint)
+
+    def _clear_startup_hold_locked(self) -> tuple[bool, AttemptCheckpoint | None]:
+        """Clear a repaired startup hold and log the recovery (caller holds the lock).
+
+        Returns ``(cleared, checkpoint)``: ``cleared`` is False while the
+        state still fails to read (the hold stays, silently after the first
+        heartbeat); on success the hold is reset and the re-read checkpoint
+        (possibly ``None`` when the operator removed it) is returned for the
+        caller to continue with.
+        """
+
+        cleared, checkpoint = self._reread_after_startup_hold()
+        if not cleared:
+            return (False, None)
+        self._startup_hold_detail = None
+        self._startup_hold_kind = None
+        self._startup_hold_reported = False
+        self._event_log(
+            "startup_hold_cleared",
+            "the unreadable state now reads cleanly; the startup hold is cleared",
+            level="INFO",
+        )
+        return (True, checkpoint)
 
     # -- recovery execution -------------------------------------------------
 
@@ -2189,6 +2320,36 @@ class AgentLifecycle:
         )
 
         if checkpoint is None:
+            if self._startup_hold_detail is not None:
+                # The checkpoint or completion ledger cannot be read: report
+                # the startup hold (read-only; never logs from status) with
+                # the dirty paths when the tree is dirty too.
+                reason = self._startup_hold_detail
+                if self._workspace_is_dirty():
+                    suffix = self._dirty_paths_suffix()
+                    reason += " The working tree is also dirty" + (
+                        suffix if suffix else "."
+                    )
+                return {
+                    "attempt_id": None,
+                    "issue_number": None,
+                    "phase": None,
+                    "outcome": None,
+                    "branch": None,
+                    "workspace": str(self._workspace.working_directory),
+                    "checkpoint": False,
+                    "publication": {
+                        "phase": None,
+                        "comment_confirmed": None,
+                        "pull_request": None,
+                    },
+                    "hold_reason": reason,
+                    "next_action": (
+                        "Repair or remove the unreadable state file described"
+                        " in the hold reason; intake resumes automatically"
+                        " once it reads cleanly."
+                    ),
+                }
             if not self._workspace_is_dirty():
                 return None
             reason = self._dirty_tree_detail()
@@ -2477,7 +2638,20 @@ class AgentLifecycle:
             raise ControlStoreError("Operator control is not configured")
         with self._control_lock:
             store = self._control_store
-            checkpoint = self._attempt_state.read()
+            try:
+                checkpoint = self._attempt_state.read()
+            except AttemptStateError as error:
+                # Status is read-only: record the startup hold silently (no
+                # event) so the operator still sees the hold reason instead
+                # of an error while the process stays up.
+                if self._startup_hold_detail is None:
+                    self._startup_hold_kind = "checkpoint"
+                    self._startup_hold_detail = (
+                        f"{_exception_detail(error)} The checkpoint is preserved for"
+                        " inspection; issue intake is held until it is repaired or"
+                        " removed by an operator."
+                    )
+                checkpoint = None
             active = (
                 ActiveAttemptInfo(
                     issue_number=checkpoint.issue_number,
@@ -2635,7 +2809,10 @@ class AgentLifecycle:
             # Unexplained dirty or untracked work: hold intake and preserve
             # the branch, checkpoint, and entire working tree for inspection.
             # Publishing or releasing here would discard evidence about work
-            # this attempt never produced.
+            # this attempt never produced. The attempt stays held (no exit):
+            # the finally boundary below logs ``attempt_finalization_held``
+            # and retains the checkpoint, so the next poll holds on the
+            # retained attempt instead of claiming new work.
             self._event_log(
                 "workspace_hold",
                 f"{_exception_detail(error)} The branch, checkpoint, and working tree "
@@ -2646,7 +2823,6 @@ class AgentLifecycle:
             )
             comment_posted = False
             prepared = None
-            raise SystemExit(1) from error
         except GitWorkspaceRecoveryError as error:
             self._event_log(
                 "git_workspace_unrecoverable",
@@ -2656,7 +2832,6 @@ class AgentLifecycle:
             )
             comment_posted = False
             prepared = None
-            raise SystemExit(1) from error
         except SystemExit:
             raise
         except RebaseConflictError as error:
@@ -2818,20 +2993,36 @@ class AgentLifecycle:
         """
 
         with self._control_lock:
+            if self._startup_hold_detail is not None:
+                # A startup hold (unreadable checkpoint or completion
+                # ledger) is active, with or without operator control:
+                # resume only once the state reads cleanly again
+                # (operator repair); otherwise stay held silently after
+                # the first heartbeat.
+                cleared, _ = self._clear_startup_hold_locked()
+                if not cleared:
+                    return (None, None)
+                # The hold cleared: fall through and read fresh state below.
             if self._control_store is not None:
                 intake = self._control_store.intake_state()
                 if intake is not IntakeState.RUNNING:
-                    if (
-                        intake is IntakeState.STOPPING
-                        and self._attempt_state.read() is None
-                    ):
-                        # The waited-for attempt is gone without finalizing
-                        # through this path (e.g. it was reconciled on a
-                        # previous start); finish the stop instead of holding.
-                        # A pending handoff can never still be observed, so
-                        # it is failed rather than waited on forever.
-                        self._fail_orphan_handoff_locked()
-                        self._control_store.complete_pending_stop()
+                    if intake is IntakeState.STOPPING:
+                        try:
+                            stopped_empty = self._attempt_state.read() is None
+                        except AttemptStateError as error:
+                            # The checkpoint cannot be read, so the
+                            # waited-for attempt may still exist: hold
+                            # instead of finishing the stop.
+                            self._enter_checkpoint_hold_locked(error)
+                            return (None, None)
+                        if stopped_empty:
+                            # The waited-for attempt is gone without finalizing
+                            # through this path (e.g. it was reconciled on a
+                            # previous start); finish the stop instead of holding.
+                            # A pending handoff can never still be observed, so
+                            # it is failed rather than waited on forever.
+                            self._fail_orphan_handoff_locked()
+                            self._control_store.complete_pending_stop()
                     self._event_log(
                         "intake_stopped",
                         f"issue intake is {self._control_store.intake_state().value};"
@@ -2839,7 +3030,14 @@ class AgentLifecycle:
                         level="INFO",
                     )
                     return (None, None)
-                retained = self._attempt_state.read()
+                try:
+                    retained = self._attempt_state.read()
+                except AttemptStateError as error:
+                    # The checkpoint became unreadable after startup:
+                    # hold without exiting, as startup reconciliation
+                    # does, instead of claiming over unknown state.
+                    self._enter_checkpoint_hold_locked(error)
+                    return (None, None)
                 if retained is not None:
                     # A retained checkpoint means an earlier attempt is held
                     # for recovery (or a recovery command is working through
@@ -3431,27 +3629,39 @@ class AgentLifecycle:
                 claim.issue.number, "ready-for-agent", claim.assignment.assignee_id
             )
 
-    def _hold_dirty_workspace(self, issue_number: int, error: DirtyWorkspaceError) -> NoReturn:
+    def _hold_dirty_workspace(self, issue_number: int, error: DirtyWorkspaceError) -> None:
         """Hold intake with a dirty tree preserved on the attempt branch.
 
         Cleanup refused to switch to the base branch while the tree is
         dirty, so the workspace stays on the attempt branch: emit the hold
-        event and pause the agent loop for the operator instead of
-        finalizing or claiming further issues. The branch, checkpoint, and
-        entire working tree are preserved for inspection.
+        event and return to the poll loop instead of finalizing or claiming
+        further issues. The caller retains the checkpoint (its cleanup-ok
+        flag stays false), so the next poll holds on the retained attempt.
+        The branch, checkpoint, and entire working tree are preserved for
+        inspection.
         """
 
         self._emit_workspace_hold(issue_number, error)
-        raise SystemExit(1) from error
 
     def _emit_workspace_hold(self, issue_number: int, error: DirtyWorkspaceError) -> None:
-        """Record that intake is held on a dirty attempt workspace."""
+        """Record that intake is held on a dirty attempt workspace.
 
-        self._event_log(
-            "workspace_hold",
+        Names the offending paths, as the intake dirty-tree hold does:
+        the cleanup error itself carries no paths, so they are read
+        best-effort from the tree.
+        """
+
+        detail = (
             f"{_exception_detail(error)} The branch, checkpoint, and working tree "
             "are preserved for inspection; issue intake is held until the "
-            "workspace is repaired by an operator.",
+            "workspace is repaired by an operator."
+        )
+        listed = self._dirty_path_list()
+        if listed:
+            detail += f" Offending paths: {listed}."
+        self._event_log(
+            "workspace_hold",
+            detail,
             level="WARNING",
             issue_number=issue_number,
         )
@@ -3500,13 +3710,25 @@ class AgentLifecycle:
         try:
             checkpoint = self._attempt_state.read()
         except AttemptStateError as error:
+            # An unreadable checkpoint is operator-repairable (repair or
+            # remove the file), not a fatal error: hold intake without
+            # exiting, keeping the process polling and the control socket
+            # serving until the state reads cleanly again.
+            detail = (
+                f"{_exception_detail(error)} The checkpoint is preserved for inspection; "
+                "issue intake is held until it is repaired or removed by an operator."
+            )
             self._event_log(
                 "attempt_checkpoint_unusable",
-                f"{_exception_detail(error)} The checkpoint is preserved for inspection; "
-                "issue intake is held until it is repaired or removed by an operator.",
+                detail,
                 level="ERROR",
             )
-            raise SystemExit(1) from error
+            if self._startup_hold_detail is None:
+                self._startup_hold_kind = "checkpoint"
+                self._startup_hold_detail = detail
+            self._note_startup_hold_locked(detail)
+            self._active_issue_number = None
+            return None
         if checkpoint is None:
             return None
         try:
@@ -3515,14 +3737,27 @@ class AgentLifecycle:
                 and self._completion_store.is_finalized(checkpoint.started_at)
             )
         except CompletionStoreError as error:
-            self._event_log(
-                "attempt_completion_unusable",
+            # An unreadable completion ledger is operator-repairable like
+            # an unreadable checkpoint: hold without exiting rather than
+            # crash-looping under process restart.
+            detail = (
                 f"{_exception_detail(error)} The completion ledger is preserved for "
                 "inspection; issue intake is held until it is repaired or removed "
-                "by an operator.",
+                "by an operator."
+            )
+            self._event_log(
+                "attempt_completion_unusable",
+                detail,
                 level="ERROR",
             )
-            raise SystemExit(1) from error
+            if self._startup_hold_detail is None:
+                self._startup_hold_kind = "completion"
+                self._startup_hold_detail = detail
+            self._note_startup_hold_locked(
+                detail, issue_number=checkpoint.issue_number
+            )
+            self._active_issue_number = None
+            return None
         if finalized:
             # The previous process finalized every boundary step and recorded
             # the attempt, then crashed before removing the checkpoint.
@@ -3715,7 +3950,10 @@ class AgentLifecycle:
             # Unexplained dirty or untracked work: hold intake and preserve
             # the branch, checkpoint, and entire working tree for inspection.
             # Publishing or releasing here would discard evidence about work
-            # this attempt never produced.
+            # this attempt never produced. The attempt stays held (no exit):
+            # the finally boundary below logs ``attempt_finalization_held``
+            # and retains the checkpoint, so the next poll holds on the
+            # retained attempt instead of claiming new work.
             self._event_log(
                 "workspace_hold",
                 f"{_exception_detail(error)} The branch, checkpoint, and working tree "
@@ -3726,7 +3964,6 @@ class AgentLifecycle:
             )
             comment_posted = False
             prepared = None
-            raise SystemExit(1) from error
         except GitWorkspaceRecoveryError as error:
             self._event_log(
                 "git_workspace_unrecoverable",
@@ -3736,7 +3973,6 @@ class AgentLifecycle:
             )
             comment_posted = False
             prepared = None
-            raise SystemExit(1) from error
         except SystemExit:
             raise
         except RebaseConflictError as error:

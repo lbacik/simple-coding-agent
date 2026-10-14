@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 from simple_coding_agent.attempt_state import AttemptPhase, AttemptStateStore
 from simple_coding_agent.completion import AttemptOutcome, CompletionDecision, PublicationPath
+from simple_coding_agent.control import ControlStore
 from simple_coding_agent.git_workspace import GitWorkspaceRecoveryError, RebaseConflictError
 from simple_coding_agent.github_tracker import Assignment, Claim, TrackerIssue
 from simple_coding_agent.lifecycle import AgentLifecycle, AttemptEvidence, LifecycleStatus
@@ -522,8 +523,9 @@ def test_dirty_tree_at_cleanup_holds_the_workspace_on_the_attempt_branch(
 
     The workflow leaves dirty work behind (as an unverified final check
     would); cleanup must refuse to check out the base branch, emit
-    ``workspace_hold``, and pause the loop via ``SystemExit(1)`` without
-    finalizing the checkpoint.
+    ``workspace_hold`` naming the offending paths, and hold the attempt
+    without exiting, so the next poll holds on the retained attempt instead
+    of claiming new work.
     """
 
     claim = Claim(issue(24), Assignment("issue-24", "agent-id"))
@@ -551,24 +553,45 @@ def test_dirty_tree_at_cleanup_holds_the_workspace_on_the_attempt_branch(
         profile_loader=lambda _: profile(),
         publisher=publisher,
         attempt_runner=run_workflow,
+        control_store=ControlStore(tmp_path),
         event_log=lambda event, detail="", level="INFO", issue_number=None: events.append(
             (event, detail, level, issue_number)
         ),
+        sleeper=lambda seconds: None,
     )
 
-    with pytest.raises(SystemExit) as held:
-        lifecycle.run_once()
+    result = lifecycle.run_once()
 
-    assert held.value.code == 1
+    assert result.status is LifecycleStatus.ATTEMPTED
     # Cleanup was attempted but refused to leave the attempt branch.
     assert workspace.cleanup_calls == [("main", False)]
     assert workspace.current_branch == "agent/issue-24"
-    assert any(
-        event == "workspace_hold" and level == "WARNING" and issue_number == 24
-        for event, _, level, issue_number in events
-    )
+    holds = [
+        detail
+        for event, detail, level, issue_number in events
+        if event == "workspace_hold" and level == "WARNING" and issue_number == 24
+    ]
+    assert len(holds) == 1
+    assert "uncommitted.py" in holds[0]
     # The checkpoint is retained for operator recovery, not finalized.
     assert state.read() is not None
+
+    # The hold is operator-visible with the offending paths.
+    snapshot = lifecycle.control_status("owner/repo")
+    assert snapshot["recovery"] is not None
+    assert snapshot["recovery"]["issue_number"] == 24
+    assert "uncommitted.py" in snapshot["recovery"]["hold_reason"]
+
+    # The next poll holds on the retained attempt without exiting or claiming.
+    tracker.next_claim = Claim(issue(25), Assignment("issue-25", "agent-id"))
+    followup = lifecycle.run_once()
+
+    assert followup.status is LifecycleStatus.IDLE
+    assert tracker.claimed == [24]
+    assert state.read() is not None
+    assert any(
+        event == "intake_held_for_recovery" for event, _, _, _ in events
+    )
 
 
 def test_logs_every_stage_from_claiming_the_issue_to_dispatching_the_model(
@@ -681,7 +704,7 @@ def test_does_not_start_cleanup_when_the_result_comment_was_not_posted(tmp_path:
     assert workspace.cleanup_calls == []
 
 
-def test_stops_without_touching_the_issue_when_the_workspace_cannot_be_repaired(
+def test_unrecoverable_workspace_holds_intake_without_exiting(
     tmp_path: Path,
 ) -> None:
     events: list[tuple[str, str, str]] = []
@@ -694,14 +717,17 @@ def test_stops_without_touching_the_issue_when_the_workspace_cannot_be_repaired(
         workspace=workspace,
         profile_loader=lambda _: (_ for _ in ()).throw(AssertionError("must not be reached")),
         publisher=FakePublisher(),
+        control_store=ControlStore(tmp_path),
         event_log=lambda event, detail="", level="INFO", issue_number=None: events.append(
             (event, detail, level, issue_number)
         ),
+        sleeper=lambda seconds: None,
     )
 
-    with pytest.raises(SystemExit):
-        lifecycle.run_once()
+    result = lifecycle.run_once()
 
+    # The process stays up (no ``SystemExit``) with the checkpoint retained.
+    assert result.status is LifecycleStatus.ATTEMPTED
     assert tracker.cleanup == []
     assert workspace.cleanup_calls == []
     assert state.read() is not None
@@ -711,6 +737,14 @@ def test_stops_without_touching_the_issue_when_the_workspace_cannot_be_repaired(
         "ERROR",
         24,
     ) in events
+
+    # The next poll holds on the retained attempt without claiming new work.
+    tracker.next_claim = Claim(issue(25), Assignment("issue-25", "agent-id"))
+    followup = lifecycle.run_once()
+
+    assert followup.status is LifecycleStatus.IDLE
+    assert tracker.claimed == [24]
+    assert state.read() is not None
 
 
 def test_unresolved_rebase_conflict_after_the_model_reports_infrastructure_error(
