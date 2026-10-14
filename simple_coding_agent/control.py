@@ -113,6 +113,7 @@ class ActiveAttemptInfo:
     branch: str
     phase: str
     started_at: str
+    issue_title: str | None = None
 
 
 @dataclass(frozen=True)
@@ -2097,6 +2098,7 @@ def build_status(
                 "branch": active_attempt.branch,
                 "phase": active_attempt.phase,
                 "started_at": active_attempt.started_at,
+                "issue_title": active_attempt.issue_title,
             }
             if active_attempt is not None
             else None

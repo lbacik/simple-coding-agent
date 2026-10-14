@@ -2718,6 +2718,67 @@ class AgentLifecycle:
             issue_number=issue_number,
         )
 
+    def _continuation_index_for_claim(
+        self, source: str, auto_count: int | None
+    ) -> int | None:
+        """The claim-time automatic-continuation index stored for telemetry.
+
+        A human requeue starts a new row at zero; an automatic continuation
+        continues it at ``count + 1``. An unreadable count stays unknown
+        (``None``) so telemetry reports it as unavailable instead of guessing.
+        """
+
+        if source != REQUEUE_SOURCE_AUTOMATIC:
+            return 0
+        if not isinstance(auto_count, int) or isinstance(auto_count, bool):
+            return None
+        return auto_count + 1
+
+    def _telemetry_begin_for_checkpoint(self, checkpoint: AttemptCheckpoint) -> None:
+        """Seed telemetry ``current_attempt`` at claim; never raises.
+
+        A telemetry failure logs once and keeps the previous view so it can
+        never break the claim it observes.
+        """
+
+        reporter = self._telemetry
+        if reporter is None:
+            return
+        try:
+            reporter.begin_attempt(
+                {
+                    "attempt_id": checkpoint.started_at,
+                    "issue_number": checkpoint.issue_number,
+                    "issue_title": getattr(checkpoint, "issue_title", None),
+                    "continuation_index": getattr(checkpoint, "continuation_index", None),
+                    "continuation_max": self._max_auto_continuations,
+                }
+            )
+        except Exception as error:
+            self._event_log(
+                "telemetry_publish_failed",
+                f"telemetry begin_attempt failed: {error}; keeping previous view",
+                level="WARNING",
+                issue_number=checkpoint.issue_number,
+            )
+
+    def _telemetry_finish(self) -> None:
+        """Clear telemetry ``current_attempt`` at finalisation; never raises."""
+
+        reporter = self._telemetry
+        if reporter is None:
+            return
+        try:
+            finish = getattr(reporter, "finish_attempt", None)
+            if callable(finish):
+                finish()
+        except Exception as error:
+            self._event_log(
+                "telemetry_publish_failed",
+                f"telemetry finish_attempt failed: {error}; keeping previous view",
+                level="WARNING",
+            )
+
     def _handoff_publication_details(
         self,
         claim: Claim,
@@ -2881,6 +2942,7 @@ class AgentLifecycle:
                     branch=checkpoint.branch,
                     phase=checkpoint.phase.value,
                     started_at=checkpoint.started_at,
+                    issue_title=getattr(checkpoint, "issue_title", None),
                 )
                 if checkpoint is not None
                 else None
@@ -2967,6 +3029,7 @@ class AgentLifecycle:
                 branch=checkpoint.branch,
                 phase=checkpoint.phase.value,
                 started_at=checkpoint.started_at,
+                issue_title=getattr(checkpoint, "issue_title", None),
             )
             if checkpoint is not None
             else None
@@ -3555,18 +3618,25 @@ class AgentLifecycle:
                     level="INFO",
                 )
                 return (None, None)
-            checkpoint = self._attempt_state.start(
-                issue_number=claim.issue.number,
-                branch=f"agent/issue-{claim.issue.number}",
-                auto_merge_opt_in=AUTO_MERGE_LABEL in claim.issue.labels,
-                requeue_source=requeue_source_for_labels(claim.issue.labels),
-            )
-            self._attempt_processing = True
-            if requeue_source_for_labels(claim.issue.labels) == REQUEUE_SOURCE_AUTOMATIC:
+            source = requeue_source_for_labels(claim.issue.labels)
+            if source == REQUEUE_SOURCE_AUTOMATIC:
                 try:
                     auto_count = self._auto_continuation_count(claim.issue)
                 except Exception:
                     auto_count = None
+            else:
+                auto_count = None
+            checkpoint = self._attempt_state.start(
+                issue_number=claim.issue.number,
+                branch=f"agent/issue-{claim.issue.number}",
+                auto_merge_opt_in=AUTO_MERGE_LABEL in claim.issue.labels,
+                requeue_source=source,
+                issue_title=claim.issue.title,
+                continuation_index=self._continuation_index_for_claim(source, auto_count),
+            )
+            self._attempt_processing = True
+            self._telemetry_begin_for_checkpoint(checkpoint)
+            if source == REQUEUE_SOURCE_AUTOMATIC:
                 self._emit_auto_continuation_claim(claim.issue.number, auto_count)
             if self._control_store is not None:
                 # The final counted attempt of a ``stop --after`` plan enters
@@ -3691,15 +3761,24 @@ class AgentLifecycle:
             level="INFO",
             issue_number=claim.issue.number,
         )
-        if requeue_source_for_labels(fresh.labels) == REQUEUE_SOURCE_AUTOMATIC:
+        source = requeue_source_for_labels(fresh.labels)
+        if source == REQUEUE_SOURCE_AUTOMATIC:
             self._emit_auto_continuation_claim(claim.issue.number, auto_count)
+            continuation_index: int | None = self._continuation_index_for_claim(
+                source, auto_count
+            )
+        else:
+            continuation_index = 0
         checkpoint = self._attempt_state.start(
             issue_number=claim.issue.number,
             branch=f"agent/issue-{claim.issue.number}",
             auto_merge_opt_in=AUTO_MERGE_LABEL in claim.issue.labels,
-            requeue_source=requeue_source_for_labels(claim.issue.labels),
+            requeue_source=source,
+            issue_title=claim.issue.title,
+            continuation_index=continuation_index,
         )
         self._attempt_processing = True
+        self._telemetry_begin_for_checkpoint(checkpoint)
         return (claim, checkpoint)
 
     def _wire_attempt_runner_handoff(self) -> None:
@@ -4197,6 +4276,7 @@ class AgentLifecycle:
             )
         self._record_control_finalization(attempt_id, outcome)
         self._attempt_state.delete()
+        self._telemetry_finish()
 
     def _reconcile_startup(self) -> AttemptOutcome | None:
         """Finish one durable attempt without recreating its SDK execution context."""
@@ -4291,6 +4371,7 @@ class AgentLifecycle:
                         self._active_issue_number = None
                         return None
             self._attempt_state.delete()
+            self._telemetry_finish()
             self._active_issue_number = None
             return None
         claim = self._tracker.recover_claim(checkpoint.issue_number)

@@ -106,6 +106,10 @@ def main() -> None:
         sdk_version=provenance.sdk_version,
         cli_version=provenance.cli_version,
         process_started_at=process_started_at,
+        hard_ceiling=config.max_budget_tokens,
+        turns_max=config.max_turns,
+        timeout_seconds=config.model_timeout,
+        continuation_max=config.max_auto_continuations,
     )
     lifecycle = AgentLifecycle(
         tracker=tracker,
