@@ -403,6 +403,7 @@ def test_auto_merge_falls_back_to_direct_merge_when_already_mergeable(tmp_path: 
     [
         "Pull request is in clean status",
         "Pull request is in unstable status",
+        "GitHub GraphQL request was rejected: Pull request Protected branch rules not configured for this branch",
     ],
 )
 def test_auto_merge_falls_back_to_direct_merge_on_unprotected_branch(
@@ -413,9 +414,17 @@ def test_auto_merge_falls_back_to_direct_merge_on_unprotected_branch(
     prepared = workspace.prepare_attempt(base_branch="main", issue_number=23)
     write_and_commit(tmp_path / "clone", "feature.txt", "done", "Implement publication")
     github = FakeGitHub(enable_error=OSError(refusal))
+    events: list[tuple[str, str, str, int | None]] = []
 
     result = Publisher(
-        workspace, github, "octo/example", auto_merge=True, merge_method="squash"
+        workspace,
+        github,
+        "octo/example",
+        auto_merge=True,
+        merge_method="squash",
+        event_log=lambda event, detail="", level="INFO", issue_number=None: events.append(
+            (event, detail, level, issue_number)
+        ),
     ).publish(
         request(CompletionDecision(None, True, PublicationPath.COMPLETE, ("ready",)), prepared.branch)
     )
@@ -425,6 +434,8 @@ def test_auto_merge_falls_back_to_direct_merge_on_unprotected_branch(
     assert len(github.auto_merge_calls) == 1
     assert github.merge_calls == [("octo/example", 1, "squash")]
     assert "**Merge**: merged" in github.comments[0][1]
+    assert any(event == "pull_request_merged" for event, _, _, _ in events)
+    assert all(event != "auto_merge_failed" for event, _, _, _ in events)
 
 
 def test_auto_merge_failure_keeps_complete_and_reports_the_reason(tmp_path: Path) -> None:

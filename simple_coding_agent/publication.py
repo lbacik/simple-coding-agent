@@ -440,10 +440,21 @@ def _error_text(error: Exception) -> str:
 
 
 def _is_already_mergeable(error: Exception) -> bool:
-    """Whether enabling auto-merge was refused because the PR can merge now."""
+    """Whether enabling auto-merge was refused because the PR can merge now.
+
+    An unprotected base branch (``protected branch rules not configured``)
+    merges directly: with no required checks to wait for, the agent's own
+    final check stands as the gate, and ``_merge_directly`` still reports a
+    genuinely unmergeable PR (e.g. conflicts) via ``mergePullRequest``.
+    """
 
     text = _error_text(error)
-    return "mergeable" in text or "clean status" in text or "unstable status" in text
+    return (
+        "mergeable" in text
+        or "clean status" in text
+        or "unstable status" in text
+        or "protected branch rules not configured" in text
+    )
 
 
 def _is_already_enabled(error: Exception) -> bool:
