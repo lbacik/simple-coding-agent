@@ -75,3 +75,11 @@ _Avoid_: Budget cap, kill limit
 **Pinned runtime**:
 The single approved agent-SDK release, together with the Claude Code CLI shipped inside it, that every model execution must run on. Pinning the SDK pins the CLI; the CLI never has a version of its own to keep in step. Provenance verification confirms at startup that the CLI about to run is exactly the one this release ships, and refuses to start otherwise.
 _Avoid_: Runtime pair, SDK and CLI pins, the CLI on PATH
+
+**Dashboard**:
+A separate operator view over the managed instances on one Docker host. It observes instances and, from its second version, relays operator commands to them; it never claims issues or takes part in an implementation attempt.
+_Avoid_: Control panel, monitor, fleet manager
+
+**Managed instance**:
+One agent container that a dashboard discovers and observes, serving exactly one target repository. It is identified by its container name, so recreating the container keeps the same managed instance; a container started for a one-off command is never a managed instance.
+_Avoid_: Agent, worker, node
