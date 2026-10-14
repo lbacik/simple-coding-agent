@@ -83,3 +83,11 @@ _Avoid_: Control panel, monitor, fleet manager
 **Managed instance**:
 One agent container that a dashboard discovers and observes, serving exactly one target repository. It is identified by its container name, so recreating the container keeps the same managed instance; a container started for a one-off command is never a managed instance.
 _Avoid_: Agent, worker, node
+
+**Telemetry snapshot**:
+A point-in-time, read-only report a managed instance gives about itself: its control state, the current (or last finished) implementation attempt's token, budget and context figures, and its most recent events. The agent owns and versions it; a dashboard only reads it and tolerates versions it does not fully know.
+_Avoid_: Status, metrics, heartbeat
+
+**Figure basis**:
+How a figure in a telemetry snapshot was obtained: `measured` (reported by the provider), `estimated` (computed by the agent), `configured` (set by the operator), `sdk_assumed` (a default the runtime assumes for an unknown model), or `unavailable` (no trustworthy source). An unavailable figure is never shown as zero.
+_Avoid_: Provenance (reserved for provenance verification of the pinned runtime), source, confidence
