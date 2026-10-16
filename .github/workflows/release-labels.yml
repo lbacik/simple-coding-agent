@@ -1,0 +1,65 @@
+name: Release labels
+
+on:
+  pull_request:
+    types: [opened, edited, reopened]
+
+permissions:
+  contents: read
+  issues: read
+  pull-requests: write
+
+jobs:
+  copy-issue-labels:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Copy linked-issue release labels onto the PR
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+          HEAD_BRANCH: ${{ github.event.pull_request.head.ref }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          export PYTHONPATH="$GITHUB_WORKSPACE/scripts"
+
+          ISSUE_NUMBER="$(python - <<'EOF'
+          import os
+          from release_labels import linked_issue_number
+          number = linked_issue_number(os.environ.get("PR_BODY", ""))
+          print(number if number is not None else "")
+          EOF
+          )"
+
+          ISSUE_LABELS_JSON="[]"
+          if [ -n "$ISSUE_NUMBER" ]; then
+            # A missing issue must not fail the workflow; worst case the PR
+            # lands under "Other changes" in the generated release notes.
+            ISSUE_LABELS_JSON="$(gh api "repos/$GITHUB_REPOSITORY/issues/$ISSUE_NUMBER" --jq '[.labels[].name]' || echo '[]')"
+          fi
+
+          LABELS_TO_ADD="$(ISSUE_LABELS_JSON="$ISSUE_LABELS_JSON" python - <<'EOF'
+          import json
+          import os
+          from release_labels import labels_to_add
+          issue_labels = json.loads(os.environ.get("ISSUE_LABELS_JSON", "[]"))
+          labels = labels_to_add(
+              os.environ.get("PR_BODY", ""),
+              os.environ.get("HEAD_BRANCH", ""),
+              issue_labels,
+          )
+          print(",".join(labels))
+          EOF
+          )"
+
+          if [ -z "$LABELS_TO_ADD" ]; then
+            echo "No release labels to add."
+          else
+            # --add-label only adds; it never removes existing PR labels.
+            echo "Adding labels: $LABELS_TO_ADD"
+            gh pr edit "$PR_NUMBER" --add-label "$LABELS_TO_ADD"
+          fi
