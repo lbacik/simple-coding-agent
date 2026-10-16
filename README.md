@@ -281,8 +281,13 @@ interrupted cleanup without duplicating a result.
 1. Bump `version` in `pyproject.toml` and merge the change to `main`.
 2. Tag that commit `v<version>` (for example `v0.3.0`) and push the tag.
 
+Pushing the tag automatically creates a GitHub Release named for the tag with
+generated notes (`.github/release.yml` categories). If a Release for the tag
+already exists, the job leaves it unchanged.
+
 CI runs `scripts/check_tag_version.py` on every `v*` tag push and fails when the
 tag is not exactly `v` + the `pyproject.toml` version, naming both values. The
+Release is created only after that check passes. The
 agent never creates or pushes tags. The running version is reported in the
 startup `provenance_verified` event, each attempt's `attempt.json`
 (`agent_version`) and `agentctl status`.

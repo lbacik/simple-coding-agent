@@ -20,6 +20,40 @@ jobs:
           python-version: "3.13"
       - run: python scripts/check_tag_version.py "$GITHUB_REF_NAME"
 
+  release:
+    if: github.ref_type == 'tag'
+    needs: tag-version
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="$GITHUB_REF_NAME"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG already exists, leaving it unchanged."
+            exit 0
+          fi
+          PREV=""
+          for t in $(git tag --list 'v*' --sort=v:refname); do
+            if [ "$t" = "$TAG" ]; then
+              break
+            fi
+            PREV="$t"
+          done
+          if [ -n "$PREV" ]; then
+            echo "Creating release $TAG with notes since $PREV."
+            gh release create "$TAG" --title "$TAG" --generate-notes --notes-start-tag "$PREV"
+          else
+            echo "Creating release $TAG with notes (no previous tag)."
+            gh release create "$TAG" --title "$TAG" --generate-notes
+          fi
+
   lint:
     runs-on: ubuntu-latest
     steps:
