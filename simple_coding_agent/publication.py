@@ -249,7 +249,7 @@ class Publisher:
                     self._repository,
                     request.branch,
                     request.base_branch,
-                    f"agent: {request.issue_title}",
+                    request.issue_title,
                     body,
                 )
             except Exception:

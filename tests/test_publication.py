@@ -40,7 +40,8 @@ def test_publishes_a_complete_attempt_once_and_renders_the_standard_result(tmp_p
     assert result.outcome is AttemptOutcome.COMPLETE
     assert result.pull_request == PullRequest(1, "https://example.test/pulls/1", "pr-node-1")
     assert git(tmp_path / "clone", "ls-remote", "origin", "refs/heads/agent/issue-23")
-    assert github.created == [("octo/example", "agent/issue-23", "main", "agent: Implement publication")]
+    assert github.created == [("octo/example", "agent/issue-23", "main", "Implement publication")]
+    assert not github.created[0][3].startswith("agent: ")
     assert "Closes #23" in github.pull_request_bodies[0]
     assert "## Agent Attempt Result: complete" in github.comments[0][1]
     assert "<!-- agent-attempt: 2026-09-20T13:00:00Z -->" in github.comments[0][1]
