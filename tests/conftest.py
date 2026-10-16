@@ -12,6 +12,7 @@ with one rooted directly under ``/tmp``.
 from __future__ import annotations
 
 import shutil
+import sys
 import tempfile
 from collections.abc import Iterator
 from pathlib import Path
@@ -19,6 +20,11 @@ from pathlib import Path
 import pytest
 
 from tests.fakes import FakePublisher, FakeTracker, InMemoryWorkspace
+
+# Repository automation helpers (e.g. scripts/release_labels.py) are plain
+# modules, not part of the product package. Put scripts/ on the import path
+# so unit tests (and the release backfill script later) import the same rule.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 
 
 @pytest.fixture
