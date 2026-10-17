@@ -9,8 +9,11 @@ from __future__ import annotations
 import release_labels
 from backfill_releases import (
     BackfillPlan,
+    LabelOp,
     PullRequest,
     ReleaseInfo,
+    ReleaseOp,
+    apply_plan,
     categorize,
     count_categories,
     labels_to_add,
@@ -243,3 +246,52 @@ def test_report_probe_accepts_categorised_notes(capsys) -> None:
 def test_report_probe_rejects_uncategorised_notes(capsys) -> None:
     assert report_probe("v0.2.0", "v0.1.0", "### Other changes\n") is False
     assert "Probe FAILED for v0.2.0" in capsys.readouterr().err
+
+
+class FakeGitHub:
+    """Records the order of calls; notes are categorised once labels are added."""
+
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+        self.labelled = False
+
+    def add_labels(self, number: int, labels: tuple[str, ...]) -> None:
+        self.calls.append(f"label #{number}")
+        self.labelled = True
+
+    def retitle(self, number: int, new_title: str) -> None:
+        self.calls.append(f"retitle #{number}")
+
+    def generate_notes(self, tag: str, previous: str | None) -> str:
+        self.calls.append("probe")
+        return "### Features\n### Fixes\n" if self.labelled else "* flat list\n"
+
+    def create_release(self, tag: str, previous: str | None) -> None:
+        self.calls.append(f"release {tag}")
+
+    def mark_latest(self, tag: str) -> None:
+        self.calls.append(f"latest {tag}")
+
+
+def test_apply_plan_probes_after_labels_and_before_releases() -> None:
+    gh = FakeGitHub()
+    plan = BackfillPlan(
+        label_ops=(LabelOp(7, ("bug",)),),
+        release_ops=(ReleaseOp("v0.1.0", None), ReleaseOp("v0.2.0", "v0.1.0")),
+        mark_latest="v0.2.0",
+    )
+    assert apply_plan(gh, plan, ["v0.1.0", "v0.2.0"]) == 0  # type: ignore[arg-type]
+    assert gh.calls == [
+        "label #7",
+        "probe",
+        "release v0.1.0",
+        "release v0.2.0",
+        "latest v0.2.0",
+    ]
+
+
+def test_apply_plan_creates_no_release_when_the_probe_fails(capsys) -> None:
+    gh = FakeGitHub()
+    plan = BackfillPlan(release_ops=(ReleaseOp("v0.1.0", None),), mark_latest="v0.1.0")
+    assert apply_plan(gh, plan, ["v0.1.0", "v0.2.0"]) == 1  # type: ignore[arg-type]
+    assert gh.calls == ["probe"]

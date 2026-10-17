@@ -15,9 +15,13 @@ Steps, in this order:
    only for the first tag), ``make_latest: false``, neither draft nor
    prerelease. Afterwards mark the highest-semver tag's Release as latest.
 
+A generate-notes probe runs after steps 1 and 2 and before step 3: it aborts
+before any Release exists when the ``Features`` / ``Fixes`` categories are
+missing. It cannot run under ``--dry-run``, because generated notes categorise
+by the labels the PRs carry *now* and a dry run has not added them yet.
+
 The run is idempotent: a second run plans nothing. ``--dry-run`` changes
-nothing and prints the plan, category counts, and a generate-notes probe
-which aborts when the ``Features`` / ``Fixes`` categories are missing.
+nothing and prints the plan and the category counts.
 """
 
 from __future__ import annotations
@@ -370,19 +374,30 @@ def report_probe(tag: str, previous: str | None, body: str) -> bool:
     return True
 
 
-def apply_plan(gh: GitHub, plan: BackfillPlan) -> None:
+def apply_plan(gh: GitHub, plan: BackfillPlan, tags: list[str]) -> int:
+    """Apply ``plan``; return the exit code.
+
+    The probe sits between the PR edits and the Releases: generated notes only
+    show categories once the labels are on the PRs, and no Release is created
+    when the probe fails.
+    """
     for op in plan.label_ops:
         print(f"Adding {', '.join(op.add)} to #{op.number}.")
         gh.add_labels(op.number, op.add)
     for op in plan.retitle_ops:
         print(f"Retitling #{op.number} to {op.new_title!r}.")
         gh.retitle(op.number, op.new_title)
+    if tags:
+        tag, previous, body = fetch_probe(gh, tags)
+        if not report_probe(tag, previous, body):
+            return 1
     for op in plan.release_ops:
         print(f"Creating release {op.tag}.")
         gh.create_release(op.tag, op.previous_tag)
     if plan.mark_latest is not None:
         print(f"Marking {plan.mark_latest} as latest.")
         gh.mark_latest(plan.mark_latest)
+    return 0
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -400,24 +415,13 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.dry_run:
         print_plan(plan, counts)
-        if tags:
-            tag, previous, body = fetch_probe(gh, tags)
-            if not report_probe(tag, previous, body):
-                raise SystemExit(1)
-        else:
-            print("Probe skipped: no v* tags.")
+        print("Probe skipped: it runs after the labels are added, in a real run.")
         return 0
 
-    if tags:
-        # Prove the categories apply before mutating anything.
-        tag, previous, body = fetch_probe(gh, tags)
-        if not report_probe(tag, previous, body):
-            return 1
     if plan_is_empty(plan):
         print("Nothing to do.")
         return 0
-    apply_plan(gh, plan)
-    return 0
+    return apply_plan(gh, plan, tags)
 
 
 if __name__ == "__main__":
