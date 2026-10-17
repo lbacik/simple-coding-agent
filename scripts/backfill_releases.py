@@ -11,17 +11,20 @@ Steps, in this order:
    :mod:`release_labels` (imported, not copied). Labels are only ever added.
 2. Strip a leading ``agent: `` from the title of every merged PR.
 3. Create a Release for each ``v*`` tag without one, in ascending semver
-   order, with generated notes and an explicit ``previous_tag_name`` (omitted
-   only for the first tag), ``make_latest: false``, neither draft nor
-   prerelease. Afterwards mark the highest-semver tag's Release as latest.
+   order, with notes, neither draft nor prerelease. Afterwards mark the
+   highest-semver tag's Release as latest.
 
-A generate-notes probe runs after steps 1 and 2 and before step 3: it aborts
-before any Release exists when the ``Features`` / ``Fixes`` categories are
-missing. It cannot run under ``--dry-run``, because generated notes categorise
-by the labels the PRs carry *now* and a dry run has not added them yet.
+The notes are rendered here, not by GitHub's categoriser: GitHub reads
+``.github/release.yml`` from the commit of the tag being described, and the
+historical tags predate that file, so their generated notes come out as a flat
+list. The PR list in each range still comes from generate-notes; the script
+groups it into Features / Fixes / Other changes with :func:`categorize` (the
+same rule as ``.github/release.yml``) and drops hidden PRs. The notes are
+rendered before anything is changed, so a bad render aborts the run early.
 
 The run is idempotent: a second run plans nothing. ``--dry-run`` changes
-nothing and prints the plan and the category counts.
+nothing and prints the plan, the category counts and a check of the rendered
+notes.
 """
 
 from __future__ import annotations
@@ -48,6 +51,8 @@ AGENT_PREFIX = "agent: "
 EXCLUDED_LABELS = frozenset({"documentation", "skip-changelog"})
 
 _TAG_RE = re.compile(r"^v(\d+)\.(\d+)\.(\d+)$")
+
+_PR_LINE_RE = re.compile(r"^\* .* in https://github\.com/\S+/pull/(\d+)\s*$")
 
 
 @dataclass(frozen=True)
@@ -194,17 +199,55 @@ def count_categories(
     return counts
 
 
-def probe_target(tags: list[str]) -> tuple[str, str | None]:
-    """Pick one old tag (and its predecessor) for the generate-notes probe."""
-    ordered = sort_tags_semver(tags)
-    if len(ordered) >= 2:
-        return (ordered[1], ordered[0])
-    return (ordered[0], None)
+def final_labels(
+    prs: list[PullRequest], plan: BackfillPlan
+) -> dict[int, tuple[str, ...]]:
+    """Return each PR's labels as they will be after the planned additions."""
+    added = {op.number: op.add for op in plan.label_ops}
+    return {
+        pr.number: tuple(sorted(set(pr.labels) | set(added.get(pr.number, ()))))
+        for pr in prs
+    }
 
 
-def probe_ok(notes_body: str) -> bool:
-    """Return True when generated notes carry the Features/Fixes categories."""
-    return "Features" in notes_body and "Fixes" in notes_body
+def render_notes(flat_body: str, labels_by_pr: dict[int, tuple[str, ...]]) -> str:
+    """Group generate-notes' flat PR list into the release.yml categories."""
+    entries: list[tuple[int, str]] = []
+    tail: list[str] = []
+    for line in flat_body.splitlines():
+        match = _PR_LINE_RE.match(line)
+        if match:
+            entries.append((int(match.group(1)), "* " + strip_agent_prefix(line[2:])))
+        elif entries:
+            tail.append(line)
+    if not entries:
+        return flat_body
+
+    sections: dict[str, list[str]] = {
+        "Features": [],
+        "Fixes": [],
+        "Other changes": [],
+    }
+    for number, line in entries:
+        category = categorize(labels_by_pr.get(number, ()))
+        if category != "hidden":
+            sections[category].append(line)
+
+    while tail and not tail[0].strip():
+        tail.pop(0)
+    parts = ["## What's Changed"]
+    for name, lines in sections.items():
+        if lines:
+            parts += [f"### {name}", *lines, ""]
+    parts += tail
+    return "\n".join(parts).strip() + "\n"
+
+
+def notes_have_categories(notes: list[str]) -> bool:
+    """Return True when the rendered notes use both Features and Fixes."""
+    return any("### Features" in n for n in notes) and any(
+        "### Fixes" in n for n in notes
+    )
 
 
 class GitHub:
@@ -311,19 +354,19 @@ class GitHub:
     def retitle(self, number: int, new_title: str) -> None:
         self._gh("pr", "edit", str(number), "--title", new_title)
 
-    def create_release(self, tag: str, previous: str | None) -> None:
-        args = [
+    def create_release(self, tag: str, notes: str) -> None:
+        self._gh(
             "release",
             "create",
             tag,
             "--title",
             tag,
-            "--generate-notes",
+            "--notes-file",
+            "-",
             "--latest=false",
-        ]
-        if previous is not None:
-            args += ["--notes-start-tag", previous]
-        self._gh(*args)
+            "--verify-tag",
+            input_text=notes,
+        )
 
     def mark_latest(self, tag: str) -> None:
         self._gh("release", "edit", tag, "--latest")
@@ -357,47 +400,29 @@ def print_plan(plan: BackfillPlan, counts: dict[str, int]) -> None:
     )
 
 
-def fetch_probe(gh: GitHub, tags: list[str]) -> tuple[str, str | None, str]:
-    """Generate notes for one old tag; return the tag, previous tag and body."""
-    tag, previous = probe_target(tags)
-    return (tag, previous, gh.generate_notes(tag, previous))
+def build_notes(
+    gh: GitHub, plan: BackfillPlan, labels_by_pr: dict[int, tuple[str, ...]]
+) -> dict[str, str]:
+    """Render the notes of every planned Release; only reads from GitHub."""
+    return {
+        op.tag: render_notes(gh.generate_notes(op.tag, op.previous_tag), labels_by_pr)
+        for op in plan.release_ops
+    }
 
 
-def report_probe(tag: str, previous: str | None, body: str) -> bool:
-    """Print the probe outcome; return False unless categories apply."""
-    where = f"{tag} (previous_tag_name: {previous if previous else 'none'})"
-    if not probe_ok(body):
-        print(f"Probe FAILED for {where}: no Features/Fixes categories.", file=sys.stderr)
-        print("Is .github/release.yml on main? Aborting.", file=sys.stderr)
-        return False
-    print(f"Probe OK for {where}: notes carry Features/Fixes categories.")
-    return True
-
-
-def apply_plan(gh: GitHub, plan: BackfillPlan, tags: list[str]) -> int:
-    """Apply ``plan``; return the exit code.
-
-    The probe sits between the PR edits and the Releases: generated notes only
-    show categories once the labels are on the PRs, and no Release is created
-    when the probe fails.
-    """
+def apply_plan(gh: GitHub, plan: BackfillPlan, notes: dict[str, str]) -> None:
     for op in plan.label_ops:
         print(f"Adding {', '.join(op.add)} to #{op.number}.")
         gh.add_labels(op.number, op.add)
     for op in plan.retitle_ops:
         print(f"Retitling #{op.number} to {op.new_title!r}.")
         gh.retitle(op.number, op.new_title)
-    if tags:
-        tag, previous, body = fetch_probe(gh, tags)
-        if not report_probe(tag, previous, body):
-            return 1
     for op in plan.release_ops:
         print(f"Creating release {op.tag}.")
-        gh.create_release(op.tag, op.previous_tag)
+        gh.create_release(op.tag, notes[op.tag])
     if plan.mark_latest is not None:
         print(f"Marking {plan.mark_latest} as latest.")
         gh.mark_latest(plan.mark_latest)
-    return 0
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -415,13 +440,23 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.dry_run:
         print_plan(plan, counts)
-        print("Probe skipped: it runs after the labels are added, in a real run.")
-        return 0
 
     if plan_is_empty(plan):
         print("Nothing to do.")
         return 0
-    return apply_plan(gh, plan, tags)
+
+    notes = build_notes(gh, plan, final_labels(prs, plan))
+    if plan.release_ops and not notes_have_categories(list(notes.values())):
+        print("Rendered notes carry no Features/Fixes categories. Aborting.",
+              file=sys.stderr)
+        return 1
+    if args.dry_run:
+        for tag, body in notes.items():
+            print(f"\n--- notes for {tag} ---\n{body}")
+        return 0
+
+    apply_plan(gh, plan, notes)
+    return 0
 
 
 if __name__ == "__main__":
