@@ -9,19 +9,16 @@ from __future__ import annotations
 import release_labels
 from backfill_releases import (
     BackfillPlan,
-    LabelOp,
     PullRequest,
     ReleaseInfo,
-    ReleaseOp,
-    apply_plan,
     categorize,
     count_categories,
     labels_to_add,
     plan_backfill,
     plan_is_empty,
-    probe_ok,
-    probe_target,
-    report_probe,
+    final_labels,
+    notes_have_categories,
+    render_notes,
     sort_tags_semver,
     strip_agent_prefix,
 )
@@ -223,75 +220,56 @@ def test_count_categories_uses_final_labels() -> None:
     }
 
 
-def test_probe_target_picks_an_old_tag_with_its_predecessor() -> None:
-    assert probe_target(["v0.5.0", "v0.1.0", "v0.2.0"]) == ("v0.2.0", "v0.1.0")
-
-
-def test_probe_requires_features_and_fixes_categories() -> None:
-    assert probe_ok("### Features\n### Fixes\n") is True
-    assert probe_ok("### Other changes\n") is False
-    assert probe_ok("### Features\n") is False
-    assert probe_ok("") is False
-
-
 def test_empty_plan_for_no_tags_no_releases_no_prs() -> None:
     assert plan_is_empty(plan_backfill([], [], []))
 
 
-def test_report_probe_accepts_categorised_notes(capsys) -> None:
-    assert report_probe("v0.2.0", "v0.1.0", "### Features\n### Fixes\n") is True
-    assert "Probe OK for v0.2.0 (previous_tag_name: v0.1.0)" in capsys.readouterr().out
-
-
-def test_report_probe_rejects_uncategorised_notes(capsys) -> None:
-    assert report_probe("v0.2.0", "v0.1.0", "### Other changes\n") is False
-    assert "Probe FAILED for v0.2.0" in capsys.readouterr().err
-
-
-class FakeGitHub:
-    """Records the order of calls; notes are categorised once labels are added."""
-
-    def __init__(self) -> None:
-        self.calls: list[str] = []
-        self.labelled = False
-
-    def add_labels(self, number: int, labels: tuple[str, ...]) -> None:
-        self.calls.append(f"label #{number}")
-        self.labelled = True
-
-    def retitle(self, number: int, new_title: str) -> None:
-        self.calls.append(f"retitle #{number}")
-
-    def generate_notes(self, tag: str, previous: str | None) -> str:
-        self.calls.append("probe")
-        return "### Features\n### Fixes\n" if self.labelled else "* flat list\n"
-
-    def create_release(self, tag: str, previous: str | None) -> None:
-        self.calls.append(f"release {tag}")
-
-    def mark_latest(self, tag: str) -> None:
-        self.calls.append(f"latest {tag}")
-
-
-def test_apply_plan_probes_after_labels_and_before_releases() -> None:
-    gh = FakeGitHub()
-    plan = BackfillPlan(
-        label_ops=(LabelOp(7, ("bug",)),),
-        release_ops=(ReleaseOp("v0.1.0", None), ReleaseOp("v0.2.0", "v0.1.0")),
-        mark_latest="v0.2.0",
+def _flat(*prs: tuple[int, str]) -> str:
+    lines = [f"* {t} by @u in https://github.com/o/r/pull/{n}" for n, t in prs]
+    return (
+        "## What's Changed\n"
+        + "\n".join(lines)
+        + "\n\n\n**Full Changelog**: https://github.com/o/r/compare/v0.1.0...v0.2.0"
     )
-    assert apply_plan(gh, plan, ["v0.1.0", "v0.2.0"]) == 0  # type: ignore[arg-type]
-    assert gh.calls == [
-        "label #7",
-        "probe",
-        "release v0.1.0",
-        "release v0.2.0",
-        "latest v0.2.0",
-    ]
 
 
-def test_apply_plan_creates_no_release_when_the_probe_fails(capsys) -> None:
-    gh = FakeGitHub()
-    plan = BackfillPlan(release_ops=(ReleaseOp("v0.1.0", None),), mark_latest="v0.1.0")
-    assert apply_plan(gh, plan, ["v0.1.0", "v0.2.0"]) == 1  # type: ignore[arg-type]
-    assert gh.calls == ["probe"]
+def test_render_notes_groups_prs_by_final_label() -> None:
+    body = _flat((1, "Add a thing"), (2, "Fix a thing"), (3, "Tidy"), (4, "Docs"))
+    labels = {1: ("enhancement",), 2: ("bug",), 3: (), 4: ("documentation",)}
+    assert render_notes(body, labels) == (
+        "## What's Changed\n"
+        "### Features\n"
+        "* Add a thing by @u in https://github.com/o/r/pull/1\n"
+        "\n"
+        "### Fixes\n"
+        "* Fix a thing by @u in https://github.com/o/r/pull/2\n"
+        "\n"
+        "### Other changes\n"
+        "* Tidy by @u in https://github.com/o/r/pull/3\n"
+        "\n"
+        "**Full Changelog**: https://github.com/o/r/compare/v0.1.0...v0.2.0\n"
+    )
+
+
+def test_render_notes_strips_the_agent_prefix_and_omits_empty_sections() -> None:
+    out = render_notes(_flat((1, "agent: Fix it")), {1: ("bug",)})
+    assert "* Fix it by @u" in out
+    assert "agent:" not in out
+    assert "### Features" not in out
+    assert "### Other changes" not in out
+
+
+def test_render_notes_leaves_a_body_without_prs_alone() -> None:
+    assert render_notes("## What's Changed\n", {}) == "## What's Changed\n"
+
+
+def test_final_labels_include_the_planned_additions() -> None:
+    prs = [make_pr(1, labels=("x",)), make_pr(2)]
+    plan = plan_backfill([], [], prs)
+    assert final_labels(prs, plan)[1] == ("x",)
+
+
+def test_notes_have_categories_needs_features_and_fixes_somewhere() -> None:
+    assert notes_have_categories(["### Features\n", "### Fixes\n"]) is True
+    assert notes_have_categories(["### Fixes\n"]) is False
+    assert notes_have_categories(["## What's Changed\n"]) is False
