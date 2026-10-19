@@ -59,9 +59,22 @@ adds `ready-for-agent` or `round-finished`, and posts a result comment
 stamped with a `<!-- conflict-attempt: ... -->` marker carrying the
 outcome (`success`, `skipped`, or a failure kind), the pushed sha, the
 conflicted files, files the resolution changed outside them, and fix
-commits.
+commits. Every conflict result carries its `k/N` standing against
+`MAX_CONFLICT_ATTEMPTS`.
 Those comments are transparent to the automatic-continuation count: they
 neither consume nor reset the budget.
+
+N consecutive failures on one issue (including a push that changes
+nothing) escalate to you: the attempt whose failure reaches the budget
+adds `ready-for-human` — the first label the agent applies itself — and
+its own result comment carries the handoff (the failure tail or reason, a
+pull-request link, and the hand-back line) plus the hidden
+`<!-- conflict-escalation -->` marker. While `ready-for-human` is present
+the issue is out of scope: the detector will not relabel it and the queue
+will not claim it, even with a hand-applied `merge-conflict`, and the
+agent never removes the label. Remove `ready-for-human` to hand the issue
+back: the escalation comment stops the streak, so the next poll requeues
+with the full budget and N more failures are needed to escalate again.
 
 ## `agent-auto-merge` opt-in
 

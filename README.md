@@ -29,7 +29,13 @@ repository's open pull requests and labels an otherwise ordinary issue
 so the conflict attempt starts without a human. The conflict attempt
 rebases the published branch onto the base, checks it, and force-pushes
 only when green — no model call runs. A human may also apply the label
-manually. An issue labelled `ready-for-human` is never eligible.
+manually. N consecutive failed conflict attempts on one issue
+(`no_change` counts) hand it to a human instead: the attempt whose
+failure reaches the budget adds `ready-for-human` and carries the handoff
+in its own result comment (`k/N`, the failure tail, a pull-request link).
+The agent never removes that label — a human hands the issue back by
+removing it, which requeues with the full budget. An issue labelled
+`ready-for-human` is never eligible.
 
 Applying `ready-for-agent` is the human trust boundary: only repository
 collaborators with write access may apply it. The issue body is passed to the

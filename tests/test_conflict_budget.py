@@ -234,9 +234,17 @@ def test_each_failure_kind_counts() -> None:
         "model_limit",
         "resolution_failed",
         "no_change",
-        "mystery_future_outcome",
     ):
         assert is_conflict_failure(fail_body(outcome)) is True, outcome
+    # A future unknown outcome is still a failure: it can never be written
+    # through conflict_attempt_marker (which rejects it, see
+    # test_conflict_marker_rejects_invalid_values), so build it raw.
+    future_body = (
+        "## Conflict Attempt Result: mystery\n\nRebase hit conflicts.\n\n"
+        "<!-- agent-attempt: 2026-10-11T10:00:00Z -->\n"
+        "<!-- conflict-attempt: outcome=mystery_future_outcome sha=none -->"
+    )
+    assert is_conflict_failure(future_body) is True
 
 
 def test_success_skipped_and_escalation_are_not_failures() -> None:
@@ -253,7 +261,8 @@ def test_success_without_a_push_counts_as_a_failure() -> None:
 def test_streak_stops_at_success_ordinary_skipped_or_escalation() -> None:
     assert count_conflict_failures([fail_body(), fail_body("success", sha="x")]) == 1
     assert count_conflict_failures([fail_body(), ordinary_body()]) == 1
-    assert count_conflict_failures([fail_body("skipped"), fail_body()]) == 1
+    assert count_conflict_failures([fail_body(), fail_body("skipped")]) == 1
+    assert count_conflict_failures([fail_body("skipped"), fail_body()]) == 0
     assert (
         count_conflict_failures([fail_body(), escalation_body(), fail_body()]) == 1
     )
@@ -274,7 +283,7 @@ def test_production_streak_ignores_other_logins_and_deleted_accounts() -> None:
         )
     )
 
-    assert tracker.conflict_failure_streak(issue()) == 1
+    assert tracker.conflict_failure_streak(issue()) == 2
 
 
 def test_production_streak_counts_peer_logins(monkeypatch) -> None:  # type: ignore[no-untyped-def]
@@ -436,6 +445,7 @@ def test_hand_back_requeues_and_needs_n_more_failures(tmp_path: Path) -> None:
         {7: issue()},
         fifo=[7],
         comments={7: [("agent", fail_body("check_failed"))]},
+        max_conflict_attempts=2,
     )
     run_budget(tmp_path, tracker, tmp_path / "store1")
     assert tracker.escalated == [7]
@@ -734,7 +744,10 @@ def test_production_publish_reports_an_unchanged_push_as_no_change() -> None:
 
     assert result.conflict_outcome == CONFLICT_OUTCOME_NO_CHANGE
     assert result.escalated is True
-    assert is_conflict_failure(github.comments[0]) is True
+    assert parse_conflict_attempt(github.comments[0])["outcome"] == "no_change"
+    # The escalation marker stops the streak, so an escalation comment is
+    # never itself a failure (see test_success_skipped_and_escalation...).
+    assert is_conflict_failure(github.comments[0]) is False
     assert "**Conflict attempts**: 2/2" in github.comments[0]
     assert is_conflict_escalation(github.comments[0]) is True
 

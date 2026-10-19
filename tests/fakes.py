@@ -576,7 +576,7 @@ class FakeTracker:
 
         Only rows authored by the worker identity (``agent``) or a seeded
         peer login are examined, newest first, under the same stopping rule
-        as the production tracker; any other row stops the streak.
+        as the production tracker; any other row is ignored.
         """
 
         allowed = {"agent"} | set(self.peer_logins)

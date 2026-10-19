@@ -722,8 +722,8 @@ def _conflict_result_comment(
     merge_result: str | None,
     pushed_sha: str | None,
     *,
-    conflict_index: int = 0,
-    escalate: bool = False,
+    conflict_index: int | None = None,
+    escalate: bool | None = None,
 ) -> str:
     """Build the conflict-attempt result comment with its machine-readable marker.
 
@@ -740,6 +740,8 @@ def _conflict_result_comment(
     streak, so removing ``ready-for-human`` requeues with the full budget.
     """
 
+    effective_index = request.conflict_index if conflict_index is None else conflict_index
+    effective_escalate = request.escalate if escalate is None else escalate
     if branch_url and pushed_sha:
         branch = f"[{request.branch}]({branch_url}) (sha `{pushed_sha}`)"
     elif branch_url:
@@ -749,7 +751,7 @@ def _conflict_result_comment(
     pr = f"[#{pull_request.number}]({pull_request.url})" if pull_request else "none"
     merge_line = f"**Merge**: {merge_result}\n" if merge_result is not None else ""
     standing_line = (
-        f"**Conflict attempts**: {conflict_index}/{request.conflict_budget}\n"
+        f"**Conflict attempts**: {effective_index}/{request.conflict_budget}\n"
         if request.conflict_budget > 0
         else ""
     )
@@ -769,7 +771,7 @@ def _conflict_result_comment(
         else ""
     )
     escalation_section = ""
-    if escalate:
+    if effective_escalate:
         failure_text = request.failure_output or _escalation_failure_text(
             details or request.reason
         )
@@ -781,7 +783,7 @@ def _conflict_result_comment(
         escalation_section = (
             "### Human handoff\n\n"
             f"The conflict-attempt budget is exhausted "
-            f"({conflict_index}/{request.conflict_budget} consecutive failures). "
+            f"({effective_index}/{request.conflict_budget} consecutive failures). "
             "The issue is labelled `ready-for-human`.\n\n"
             "<details>\n"
             "<summary>Failure output (tail)</summary>\n\n"
