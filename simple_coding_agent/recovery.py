@@ -135,6 +135,14 @@ CONFLICT_OUTCOME_SETUP_FAILED = "setup_failed"
 CONFLICT_OUTCOME_CHECK_FAILED = "check_failed"
 CONFLICT_OUTCOME_PUSH_FAILED = "push_failed"
 CONFLICT_OUTCOME_ERROR = "error"
+#: The single model resolution session reached its ordinary turn, time, or
+#: token limit instead of resolving the conflict (issue #271). An ordinary
+#: failure: nothing is pushed and no handoff note is written.
+CONFLICT_OUTCOME_MODEL_LIMIT = "model_limit"
+#: The model resolution changed the rebased commit count (a squash, drop, or
+#: amend of the pull request's own commits) instead of adding fixes only on
+#: top (issue #271). An ordinary failure: nothing is pushed.
+CONFLICT_OUTCOME_RESOLUTION_FAILED = "resolution_failed"
 
 CONFLICT_OUTCOMES = frozenset(
     {
@@ -145,6 +153,8 @@ CONFLICT_OUTCOMES = frozenset(
         CONFLICT_OUTCOME_CHECK_FAILED,
         CONFLICT_OUTCOME_PUSH_FAILED,
         CONFLICT_OUTCOME_ERROR,
+        CONFLICT_OUTCOME_MODEL_LIMIT,
+        CONFLICT_OUTCOME_RESOLUTION_FAILED,
     }
 )
 
@@ -155,7 +165,8 @@ CONFLICT_REASON_NOT_CONFLICTING = "not_conflicting"
 CONFLICT_REASON_BASE_MISMATCH = "base_mismatch"
 
 #: Marker keys reserved for the model resolution follow-up (#271): the
-#: conflicted files and the fix commits it publishes.
+#: conflicted files, the files the resolution changed outside them, and the
+#: fix commits it publishes.
 _CONFLICT_MARKER_PREFIX = "<!-- conflict-attempt:"
 
 
@@ -166,16 +177,17 @@ def conflict_attempt_marker(
     reason: str | None = None,
     files: tuple[str, ...] | list[str] = (),
     fix_commits: tuple[str, ...] | list[str] = (),
+    extra_files: tuple[str, ...] | list[str] = (),
 ) -> str:
     """The durable issue-comment marker recording one conflict attempt's outcome.
 
     ``outcome`` is one of :data:`CONFLICT_OUTCOMES`; ``sha`` is the pushed
     rebased revision (``None`` renders as ``none`` when nothing was pushed).
     ``reason`` names the entry-check reason for a ``skipped`` outcome.
-    ``files`` and ``fix_commits`` leave room for the conflicted files and
-    fix commits the model resolution follow-up adds; they are omitted when
-    empty. Values are restricted to marker-safe characters so the comment
-    stays greppable.
+    ``files`` names the conflicted files, ``extra_files`` the files the model
+    resolution changed outside them, and ``fix_commits`` the fix commits the
+    model resolution added on top; each is omitted when empty. Values are
+    restricted to marker-safe characters so the comment stays greppable.
     """
 
     if outcome not in CONFLICT_OUTCOMES:
@@ -185,6 +197,7 @@ def conflict_attempt_marker(
         values.append(reason)
     values.extend(files)
     values.extend(fix_commits)
+    values.extend(extra_files)
     for value in values:
         if not value or any(character.isspace() for character in value):
             raise ValueError(f"Invalid conflict marker value {value!r}")
@@ -195,6 +208,8 @@ def conflict_attempt_marker(
         parts.append(f"files={','.join(files)}")
     if fix_commits:
         parts.append(f"fix_commits={','.join(fix_commits)}")
+    if extra_files:
+        parts.append(f"extra_files={','.join(extra_files)}")
     return f"{_CONFLICT_MARKER_PREFIX} {' '.join(parts)} -->"
 
 

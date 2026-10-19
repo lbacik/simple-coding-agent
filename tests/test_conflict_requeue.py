@@ -4,8 +4,9 @@ The tracer bullet of Conflict requeue: an issue returns to the queue because
 the pull request a worker already published for it reports merge conflicts
 with the base branch. The conflict attempt that follows only brings that
 pull request up to date (clean rebase, setup plus one profile check, push
-with ``--force-with-lease``) and does no new work: no model call runs.
-Detection and model resolution come later.
+with ``--force-with-lease``) and does no new work: a real rebase conflict,
+or a red check after a clean rebase, runs at most one narrow model
+resolution session under the ordinary model limits.
 
 ``MAX_CONFLICT_ATTEMPTS`` (operator ``.env`` only, default ``0``) gates the
 path: with ``0`` a ``merge-conflict`` issue is never claimed. Conflict
@@ -25,11 +26,7 @@ from pathlib import Path
 import pytest
 
 from simple_coding_agent.attempt_state import AttemptStateStore
-from simple_coding_agent.command_runner import (
-    CommandExecution,
-    CommandResult,
-    CommandStatus,
-)
+from simple_coding_agent.command_runner import CommandResult
 from simple_coding_agent.completion import AttemptOutcome
 from simple_coding_agent.config import (
     ConfigurationError,
@@ -67,7 +64,15 @@ from simple_coding_agent.recovery import (
     parse_conflict_attempt,
     requeue_source_marker,
 )
-from tests.fakes import FakePublisher, FakeTracker, InMemoryWorkspace
+from tests.fakes import (
+    FakeCommandRunner,
+    FakeConflictExecutor,
+    FakePublisher,
+    FakeTracker,
+    InMemoryWorkspace,
+    failed_result,
+    ok_result,
+)
 
 READY = frozenset({"ready-for-agent"})
 ROUND = frozenset({"round-finished"})
@@ -118,45 +123,14 @@ def profile() -> RepositoryProfile:
     )
 
 
-def ok_result(command: str = "pytest") -> CommandResult:
-    return CommandResult(
-        CommandStatus.SUCCEEDED,
-        (CommandExecution(command, 0, "", "", False),),
-        0.1,
-    )
-
-
-def failed_result(command: str = "pytest", exit_code: int = 1) -> CommandResult:
-    return CommandResult(
-        CommandStatus.FAILED,
-        (CommandExecution(command, exit_code, "", "boom", False),),
-        0.1,
-    )
-
-
-class FakeCommandRunner:
-    """Serve scripted profile-command results to conflict attempts."""
-
-    def __init__(self, results: list[CommandResult]) -> None:
-        self._results = list(results)
-        self.calls: list[tuple[tuple[str, ...], float, Path, object]] = []
-
-    def run(
-        self,
-        commands: tuple[str, ...],
-        *,
-        timeout: float,
-        cwd: Path,
-        environment: object = None,
-    ) -> CommandResult:
-        self.calls.append((tuple(commands), timeout, cwd, environment))
-        return self._results.pop(0)
-
-
 def raising_runner(claim: object, profile: object, prepared: object) -> object:
-    """The model seam: conflict attempts must never reach it."""
+    """The ordinary model seam: conflict attempts must never reach it.
 
-    raise AssertionError("a conflict attempt must never call the model")
+    Conflict resolution runs through ``conflict_model_executor`` instead, so
+    the ordinary attempt runner stays untouched by conflict attempts.
+    """
+
+    raise AssertionError("a conflict attempt must never call the ordinary model path")
 
 
 def make_conflict_lifecycle(
@@ -170,6 +144,7 @@ def make_conflict_lifecycle(
     command_runner: FakeCommandRunner | None = None,
     runner: object | None = None,
     workspace: InMemoryWorkspace | None = None,
+    conflict_executor: FakeConflictExecutor | None = None,
 ):
     """A lifecycle wired for conflict tests, recording observability events."""
 
@@ -199,6 +174,7 @@ def make_conflict_lifecycle(
         event_log=event_log,
         max_conflict_attempts=budget,
         command_runner=active_runner,  # type: ignore[arg-type]
+        conflict_model_executor=conflict_executor,
     )
     return lifecycle, tracker, publisher, active_workspace, active_runner, events
 
@@ -684,13 +660,19 @@ def test_clean_rebase_with_green_check_pushes_without_a_model_call(
     assert tracker.cleanup == [(7, "merge-conflict", "agent-id")]
 
 
-def test_conflicting_rebase_pushes_nothing_and_reports_files(tmp_path: Path) -> None:
-    workspace = InMemoryWorkspace(tmp_path / "repo")
+def test_conflicting_rebase_runs_one_session_and_reports_unresolved(
+    tmp_path: Path,
+) -> None:
+    workspace = InMemoryWorkspace(tmp_path / "repo", resolve_after_model=False)
     workspace.prepare_conflicts = ("a.txt", "b.txt")
+    calls: list[str] = []
+    executor = FakeConflictExecutor(calls=calls)
+    executor.after_execute = workspace.note_model_finished
     result, tracker, publisher, active, runner, events = run_conflict(
         tmp_path,
         pull_requests={"agent/issue-7": pull_request()},
         workspace=workspace,
+        conflict_executor=executor,
     )
 
     assert result.outcome is AttemptOutcome.INCOMPLETE
@@ -698,17 +680,36 @@ def test_conflicting_rebase_pushes_nothing_and_reports_files(tmp_path: Path) -> 
     assert request.conflict_outcome == CONFLICT_OUTCOME_REBASE_CONFLICT
     assert request.push_branch is False
     assert request.conflicted_files == ("a.txt", "b.txt")
-    # The conflicting rebase was aborted; setup and the check never ran.
+    # Exactly one model session ran; the narrow prompt carries no
+    # full-implementation continuation and no mandatory review instruction.
+    assert calls == ["execute"]
+    assert executor.captured_prompt is not None
+    assert "then continue the implementation" not in executor.captured_prompt
+    assert "an attempt with commits but no `code-review` invocation" not in (
+        executor.captured_prompt
+    )
+    # The unresolved rebase was aborted; setup and the check never ran.
     assert active.abort_calls != []
     assert runner.calls == []
     assert tracker.cleanup == [(7, "merge-conflict", "agent-id")]
 
 
-def test_red_check_pushes_nothing(tmp_path: Path) -> None:
+def test_red_check_runs_one_session_and_reports_when_still_red(
+    tmp_path: Path,
+) -> None:
+    calls: list[str] = []
+    executor = FakeConflictExecutor(calls=calls)
     result, tracker, publisher, workspace, runner, events = run_conflict(
         tmp_path,
         pull_requests={"agent/issue-7": pull_request()},
-        command_results=[ok_result("setup.sh"), failed_result()],
+        # The pre-model setup/check plus the post-model setup/check rerun.
+        command_results=[
+            ok_result("setup.sh"),
+            failed_result(),
+            ok_result("setup.sh"),
+            failed_result(),
+        ],
+        conflict_executor=executor,
     )
 
     assert result.outcome is AttemptOutcome.INCOMPLETE
@@ -717,6 +718,16 @@ def test_red_check_pushes_nothing(tmp_path: Path) -> None:
     assert request.push_branch is False
     assert request.check_command == "pytest"
     assert request.check_exit_code == 1
+    # Exactly one model session ran with the red check output in its prompt.
+    assert calls == ["execute"]
+    assert executor.captured_prompt is not None
+    assert "Failing check output" in executor.captured_prompt
+    assert [call[0] for call in runner.calls] == [
+        ("setup.sh",),
+        ("pytest",),
+        ("setup.sh",),
+        ("pytest",),
+    ]
     assert tracker.cleanup == [(7, "merge-conflict", "agent-id")]
 
 

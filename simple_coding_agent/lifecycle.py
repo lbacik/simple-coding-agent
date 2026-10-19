@@ -67,13 +67,31 @@ from simple_coding_agent.conflict_attempt import (
     attempt_branch as _conflict_attempt_branch,
 )
 from simple_coding_agent.conflict_attempt import (
+    base_changes_text as _conflict_base_changes_text,
+)
+from simple_coding_agent.conflict_attempt import (
     base_mismatch_reason as _conflict_base_mismatch_reason,
+)
+from simple_coding_agent.conflict_attempt import (
+    build_resolution_prompt as _conflict_resolution_prompt,
 )
 from simple_coding_agent.conflict_attempt import (
     check_failed_details as _conflict_check_failed_details,
 )
 from simple_coding_agent.conflict_attempt import (
+    commit_count_changed_details as _conflict_count_changed_details,
+)
+from simple_coding_agent.conflict_attempt import (
     entry_skip_reason as _conflict_entry_skip_reason,
+)
+from simple_coding_agent.conflict_attempt import (
+    files_outside_conflict as _conflict_files_outside,
+)
+from simple_coding_agent.conflict_attempt import (
+    fix_commit_count as _conflict_fix_commit_count,
+)
+from simple_coding_agent.conflict_attempt import (
+    format_check_output as _conflict_format_check_output,
 )
 from simple_coding_agent.conflict_attempt import (
     is_conflict_claim as _is_conflict_claim,
@@ -82,10 +100,25 @@ from simple_coding_agent.conflict_attempt import (
     lifecycle_outcome as _conflict_lifecycle_outcome,
 )
 from simple_coding_agent.conflict_attempt import (
+    model_error_details as _conflict_model_error_details,
+)
+from simple_coding_agent.conflict_attempt import (
+    model_limit_details as _conflict_model_limit_details,
+)
+from simple_coding_agent.conflict_attempt import (
+    model_success_details as _conflict_model_success_details,
+)
+from simple_coding_agent.conflict_attempt import (
+    model_unresolved_details as _conflict_model_unresolved_details,
+)
+from simple_coding_agent.conflict_attempt import (
     rebase_conflict_details as _conflict_rebase_conflict_details,
 )
 from simple_coding_agent.conflict_attempt import (
     setup_failed_details as _conflict_setup_failed_details,
+)
+from simple_coding_agent.conflict_attempt import (
+    short_revision as _conflict_short_revision,
 )
 from simple_coding_agent.conflict_attempt import (
     success_details as _conflict_success_details,
@@ -109,7 +142,9 @@ from simple_coding_agent.publication import (
 from simple_coding_agent.recovery import (
     CONFLICT_OUTCOME_CHECK_FAILED,
     CONFLICT_OUTCOME_ERROR,
+    CONFLICT_OUTCOME_MODEL_LIMIT,
     CONFLICT_OUTCOME_REBASE_CONFLICT,
+    CONFLICT_OUTCOME_RESOLUTION_FAILED,
     CONFLICT_OUTCOME_SETUP_FAILED,
     CONFLICT_OUTCOME_SKIPPED,
     CONFLICT_OUTCOME_SUCCESS,
@@ -1214,6 +1249,9 @@ class AgentLifecycle:
         max_auto_continuations: int = 0,
         max_conflict_attempts: int = 0,
         command_runner: ConflictCheckRunner | None = None,
+        conflict_model_executor: object | None = None,
+        conflict_issue_comments: Callable[[TrackerIssue], tuple[str, ...]] | None = None,
+        conflict_prompt_redactions: Sequence[str] = (),
         event_log: Callable[..., None] = (
             lambda event, detail="", level="INFO", issue_number=None: None
         ),
@@ -1238,6 +1276,9 @@ class AgentLifecycle:
         self._max_auto_continuations = max_auto_continuations
         self._max_conflict_attempts = max_conflict_attempts
         self._command_runner = command_runner
+        self._conflict_model_executor = conflict_model_executor
+        self._conflict_issue_comments = conflict_issue_comments
+        self._conflict_prompt_redactions = tuple(conflict_prompt_redactions)
         self._event_log = event_log
         self._attempt_archive_factory = attempt_archive_factory
         self._completion_store = completion_store
@@ -3400,10 +3441,11 @@ class AgentLifecycle:
         retain_branch = False
         comment_posted = True
         publication_started_at: datetime | None = None
-        # A conflict requeue routes to the model-free fast path instead of
-        # the ordinary model-driven path; both share the except/finally
-        # boundary that follows (holds, error publication, release, cleanup,
-        # and finalization).
+        # A conflict requeue routes to the conflict path (a fast path plus at
+        # most one narrow model resolution session) instead of the ordinary
+        # model-driven path; both share the except/finally boundary that
+        # follows (holds, error publication, release, cleanup, and
+        # finalization).
         is_conflict_claim = _is_conflict_claim(claim.issue.labels)
         try:
             if is_conflict_claim:
@@ -3540,9 +3582,10 @@ class AgentLifecycle:
         except RebaseConflictError as error:
             publication_started_at = self._clock()
             if is_conflict_claim:
-                # The fast path never runs the model, so a rebase left in
-                # progress reaches here only defensively: restore the branch
-                # best-effort and report the conflict without pushing.
+                # The model already had its single resolution session, so a
+                # rebase left in progress reaches here only defensively:
+                # restore the branch best-effort and report the conflict
+                # without pushing.
                 if prepared is not None:
                     try:
                         self._workspace.abort_unresolved_rebase(prepared)
@@ -5047,16 +5090,20 @@ class AgentLifecycle:
         claim: Claim,
         checkpoint: AttemptCheckpoint,
     ) -> tuple[ConflictPublicationRequest, PreparedAttempt | None, RepositoryProfile | None]:
-        """Run the model-free conflict fast path and build its publication request.
+        """Run the conflict fast path, with one model session on real conflicts.
 
         The entry check re-reads the open pull request behind the published
         branch before any git work: a missing, draft, or no-longer-conflicting
         pull request ends the attempt as ``skipped``, as does a pull request
         targeting another base branch once the profile is loaded. A clean
         rebase runs setup plus one profile check (no baseline, no model
-        call); only that green path pushes. Returns the publication request
-        together with the prepared attempt (``None`` when skipped before any
-        git work ran) and the profile (``None`` when it never loaded).
+        call); only that green path pushes directly. A real rebase conflict,
+        or a red check after a clean rebase (a semantic conflict), runs at
+        most one narrow model resolution session under the ordinary model
+        limits; the session brings the branch up to date and does no new
+        work. Returns the publication request together with the prepared
+        attempt (``None`` when skipped before any git work ran) and the
+        profile (``None`` when it never loaded).
         """
 
         issue_number = claim.issue.number
@@ -5143,8 +5190,8 @@ class AgentLifecycle:
         state = self._workspace.conflict_state()
         conflicted = tuple(state.conflicted_files) or tuple(prepared.rebase_conflicts or ())
         if state.in_progress or prepared.rebase_conflicts:
-            if state.in_progress:
-                self._workspace.abort_unresolved_rebase(prepared)
+            # A real rebase conflict: leave the rebase in place for the
+            # single model resolution session instead of aborting up front.
             self._event_log(
                 "conflict_rebase_conflict",
                 f"branch={prepared.branch}; base_branch={profile.base_branch}"
@@ -5153,8 +5200,14 @@ class AgentLifecycle:
                 issue_number=issue_number,
             )
             return (
-                self._conflict_rebase_request(
-                    claim, checkpoint, prepared, profile, pull_request, conflicted
+                self._resolve_conflict_with_model(
+                    claim,
+                    checkpoint,
+                    prepared,
+                    profile,
+                    pull_request,
+                    conflicted,
+                    check_output=None,
                 ),
                 prepared,
                 profile,
@@ -5215,23 +5268,22 @@ class AgentLifecycle:
         )
         check_command = " && ".join(profile.check)
         if not check_result.succeeded:
+            # A red check after a clean rebase is a semantic conflict: the
+            # single model resolution session runs with the check output in
+            # its prompt instead of failing here.
             detail = _conflict_check_failed_details(check_result)
             self._event_log(
                 "conflict_check_failed", detail, level="WARNING", issue_number=issue_number
             )
             return (
-                self._build_conflict_request(
+                self._resolve_conflict_with_model(
                     claim,
                     checkpoint,
-                    prepared.branch,
-                    profile.base_branch,
+                    prepared,
+                    profile,
                     pull_request,
-                    CONFLICT_OUTCOME_CHECK_FAILED,
-                    "",
-                    detail,
-                    push_branch=False,
-                    check_command=check_command,
-                    check_exit_code=check_result.exit_code,
+                    (),
+                    check_output=_conflict_format_check_output(check_result),
                 ),
                 prepared,
                 profile,
@@ -5261,6 +5313,447 @@ class AgentLifecycle:
             profile,
         )
 
+    def _resolve_conflict_with_model(
+        self,
+        claim: Claim,
+        checkpoint: AttemptCheckpoint,
+        prepared: PreparedAttempt,
+        profile: RepositoryProfile,
+        pull_request: PullRequest | None,
+        conflicted: tuple[str, ...],
+        *,
+        check_output: str | None,
+    ) -> ConflictPublicationRequest:
+        """Run the single narrow model session resolving a conflict attempt.
+
+        Runs for a real rebase conflict (``check_output`` is ``None``) or for
+        a red profile check after a clean rebase (a semantic conflict, with
+        the check output in the prompt). Exactly one ``execute()`` call runs
+        per conflict attempt, under the ordinary model limits. The prompt
+        carries the issue body and trusted comments marked context-only plus
+        the conflicted files, the base changes, and the review-free gate;
+        the full-implementation continuation and the ``code-review``
+        instruction are absent, and the review gate is never wired.
+        ``MODEL_LIMIT_REACHED``, an unresolved rebase, a changed commit
+        count, and a red verification are ordinary failures: nothing is
+        pushed and no handoff note is written.
+        """
+
+        issue_number = claim.issue.number
+        branch = prepared.branch
+        base_branch = profile.base_branch
+        working_directory = self._workspace.working_directory
+        try:
+            before_subjects = tuple(
+                commit.subject
+                for commit in reversed(self._workspace.commits_added(prepared))
+            )
+        except Exception as error:
+            return self._conflict_error_request(
+                claim,
+                checkpoint,
+                prepared,
+                profile,
+                "Could not read the pull request's commits before model resolution: "
+                f"{_exception_detail(error)}",
+            )
+        executor = self._conflict_model_executor
+        if executor is None:
+            return self._conflict_error_request(
+                claim,
+                checkpoint,
+                prepared,
+                profile,
+                "No model executor is configured for conflict resolution; the remote "
+                "branch is left untouched so the pull request stays `CONFLICTING`.",
+            )
+        try:
+            current = self._attempt_state.read()
+        except Exception:
+            current = None
+        if current is not None and current.phase is AttemptPhase.SETUP:
+            # The rebase-conflict path arrives here straight from setup; the
+            # red-check path already moved to MODEL_RUNNING for its check.
+            self._attempt_state.transition(AttemptPhase.MODEL_RUNNING)
+            self._event_log(
+                "attempt_phase_transitioned",
+                f"phase={AttemptPhase.MODEL_RUNNING.value}",
+                level="INFO",
+                issue_number=issue_number,
+            )
+        comments = (
+            self._conflict_issue_comments(claim.issue)
+            if self._conflict_issue_comments is not None
+            else ()
+        )
+        prompt = _conflict_resolution_prompt(
+            issue_body=claim.issue.body,
+            comments=comments,
+            conflicted_files=conflicted,
+            base_changes=_conflict_base_changes_text(
+                working_directory, base_branch, conflicted
+            ),
+            check_output=check_output,
+            gate_section=_gate_section(
+                profile,
+                self._conflict_prompt_redactions,
+                include_review_instruction=False,
+            ),
+        )
+        self._event_log(
+            "conflict_model_started",
+            f"branch={branch}; base_branch={base_branch}"
+            + (f"; files={', '.join(conflicted)}" if conflicted else "")
+            + ("; after_check=true" if check_output is not None else ""),
+            level="INFO",
+            issue_number=issue_number,
+        )
+        archive = self._archive_for(issue_number, checkpoint.started_at)
+        attempt_id = _attempt_id(checkpoint)
+        try:
+            execution = asyncio.run(
+                _execute_model(
+                    executor,
+                    issue_body=prompt,
+                    working_directory=working_directory,
+                    issue_number=issue_number,
+                    archive=archive,
+                    attempt_id=attempt_id,
+                    branch=prepared.branch,
+                    base_revision=prepared.base_revision,
+                )
+            )
+        except Exception as error:
+            detail = (
+                "The conflict resolution session could not finish: "
+                f"{_exception_detail(error)}"
+            )
+            self._event_log(
+                "conflict_model_failed", detail, level="ERROR", issue_number=issue_number
+            )
+            self._abort_conflict_best_effort(prepared, issue_number)
+            self._seal_conflict_best_effort(
+                issue_number, attempt_id, ModelExecutionStatus.INFRASTRUCTURE_ERROR
+            )
+            return self._build_conflict_request(
+                claim,
+                checkpoint,
+                branch,
+                base_branch,
+                pull_request,
+                CONFLICT_OUTCOME_ERROR,
+                "",
+                _conflict_model_error_details(branch, base_branch, f"{detail} "),
+                push_branch=False,
+                conflicted_files=tuple(conflicted),
+            )
+        self._archive_conflict_model_result(archive, issue_number, execution)
+        status = execution.status
+        self._event_log(
+            "conflict_model_finished",
+            f"status={status}",
+            level="INFO" if status is ModelExecutionStatus.SUCCEEDED else "WARNING",
+            issue_number=issue_number,
+        )
+        if status is ModelExecutionStatus.MODEL_LIMIT_REACHED:
+            self._abort_conflict_best_effort(prepared, issue_number)
+            self._seal_conflict_best_effort(issue_number, attempt_id, status)
+            return self._build_conflict_request(
+                claim,
+                checkpoint,
+                branch,
+                base_branch,
+                pull_request,
+                CONFLICT_OUTCOME_MODEL_LIMIT,
+                "",
+                _conflict_model_limit_details(branch, base_branch, conflicted),
+                push_branch=False,
+                conflicted_files=tuple(conflicted),
+            )
+        if status is not ModelExecutionStatus.SUCCEEDED:
+            self._abort_conflict_best_effort(prepared, issue_number)
+            self._seal_conflict_best_effort(issue_number, attempt_id, status)
+            detail = (
+                f"the model session ended with status `{status}` instead of "
+                "resolving the conflict. "
+            )
+            return self._build_conflict_request(
+                claim,
+                checkpoint,
+                branch,
+                base_branch,
+                pull_request,
+                CONFLICT_OUTCOME_ERROR,
+                "",
+                _conflict_model_error_details(branch, base_branch, detail),
+                push_branch=False,
+                conflicted_files=tuple(conflicted),
+            )
+        post_state = self._workspace.conflict_state()
+        if post_state.resolution_problems:
+            remaining = tuple(post_state.conflicted_files) or tuple(conflicted)
+            self._event_log(
+                "conflict_model_unresolved",
+                "; ".join(post_state.resolution_problems),
+                level="WARNING",
+                issue_number=issue_number,
+            )
+            self._abort_conflict_best_effort(prepared, issue_number)
+            self._seal_conflict_best_effort(issue_number, attempt_id, status)
+            return self._build_conflict_request(
+                claim,
+                checkpoint,
+                branch,
+                base_branch,
+                pull_request,
+                CONFLICT_OUTCOME_REBASE_CONFLICT,
+                "",
+                _conflict_model_unresolved_details(
+                    branch,
+                    base_branch,
+                    remaining,
+                    after_check=check_output is not None,
+                ),
+                push_branch=False,
+                conflicted_files=tuple(remaining),
+            )
+        try:
+            self._workspace.seal(
+                issue_number=issue_number, attempt_id=attempt_id, status=status
+            )
+        except Exception as error:
+            return self._conflict_error_request(
+                claim,
+                checkpoint,
+                prepared,
+                profile,
+                "Failed to seal conflict resolution work: "
+                f"{_exception_detail(error)}",
+            )
+        try:
+            after_commits = tuple(self._workspace.commits_added(prepared))
+        except Exception as error:
+            return self._conflict_error_request(
+                claim,
+                checkpoint,
+                prepared,
+                profile,
+                "Could not read the pull request's commits after model resolution: "
+                f"{_exception_detail(error)}",
+            )
+        after_subjects = tuple(commit.subject for commit in reversed(after_commits))
+        fix_count = _conflict_fix_commit_count(before_subjects, after_subjects)
+        if fix_count is None:
+            return self._build_conflict_request(
+                claim,
+                checkpoint,
+                branch,
+                base_branch,
+                pull_request,
+                CONFLICT_OUTCOME_RESOLUTION_FAILED,
+                "",
+                _conflict_count_changed_details(
+                    branch,
+                    base_branch,
+                    expected=len(before_subjects),
+                    actual=len(after_subjects),
+                ),
+                push_branch=False,
+                conflicted_files=tuple(conflicted),
+            )
+        runner = self._command_runner
+        if runner is None:
+            return self._conflict_error_request(
+                claim,
+                checkpoint,
+                prepared,
+                profile,
+                "No command runner is configured for conflict attempts; the resolved "
+                "branch was not verified, so the remote branch is left untouched.",
+            )
+        setup_result = runner.run(
+            tuple(profile.setup),
+            timeout=profile.setup_timeout,
+            cwd=working_directory,
+            environment=profile.env,
+        )
+        if not setup_result.succeeded:
+            detail = _conflict_setup_failed_details(setup_result)
+            self._event_log(
+                "conflict_setup_failed", detail, level="WARNING", issue_number=issue_number
+            )
+            return self._build_conflict_request(
+                claim,
+                checkpoint,
+                branch,
+                base_branch,
+                pull_request,
+                CONFLICT_OUTCOME_SETUP_FAILED,
+                "",
+                detail,
+                push_branch=False,
+                conflicted_files=tuple(conflicted),
+            )
+        check_result = runner.run(
+            tuple(profile.check),
+            timeout=profile.timeout,
+            cwd=working_directory,
+            environment=profile.env,
+        )
+        check_command = " && ".join(profile.check)
+        if not check_result.succeeded:
+            detail = _conflict_check_failed_details(check_result)
+            self._event_log(
+                "conflict_check_failed", detail, level="WARNING", issue_number=issue_number
+            )
+            return self._build_conflict_request(
+                claim,
+                checkpoint,
+                branch,
+                base_branch,
+                pull_request,
+                CONFLICT_OUTCOME_CHECK_FAILED,
+                "",
+                detail,
+                push_branch=False,
+                check_command=check_command,
+                check_exit_code=check_result.exit_code,
+                conflicted_files=tuple(conflicted),
+            )
+        self._attempt_state.transition(AttemptPhase.PUSHING)
+        self._event_log(
+            "attempt_phase_transitioned",
+            f"phase={AttemptPhase.PUSHING.value}",
+            level="INFO",
+            issue_number=issue_number,
+        )
+        # The commit count held, so the newest ``fix_count`` commits
+        # (newest-first, seal commit included) are the fixes on top.
+        fix_revisions = tuple(commit.revision for commit in after_commits[:fix_count])
+        fix_files: list[str] = []
+        for revision in fix_revisions:
+            fix_files.extend(self._workspace.files_changed(revision))
+        extra_files = _conflict_files_outside(fix_files, conflicted)
+        self._event_log(
+            "conflict_resolution_verified",
+            f"branch={branch}; fix_commits="
+            f"{', '.join(_conflict_short_revision(revision) for revision in fix_revisions) or 'none'}"
+            + (f"; extra_files={', '.join(extra_files)}" if extra_files else ""),
+            level="INFO",
+            issue_number=issue_number,
+        )
+        return self._build_conflict_request(
+            claim,
+            checkpoint,
+            branch,
+            base_branch,
+            pull_request,
+            CONFLICT_OUTCOME_SUCCESS,
+            "",
+            _conflict_model_success_details(
+                branch,
+                base_branch,
+                files=tuple(conflicted),
+                extra_files=extra_files,
+                fix_commits=fix_revisions,
+            ),
+            push_branch=True,
+            check_command=check_command,
+            check_exit_code=check_result.exit_code,
+            conflicted_files=tuple(conflicted),
+            extra_files=extra_files,
+            fix_commits=fix_revisions,
+        )
+
+    def _abort_conflict_best_effort(
+        self, prepared: PreparedAttempt, issue_number: int
+    ) -> None:
+        """Abort an in-progress rebase without changing the attempt's outcome."""
+
+        try:
+            if not self._workspace.conflict_state().in_progress:
+                return
+        except Exception as error:
+            self._event_log(
+                "conflict_abort_failed",
+                f"reason={_exception_detail(error)}",
+                level="WARNING",
+                issue_number=issue_number,
+            )
+            return
+        try:
+            self._workspace.abort_unresolved_rebase(prepared)
+        except Exception as error:
+            self._event_log(
+                "conflict_abort_failed",
+                f"reason={_exception_detail(error)}",
+                level="WARNING",
+                issue_number=issue_number,
+            )
+
+    def _seal_conflict_best_effort(
+        self,
+        issue_number: int,
+        attempt_id: str,
+        status: ModelExecutionStatus,
+    ) -> None:
+        """Seal leftover resolution work without changing the attempt's outcome."""
+
+        try:
+            self._workspace.seal(
+                issue_number=issue_number, attempt_id=attempt_id, status=status
+            )
+        except Exception as error:
+            self._event_log(
+                "seal_attempt_work_failed",
+                _exception_detail(error),
+                level="ERROR",
+                issue_number=issue_number,
+            )
+
+    def _archive_conflict_model_result(
+        self, archive: object | None, issue_number: int, execution: object
+    ) -> None:
+        """Archive one conflict resolution session's usage, best-effort."""
+
+        if archive is None:
+            return
+        write = getattr(archive, "write_attempt", None)
+        if callable(write):
+            try:
+                write(
+                    {
+                        "model_usage": getattr(execution, "model_usage", None),
+                        "skill_events": [
+                            event.__dict__ for event in getattr(execution, "skill_events", ())
+                        ],
+                        "model_stop_reason": getattr(execution, "stop_reason", None),
+                        "token_budget": getattr(execution, "token_budget", None),
+                    }
+                )
+            except Exception as error:
+                self._event_log(
+                    "conflict_archive_failed",
+                    f"reason={_exception_detail(error)}",
+                    level="WARNING",
+                    issue_number=issue_number,
+                )
+        copy = getattr(archive, "copy_cli_transcripts", None)
+        if callable(copy):
+            try:
+                copy(
+                    getattr(self._conflict_model_executor, "cli_session_id", None),
+                    issue_number=issue_number,
+                    event_log=self._event_log,
+                )
+            except Exception as error:
+                self._event_log(
+                    "transcripts_copy_failed",
+                    f"reason={_exception_detail(error)}",
+                    level="WARNING",
+                    issue_number=issue_number,
+                )
+
     def _build_conflict_request(
         self,
         claim: Claim,
@@ -5276,6 +5769,8 @@ class AgentLifecycle:
         check_command: str = "not run",
         check_exit_code: int | None = None,
         conflicted_files: tuple[str, ...] = (),
+        extra_files: tuple[str, ...] = (),
+        fix_commits: tuple[str, ...] = (),
     ) -> ConflictPublicationRequest:
         """Build one conflict publication request from its outcome and evidence."""
 
@@ -5295,6 +5790,8 @@ class AgentLifecycle:
             check_exit_code=check_exit_code,
             conflicted_files=tuple(conflicted_files),
             auto_merge_opt_in=_claim_time_opt_in(claim, checkpoint),
+            extra_files=tuple(extra_files),
+            fix_commits=tuple(fix_commits),
         )
 
     def _conflict_error_request(
@@ -5799,13 +6296,21 @@ def _prompt_redactor(
     return Redactor(values)
 
 
-def _gate_section(profile: RepositoryProfile, redactions: Sequence[str]) -> str:
+def _gate_section(
+    profile: RepositoryProfile,
+    redactions: Sequence[str],
+    *,
+    include_review_instruction: bool = True,
+) -> str:
     """Describe the repository check gate the attempt is judged by.
 
     Every check command is listed exactly as the profile gives it (after
     redaction), one per line and numbered, in profile order. When the
     profile carries ``env``, only the variable names are shown so the model
-    can reproduce the gate's environment without seeing the values.
+    can reproduce the gate's environment without seeing the values. Conflict
+    resolution sessions pass ``include_review_instruction=False``: bringing
+    the branch up to date needs no review, so the mandatory ``code-review``
+    gate for ordinary work stays out of their prompt.
     """
 
     redactor = _prompt_redactor(profile, redactions)
@@ -5826,11 +6331,14 @@ def _gate_section(profile: RepositoryProfile, redactions: Sequence[str]) -> str:
         "model finishes. They run in sequence and the first failure fails "
         "the gate.",
         "",
-        "Before finishing, invoke the `code-review` skill on your changes: "
-        "an attempt with commits but no `code-review` invocation in this run "
-        "is classified as incomplete, even when the checks pass and the "
-        "change is small (for example formatting).",
     ]
+    if include_review_instruction:
+        lines += [
+            "Before finishing, invoke the `code-review` skill on your changes: "
+            "an attempt with commits but no `code-review` invocation in this run "
+            "is classified as incomplete, even when the checks pass and the "
+            "change is small (for example formatting).",
+        ]
     if profile.env:
         names = ", ".join(profile.env.keys())
         lines.append(
