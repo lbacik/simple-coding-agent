@@ -29,7 +29,14 @@ from simple_coding_agent.git_workspace import (
     GitWorkspaceError,
     PreparedAttempt,
 )
-from simple_coding_agent.github_tracker import ROUND_FINISHED, Assignment, Claim, TrackerIssue
+from simple_coding_agent.github_tracker import (
+    MERGE_CONFLICT,
+    READY_FOR_AGENT,
+    ROUND_FINISHED,
+    Assignment,
+    Claim,
+    TrackerIssue,
+)
 from simple_coding_agent.model_execution import ModelExecutionStatus
 
 
@@ -139,6 +146,9 @@ class InMemoryWorkspace:
         self._commits: list[_RecordedCommit] = []
         self._sequence = 0
         self._conflict = ConflictState(in_progress=False)
+        # Conflicted files ``prepare_attempt`` reports (and leaves in
+        # progress) to simulate a conflicting rebase for conflict attempts.
+        self.prepare_conflicts: tuple[str, ...] = ()
         self.abort_calls: list[object] = []
         self.cleanup_calls: list[tuple[str, bool]] = []
         self.seal_calls: list[tuple[int, str, ModelExecutionStatus]] = []
@@ -190,6 +200,16 @@ class InMemoryWorkspace:
         self.prepared_bases.append(base_branch)
         self._branch = f"agent/issue-{issue_number}"
         self.current_branch = self._branch
+        if self.prepare_conflicts:
+            # Simulate a published branch whose rebase onto the base hits
+            # conflicts: the rebase stays in progress with its files reported,
+            # like the production workspace, for the caller to abort.
+            self.leave_conflict(self.prepare_conflicts)
+            return PreparedAttempt(
+                branch=self._branch,
+                base_revision=self._base_revision,
+                rebase_conflicts=tuple(self.prepare_conflicts),
+            )
         return PreparedAttempt(branch=self._branch, base_revision=self._base_revision)
 
     def is_clean(self) -> bool:
@@ -459,6 +479,13 @@ class FakeTracker:
         assert current is not None
         if ROUND_FINISHED in current.labels:
             self.removed_labels.append((current.id, ROUND_FINISHED))
+        if MERGE_CONFLICT in current.labels and (
+            READY_FOR_AGENT in current.labels or ROUND_FINISHED in current.labels
+        ):
+            # The ordinary (or continuation) path takes precedence over the
+            # conflict signal, so the stale label goes at the claim, exactly
+            # like the production tracker.
+            self.removed_labels.append((current.id, MERGE_CONFLICT))
         self.claimed_verified.append(issue.number)
         return Claim(issue=current, assignment=Assignment(issue_id=current.id, assignee_id="agent-id"))
 
@@ -512,14 +539,18 @@ class FakePublisher:
         branch_url: str | None = _DEFAULT_BRANCH_URL,
         comment_posted: bool = True,
         pull_request: object = None,
+        pull_requests: dict[str, object] | None = None,
     ) -> None:
         self._outcome = outcome
         self._branch_url = branch_url
         self._comment_posted = comment_posted
         self._pull_request = pull_request
+        self._pull_requests = dict(pull_requests or {})
         self.requests: list[object] = []
         self.outcomes: list[AttemptOutcome] = []
         self.timeouts: list[float | None] = []
+        self.pr_lookups: list[str] = []
+        self.conflict_requests: list[object] = []
 
     def publish(self, request: object, *, timeout: float | None = None) -> PublishedAttempt:
         self.requests.append(request)
@@ -535,4 +566,31 @@ class FakePublisher:
             branch_url=branch_url,
             comment_posted=self._comment_posted,
             pull_request=self._pull_request,
+        )
+
+    def find_pull_request(self, head: str) -> object | None:
+        """Return the seeded open pull request for an attempt branch, if any."""
+
+        self.pr_lookups.append(head)
+        return self._pull_requests.get(head)
+
+    def publish_conflict(self, request: object, *, timeout: float | None = None) -> PublishedAttempt:
+        """Publish one conflict attempt: a branch URL only for the push path."""
+
+        self.requests.append(request)
+        self.conflict_requests.append(request)
+        self.timeouts.append(timeout)
+        outcome = self._outcome or request.outcome
+        self.outcomes.append(outcome)
+        if self._branch_url == FakePublisher._DEFAULT_BRANCH_URL:
+            branch_url = (
+                f"https://example.test/tree/{request.branch}" if request.push_branch else None
+            )
+        else:
+            branch_url = self._branch_url
+        return PublishedAttempt(
+            outcome=outcome,
+            branch_url=branch_url,
+            comment_posted=self._comment_posted,
+            pull_request=request.pull_request,
         )

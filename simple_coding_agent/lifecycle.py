@@ -63,7 +63,35 @@ from simple_coding_agent.git_workspace import (
     RebaseConflictError,
     handoff_note_relpath,
 )
+from simple_coding_agent.conflict_attempt import (
+    attempt_branch as _conflict_attempt_branch,
+)
+from simple_coding_agent.conflict_attempt import (
+    base_mismatch_reason as _conflict_base_mismatch_reason,
+)
+from simple_coding_agent.conflict_attempt import (
+    check_failed_details as _conflict_check_failed_details,
+)
+from simple_coding_agent.conflict_attempt import (
+    entry_skip_reason as _conflict_entry_skip_reason,
+)
+from simple_coding_agent.conflict_attempt import (
+    is_conflict_claim as _is_conflict_claim,
+)
+from simple_coding_agent.conflict_attempt import (
+    lifecycle_outcome as _conflict_lifecycle_outcome,
+)
+from simple_coding_agent.conflict_attempt import (
+    rebase_conflict_details as _conflict_rebase_conflict_details,
+)
+from simple_coding_agent.conflict_attempt import (
+    setup_failed_details as _conflict_setup_failed_details,
+)
+from simple_coding_agent.conflict_attempt import (
+    success_details as _conflict_success_details,
+)
 from simple_coding_agent.github_tracker import (
+    MERGE_CONFLICT,
     ROUND_FINISHED,
     Claim,
     TrackerIssue,
@@ -72,8 +100,23 @@ from simple_coding_agent.github_tracker import (
 from simple_coding_agent.model_execution import ModelExecutionStatus, ModelExecutor, OperatorHandoff, ToolCallRecord
 from simple_coding_agent.observability import AttemptArchive, Redactor
 from simple_coding_agent.operating import ConsecutiveErrorStore
-from simple_coding_agent.publication import AUTO_MERGE_LABEL, PublicationRequest
-from simple_coding_agent.recovery import REQUEUE_SOURCE_AUTOMATIC, requeue_source_for_labels
+from simple_coding_agent.publication import (
+    AUTO_MERGE_LABEL,
+    ConflictPublicationRequest,
+    PublicationRequest,
+    PullRequest,
+)
+from simple_coding_agent.recovery import (
+    CONFLICT_OUTCOME_CHECK_FAILED,
+    CONFLICT_OUTCOME_ERROR,
+    CONFLICT_OUTCOME_REBASE_CONFLICT,
+    CONFLICT_OUTCOME_SETUP_FAILED,
+    CONFLICT_OUTCOME_SKIPPED,
+    CONFLICT_OUTCOME_SUCCESS,
+    REQUEUE_SOURCE_AUTOMATIC,
+    REQUEUE_SOURCE_HUMAN,
+    requeue_source_for_labels,
+)
 from simple_coding_agent.telemetry import (
     CONTROL_LOCK_TIMEOUT_SECONDS,
     SnapshotFailedError,
@@ -273,6 +316,23 @@ class Publisher(Protocol):
     """Publication boundary, including the result-comment operation."""
 
     def publish(self, request: PublicationRequest): ...
+
+    def find_pull_request(self, head: str) -> PullRequest | None: ...
+
+    def publish_conflict(self, request: ConflictPublicationRequest): ...
+
+
+class ConflictCheckRunner(Protocol):
+    """Run one profile command sequence for a conflict attempt's fast path."""
+
+    def run(
+        self,
+        commands: Sequence[str],
+        *,
+        timeout: float,
+        cwd: Path,
+        environment: Mapping[str, str] | None = None,
+    ): ...
 
 
 class ModelAttemptRunner:
@@ -1152,6 +1212,8 @@ class AgentLifecycle:
         error_store: ConsecutiveErrorStore | None = None,
         max_consecutive_errors: int = 3,
         max_auto_continuations: int = 0,
+        max_conflict_attempts: int = 0,
+        command_runner: ConflictCheckRunner | None = None,
         event_log: Callable[..., None] = (
             lambda event, detail="", level="INFO", issue_number=None: None
         ),
@@ -1174,6 +1236,8 @@ class AgentLifecycle:
         self._error_store = error_store
         self._max_consecutive_errors = max_consecutive_errors
         self._max_auto_continuations = max_auto_continuations
+        self._max_conflict_attempts = max_conflict_attempts
+        self._command_runner = command_runner
         self._event_log = event_log
         self._attempt_archive_factory = attempt_archive_factory
         self._completion_store = completion_store
@@ -1423,6 +1487,7 @@ class AgentLifecycle:
                 number,
                 max_auto_continuations=self._max_auto_continuations,
                 auto_continuation_count=auto_count,
+                max_conflict_attempts=self._max_conflict_attempts,
             )
             if reason is not None:
                 raise NextIssueRejectedError(
@@ -2750,6 +2815,16 @@ class AgentLifecycle:
             issue_number=issue_number,
         )
 
+    def _emit_conflict_attempt_claim(self, issue_number: int) -> None:
+        """Emit the observability event for a conflict-attempt claim."""
+
+        self._event_log(
+            "conflict_attempt_claimed",
+            f"issue #{issue_number}; merge-conflict requeue",
+            level="INFO",
+            issue_number=issue_number,
+        )
+
     def _continuation_index_for_claim(
         self, source: str, auto_count: int | None
     ) -> int | None:
@@ -3325,96 +3400,113 @@ class AgentLifecycle:
         retain_branch = False
         comment_posted = True
         publication_started_at: datetime | None = None
+        # A conflict requeue routes to the model-free fast path instead of
+        # the ordinary model-driven path; both share the except/finally
+        # boundary that follows (holds, error publication, release, cleanup,
+        # and finalization).
+        is_conflict_claim = _is_conflict_claim(claim.issue.labels)
         try:
-            # Bootstrap only checks out the default base so the profile can be
-            # read. It must never touch the attempt branch: rebasing here onto
-            # "main" would corrupt (or fail on) branches built on the profile's
-            # real base branch before the profile is even loaded. The attempt
-            # is prepared exactly once below, onto profile.base_branch.
-            self._workspace.prepare_for_profile_read()
-            self._event_log(
-                "workspace_prepared_for_profile_read",
-                "base_branch=main",
-                level="INFO",
-                issue_number=claim.issue.number,
-            )
-            profile = self._profile_loader(self._workspace.working_directory)
-            self._event_log(
-                "profile_loaded",
-                f"base_branch={profile.base_branch}",
-                level="INFO",
-                issue_number=claim.issue.number,
-            )
-            prepared = self._workspace.prepare_attempt(
-                base_branch=profile.base_branch, issue_number=claim.issue.number
-            )
-            rebase_conflicts = tuple(prepared.rebase_conflicts or ())
-            prepared_detail = (
-                f"branch={prepared.branch}; base_branch={profile.base_branch}"
-            )
-            if rebase_conflicts:
-                prepared_detail += f"; rebase_conflicts={', '.join(rebase_conflicts)}"
-            self._event_log(
-                "workspace_prepared",
-                prepared_detail,
-                level="INFO",
-                issue_number=claim.issue.number,
-            )
-            self._attempt_state.transition(AttemptPhase.SETUP)
-            self._event_log(
-                "attempt_phase_transitioned",
-                f"phase={AttemptPhase.SETUP.value}",
-                level="INFO",
-                issue_number=claim.issue.number,
-            )
-            if self._attempt_runner is None:
-                outcome = AttemptOutcome.INFRASTRUCTURE_ERROR
-                publication_started_at = self._clock()
-                published = self._publish_terminal(
-                    claim, checkpoint.started_at, prepared, profile, outcome,
-                    timeout=self._handoff_publish_budget(),
-                    auto_merge_opt_in=_claim_time_opt_in(claim, checkpoint),
-                    requeue_source=_claim_time_requeue_source(claim, checkpoint),
+            if is_conflict_claim:
+                conflict_request, prepared, profile = self._execute_conflict_attempt(
+                    claim, checkpoint
                 )
-                comment_posted = getattr(published, "comment_posted", True)
-            else:
-                self._wire_attempt_runner_handoff()
-                self._wire_attempt_telemetry_publisher()
-                evidence = self._attempt_runner(claim, profile, prepared)
                 publication_started_at = self._clock()
-                published = self._publish_bounded(
-                    PublicationRequest(
-                        issue_number=claim.issue.number,
-                        issue_title=claim.issue.title,
-                        branch=prepared.branch,
-                        started_at=checkpoint.started_at,
-                        decision=evidence.decision,
-                        check_command=evidence.check_command,
-                        check_exit_code=evidence.check_exit_code,
-                        review_cycles=evidence.review_cycles,
-                        reviews_performed=evidence.reviews_performed,
-                        review_findings=evidence.review_findings,
-                        details=self._handoff_publication_details(
-                            claim,
-                            checkpoint,
-                            evidence.details,
-                            evidence.decision.outcome,
-                        ),
-                        base_branch=profile.base_branch,
-                        note_commit_sha=evidence.note_commit_sha,
-                        auto_merge_opt_in=_claim_time_opt_in(claim, checkpoint),
-                        requeue_source=_claim_time_requeue_source(claim, checkpoint),
-                    )
-                )
+                published = self._publish_conflict_bounded(conflict_request)
                 outcome = published.outcome
                 comment_posted = getattr(published, "comment_posted", True)
                 retain_branch = getattr(published, "branch_url", None) is None and (
                     outcome is AttemptOutcome.INFRASTRUCTURE_ERROR
-                    or (
-                        outcome is AttemptOutcome.INCOMPLETE
-                        and evidence.decision.publication_path is PublicationPath.PARTIAL
-                    )
                 )
+            else:
+                # Bootstrap only checks out the default base so the profile can be
+                # read. It must never touch the attempt branch: rebasing here onto
+                # "main" would corrupt (or fail on) branches built on the profile's
+                # real base branch before the profile is even loaded. The attempt
+                # is prepared exactly once below, onto profile.base_branch.
+                self._workspace.prepare_for_profile_read()
+                self._event_log(
+                    "workspace_prepared_for_profile_read",
+                    "base_branch=main",
+                    level="INFO",
+                    issue_number=claim.issue.number,
+                )
+                profile = self._profile_loader(self._workspace.working_directory)
+                self._event_log(
+                    "profile_loaded",
+                    f"base_branch={profile.base_branch}",
+                    level="INFO",
+                    issue_number=claim.issue.number,
+                )
+                prepared = self._workspace.prepare_attempt(
+                    base_branch=profile.base_branch, issue_number=claim.issue.number
+                )
+                rebase_conflicts = tuple(prepared.rebase_conflicts or ())
+                prepared_detail = (
+                    f"branch={prepared.branch}; base_branch={profile.base_branch}"
+                )
+                if rebase_conflicts:
+                    prepared_detail += f"; rebase_conflicts={', '.join(rebase_conflicts)}"
+                self._event_log(
+                    "workspace_prepared",
+                    prepared_detail,
+                    level="INFO",
+                    issue_number=claim.issue.number,
+                )
+                self._attempt_state.transition(AttemptPhase.SETUP)
+                self._event_log(
+                    "attempt_phase_transitioned",
+                    f"phase={AttemptPhase.SETUP.value}",
+                    level="INFO",
+                    issue_number=claim.issue.number,
+                )
+                if self._attempt_runner is None:
+                    outcome = AttemptOutcome.INFRASTRUCTURE_ERROR
+                    publication_started_at = self._clock()
+                    published = self._publish_terminal(
+                        claim, checkpoint.started_at, prepared, profile, outcome,
+                        timeout=self._handoff_publish_budget(),
+                        auto_merge_opt_in=_claim_time_opt_in(claim, checkpoint),
+                        requeue_source=_claim_time_requeue_source(claim, checkpoint),
+                    )
+                    comment_posted = getattr(published, "comment_posted", True)
+                else:
+                    self._wire_attempt_runner_handoff()
+                    self._wire_attempt_telemetry_publisher()
+                    evidence = self._attempt_runner(claim, profile, prepared)
+                    publication_started_at = self._clock()
+                    published = self._publish_bounded(
+                        PublicationRequest(
+                            issue_number=claim.issue.number,
+                            issue_title=claim.issue.title,
+                            branch=prepared.branch,
+                            started_at=checkpoint.started_at,
+                            decision=evidence.decision,
+                            check_command=evidence.check_command,
+                            check_exit_code=evidence.check_exit_code,
+                            review_cycles=evidence.review_cycles,
+                            reviews_performed=evidence.reviews_performed,
+                            review_findings=evidence.review_findings,
+                            details=self._handoff_publication_details(
+                                claim,
+                                checkpoint,
+                                evidence.details,
+                                evidence.decision.outcome,
+                            ),
+                            base_branch=profile.base_branch,
+                            note_commit_sha=evidence.note_commit_sha,
+                            auto_merge_opt_in=_claim_time_opt_in(claim, checkpoint),
+                            requeue_source=_claim_time_requeue_source(claim, checkpoint),
+                        )
+                    )
+                    outcome = published.outcome
+                    comment_posted = getattr(published, "comment_posted", True)
+                    retain_branch = getattr(published, "branch_url", None) is None and (
+                        outcome is AttemptOutcome.INFRASTRUCTURE_ERROR
+                        or (
+                            outcome is AttemptOutcome.INCOMPLETE
+                            and evidence.decision.publication_path is PublicationPath.PARTIAL
+                        )
+                    )
         except DirtyWorkspaceError as error:
             # Unexplained dirty or untracked work: hold intake and preserve
             # the branch, checkpoint, and entire working tree for inspection.
@@ -3447,25 +3539,54 @@ class AgentLifecycle:
             raise
         except RebaseConflictError as error:
             publication_started_at = self._clock()
-            published = self._publish_rebase_conflict(
-                claim, checkpoint.started_at, prepared, profile, error,
-                timeout=self._handoff_publish_budget(),
-                auto_merge_opt_in=_claim_time_opt_in(claim, checkpoint),
-                requeue_source=_claim_time_requeue_source(claim, checkpoint),
-            )
-            outcome = AttemptOutcome.INFRASTRUCTURE_ERROR
+            if is_conflict_claim:
+                # The fast path never runs the model, so a rebase left in
+                # progress reaches here only defensively: restore the branch
+                # best-effort and report the conflict without pushing.
+                if prepared is not None:
+                    try:
+                        self._workspace.abort_unresolved_rebase(prepared)
+                    except Exception as abort_error:
+                        self._event_log(
+                            "conflict_abort_failed",
+                            _exception_detail(abort_error),
+                            level="WARNING",
+                            issue_number=claim.issue.number,
+                        )
+                published = self._publish_conflict_bounded(
+                    self._conflict_rebase_request(
+                        claim, checkpoint, prepared, profile, None, error.conflicted_files
+                    )
+                )
+                outcome = published.outcome
+            else:
+                published = self._publish_rebase_conflict(
+                    claim, checkpoint.started_at, prepared, profile, error,
+                    timeout=self._handoff_publish_budget(),
+                    auto_merge_opt_in=_claim_time_opt_in(claim, checkpoint),
+                    requeue_source=_claim_time_requeue_source(claim, checkpoint),
+                )
+                outcome = AttemptOutcome.INFRASTRUCTURE_ERROR
             comment_posted = getattr(published, "comment_posted", True)
         except Exception as error:
             self._event_log(
                 "attempt_exception", _exception_detail(error), level="ERROR", issue_number=claim.issue.number
             )
             publication_started_at = self._clock()
-            published = self._publish_terminal(
-                claim, checkpoint.started_at, prepared, profile, outcome,
-                timeout=self._handoff_publish_budget(),
-                auto_merge_opt_in=_claim_time_opt_in(claim, checkpoint),
-                requeue_source=_claim_time_requeue_source(claim, checkpoint),
-            )
+            if is_conflict_claim:
+                published = self._publish_conflict_bounded(
+                    self._conflict_error_request(
+                        claim, checkpoint, prepared, profile, _exception_detail(error)
+                    )
+                )
+                outcome = published.outcome
+            else:
+                published = self._publish_terminal(
+                    claim, checkpoint.started_at, prepared, profile, outcome,
+                    timeout=self._handoff_publish_budget(),
+                    auto_merge_opt_in=_claim_time_opt_in(claim, checkpoint),
+                    requeue_source=_claim_time_requeue_source(claim, checkpoint),
+                )
             comment_posted = getattr(published, "comment_posted", True)
         except BaseException as error:
             # KeyboardInterrupt and friends bypass `except Exception` (which is
@@ -3477,12 +3598,20 @@ class AgentLifecycle:
             )
             try:
                 publication_started_at = self._clock()
-                published = self._publish_terminal(
-                    claim, checkpoint.started_at, prepared, profile, outcome,
-                    timeout=self._handoff_publish_budget(),
-                    auto_merge_opt_in=_claim_time_opt_in(claim, checkpoint),
-                    requeue_source=_claim_time_requeue_source(claim, checkpoint),
-                )
+                if is_conflict_claim:
+                    published = self._publish_conflict_bounded(
+                        self._conflict_error_request(
+                            claim, checkpoint, prepared, profile, _exception_detail(error)
+                        )
+                    )
+                    outcome = published.outcome
+                else:
+                    published = self._publish_terminal(
+                        claim, checkpoint.started_at, prepared, profile, outcome,
+                        timeout=self._handoff_publish_budget(),
+                        auto_merge_opt_in=_claim_time_opt_in(claim, checkpoint),
+                        requeue_source=_claim_time_requeue_source(claim, checkpoint),
+                    )
                 comment_posted = getattr(published, "comment_posted", True)
             except Exception:
                 comment_posted = False
@@ -3690,24 +3819,36 @@ class AgentLifecycle:
                 )
                 return (None, None)
             source = requeue_source_for_labels(claim.issue.labels)
-            if source == REQUEUE_SOURCE_AUTOMATIC:
+            is_conflict = _is_conflict_claim(claim.issue.labels)
+            if is_conflict:
+                # A conflict requeue is transparent to the continuation
+                # budget: it records a human requeue source with no
+                # continuation index, and never emits the automatic event.
+                source = REQUEUE_SOURCE_HUMAN
+                auto_count = None
+                continuation_index = None
+            elif source == REQUEUE_SOURCE_AUTOMATIC:
                 try:
                     auto_count = self._auto_continuation_count(claim.issue)
                 except Exception:
                     auto_count = None
+                continuation_index = self._continuation_index_for_claim(source, auto_count)
             else:
                 auto_count = None
+                continuation_index = self._continuation_index_for_claim(source, auto_count)
             checkpoint = self._attempt_state.start(
                 issue_number=claim.issue.number,
                 branch=f"agent/issue-{claim.issue.number}",
                 auto_merge_opt_in=AUTO_MERGE_LABEL in claim.issue.labels,
                 requeue_source=source,
                 issue_title=claim.issue.title,
-                continuation_index=self._continuation_index_for_claim(source, auto_count),
+                continuation_index=continuation_index,
             )
             self._attempt_processing = True
             self._telemetry_begin_for_checkpoint(checkpoint)
-            if source == REQUEUE_SOURCE_AUTOMATIC:
+            if is_conflict:
+                self._emit_conflict_attempt_claim(claim.issue.number)
+            elif source == REQUEUE_SOURCE_AUTOMATIC:
                 self._emit_auto_continuation_claim(claim.issue.number, auto_count)
             if self._control_store is not None:
                 # The final counted attempt of a ``stop --after`` plan enters
@@ -3768,6 +3909,7 @@ class AgentLifecycle:
             target_number,
             max_auto_continuations=self._max_auto_continuations,
             auto_continuation_count=auto_count,
+            max_conflict_attempts=self._max_conflict_attempts,
         )
         if reason is not None:
             if fresh is not None and self._is_self_assignment(fresh):
@@ -3833,9 +3975,13 @@ class AgentLifecycle:
             issue_number=claim.issue.number,
         )
         source = requeue_source_for_labels(fresh.labels)
-        if source == REQUEUE_SOURCE_AUTOMATIC:
+        if _is_conflict_claim(fresh.labels):
+            source = REQUEUE_SOURCE_HUMAN
+            continuation_index = None
+            self._emit_conflict_attempt_claim(claim.issue.number)
+        elif source == REQUEUE_SOURCE_AUTOMATIC:
             self._emit_auto_continuation_claim(claim.issue.number, auto_count)
-            continuation_index: int | None = self._continuation_index_for_claim(
+            continuation_index = self._continuation_index_for_claim(
                 source, auto_count
             )
         else:
@@ -4286,11 +4432,17 @@ class AgentLifecycle:
 
         A handoff must add ``round-finished`` for human-controlled requeue
         instead of the plain ready-for-agent/assignee release every other
-        outcome uses.
+        outcome uses. A conflict attempt releases ``merge-conflict`` instead:
+        every conflict outcome removes the conflict signal and the assignee,
+        and never adds ``ready-for-agent`` or ``round-finished``.
         """
 
         if outcome is AttemptOutcome.HANDOFF:
             self._tracker.release_handoff(claim.issue.number, claim.assignment.assignee_id)
+        elif _is_conflict_claim(claim.issue.labels):
+            self._tracker.release_attempt(
+                claim.issue.number, MERGE_CONFLICT, claim.assignment.assignee_id
+            )
         else:
             self._tracker.release_attempt(
                 claim.issue.number, "ready-for-agent", claim.assignment.assignee_id
@@ -4887,6 +5039,334 @@ class AgentLifecycle:
 
         while not stop():
             self.run_once()
+
+    # -- conflict attempts ----------------------------------------------------
+
+    def _execute_conflict_attempt(
+        self,
+        claim: Claim,
+        checkpoint: AttemptCheckpoint,
+    ) -> tuple[ConflictPublicationRequest, PreparedAttempt | None, RepositoryProfile | None]:
+        """Run the model-free conflict fast path and build its publication request.
+
+        The entry check re-reads the open pull request behind the published
+        branch before any git work: a missing, draft, or no-longer-conflicting
+        pull request ends the attempt as ``skipped``, as does a pull request
+        targeting another base branch once the profile is loaded. A clean
+        rebase runs setup plus one profile check (no baseline, no model
+        call); only that green path pushes. Returns the publication request
+        together with the prepared attempt (``None`` when skipped before any
+        git work ran) and the profile (``None`` when it never loaded).
+        """
+
+        issue_number = claim.issue.number
+        branch = _conflict_attempt_branch(issue_number)
+        pull_request = self._publisher.find_pull_request(branch)
+        skip = _conflict_entry_skip_reason(pull_request, branch=branch)
+        if skip is not None:
+            reason, details = skip
+            self._event_log(
+                "conflict_attempt_skipped",
+                f"{reason}: {details}",
+                level="INFO",
+                issue_number=issue_number,
+            )
+            return (
+                self._build_conflict_request(
+                    claim,
+                    checkpoint,
+                    branch,
+                    "main",
+                    pull_request,
+                    CONFLICT_OUTCOME_SKIPPED,
+                    reason,
+                    details,
+                    push_branch=False,
+                ),
+                None,
+                None,
+            )
+        self._workspace.prepare_for_profile_read()
+        self._event_log(
+            "workspace_prepared_for_profile_read",
+            "base_branch=main",
+            level="INFO",
+            issue_number=issue_number,
+        )
+        profile = self._profile_loader(self._workspace.working_directory)
+        self._event_log(
+            "profile_loaded",
+            f"base_branch={profile.base_branch}",
+            level="INFO",
+            issue_number=issue_number,
+        )
+        base_skip = _conflict_base_mismatch_reason(pull_request, profile.base_branch)
+        if base_skip is not None:
+            reason, details = base_skip
+            self._event_log(
+                "conflict_attempt_skipped",
+                f"{reason}: {details}",
+                level="INFO",
+                issue_number=issue_number,
+            )
+            return (
+                self._build_conflict_request(
+                    claim,
+                    checkpoint,
+                    branch,
+                    profile.base_branch,
+                    pull_request,
+                    CONFLICT_OUTCOME_SKIPPED,
+                    reason,
+                    details,
+                    push_branch=False,
+                ),
+                None,
+                profile,
+            )
+        self._attempt_state.transition(AttemptPhase.SETUP)
+        self._event_log(
+            "attempt_phase_transitioned",
+            f"phase={AttemptPhase.SETUP.value}",
+            level="INFO",
+            issue_number=issue_number,
+        )
+        prepared = self._workspace.prepare_attempt(
+            base_branch=profile.base_branch, issue_number=issue_number
+        )
+        self._event_log(
+            "workspace_prepared",
+            f"branch={prepared.branch}; base_branch={profile.base_branch}",
+            level="INFO",
+            issue_number=issue_number,
+        )
+        state = self._workspace.conflict_state()
+        conflicted = tuple(state.conflicted_files) or tuple(prepared.rebase_conflicts or ())
+        if state.in_progress or prepared.rebase_conflicts:
+            if state.in_progress:
+                self._workspace.abort_unresolved_rebase(prepared)
+            self._event_log(
+                "conflict_rebase_conflict",
+                f"branch={prepared.branch}; base_branch={profile.base_branch}"
+                + (f"; files={', '.join(conflicted)}" if conflicted else ""),
+                level="WARNING",
+                issue_number=issue_number,
+            )
+            return (
+                self._conflict_rebase_request(
+                    claim, checkpoint, prepared, profile, pull_request, conflicted
+                ),
+                prepared,
+                profile,
+            )
+        runner = self._command_runner
+        if runner is None:
+            detail = (
+                "No command runner is configured for conflict attempts; the rebased "
+                "branch was not verified, so the remote branch is left untouched."
+            )
+            self._event_log(
+                "conflict_attempt_error", detail, level="ERROR", issue_number=issue_number
+            )
+            return (
+                self._conflict_error_request(claim, checkpoint, prepared, profile, detail),
+                prepared,
+                profile,
+            )
+        working_directory = self._workspace.working_directory
+        setup_result = runner.run(
+            tuple(profile.setup),
+            timeout=profile.setup_timeout,
+            cwd=working_directory,
+            environment=profile.env,
+        )
+        if not setup_result.succeeded:
+            detail = _conflict_setup_failed_details(setup_result)
+            self._event_log(
+                "conflict_setup_failed", detail, level="WARNING", issue_number=issue_number
+            )
+            return (
+                self._build_conflict_request(
+                    claim,
+                    checkpoint,
+                    prepared.branch,
+                    profile.base_branch,
+                    pull_request,
+                    CONFLICT_OUTCOME_SETUP_FAILED,
+                    "",
+                    detail,
+                    push_branch=False,
+                ),
+                prepared,
+                profile,
+            )
+        self._attempt_state.transition(AttemptPhase.MODEL_RUNNING)
+        self._event_log(
+            "attempt_phase_transitioned",
+            f"phase={AttemptPhase.MODEL_RUNNING.value}",
+            level="INFO",
+            issue_number=issue_number,
+        )
+        check_result = runner.run(
+            tuple(profile.check),
+            timeout=profile.timeout,
+            cwd=working_directory,
+            environment=profile.env,
+        )
+        check_command = " && ".join(profile.check)
+        if not check_result.succeeded:
+            detail = _conflict_check_failed_details(check_result)
+            self._event_log(
+                "conflict_check_failed", detail, level="WARNING", issue_number=issue_number
+            )
+            return (
+                self._build_conflict_request(
+                    claim,
+                    checkpoint,
+                    prepared.branch,
+                    profile.base_branch,
+                    pull_request,
+                    CONFLICT_OUTCOME_CHECK_FAILED,
+                    "",
+                    detail,
+                    push_branch=False,
+                    check_command=check_command,
+                    check_exit_code=check_result.exit_code,
+                ),
+                prepared,
+                profile,
+            )
+        self._attempt_state.transition(AttemptPhase.PUSHING)
+        self._event_log(
+            "attempt_phase_transitioned",
+            f"phase={AttemptPhase.PUSHING.value}",
+            level="INFO",
+            issue_number=issue_number,
+        )
+        return (
+            self._build_conflict_request(
+                claim,
+                checkpoint,
+                prepared.branch,
+                profile.base_branch,
+                pull_request,
+                CONFLICT_OUTCOME_SUCCESS,
+                "",
+                _conflict_success_details(prepared.branch, profile.base_branch),
+                push_branch=True,
+                check_command=check_command,
+                check_exit_code=check_result.exit_code,
+            ),
+            prepared,
+            profile,
+        )
+
+    def _build_conflict_request(
+        self,
+        claim: Claim,
+        checkpoint: AttemptCheckpoint,
+        branch: str,
+        base_branch: str,
+        pull_request: PullRequest | None,
+        conflict_outcome: str,
+        reason: str,
+        details: str,
+        *,
+        push_branch: bool,
+        check_command: str = "not run",
+        check_exit_code: int | None = None,
+        conflicted_files: tuple[str, ...] = (),
+    ) -> ConflictPublicationRequest:
+        """Build one conflict publication request from its outcome and evidence."""
+
+        return ConflictPublicationRequest(
+            issue_number=claim.issue.number,
+            issue_title=claim.issue.title,
+            branch=branch,
+            started_at=checkpoint.started_at,
+            base_branch=base_branch,
+            outcome=_conflict_lifecycle_outcome(conflict_outcome),
+            conflict_outcome=conflict_outcome,
+            reason=reason,
+            details=details,
+            push_branch=push_branch,
+            pull_request=pull_request,
+            check_command=check_command,
+            check_exit_code=check_exit_code,
+            conflicted_files=tuple(conflicted_files),
+            auto_merge_opt_in=_claim_time_opt_in(claim, checkpoint),
+        )
+
+    def _conflict_error_request(
+        self,
+        claim: Claim,
+        checkpoint: AttemptCheckpoint,
+        prepared: PreparedAttempt | None,
+        profile: RepositoryProfile | None,
+        detail: str,
+    ) -> ConflictPublicationRequest:
+        """Build the conflict error request for an unexpected failure."""
+
+        branch = (
+            prepared.branch if prepared is not None else _conflict_attempt_branch(claim.issue.number)
+        )
+        base_branch = profile.base_branch if profile is not None else "main"
+        return self._build_conflict_request(
+            claim,
+            checkpoint,
+            branch,
+            base_branch,
+            None,
+            CONFLICT_OUTCOME_ERROR,
+            "",
+            f"Conflict attempt failed before a result could be verified: {detail}",
+            push_branch=False,
+        )
+
+    def _conflict_rebase_request(
+        self,
+        claim: Claim,
+        checkpoint: AttemptCheckpoint,
+        prepared: PreparedAttempt | None,
+        profile: RepositoryProfile | None,
+        pull_request: PullRequest | None,
+        conflicted_files: tuple[str, ...],
+    ) -> ConflictPublicationRequest:
+        """Build the conflict request for a rebase that hit conflicts."""
+
+        branch = (
+            prepared.branch if prepared is not None else _conflict_attempt_branch(claim.issue.number)
+        )
+        base_branch = profile.base_branch if profile is not None else "main"
+        return self._build_conflict_request(
+            claim,
+            checkpoint,
+            branch,
+            base_branch,
+            pull_request,
+            CONFLICT_OUTCOME_REBASE_CONFLICT,
+            "",
+            _conflict_rebase_conflict_details(branch, base_branch, conflicted_files),
+            push_branch=False,
+            conflicted_files=tuple(conflicted_files),
+        )
+
+    def _publish_conflict_bounded(self, request: ConflictPublicationRequest):
+        """Publish a conflict attempt, bounding the call by the handoff budget."""
+
+        budget = self._handoff_publish_budget()
+        if budget is None:
+            published = self._publisher.publish_conflict(request)
+        else:
+            published = self._publisher.publish_conflict(request, timeout=budget)
+        # Remember the verified result for telemetry (no extra lookup), plus
+        # the workspace state observed right after publication. The pull
+        # request is also written into the attempt's archive record here, at
+        # publication, so the telemetry seed finds it after a restart.
+        self._remember_publication_result(request.started_at, published)
+        self._archive_pull_request(request.issue_number, request.started_at, published)
+        self._observe_and_remember_workspace_dirty(request.started_at)
+        return published
 
     def _publish_terminal(
         self,

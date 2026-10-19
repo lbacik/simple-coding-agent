@@ -107,6 +107,7 @@ class RuntimeConfig:
     pr_auto_merge: str = "false"
     pr_merge_method: str = "merge"
     max_auto_continuations: int = 0
+    max_conflict_attempts: int = 0
 
     @property
     def soft_threshold_tokens(self) -> int:
@@ -218,6 +219,7 @@ def load_runtime_config(environ: Mapping[str, str] | None = None) -> RuntimeConf
         pr_auto_merge=_auto_merge_mode(values),
         pr_merge_method=_merge_method(values),
         max_auto_continuations=_non_negative_integer(values, "MAX_AUTO_CONTINUATIONS", 0),
+        max_conflict_attempts=_non_negative_integer(values, "MAX_CONFLICT_ATTEMPTS", 0),
     )
     _warn_when_claude_code_version_is_set(values)
     _warn_when_claude_agent_sdk_version_is_set(values)

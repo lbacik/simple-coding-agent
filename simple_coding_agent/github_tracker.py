@@ -16,6 +16,8 @@ from simple_coding_agent.recovery import count_automatic_continuations
 
 READY_FOR_AGENT = "ready-for-agent"
 ROUND_FINISHED = "round-finished"
+READY_FOR_HUMAN = "ready-for-human"
+MERGE_CONFLICT = "merge-conflict"
 
 
 def ineligibility_reason(
@@ -24,17 +26,21 @@ def ineligibility_reason(
     *,
     max_auto_continuations: int = 0,
     auto_continuation_count: int = 0,
+    max_conflict_attempts: int = 0,
 ) -> str | None:
     """Explain why a ``next issue`` target cannot be accepted or claimed.
 
     Returns ``None`` when the issue is currently eligible under the ordinary
     queue rules (open, unassigned, labelled ``ready-for-agent``, with a
-    non-empty body and no open blocker) or as an automatic continuation (open,
+    non-empty body and no open blocker), as an automatic continuation (open,
     unassigned, labelled ``round-finished`` without ``ready-for-agent``, with
     a non-empty body and no open blocker, whose automatic-continuation count
-    is below ``max_auto_continuations``); otherwise returns a visible reason
-    naming the observed state. An over-budget continuation names the limit as
-    ``(k/N)``.
+    is below ``max_auto_continuations``), or as a conflict requeue (open,
+    unassigned, labelled ``merge-conflict`` without ``ready-for-agent``,
+    ``round-finished`` or ``ready-for-human``, with a non-empty body and no
+    open blocker, while ``max_conflict_attempts`` is positive); otherwise
+    returns a visible reason naming the observed state. An over-budget
+    continuation names the limit as ``(k/N)``.
     """
 
     if issue is None:
@@ -51,6 +57,18 @@ def ineligibility_reason(
                     f" ({auto_continuation_count}/{max_auto_continuations})"
                 )
             # A ``round-finished`` issue that fails the base queue rules is
+            # reported through the same checks as an ordinary issue below.
+        elif READY_FOR_HUMAN in issue.labels:
+            return f"issue #{number} requires human implementation (labelled `{READY_FOR_HUMAN}`)"
+        elif (
+            max_conflict_attempts > 0
+            and MERGE_CONFLICT in issue.labels
+            and READY_FOR_HUMAN not in issue.labels
+            and ROUND_FINISHED not in issue.labels
+        ):
+            if issue.meets_base_queue_rules:
+                return None
+            # A ``merge-conflict`` issue that fails the base queue rules is
             # reported through the same checks as an ordinary issue below.
         else:
             return f"issue #{number} is not labelled `{READY_FOR_AGENT}`"
@@ -121,6 +139,23 @@ class TrackerIssue:
 
         return ROUND_FINISHED in self.labels and READY_FOR_AGENT not in self.labels
 
+    @property
+    def is_conflict_signal(self) -> bool:
+        """Whether the issue carries a conflict-requeue signal only.
+
+        ``merge-conflict`` without ``ready-for-agent``, ``round-finished`` or
+        ``ready-for-human``: an issue carrying one of those takes the
+        ordinary (or continuation) path instead, and ``ready-for-human``
+        always stays with a human.
+        """
+
+        return (
+            MERGE_CONFLICT in self.labels
+            and READY_FOR_AGENT not in self.labels
+            and ROUND_FINISHED not in self.labels
+            and READY_FOR_HUMAN not in self.labels
+        )
+
 
 @dataclass(frozen=True)
 class IssuePage:
@@ -186,7 +221,12 @@ class GitHubTracker:
     """Select and claim one eligible issue within exactly one repository."""
 
     def __init__(
-        self, transport: GitHubTransport, target_repo: str, *, max_auto_continuations: int = 0
+        self,
+        transport: GitHubTransport,
+        target_repo: str,
+        *,
+        max_auto_continuations: int = 0,
+        max_conflict_attempts: int = 0,
     ) -> None:
         if (
             isinstance(max_auto_continuations, bool)
@@ -194,15 +234,43 @@ class GitHubTracker:
             or max_auto_continuations < 0
         ):
             raise GitHubTrackerError("MAX_AUTO_CONTINUATIONS must be a non-negative integer")
+        if (
+            isinstance(max_conflict_attempts, bool)
+            or not isinstance(max_conflict_attempts, int)
+            or max_conflict_attempts < 0
+        ):
+            raise GitHubTrackerError("MAX_CONFLICT_ATTEMPTS must be a non-negative integer")
         self._transport = transport
         self._target_repo = target_repo
         self._max_auto_continuations = max_auto_continuations
+        self._max_conflict_attempts = max_conflict_attempts
 
     @property
     def max_auto_continuations(self) -> int:
         """The operator's automatic-continuation budget (0 disables the path)."""
 
         return self._max_auto_continuations
+
+    @property
+    def max_conflict_attempts(self) -> int:
+        """The operator's conflict-requeue budget (0 disables the path)."""
+
+        return self._max_conflict_attempts
+
+    def is_conflict_eligible(self, issue: TrackerIssue) -> bool:
+        """Whether a ``merge-conflict`` issue may be claimed for a conflict attempt.
+
+        The issue must carry only the conflict signal (never alongside
+        ``ready-for-agent`` or ``round-finished``, which take the ordinary
+        path, and never with ``ready-for-human``) and meet the base queue
+        rules. With a zero budget this is always False and reads no comments.
+        Per-issue attempt counting arrives with the budget follow-up; today
+        the setting only gates the queue.
+        """
+
+        if self._max_conflict_attempts <= 0:
+            return False
+        return bool(issue.is_conflict_signal and issue.meets_base_queue_rules)
 
     def is_auto_continuation_eligible(self, issue: TrackerIssue) -> bool:
         """Whether a ``round-finished`` issue may continue without a human requeue.
@@ -220,15 +288,19 @@ class GitHubTracker:
         return self.automatic_continuation_count(issue) < self._max_auto_continuations
 
     def runnable_queue(self) -> tuple[TrackerIssue, ...]:
-        """Return all eligible issues, continuations before ordinary issues.
+        """Return all eligible issues, conflicts then continuations then ordinary.
 
-        Issues eligible for automatic continuation are claimed before ordinary
-        ``ready-for-agent`` issues so a started branch does not wait behind
-        new work; within each group the order is FIFO by creation date. A
+        Conflict requeues (``merge-conflict``) are claimed before automatic
+        continuations, which are claimed before ordinary ``ready-for-agent``
+        issues, so a blocked published branch does not wait behind new work;
+        within each group the order is FIFO by creation date. A
         ``ready-for-agent`` issue that is also a continuation (a human requeue
-        after a handoff) stays in the ordinary group.
+        after a handoff) stays in the ordinary group, as does any issue
+        carrying ``ready-for-agent`` or ``round-finished`` alongside
+        ``merge-conflict``.
         """
 
+        conflicts: list[TrackerIssue] = []
         continuations: list[TrackerIssue] = []
         ordinary: list[TrackerIssue] = []
         cursor: str | None = None
@@ -237,13 +309,19 @@ class GitHubTracker:
             for issue in page.issues:
                 if issue.is_eligible:
                     ordinary.append(issue)
+                elif self.is_conflict_eligible(issue):
+                    conflicts.append(issue)
                 elif self.is_auto_continuation_eligible(issue):
                     continuations.append(issue)
             if page.next_cursor is None:
                 break
             cursor = page.next_cursor
         by_fifo = lambda issue: (issue.created_at, issue.number)
-        return tuple(sorted(continuations, key=by_fifo) + sorted(ordinary, key=by_fifo))
+        return tuple(
+            sorted(conflicts, key=by_fifo)
+            + sorted(continuations, key=by_fifo)
+            + sorted(ordinary, key=by_fifo)
+        )
 
     def fetch_issue(self, number: int) -> TrackerIssue | None:
         """Re-read one issue's current state for ``next issue`` validation."""
@@ -275,6 +353,14 @@ class GitHubTracker:
         assignment = self._transport.assign_issue(issue.id, identity.id)
         if ROUND_FINISHED in issue.labels:
             self._transport.remove_label(issue.id, ROUND_FINISHED)
+        if MERGE_CONFLICT in issue.labels and (
+            READY_FOR_AGENT in issue.labels or ROUND_FINISHED in issue.labels
+        ):
+            # An ordinary or continuation claim on an issue that also carries
+            # ``merge-conflict``: those paths take precedence, so the stale
+            # conflict signal is removed at the claim. A conflict-path claim
+            # keeps the label until the conflict attempt itself finishes.
+            self._transport.remove_label(issue.id, MERGE_CONFLICT)
         return Claim(issue=issue, assignment=assignment)
 
     def claim_next(self) -> Claim | None:
@@ -300,12 +386,20 @@ class GitHubTracker:
             # read: an issue whose budget ran out, or that a human
             # relabelled, between the two reads is skipped.
             if current is None or (
-                not current.is_eligible and not self.is_auto_continuation_eligible(current)
+                not current.is_eligible
+                and not self.is_conflict_eligible(current)
+                and not self.is_auto_continuation_eligible(current)
             ):
                 continue
             assignment = self._transport.assign_issue(current.id, identity.id)
             if ROUND_FINISHED in current.labels:
                 self._transport.remove_label(current.id, ROUND_FINISHED)
+            if MERGE_CONFLICT in current.labels and (
+                READY_FOR_AGENT in current.labels or ROUND_FINISHED in current.labels
+            ):
+                # The ordinary (or continuation) path takes precedence over
+                # the conflict signal, so the stale label goes at the claim.
+                self._transport.remove_label(current.id, MERGE_CONFLICT)
             return Claim(issue=current, assignment=assignment)
         return None
 
@@ -635,7 +729,13 @@ class GitHubGraphQLTransport:
         raise GitHubTrackerError("GitHub returned an invalid repository label") from error
 
     def find_pull_request(self, repository: str, head: str) -> PullRequest | None:
-        """Return an existing open PR for an attempt branch, if any."""
+        """Return an existing open PR for an attempt branch, if any.
+
+        The entry-check fields (draft state, mergeable status, and base
+        branch) ride along so a conflict attempt can decide without a second
+        read; only open pull requests are returned, so a merged or closed PR
+        reads as absent.
+        """
 
         owner, name = _repository_parts(repository)
         data = self._execute(
@@ -643,7 +743,7 @@ class GitHubGraphQLTransport:
             query PullRequest($owner: String!, $name: String!, $head: String!) {
               repository(owner: $owner, name: $name) {
                 pullRequests(first: 1, states: OPEN, headRefName: $head) {
-                  nodes { id number url }
+                  nodes { id number url isDraft mergeable baseRefName }
                 }
               }
             }
@@ -732,7 +832,11 @@ class GitHubGraphQLTransport:
         )
 
     def find_attempt_comment(self, repository: str, issue_number: int, marker: str) -> bool:
-        """Find a result only when it carries this attempt's durable marker."""
+        """Find a result only when it carries this attempt's durable marker.
+
+        Both ordinary attempt results and conflict-attempt results carry the
+        attempt marker; the header distinguishes them.
+        """
 
         owner, name = _repository_parts(repository)
         data = self._execute(
@@ -748,7 +852,11 @@ class GitHubGraphQLTransport:
         try:
             comments = data["repository"]["issue"]["comments"]["nodes"]
             return any(
-                "Agent Attempt Result" in comment["body"] and marker in comment["body"]
+                (
+                    "Agent Attempt Result" in comment["body"]
+                    or "Conflict Attempt Result" in comment["body"]
+                )
+                and marker in comment["body"]
                 for comment in comments
             )
         except (KeyError, TypeError) as error:
@@ -935,8 +1043,17 @@ def _pull_request_from_graphql(value: dict[str, Any]) -> PullRequest:
     number = value["number"]
     url = value["url"]
     node_id = value.get("id", "")
+    draft = value.get("isDraft", False)
+    mergeable = value.get("mergeable", "UNKNOWN")
+    base_ref = value.get("baseRefName", "")
     if isinstance(number, bool) or not isinstance(number, int) or not isinstance(url, str) or not url:
         raise ValueError("invalid pull request")
     if not isinstance(node_id, str):
         raise ValueError("invalid pull request")
-    return PullRequest(number, url, node_id)
+    if not isinstance(draft, bool):
+        raise ValueError("invalid pull request")
+    if not isinstance(mergeable, str) or not mergeable:
+        raise ValueError("invalid pull request")
+    if not isinstance(base_ref, str):
+        raise ValueError("invalid pull request")
+    return PullRequest(number, url, node_id, draft, mergeable.upper(), base_ref)
