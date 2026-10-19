@@ -57,6 +57,7 @@ class PullRequest:
     draft: bool = False
     mergeable: str = "UNKNOWN"
     base_ref: str = ""
+    head_sha: str = ""
 
 
 class PublicationTransport(Protocol):

@@ -13,7 +13,8 @@ does.
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from collections.abc import Callable
+from dataclasses import dataclass, replace
 from pathlib import Path
 import shutil
 import subprocess
@@ -36,8 +37,11 @@ from simple_coding_agent.github_tracker import (
     Assignment,
     Claim,
     TrackerIssue,
+    conflict_branch_issue_number,
+    is_conflict_detection_eligible,
 )
 from simple_coding_agent.model_execution import ModelExecutionStatus
+from simple_coding_agent.publication import PullRequest
 
 
 # ---------------------------------------------------------------------------
@@ -429,6 +433,9 @@ class FakeTracker:
         fifo: list[int] | None = None,
         next_claim: Claim | None = None,
         auto_counts: dict[int, int] | None = None,
+        open_pull_requests: dict[str, PullRequest] | None = None,
+        max_conflict_attempts: int = 0,
+        event_log: Callable[..., None] | None = None,
     ) -> None:
         self.issues = dict(issues or {})
         self.fifo: list[int] = list(fifo or [])
@@ -443,8 +450,67 @@ class FakeTracker:
         self.claimed_verified: list[int] = []
         self.cleanup: list[tuple[int, str, str]] = []
         self.removed_labels: list[tuple[str, str]] = []
+        self.added_labels: list[tuple[str, str]] = []
+        # Open pull requests keyed by head branch, mirroring the production
+        # detector's paged query; ``None`` means the listing is unavailable.
+        self.open_pull_requests = dict(open_pull_requests or {})
+        self.has_pull_request_listing = open_pull_requests is not None
+        self.max_conflict_attempts = max_conflict_attempts
+        self._event_log = (
+            event_log
+            if event_log is not None
+            else lambda event, detail="", level="INFO", issue_number=None: None
+        )
+        # One entry per poll that ran the detector query (budget above zero).
+        self.pr_queries: list[None] = []
+
+    def detect_conflict_requeues(self) -> list[tuple[int, int, str]]:
+        """Mirror the production detector: label conflicting published branches.
+
+        With a positive conflict budget and a pull-request listing, add
+        ``merge-conflict`` to the issue behind every open, non-draft
+        ``agent/issue-N`` branch that reports ``CONFLICTING``, under the same
+        rule as :func:`is_conflict_detection_eligible
+        <simple_coding_agent.github_tracker.is_conflict_detection_eligible>`.
+        Newly labelled issues join the front of the claim queue in FIFO order
+        so the same poll can claim them. Returns the labelled ``(issue, pull
+        request, head sha)`` triples in listing order.
+        """
+
+        if self.max_conflict_attempts <= 0 or not self.has_pull_request_listing:
+            return []
+        self.pr_queries.append(None)
+        detected: list[tuple[int, int, str]] = []
+        for head, pull_request in self.open_pull_requests.items():
+            number = conflict_branch_issue_number(head)
+            if number is None:
+                continue
+            issue = self.issues.get(number)
+            if issue is None:
+                continue
+            if not is_conflict_detection_eligible(
+                issue, draft=pull_request.draft, mergeable=pull_request.mergeable
+            ):
+                continue
+            self.issues[number] = replace(issue, labels=issue.labels | {MERGE_CONFLICT})
+            self.added_labels.append((issue.id, MERGE_CONFLICT))
+            detected.append((number, pull_request.number, pull_request.head_sha))
+            self._event_log(
+                "conflict_requeue_detected",
+                f"issue #{number}; pull request #{pull_request.number}"
+                f" ({pull_request.head_sha}) reports merge conflicts",
+                level="INFO",
+                issue_number=number,
+            )
+        newly = sorted(
+            (number for number, _, _ in detected if number not in self.fifo),
+            key=lambda number: (self.issues[number].created_at, number),
+        )
+        self.fifo = newly + self.fifo
+        return detected
 
     def claim_next(self) -> Claim | None:
+        self.detect_conflict_requeues()
         if self.next_claim is not None:
             claim, self.next_claim = self.next_claim, None
             self.claimed.append(claim.issue.number)

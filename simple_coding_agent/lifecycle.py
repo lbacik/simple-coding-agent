@@ -3814,7 +3814,7 @@ class AgentLifecycle:
             if claim is None:
                 self._event_log(
                     "no_eligible_issue_found",
-                    f"no ready-for-agent issue available; sleeping {self._poll_interval}s",
+                    f"no eligible issue available; sleeping {self._poll_interval}s",
                     level="INFO",
                 )
                 return (None, None)
