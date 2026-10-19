@@ -18,6 +18,8 @@ import time
 from typing import Any, Protocol
 
 from simple_coding_agent.attempt_state import (
+    ATTEMPT_KIND_CONFLICT,
+    ATTEMPT_KIND_ORDINARY,
     AttemptCheckpoint,
     AttemptPhase,
     AttemptStateError,
@@ -152,6 +154,7 @@ from simple_coding_agent.recovery import (
     CONFLICT_OUTCOME_SKIPPED,
     CONFLICT_OUTCOME_SUCCESS,
     REQUEUE_SOURCE_AUTOMATIC,
+    REQUEUE_SOURCE_CONFLICT,
     REQUEUE_SOURCE_HUMAN,
     requeue_source_for_labels,
 )
@@ -1893,6 +1896,33 @@ class AgentLifecycle:
                 issue_number=issue_number,
             )
 
+    def _record_attempt_kind(self, issue_number: int, checkpoint: AttemptCheckpoint) -> None:
+        """Record a conflict attempt's kind in its archive record; never raises.
+
+        Called at claim time, so ``attempt.json`` carries
+        ``attempt_kind: conflict`` for a conflict attempt even if the
+        checkpoint is later lost. Ordinary attempts leave the archive
+        untouched.
+        """
+
+        if (
+            getattr(checkpoint, "attempt_kind", ATTEMPT_KIND_ORDINARY)
+            != ATTEMPT_KIND_CONFLICT
+        ):
+            return
+        try:
+            archive = self._archive_for(issue_number, checkpoint.started_at)
+            if archive is None:
+                return
+            archive.write_attempt({"attempt_kind": ATTEMPT_KIND_CONFLICT})
+        except Exception as error:
+            self._event_log(
+                "archive_attempt_kind_failed",
+                f"the attempt kind could not be archived: {error}",
+                level="WARNING",
+                issue_number=issue_number,
+            )
+
     def _remember_workspace_dirty(self, attempt_id: str, dirty: bool) -> None:
         """Remember the workspace-dirty state for telemetry (never raises)."""
 
@@ -2195,7 +2225,7 @@ class AgentLifecycle:
                 f" {hold_suffix}"
             )
         try:
-            self._release(claim, outcome)
+            self._release(claim, outcome, checkpoint)
         except Exception as error:
             return False, (
                 f"recovery retry for attempt {attempt_id} not fulfilled:"
@@ -3777,7 +3807,7 @@ class AgentLifecycle:
             released = False
             try:
                 if comment_posted and not hold:
-                    self._release(claim, outcome)
+                    self._release(claim, outcome, checkpoint)
                     released = True
             finally:
                 cleanup_ok = prepared is None
@@ -3955,11 +3985,12 @@ class AgentLifecycle:
                 return (None, None)
             source = requeue_source_for_labels(claim.issue.labels)
             is_conflict = _is_conflict_claim(claim.issue.labels)
+            attempt_kind = ATTEMPT_KIND_CONFLICT if is_conflict else ATTEMPT_KIND_ORDINARY
             if is_conflict:
                 # A conflict requeue is transparent to the continuation
-                # budget: it records a human requeue source with no
+                # budget: it records a conflict requeue source with no
                 # continuation index, and never emits the automatic event.
-                source = REQUEUE_SOURCE_HUMAN
+                source = REQUEUE_SOURCE_CONFLICT
                 auto_count = None
                 continuation_index = None
             elif source == REQUEUE_SOURCE_AUTOMATIC:
@@ -3978,8 +4009,9 @@ class AgentLifecycle:
                 requeue_source=source,
                 issue_title=claim.issue.title,
                 continuation_index=continuation_index,
-                is_conflict_claim=is_conflict,
+                attempt_kind=attempt_kind,
             )
+            self._record_attempt_kind(claim.issue.number, checkpoint)
             self._attempt_processing = True
             self._telemetry_begin_for_checkpoint(checkpoint)
             if is_conflict:
@@ -4111,8 +4143,9 @@ class AgentLifecycle:
             issue_number=claim.issue.number,
         )
         source = requeue_source_for_labels(fresh.labels)
-        if _is_conflict_claim(fresh.labels):
-            source = REQUEUE_SOURCE_HUMAN
+        is_conflict = _is_conflict_claim(fresh.labels)
+        if is_conflict:
+            source = REQUEUE_SOURCE_CONFLICT
             continuation_index = None
             self._emit_conflict_attempt_claim(claim.issue.number)
         elif source == REQUEUE_SOURCE_AUTOMATIC:
@@ -4129,8 +4162,9 @@ class AgentLifecycle:
             requeue_source=source,
             issue_title=claim.issue.title,
             continuation_index=continuation_index,
-            is_conflict_claim=_is_conflict_claim(fresh.labels),
+            attempt_kind=ATTEMPT_KIND_CONFLICT if is_conflict else ATTEMPT_KIND_ORDINARY,
         )
+        self._record_attempt_kind(claim.issue.number, checkpoint)
         self._attempt_processing = True
         self._telemetry_begin_for_checkpoint(checkpoint)
         return (claim, checkpoint)
@@ -4564,19 +4598,32 @@ class AgentLifecycle:
                 level="INFO",
             )
 
-    def _release(self, claim: Claim, outcome: AttemptOutcome) -> None:
+    def _release(
+        self,
+        claim: Claim,
+        outcome: AttemptOutcome,
+        checkpoint: AttemptCheckpoint | None = None,
+    ) -> None:
         """Apply the label/assignee release sequence required by the outcome.
 
         A handoff must add ``round-finished`` for human-controlled requeue
         instead of the plain ready-for-agent/assignee release every other
         outcome uses. A conflict attempt releases ``merge-conflict`` instead:
         every conflict outcome removes the conflict signal and the assignee,
-        and never adds ``ready-for-agent`` or ``round-finished``.
+        and never adds ``ready-for-agent`` or ``round-finished``. The
+        checkpoint kind decides when one is passed (it records the
+        claim-time routing, so a label change mid-attempt cannot reroute
+        the release); otherwise the live labels decide.
         """
 
         if outcome is AttemptOutcome.HANDOFF:
             self._tracker.release_handoff(claim.issue.number, claim.assignment.assignee_id)
-        elif _is_conflict_claim(claim.issue.labels):
+            return
+        if checkpoint is not None:
+            is_conflict = _is_conflict_attempt(checkpoint)
+        else:
+            is_conflict = _is_conflict_claim(claim.issue.labels)
+        if is_conflict:
             self._tracker.release_attempt(
                 claim.issue.number, MERGE_CONFLICT, claim.assignment.assignee_id
             )
@@ -4983,7 +5030,7 @@ class AgentLifecycle:
                 if note_commit is not None:
                     note_commit_sha = note_commit.revision
             publication_started_at = self._clock()
-            if checkpoint.is_conflict_claim:
+            if _is_conflict_attempt(checkpoint):
                 # A retained conflict attempt recovers as a conflict error
                 # (a failure toward the budget, possibly escalating), never
                 # as an ordinary result: an ordinary marker would stop the
@@ -4996,6 +5043,7 @@ class AgentLifecycle:
                         profile,
                         "Attempt was interrupted by a restart before a result "
                         "could be verified; the remote branch is left untouched.",
+                        requeue_source=REQUEUE_SOURCE_CONFLICT,
                     ),
                     claim,
                 )
@@ -5071,7 +5119,7 @@ class AgentLifecycle:
             raise
         except RebaseConflictError as error:
             publication_started_at = self._clock()
-            if checkpoint.is_conflict_claim:
+            if _is_conflict_attempt(checkpoint):
                 published = self._publish_conflict_bounded(
                     self._conflict_rebase_request(
                         claim,
@@ -5080,6 +5128,7 @@ class AgentLifecycle:
                         profile,
                         None,
                         error.conflicted_files,
+                        requeue_source=REQUEUE_SOURCE_CONFLICT,
                     ),
                     claim,
                 )
@@ -5097,7 +5146,7 @@ class AgentLifecycle:
                 "attempt_exception", _exception_detail(error), level="ERROR", issue_number=claim.issue.number
             )
             publication_started_at = self._clock()
-            if checkpoint.is_conflict_claim:
+            if _is_conflict_attempt(checkpoint):
                 published = self._publish_conflict_bounded(
                     self._conflict_error_request(
                         claim,
@@ -5105,6 +5154,7 @@ class AgentLifecycle:
                         prepared,
                         profile,
                         _exception_detail(error),
+                        requeue_source=REQUEUE_SOURCE_CONFLICT,
                     ),
                     claim,
                 )
@@ -5123,7 +5173,7 @@ class AgentLifecycle:
             )
             try:
                 publication_started_at = self._clock()
-                if checkpoint.is_conflict_claim:
+                if _is_conflict_attempt(checkpoint):
                     published = self._publish_conflict_bounded(
                         self._conflict_error_request(
                             claim,
@@ -5131,6 +5181,7 @@ class AgentLifecycle:
                             prepared,
                             profile,
                             _exception_detail(error),
+                            requeue_source=REQUEUE_SOURCE_CONFLICT,
                         ),
                         claim,
                     )
@@ -5166,7 +5217,7 @@ class AgentLifecycle:
             released = False
             try:
                 if comment_posted and not hold:
-                    self._release(claim, outcome)
+                    self._release(claim, outcome, checkpoint)
                     released = True
             finally:
                 cleanup_ok = prepared is None
@@ -5927,13 +5978,16 @@ class AgentLifecycle:
         extra_files: tuple[str, ...] = (),
         fix_commits: tuple[str, ...] = (),
         failure_output: str = "",
+        requeue_source: str | None = None,
     ) -> ConflictPublicationRequest:
         """Build one conflict publication request from its outcome and evidence.
 
         ``failure_output`` is the tail of the last check output quoted in
         the escalation's collapsed section when this attempt is the one
         whose failure reaches the budget; failures without command output
-        fall back to the reason and details at render time.
+        fall back to the reason and details at render time. ``requeue_source``
+        records the requeue source in the result comment (``None`` renders no
+        marker); only startup recovery of a retained conflict attempt sets it.
         """
 
         return ConflictPublicationRequest(
@@ -5955,6 +6009,7 @@ class AgentLifecycle:
             extra_files=tuple(extra_files),
             fix_commits=tuple(fix_commits),
             failure_output=failure_output,
+            requeue_source=requeue_source,
         )
 
     def _conflict_error_request(
@@ -5964,6 +6019,8 @@ class AgentLifecycle:
         prepared: PreparedAttempt | None,
         profile: RepositoryProfile | None,
         detail: str,
+        *,
+        requeue_source: str | None = None,
     ) -> ConflictPublicationRequest:
         """Build the conflict error request for an unexpected failure."""
 
@@ -5981,6 +6038,7 @@ class AgentLifecycle:
             "",
             f"Conflict attempt failed before a result could be verified: {detail}",
             push_branch=False,
+            requeue_source=requeue_source,
         )
 
     def _conflict_rebase_request(
@@ -5991,6 +6049,8 @@ class AgentLifecycle:
         profile: RepositoryProfile | None,
         pull_request: PullRequest | None,
         conflicted_files: tuple[str, ...],
+        *,
+        requeue_source: str | None = None,
     ) -> ConflictPublicationRequest:
         """Build the conflict request for a rebase that hit conflicts."""
 
@@ -6009,6 +6069,7 @@ class AgentLifecycle:
             _conflict_rebase_conflict_details(branch, base_branch, conflicted_files),
             push_branch=False,
             conflicted_files=tuple(conflicted_files),
+            requeue_source=requeue_source,
         )
 
     def _publish_conflict_bounded(self, request: ConflictPublicationRequest, claim: Claim):
@@ -6238,9 +6299,21 @@ def _claim_time_requeue_source(claim: Claim, checkpoint: AttemptCheckpoint | Non
 
     if checkpoint is not None:
         source = getattr(checkpoint, "requeue_source", None)
-        if source in ("human", "automatic"):
+        if source in (REQUEUE_SOURCE_HUMAN, REQUEUE_SOURCE_AUTOMATIC, REQUEUE_SOURCE_CONFLICT):
             return source
     return requeue_source_for_labels(claim.issue.labels)
+
+
+def _is_conflict_attempt(checkpoint: AttemptCheckpoint | None) -> bool:
+    """Whether a checkpoint belongs to a conflict attempt.
+
+    A missing checkpoint (or a checkpoint written before the kind existed)
+    reads as an ordinary attempt.
+    """
+
+    if checkpoint is None:
+        return False
+    return getattr(checkpoint, "attempt_kind", ATTEMPT_KIND_ORDINARY) == ATTEMPT_KIND_CONFLICT
 
 
 def _attempt_id(checkpoint: AttemptCheckpoint | None) -> str:
