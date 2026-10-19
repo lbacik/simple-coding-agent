@@ -109,15 +109,122 @@ def count_automatic_continuations(bodies_newest_first: tuple[str, ...] | list[st
     """Count automatic-requeue result comments in a row from the newest.
 
     Stops at the most recent human-requeue result; a legacy unmarked comment
-    counts as a human requeue and also stops the count.
+    counts as a human requeue and also stops the count. Conflict-attempt
+    result comments are transparent: they are skipped without counting and
+    without stopping the row, so a conflict resolution neither consumes nor
+    resets the automatic-continuation budget.
     """
 
     count = 0
     for body in bodies_newest_first:
+        if is_conflict_attempt(body):
+            continue
         if parse_requeue_source(body) != REQUEUE_SOURCE_AUTOMATIC:
             break
         count += 1
     return count
+
+
+#: Machine-readable outcomes carried by the conflict-attempt marker. Every
+#: conflict attempt posts exactly one result comment stamped with one of
+#: these; ``skipped`` names its entry-check reason separately.
+CONFLICT_OUTCOME_SUCCESS = "success"
+CONFLICT_OUTCOME_SKIPPED = "skipped"
+CONFLICT_OUTCOME_REBASE_CONFLICT = "rebase_conflict"
+CONFLICT_OUTCOME_SETUP_FAILED = "setup_failed"
+CONFLICT_OUTCOME_CHECK_FAILED = "check_failed"
+CONFLICT_OUTCOME_PUSH_FAILED = "push_failed"
+CONFLICT_OUTCOME_ERROR = "error"
+
+CONFLICT_OUTCOMES = frozenset(
+    {
+        CONFLICT_OUTCOME_SUCCESS,
+        CONFLICT_OUTCOME_SKIPPED,
+        CONFLICT_OUTCOME_REBASE_CONFLICT,
+        CONFLICT_OUTCOME_SETUP_FAILED,
+        CONFLICT_OUTCOME_CHECK_FAILED,
+        CONFLICT_OUTCOME_PUSH_FAILED,
+        CONFLICT_OUTCOME_ERROR,
+    }
+)
+
+#: Entry-check reasons for a ``skipped`` conflict attempt.
+CONFLICT_REASON_NO_OPEN_PR = "no_open_pr"
+CONFLICT_REASON_DRAFT = "draft"
+CONFLICT_REASON_NOT_CONFLICTING = "not_conflicting"
+CONFLICT_REASON_BASE_MISMATCH = "base_mismatch"
+
+#: Marker keys reserved for the model resolution follow-up (#271): the
+#: conflicted files and the fix commits it publishes.
+_CONFLICT_MARKER_PREFIX = "<!-- conflict-attempt:"
+
+
+def conflict_attempt_marker(
+    outcome: str,
+    *,
+    sha: str | None = None,
+    reason: str | None = None,
+    files: tuple[str, ...] | list[str] = (),
+    fix_commits: tuple[str, ...] | list[str] = (),
+) -> str:
+    """The durable issue-comment marker recording one conflict attempt's outcome.
+
+    ``outcome`` is one of :data:`CONFLICT_OUTCOMES`; ``sha`` is the pushed
+    rebased revision (``None`` renders as ``none`` when nothing was pushed).
+    ``reason`` names the entry-check reason for a ``skipped`` outcome.
+    ``files`` and ``fix_commits`` leave room for the conflicted files and
+    fix commits the model resolution follow-up adds; they are omitted when
+    empty. Values are restricted to marker-safe characters so the comment
+    stays greppable.
+    """
+
+    if outcome not in CONFLICT_OUTCOMES:
+        raise ValueError(f"Invalid conflict outcome {outcome!r}")
+    values = [outcome, sha or "none"]
+    if reason:
+        values.append(reason)
+    values.extend(files)
+    values.extend(fix_commits)
+    for value in values:
+        if not value or any(character.isspace() for character in value):
+            raise ValueError(f"Invalid conflict marker value {value!r}")
+    parts = [f"outcome={outcome}", f"sha={sha or 'none'}"]
+    if reason:
+        parts.append(f"reason={reason}")
+    if files:
+        parts.append(f"files={','.join(files)}")
+    if fix_commits:
+        parts.append(f"fix_commits={','.join(fix_commits)}")
+    return f"{_CONFLICT_MARKER_PREFIX} {' '.join(parts)} -->"
+
+
+def parse_conflict_attempt(body: str) -> dict[str, str] | None:
+    """Return the conflict-attempt marker fields in a comment body, if any.
+
+    Unknown keys are preserved so newer writers stay readable to older
+    readers; a body without the marker reads as ``None``.
+    """
+
+    start = body.find(_CONFLICT_MARKER_PREFIX)
+    if start < 0:
+        return None
+    end = body.find("-->", start)
+    if end < 0:
+        return None
+    fields: dict[str, str] = {}
+    for token in body[start + len(_CONFLICT_MARKER_PREFIX) : end].split():
+        key, separator, value = token.partition("=")
+        if separator and key and value:
+            fields[key] = value
+    if "outcome" not in fields:
+        return None
+    return fields
+
+
+def is_conflict_attempt(body: str) -> bool:
+    """Whether a comment body carries a conflict-attempt marker."""
+
+    return parse_conflict_attempt(body) is not None
 
 
 def release_comment_body(

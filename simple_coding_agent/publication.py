@@ -10,7 +10,11 @@ from simple_coding_agent.completion import AttemptOutcome, CompletionDecision, P
 from simple_coding_agent.attempt_state import AttemptPhase, AttemptStateStore
 from simple_coding_agent.attempt_workspace import BranchPusher
 from simple_coding_agent.git_workspace import GitWorkspaceError
-from simple_coding_agent.recovery import REQUEUE_SOURCE_HUMAN, requeue_source_marker
+from simple_coding_agent.recovery import (
+    REQUEUE_SOURCE_HUMAN,
+    conflict_attempt_marker,
+    requeue_source_marker,
+)
 
 
 _SUCCEEDED_BUT_UNPUBLISHED = "Implementation succeeded but publication failed."
@@ -50,6 +54,9 @@ class PullRequest:
     number: int
     url: str
     node_id: str = ""
+    draft: bool = False
+    mergeable: str = "UNKNOWN"
+    base_ref: str = ""
 
 
 class PublicationTransport(Protocol):
@@ -105,6 +112,37 @@ class PublicationResult:
     comment_posted: bool = True
     details: str = ""
     merge_result: str | None = None
+
+
+@dataclass(frozen=True)
+class ConflictPublicationRequest:
+    """Evidence and identity required to publish one conflict attempt.
+
+    ``conflict_outcome`` is the machine-readable marker outcome (``success``,
+    ``skipped``, or a failure kind); ``outcome`` is the lifecycle outcome it
+    maps to. ``push_branch`` is True only for the success path (clean rebase
+    plus a green check): every other outcome leaves the remote branch
+    untouched so the pull request stays ``CONFLICTING``. ``pull_request`` is
+    the entry-checked open pull request, reused here so publication never
+    creates one. The comment carries no requeue-source marker, keeping the
+    attempt transparent to the automatic-continuation count.
+    """
+
+    issue_number: int
+    issue_title: str
+    branch: str
+    started_at: str
+    base_branch: str
+    outcome: AttemptOutcome
+    conflict_outcome: str
+    reason: str
+    details: str
+    push_branch: bool
+    pull_request: PullRequest | None
+    check_command: str = "not run"
+    check_exit_code: int | None = None
+    conflicted_files: tuple[str, ...] = ()
+    auto_merge_opt_in: bool = False
 
 
 class Publisher:
@@ -223,6 +261,88 @@ class Publisher:
             outcome, branch_url, pull_request, comment_posted, request.details, merge_result
         )
 
+    def find_pull_request(self, head: str) -> PullRequest | None:
+        """Return the open pull request for an attempt branch, if any.
+
+        Used by the conflict-attempt entry check before any git work runs.
+        """
+
+        return self._github.find_pull_request(self._repository, head)
+
+    def publish_conflict(
+        self, request: ConflictPublicationRequest, *, timeout: float | None = None
+    ) -> PublicationResult:
+        """Publish one conflict attempt: push only on success, then comment.
+
+        The rebased branch is pushed only when the caller verified a clean
+        rebase and a green check (``push_branch``); every other outcome posts
+        its failure (or skipped) result while leaving the remote branch
+        untouched, so GitHub cannot merge an unverified resolution. Auto-merge
+        is re-enabled on the pushed branch under the same mode as ordinary
+        publication; like there, a merge-step failure is reported but never
+        redefines the outcome. The result comment carries the
+        conflict-attempt marker and no requeue-source marker.
+        """
+
+        effective_timeout = self._publish_timeout if timeout is None else timeout
+        deadline = self._monotonic() + effective_timeout
+        outcome = request.outcome
+        conflict_outcome = request.conflict_outcome
+        branch_url: str | None = None
+        pushed_sha: str | None = None
+        details = request.details
+        if request.push_branch:
+            try:
+                checkpoint = self._attempt_state.read() if self._attempt_state is not None else None
+                if checkpoint is None or checkpoint.phase is not AttemptPhase.PUBLISHING:
+                    self._check_deadline(deadline)
+                    pushed_sha = self._workspace.push_attempt_branch(
+                        request.branch, max_retries=self._max_retries, deadline=deadline
+                    )
+                    self._check_deadline(deadline)
+                    self._mark_publishing()
+                branch_url = f"https://github.com/{self._repository}/tree/{request.branch}"
+            except (GitWorkspaceError, TimeoutError) as error:
+                push_failure = f"Rebased branch push failed: {type(error).__name__}: {error}"
+                self._event_log(
+                    "publication_failed",
+                    push_failure,
+                    level="ERROR",
+                    issue_number=request.issue_number,
+                )
+                outcome = AttemptOutcome.INFRASTRUCTURE_ERROR
+                conflict_outcome = "push_failed"
+                details = "; ".join((request.details, push_failure)) if request.details else push_failure
+                comment_posted = self._post_conflict_result(
+                    request, outcome, conflict_outcome, branch_url, None, details, None, None
+                )
+                return PublicationResult(
+                    outcome, branch_url, request.pull_request, comment_posted, details
+                )
+
+        merge_result: str | None = None
+        if request.push_branch and branch_url is not None and request.pull_request is not None:
+            if self._auto_merge == "true" or (
+                self._auto_merge == "label" and request.auto_merge_opt_in
+            ):
+                merge_result = self._maybe_auto_merge(request, request.pull_request, deadline)
+            elif self._auto_merge == "label":
+                merge_result = AUTO_MERGE_SKIPPED
+
+        comment_posted = self._post_conflict_result(
+            request,
+            outcome,
+            conflict_outcome,
+            branch_url,
+            request.pull_request,
+            details,
+            merge_result,
+            pushed_sha,
+        )
+        return PublicationResult(
+            outcome, branch_url, request.pull_request, comment_posted, details, merge_result
+        )
+
     def _mark_publishing(self) -> None:
         """Durably record a verified branch write before any PR write can begin."""
 
@@ -267,7 +387,7 @@ class Publisher:
 
     def _maybe_auto_merge(
         self,
-        request: PublicationRequest,
+        request: PublicationRequest | ConflictPublicationRequest,
         pull_request: PullRequest,
         deadline: float,
     ) -> str:
@@ -311,7 +431,7 @@ class Publisher:
 
     def _merge_directly(
         self,
-        request: PublicationRequest,
+        request: PublicationRequest | ConflictPublicationRequest,
         pull_request: PullRequest,
         deadline: float,
     ) -> str:
@@ -334,7 +454,9 @@ class Publisher:
                 return "merged"
             return self._merge_failure(request, error)
 
-    def _merge_failure(self, request: PublicationRequest, error: Exception) -> str:
+    def _merge_failure(
+        self, request: PublicationRequest | ConflictPublicationRequest, error: Exception
+    ) -> str:
         reason = str(error).strip() or type(error).__name__
         result = f"auto-merge failed: {reason}"
         self._event_log(
@@ -360,6 +482,41 @@ class Publisher:
                 request.issue_number,
                 _result_comment(
                     request, outcome, branch_url, pull_request, details, marker, merge_result
+                ),
+            )
+            return True
+        except Exception:
+            # The local result remains authoritative when GitHub is unavailable.
+            return False
+
+    def _post_conflict_result(
+        self,
+        request: ConflictPublicationRequest,
+        outcome: AttemptOutcome,
+        conflict_outcome: str,
+        branch_url: str | None,
+        pull_request: PullRequest | None,
+        details: str,
+        merge_result: str | None,
+        pushed_sha: str | None,
+    ) -> bool:
+        marker = f"<!-- agent-attempt: {request.started_at} -->"
+        try:
+            if self._github.find_attempt_comment(self._repository, request.issue_number, marker):
+                return True
+            self._github.add_comment(
+                self._repository,
+                request.issue_number,
+                _conflict_result_comment(
+                    request,
+                    outcome,
+                    conflict_outcome,
+                    branch_url,
+                    pull_request,
+                    details,
+                    marker,
+                    merge_result,
+                    pushed_sha,
                 ),
             )
             return True
@@ -432,6 +589,61 @@ def _result_comment(
         f"{details}\n\n"
         f"{marker}\n"
         f"{source_marker}"
+    )
+
+
+def _conflict_result_comment(
+    request: ConflictPublicationRequest,
+    outcome: AttemptOutcome,
+    conflict_outcome: str,
+    branch_url: str | None,
+    pull_request: PullRequest | None,
+    details: str,
+    marker: str,
+    merge_result: str | None,
+    pushed_sha: str | None,
+) -> str:
+    """Build the conflict-attempt result comment with its machine-readable marker.
+
+    The header names the conflict outcome (``success``, ``skipped``, or a
+    failure kind), not the lifecycle outcome. The comment carries the
+    attempt marker for publication dedup and the conflict-attempt marker
+    (outcome plus pushed sha), and deliberately no requeue-source marker, so
+    the automatic-continuation count stays transparent to conflict attempts.
+    """
+
+    if branch_url and pushed_sha:
+        branch = f"[{request.branch}]({branch_url}) (sha `{pushed_sha}`)"
+    elif branch_url:
+        branch = f"[{request.branch}]({branch_url})"
+    else:
+        branch = f"`{request.branch}` (not pushed)"
+    pr = f"[#{pull_request.number}]({pull_request.url})" if pull_request else "none"
+    merge_line = f"**Merge**: {merge_result}\n" if merge_result is not None else ""
+    files_line = (
+        f"- Conflicted files: {', '.join(request.conflicted_files)}\n"
+        if request.conflicted_files
+        else ""
+    )
+    conflict_marker = conflict_attempt_marker(
+        conflict_outcome,
+        sha=pushed_sha,
+        reason=request.reason or None,
+        files=request.conflicted_files,
+    )
+    return (
+        f"## Conflict Attempt Result: {conflict_outcome}\n\n"
+        f"**Branch**: {branch}\n"
+        f"**PR**: {pr}\n"
+        f"{merge_line}"
+        f"**Lifecycle outcome**: {outcome.value}\n\n"
+        "### Evidence\n"
+        f"- Check command: `{request.check_command}` → exit code {request.check_exit_code}\n"
+        f"{files_line}\n"
+        "### Details\n"
+        f"{details}\n\n"
+        f"{marker}\n"
+        f"{conflict_marker}"
     )
 
 

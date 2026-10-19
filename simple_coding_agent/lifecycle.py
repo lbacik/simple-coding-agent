@@ -63,7 +63,35 @@ from simple_coding_agent.git_workspace import (
     RebaseConflictError,
     handoff_note_relpath,
 )
+from simple_coding_agent.conflict_attempt import (
+    attempt_branch as _conflict_attempt_branch,
+)
+from simple_coding_agent.conflict_attempt import (
+    base_mismatch_reason as _conflict_base_mismatch_reason,
+)
+from simple_coding_agent.conflict_attempt import (
+    check_failed_details as _conflict_check_failed_details,
+)
+from simple_coding_agent.conflict_attempt import (
+    entry_skip_reason as _conflict_entry_skip_reason,
+)
+from simple_coding_agent.conflict_attempt import (
+    is_conflict_claim as _is_conflict_claim,
+)
+from simple_coding_agent.conflict_attempt import (
+    lifecycle_outcome as _conflict_lifecycle_outcome,
+)
+from simple_coding_agent.conflict_attempt import (
+    rebase_conflict_details as _conflict_rebase_conflict_details,
+)
+from simple_coding_agent.conflict_attempt import (
+    setup_failed_details as _conflict_setup_failed_details,
+)
+from simple_coding_agent.conflict_attempt import (
+    success_details as _conflict_success_details,
+)
 from simple_coding_agent.github_tracker import (
+    MERGE_CONFLICT,
     ROUND_FINISHED,
     Claim,
     TrackerIssue,
@@ -72,8 +100,22 @@ from simple_coding_agent.github_tracker import (
 from simple_coding_agent.model_execution import ModelExecutionStatus, ModelExecutor, OperatorHandoff, ToolCallRecord
 from simple_coding_agent.observability import AttemptArchive, Redactor
 from simple_coding_agent.operating import ConsecutiveErrorStore
-from simple_coding_agent.publication import AUTO_MERGE_LABEL, PublicationRequest
-from simple_coding_agent.recovery import REQUEUE_SOURCE_AUTOMATIC, requeue_source_for_labels
+from simple_coding_agent.publication import (
+    AUTO_MERGE_LABEL,
+    ConflictPublicationRequest,
+    PublicationRequest,
+    PullRequest,
+)
+from simple_coding_agent.recovery import (
+    CONFLICT_OUTCOME_CHECK_FAILED,
+    CONFLICT_OUTCOME_ERROR,
+    CONFLICT_OUTCOME_REBASE_CONFLICT,
+    CONFLICT_OUTCOME_SETUP_FAILED,
+    CONFLICT_OUTCOME_SKIPPED,
+    CONFLICT_OUTCOME_SUCCESS,
+    REQUEUE_SOURCE_AUTOMATIC,
+    requeue_source_for_labels,
+)
 from simple_coding_agent.telemetry import (
     CONTROL_LOCK_TIMEOUT_SECONDS,
     SnapshotFailedError,
@@ -273,6 +315,23 @@ class Publisher(Protocol):
     """Publication boundary, including the result-comment operation."""
 
     def publish(self, request: PublicationRequest): ...
+
+    def find_pull_request(self, head: str) -> PullRequest | None: ...
+
+    def publish_conflict(self, request: ConflictPublicationRequest): ...
+
+
+class ConflictCheckRunner(Protocol):
+    """Run one profile command sequence for a conflict attempt's fast path."""
+
+    def run(
+        self,
+        commands: Sequence[str],
+        *,
+        timeout: float,
+        cwd: Path,
+        environment: Mapping[str, str] | None = None,
+    ): ...
 
 
 class ModelAttemptRunner:
@@ -1152,6 +1211,8 @@ class AgentLifecycle:
         error_store: ConsecutiveErrorStore | None = None,
         max_consecutive_errors: int = 3,
         max_auto_continuations: int = 0,
+        max_conflict_attempts: int = 0,
+        command_runner: ConflictCheckRunner | None = None,
         event_log: Callable[..., None] = (
             lambda event, detail="", level="INFO", issue_number=None: None
         ),
