@@ -228,6 +228,21 @@ class InMemoryWorkspace:
             for record in reversed(self._commits)
         )
 
+    def files_changed(self, revision: str) -> tuple[str, ...]:
+        """Repository-relative paths one recorded commit touched, if known."""
+
+        record = next((entry for entry in self._commits if entry.revision == revision), None)
+        if record is None:
+            return ()
+        return tuple(sorted(record.files))
+
+    def drop_newest_commits(self, count: int) -> None:
+        """Remove the newest ``count`` commits, simulating a squash or drop."""
+
+        for _ in range(max(0, count)):
+            if self._commits:
+                self._commits.pop()
+
     def commit_bodies(self) -> tuple[str, ...]:
         """Newest-first commit bodies (subjects excluded); for trailer assertions."""
 

@@ -67,13 +67,31 @@ from simple_coding_agent.conflict_attempt import (
     attempt_branch as _conflict_attempt_branch,
 )
 from simple_coding_agent.conflict_attempt import (
+    base_changes_text as _conflict_base_changes_text,
+)
+from simple_coding_agent.conflict_attempt import (
     base_mismatch_reason as _conflict_base_mismatch_reason,
+)
+from simple_coding_agent.conflict_attempt import (
+    build_resolution_prompt as _conflict_resolution_prompt,
 )
 from simple_coding_agent.conflict_attempt import (
     check_failed_details as _conflict_check_failed_details,
 )
 from simple_coding_agent.conflict_attempt import (
+    commit_count_changed_details as _conflict_count_changed_details,
+)
+from simple_coding_agent.conflict_attempt import (
     entry_skip_reason as _conflict_entry_skip_reason,
+)
+from simple_coding_agent.conflict_attempt import (
+    files_outside_conflict as _conflict_files_outside,
+)
+from simple_coding_agent.conflict_attempt import (
+    fix_commit_count as _conflict_fix_commit_count,
+)
+from simple_coding_agent.conflict_attempt import (
+    format_check_output as _conflict_format_check_output,
 )
 from simple_coding_agent.conflict_attempt import (
     is_conflict_claim as _is_conflict_claim,
@@ -82,10 +100,25 @@ from simple_coding_agent.conflict_attempt import (
     lifecycle_outcome as _conflict_lifecycle_outcome,
 )
 from simple_coding_agent.conflict_attempt import (
+    model_error_details as _conflict_model_error_details,
+)
+from simple_coding_agent.conflict_attempt import (
+    model_limit_details as _conflict_model_limit_details,
+)
+from simple_coding_agent.conflict_attempt import (
+    model_success_details as _conflict_model_success_details,
+)
+from simple_coding_agent.conflict_attempt import (
+    model_unresolved_details as _conflict_model_unresolved_details,
+)
+from simple_coding_agent.conflict_attempt import (
     rebase_conflict_details as _conflict_rebase_conflict_details,
 )
 from simple_coding_agent.conflict_attempt import (
     setup_failed_details as _conflict_setup_failed_details,
+)
+from simple_coding_agent.conflict_attempt import (
+    short_revision as _conflict_short_revision,
 )
 from simple_coding_agent.conflict_attempt import (
     success_details as _conflict_success_details,
@@ -109,7 +142,9 @@ from simple_coding_agent.publication import (
 from simple_coding_agent.recovery import (
     CONFLICT_OUTCOME_CHECK_FAILED,
     CONFLICT_OUTCOME_ERROR,
+    CONFLICT_OUTCOME_MODEL_LIMIT,
     CONFLICT_OUTCOME_REBASE_CONFLICT,
+    CONFLICT_OUTCOME_RESOLUTION_FAILED,
     CONFLICT_OUTCOME_SETUP_FAILED,
     CONFLICT_OUTCOME_SKIPPED,
     CONFLICT_OUTCOME_SUCCESS,
@@ -1214,6 +1249,9 @@ class AgentLifecycle:
         max_auto_continuations: int = 0,
         max_conflict_attempts: int = 0,
         command_runner: ConflictCheckRunner | None = None,
+        conflict_model_executor: object | None = None,
+        conflict_issue_comments: Callable[[TrackerIssue], tuple[str, ...]] | None = None,
+        conflict_prompt_redactions: Sequence[str] = (),
         event_log: Callable[..., None] = (
             lambda event, detail="", level="INFO", issue_number=None: None
         ),
@@ -1238,6 +1276,9 @@ class AgentLifecycle:
         self._max_auto_continuations = max_auto_continuations
         self._max_conflict_attempts = max_conflict_attempts
         self._command_runner = command_runner
+        self._conflict_model_executor = conflict_model_executor
+        self._conflict_issue_comments = conflict_issue_comments
+        self._conflict_prompt_redactions = tuple(conflict_prompt_redactions)
         self._event_log = event_log
         self._attempt_archive_factory = attempt_archive_factory
         self._completion_store = completion_store
@@ -5047,16 +5088,20 @@ class AgentLifecycle:
         claim: Claim,
         checkpoint: AttemptCheckpoint,
     ) -> tuple[ConflictPublicationRequest, PreparedAttempt | None, RepositoryProfile | None]:
-        """Run the model-free conflict fast path and build its publication request.
+        """Run the conflict fast path, with one model session on real conflicts.
 
         The entry check re-reads the open pull request behind the published
         branch before any git work: a missing, draft, or no-longer-conflicting
         pull request ends the attempt as ``skipped``, as does a pull request
         targeting another base branch once the profile is loaded. A clean
         rebase runs setup plus one profile check (no baseline, no model
-        call); only that green path pushes. Returns the publication request
-        together with the prepared attempt (``None`` when skipped before any
-        git work ran) and the profile (``None`` when it never loaded).
+        call); only that green path pushes directly. A real rebase conflict,
+        or a red check after a clean rebase (a semantic conflict), runs at
+        most one narrow model resolution session under the ordinary model
+        limits; the session brings the branch up to date and does no new
+        work. Returns the publication request together with the prepared
+        attempt (``None`` when skipped before any git work ran) and the
+        profile (``None`` when it never loaded).
         """
 
         issue_number = claim.issue.number
@@ -5143,8 +5188,8 @@ class AgentLifecycle:
         state = self._workspace.conflict_state()
         conflicted = tuple(state.conflicted_files) or tuple(prepared.rebase_conflicts or ())
         if state.in_progress or prepared.rebase_conflicts:
-            if state.in_progress:
-                self._workspace.abort_unresolved_rebase(prepared)
+            # A real rebase conflict: leave the rebase in place for the
+            # single model resolution session instead of aborting up front.
             self._event_log(
                 "conflict_rebase_conflict",
                 f"branch={prepared.branch}; base_branch={profile.base_branch}"
@@ -5153,8 +5198,14 @@ class AgentLifecycle:
                 issue_number=issue_number,
             )
             return (
-                self._conflict_rebase_request(
-                    claim, checkpoint, prepared, profile, pull_request, conflicted
+                self._resolve_conflict_with_model(
+                    claim,
+                    checkpoint,
+                    prepared,
+                    profile,
+                    pull_request,
+                    conflicted,
+                    check_output=None,
                 ),
                 prepared,
                 profile,
@@ -5799,13 +5850,21 @@ def _prompt_redactor(
     return Redactor(values)
 
 
-def _gate_section(profile: RepositoryProfile, redactions: Sequence[str]) -> str:
+def _gate_section(
+    profile: RepositoryProfile,
+    redactions: Sequence[str],
+    *,
+    include_review_instruction: bool = True,
+) -> str:
     """Describe the repository check gate the attempt is judged by.
 
     Every check command is listed exactly as the profile gives it (after
     redaction), one per line and numbered, in profile order. When the
     profile carries ``env``, only the variable names are shown so the model
-    can reproduce the gate's environment without seeing the values.
+    can reproduce the gate's environment without seeing the values. Conflict
+    resolution sessions pass ``include_review_instruction=False``: bringing
+    the branch up to date needs no review, so the mandatory ``code-review``
+    gate for ordinary work stays out of their prompt.
     """
 
     redactor = _prompt_redactor(profile, redactions)
@@ -5826,11 +5885,14 @@ def _gate_section(profile: RepositoryProfile, redactions: Sequence[str]) -> str:
         "model finishes. They run in sequence and the first failure fails "
         "the gate.",
         "",
-        "Before finishing, invoke the `code-review` skill on your changes: "
-        "an attempt with commits but no `code-review` invocation in this run "
-        "is classified as incomplete, even when the checks pass and the "
-        "change is small (for example formatting).",
     ]
+    if include_review_instruction:
+        lines += [
+            "Before finishing, invoke the `code-review` skill on your changes: "
+            "an attempt with commits but no `code-review` invocation in this run "
+            "is classified as incomplete, even when the checks pass and the "
+            "change is small (for example formatting).",
+        ]
     if profile.env:
         names = ", ".join(profile.env.keys())
         lines.append(

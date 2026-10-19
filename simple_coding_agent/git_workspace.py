@@ -686,6 +686,29 @@ class GitWorkspace:
             raise
         return None, ()
 
+    def files_changed(self, revision: str) -> tuple[str, ...]:
+        """Return repository-relative paths one commit touched, or () when unreadable.
+
+        Used by conflict attempts to report which files a model resolution
+        changed outside the conflicted set: the fix commits' files minus the
+        conflicted files. ``--root`` covers a root commit, which has no parent
+        to diff against.
+        """
+
+        try:
+            output = self._git(
+                "diff-tree",
+                "--no-commit-id",
+                "--name-only",
+                "-r",
+                "--root",
+                revision,
+                "--",
+            )
+        except GitWorkspaceError:
+            return ()
+        return tuple(line for line in output.splitlines() if line.strip())
+
     def conflicted_files(self) -> tuple[str, ...]:
         """Return paths with unresolved merge conflicts, or () when unavailable."""
 

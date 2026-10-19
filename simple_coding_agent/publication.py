@@ -121,12 +121,16 @@ class ConflictPublicationRequest:
 
     ``conflict_outcome`` is the machine-readable marker outcome (``success``,
     ``skipped``, or a failure kind); ``outcome`` is the lifecycle outcome it
-    maps to. ``push_branch`` is True only for the success path (clean rebase
-    plus a green check): every other outcome leaves the remote branch
-    untouched so the pull request stays ``CONFLICTING``. ``pull_request`` is
-    the entry-checked open pull request, reused here so publication never
-    creates one. The comment carries no requeue-source marker, keeping the
-    attempt transparent to the automatic-continuation count.
+    maps to. ``push_branch`` is True only for the success path (clean rebase,
+    or a model resolution that preserved the commit count, plus a green
+    check): every other outcome leaves the remote branch untouched so the
+    pull request stays ``CONFLICTING``. ``pull_request`` is the entry-checked
+    open pull request, reused here so publication never creates one.
+    ``conflicted_files`` names the files the rebase conflicted in,
+    ``extra_files`` the files a model resolution changed outside them, and
+    ``fix_commits`` the fix commits it added on top. The comment carries no
+    requeue-source marker, keeping the attempt transparent to the
+    automatic-continuation count.
     """
 
     issue_number: int
@@ -144,6 +148,8 @@ class ConflictPublicationRequest:
     check_exit_code: int | None = None
     conflicted_files: tuple[str, ...] = ()
     auto_merge_opt_in: bool = False
+    extra_files: tuple[str, ...] = ()
+    fix_commits: tuple[str, ...] = ()
 
 
 class Publisher:
@@ -593,6 +599,14 @@ def _result_comment(
     )
 
 
+def _short_revisions(revisions: tuple[str, ...], *, length: int = 12) -> tuple[str, ...]:
+    """Readable commit prefixes for prose; the marker always carries full revisions."""
+
+    return tuple(
+        revision[:length] if len(revision) > length else revision for revision in revisions
+    )
+
+
 def _conflict_result_comment(
     request: ConflictPublicationRequest,
     outcome: AttemptOutcome,
@@ -626,11 +640,23 @@ def _conflict_result_comment(
         if request.conflicted_files
         else ""
     )
+    extra_line = (
+        f"- Files changed outside the conflicted set: {', '.join(request.extra_files)}\n"
+        if request.extra_files
+        else ""
+    )
+    fixes_line = (
+        f"- Fix commits: {', '.join(_short_revisions(request.fix_commits))}\n"
+        if request.fix_commits
+        else ""
+    )
     conflict_marker = conflict_attempt_marker(
         conflict_outcome,
         sha=pushed_sha,
         reason=request.reason or None,
         files=request.conflicted_files,
+        fix_commits=request.fix_commits,
+        extra_files=request.extra_files,
     )
     return (
         f"## Conflict Attempt Result: {conflict_outcome}\n\n"
@@ -640,7 +666,9 @@ def _conflict_result_comment(
         f"**Lifecycle outcome**: {outcome.value}\n\n"
         "### Evidence\n"
         f"- Check command: `{request.check_command}` → exit code {request.check_exit_code}\n"
-        f"{files_line}\n"
+        f"{files_line}"
+        f"{extra_line}"
+        f"{fixes_line}\n"
         "### Details\n"
         f"{details}\n\n"
         f"{marker}\n"
