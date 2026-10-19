@@ -148,7 +148,7 @@ def test_empty_queue_sleeps_once_without_attempting_work(tmp_path: Path) -> None
     assert result.status is LifecycleStatus.IDLE
     assert sleeps == [17]
     assert [event for event, _, _ in events] == ["polling_for_issue", "no_eligible_issue_found"]
-    assert events[1][1] == "no ready-for-agent issue available; sleeping 17s"
+    assert events[1][1] == "no eligible issue available; sleeping 17s"
     assert events[1][2] == "INFO"
 
 

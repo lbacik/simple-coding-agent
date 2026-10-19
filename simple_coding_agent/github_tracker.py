@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from collections.abc import Callable
+from dataclasses import dataclass, replace
 from datetime import datetime
 import json
+import re
 import time
 from typing import Any, Protocol
 from urllib.error import HTTPError, URLError
@@ -18,6 +20,47 @@ READY_FOR_AGENT = "ready-for-agent"
 ROUND_FINISHED = "round-finished"
 READY_FOR_HUMAN = "ready-for-human"
 MERGE_CONFLICT = "merge-conflict"
+
+#: Fixed colour for the auto-created ``merge-conflict`` repository label.
+MERGE_CONFLICT_LABEL_COLOR = "d93f0b"
+#: Fixed description for the auto-created ``merge-conflict`` repository label.
+MERGE_CONFLICT_LABEL_DESCRIPTION = (
+    "Agent PR has merge conflicts; queued for a Conflict attempt"
+)
+
+#: Published attempt branches, and the issue number each one belongs to. The
+#: detector takes the issue number from this branch name, never from
+#: ``Closes #N`` in the pull request body, which links nothing off the
+#: default branch.
+_AGENT_BRANCH_RE = re.compile(r"^agent/issue-(\d+)$")
+
+
+def conflict_branch_issue_number(head_ref: str) -> int | None:
+    """The issue number behind a published attempt branch, if it is one."""
+
+    match = _AGENT_BRANCH_RE.fullmatch(head_ref or "")
+    return int(match.group(1)) if match else None
+
+
+def is_conflict_detection_eligible(
+    issue: TrackerIssue, *, draft: bool, mergeable: str
+) -> bool:
+    """Whether the detector may requeue ``issue`` for a conflicting pull request.
+
+    The pull request must be open, non-draft, and report ``CONFLICTING``
+    (``UNKNOWN`` only means GitHub is still computing mergeability, so this
+    poll skips it); the issue must meet the base queue rules while carrying
+    none of the queue labels (an already-queued issue is never relabelled).
+    The detector never counts any budget and never removes ``merge-conflict``.
+    """
+
+    if draft or mergeable != "CONFLICTING":
+        return False
+    if not issue.meets_base_queue_rules:
+        return False
+    return not (
+        issue.labels & {READY_FOR_AGENT, ROUND_FINISHED, READY_FOR_HUMAN, MERGE_CONFLICT}
+    )
 
 
 def ineligibility_reason(
@@ -197,10 +240,36 @@ class IssueComment:
     body: str
 
 
+@dataclass(frozen=True)
+class OpenPullRequest:
+    """The detector fields of one open repository pull request.
+
+    Only the scalars the conflict detector reads: no per-PR connections are
+    attached, because each one costs a rate-limit point.
+    """
+
+    number: int
+    head_ref: str
+    base_ref: str
+    head_sha: str
+    draft: bool
+    mergeable: str
+
+
+@dataclass(frozen=True)
+class PullRequestPage:
+    """One cursor page of open pull requests from the configured repository."""
+
+    pull_requests: tuple[OpenPullRequest, ...]
+    next_cursor: str | None
+
+
 class GitHubTransport(Protocol):
     """Transport seam; tests can provide a deterministic fake."""
 
     def list_issues(self, repository: str, cursor: str | None) -> IssuePage: ...
+
+    def list_open_pull_requests(self, repository: str, cursor: str | None) -> PullRequestPage: ...
 
     def get_issue(self, repository: str, number: int) -> TrackerIssue | None: ...
 
@@ -227,6 +296,9 @@ class GitHubTracker:
         *,
         max_auto_continuations: int = 0,
         max_conflict_attempts: int = 0,
+        event_log: Callable[..., None] = (
+            lambda event, detail="", level="INFO", issue_number=None: None
+        ),
     ) -> None:
         if (
             isinstance(max_auto_continuations, bool)
@@ -244,6 +316,7 @@ class GitHubTracker:
         self._target_repo = target_repo
         self._max_auto_continuations = max_auto_continuations
         self._max_conflict_attempts = max_conflict_attempts
+        self._event_log = event_log
 
     @property
     def max_auto_continuations(self) -> int:
@@ -287,6 +360,60 @@ class GitHubTracker:
             return False
         return self.automatic_continuation_count(issue) < self._max_auto_continuations
 
+    def detect_conflict_requeues(
+        self, by_number: dict[int, TrackerIssue]
+    ) -> list[tuple[int, int, str]]:
+        """Label issues whose published pull request reports merge conflicts.
+
+        With a positive conflict budget, read the repository's open pull
+        requests in one paged query and add ``merge-conflict`` to the issue
+        behind every open, non-draft ``agent/issue-N`` branch that reports
+        ``CONFLICTING``, when issue N is in this poll's open-issue set, meets
+        the base queue rules, and carries none of the queue labels. Each
+        labelled snapshot is updated in place so the issue is eligible in the
+        same poll. With a zero budget (or a transport without the pull-request
+        seam) no pull-request query runs and nothing is labelled. Returns the
+        ``(issue, pull request, head sha)`` triples that were labelled, in
+        pull-request page order.
+        """
+
+        if self._max_conflict_attempts <= 0:
+            return []
+        list_pull_requests = getattr(self._transport, "list_open_pull_requests", None)
+        if not callable(list_pull_requests):
+            return []
+        detected: list[tuple[int, int, str]] = []
+        cursor: str | None = None
+        while True:
+            page = list_pull_requests(self._target_repo, cursor)
+            for pull_request in page.pull_requests:
+                number = conflict_branch_issue_number(pull_request.head_ref)
+                if number is None:
+                    continue
+                issue = by_number.get(number)
+                if issue is None:
+                    continue
+                if not is_conflict_detection_eligible(
+                    issue, draft=pull_request.draft, mergeable=pull_request.mergeable
+                ):
+                    continue
+                self._transport.add_label(issue.id, MERGE_CONFLICT)
+                by_number[number] = replace(
+                    issue, labels=issue.labels | {MERGE_CONFLICT}
+                )
+                detected.append((number, pull_request.number, pull_request.head_sha))
+                self._event_log(
+                    "conflict_requeue_detected",
+                    f"issue #{number}; pull request #{pull_request.number}"
+                    f" ({pull_request.head_sha}) reports merge conflicts",
+                    level="INFO",
+                    issue_number=number,
+                )
+            if page.next_cursor is None:
+                break
+            cursor = page.next_cursor
+        return detected
+
     def runnable_queue(self) -> tuple[TrackerIssue, ...]:
         """Return all eligible issues, conflicts then continuations then ordinary.
 
@@ -298,24 +425,33 @@ class GitHubTracker:
         after a handoff) stays in the ordinary group, as does any issue
         carrying ``ready-for-agent`` or ``round-finished`` alongside
         ``merge-conflict``.
+
+        Building the queue also runs the conflict detector: with a positive
+        conflict budget, issues whose published pull request reports merge
+        conflicts are labelled ``merge-conflict`` first, so they are eligible
+        in this same poll.
         """
 
-        conflicts: list[TrackerIssue] = []
-        continuations: list[TrackerIssue] = []
-        ordinary: list[TrackerIssue] = []
+        by_number: dict[int, TrackerIssue] = {}
         cursor: str | None = None
         while True:
             page = self._transport.list_issues(self._target_repo, cursor)
             for issue in page.issues:
-                if issue.is_eligible:
-                    ordinary.append(issue)
-                elif self.is_conflict_eligible(issue):
-                    conflicts.append(issue)
-                elif self.is_auto_continuation_eligible(issue):
-                    continuations.append(issue)
+                by_number[issue.number] = issue
             if page.next_cursor is None:
                 break
             cursor = page.next_cursor
+        self.detect_conflict_requeues(by_number)
+        conflicts: list[TrackerIssue] = []
+        continuations: list[TrackerIssue] = []
+        ordinary: list[TrackerIssue] = []
+        for issue in by_number.values():
+            if issue.is_eligible:
+                ordinary.append(issue)
+            elif self.is_conflict_eligible(issue):
+                conflicts.append(issue)
+            elif self.is_auto_continuation_eligible(issue):
+                continuations.append(issue)
         by_fifo = lambda issue: (issue.created_at, issue.number)
         return tuple(
             sorted(conflicts, key=by_fifo)
@@ -564,6 +700,44 @@ class GitHubGraphQLTransport:
         except (KeyError, TypeError, ValueError) as error:
             raise GitHubTrackerError("GitHub returned an invalid issue") from error
 
+    def list_open_pull_requests(
+        self, repository: str, cursor: str | None
+    ) -> PullRequestPage:
+        """Return one page of the repository's open pull requests for the detector.
+
+        The detector owns the only pull-request listing: one paged query per
+        poll reading exactly ``number headRefName baseRefName headRefOid
+        isDraft mergeable``, with no ``baseRefName`` filter (the profile is
+        not loaded in the loop) and no per-PR connections.
+        """
+
+        owner, name = _repository_parts(repository)
+        data = self._execute(
+            """
+            query OpenPullRequests($owner: String!, $name: String!, $cursor: String) {
+              repository(owner: $owner, name: $name) {
+                pullRequests(first: 100, after: $cursor, states: OPEN, orderBy: {field: CREATED_AT, direction: ASC}) {
+                  nodes { number headRefName baseRefName headRefOid isDraft mergeable }
+                  pageInfo { hasNextPage endCursor }
+                }
+              }
+            }
+            """,
+            {"owner": owner, "name": name, "cursor": cursor},
+        )
+        try:
+            connection = data["repository"]["pullRequests"]
+            page_info = connection["pageInfo"]
+            return PullRequestPage(
+                pull_requests=tuple(
+                    _open_pull_request_from_graphql(value)
+                    for value in connection["nodes"]
+                ),
+                next_cursor=page_info["endCursor"] if page_info["hasNextPage"] else None,
+            )
+        except (KeyError, TypeError, ValueError) as error:
+            raise GitHubTrackerError("GitHub returned an invalid pull request page") from error
+
     def viewer(self) -> GitHubIdentity:
         data = self._execute("query Viewer { viewer { id login } }", {})
         try:
@@ -675,12 +849,15 @@ class GitHubGraphQLTransport:
         )
 
     def _create_label(self, repository_id: str, label: str) -> str:
-        color = "fbca04" if label == ROUND_FINISHED else "ededed"
-        description = (
-            "Agent round finished; requires human evaluation to continue"
-            if label == ROUND_FINISHED
-            else ""
-        )
+        if label == ROUND_FINISHED:
+            color = "fbca04"
+            description = "Agent round finished; requires human evaluation to continue"
+        elif label == MERGE_CONFLICT:
+            color = MERGE_CONFLICT_LABEL_COLOR
+            description = MERGE_CONFLICT_LABEL_DESCRIPTION
+        else:
+            color = "ededed"
+            description = ""
         data = self._execute(
             """
             mutation CreateLabel($repositoryId: ID!, $name: String!, $color: String!, $description: String) {
@@ -1037,6 +1214,28 @@ def _comment_from_graphql(value: dict[str, Any]) -> IssueComment:
         author_login=author["login"] if author is not None else "",
         body=value["body"],
     )
+
+
+def _open_pull_request_from_graphql(value: dict[str, Any]) -> OpenPullRequest:
+    number = value["number"]
+    head_ref = value["headRefName"]
+    base_ref = value["baseRefName"]
+    head_sha = value["headRefOid"]
+    draft = value["isDraft"]
+    mergeable = value["mergeable"]
+    if isinstance(number, bool) or not isinstance(number, int):
+        raise ValueError("invalid pull request")
+    if not isinstance(head_ref, str) or not head_ref:
+        raise ValueError("invalid pull request")
+    if not isinstance(base_ref, str):
+        raise ValueError("invalid pull request")
+    if not isinstance(head_sha, str) or not head_sha:
+        raise ValueError("invalid pull request")
+    if not isinstance(draft, bool):
+        raise ValueError("invalid pull request")
+    if not isinstance(mergeable, str) or not mergeable:
+        raise ValueError("invalid pull request")
+    return OpenPullRequest(number, head_ref, base_ref, head_sha, draft, mergeable.upper())
 
 
 def _pull_request_from_graphql(value: dict[str, Any]) -> PullRequest:

@@ -34,6 +34,12 @@ from simple_coding_agent.recovery import (
 )
 
 
+from simple_coding_agent.github_tracker import (
+    conflict_branch_issue_number as conflict_branch_issue_number,
+    is_conflict_detection_eligible as is_conflict_detection_eligible,
+)
+
+
 def is_conflict_claim(labels: Container[str]) -> bool:
     """Whether a claim snapshot routes to a conflict attempt.
 
