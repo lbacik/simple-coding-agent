@@ -91,6 +91,13 @@ def main() -> None:
         redactions=config.credential_redactions,
         extra_path=config.profile_extra_path,
     )
+    model_executor = ModelExecutor(
+        config,
+        cli_path=provenance.cli_path,
+        event_log=lambda event, detail="", level="INFO", issue_number=None: logger.emit(
+            event, phase="model_execution", detail=detail, level=level, issue_number=issue_number
+        ),
+    )
     runner = ModelAttemptRunner(
         attempt_state=attempt_state,
         workspace=workspace,
@@ -98,13 +105,7 @@ def main() -> None:
         evaluator=CompletionEvaluator(config.review_blocking_severities),
         issue_comments=tracker.trusted_comments,
         prompt_redactions=config.credential_redactions,
-        model_executor=ModelExecutor(
-            config,
-            cli_path=provenance.cli_path,
-            event_log=lambda event, detail="", level="INFO", issue_number=None: logger.emit(
-                event, phase="model_execution", detail=detail, level=level, issue_number=issue_number
-            ),
-        ),
+        model_executor=model_executor,
         attempt_archive_factory=archive_factory,
         event_log=lambda event, detail="", level="ERROR", issue_number=None: logger.emit(
             event, phase="setup", detail=detail, level=level, issue_number=issue_number
@@ -153,6 +154,9 @@ def main() -> None:
         max_auto_continuations=config.max_auto_continuations,
         max_conflict_attempts=config.max_conflict_attempts,
         command_runner=command_runner,
+        conflict_model_executor=model_executor,
+        conflict_issue_comments=tracker.trusted_comments,
+        conflict_prompt_redactions=config.credential_redactions,
         event_log=lambda event, detail="", level="INFO", issue_number=None: logger.emit(
             event, phase="polling", detail=detail, level=level, issue_number=issue_number
         ),

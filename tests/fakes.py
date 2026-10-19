@@ -40,7 +40,12 @@ from simple_coding_agent.github_tracker import (
     conflict_branch_issue_number,
     is_conflict_detection_eligible,
 )
-from simple_coding_agent.model_execution import ModelExecutionStatus
+from simple_coding_agent.command_runner import (
+    CommandExecution,
+    CommandResult,
+    CommandStatus,
+)
+from simple_coding_agent.model_execution import ModelExecution, ModelExecutionStatus
 from simple_coding_agent.publication import PullRequest
 
 
@@ -674,4 +679,83 @@ class FakePublisher:
             branch_url=branch_url,
             comment_posted=self._comment_posted,
             pull_request=request.pull_request,
+        )
+
+
+def ok_result(command: str = "pytest") -> CommandResult:
+    """A succeeded profile-command result for conflict-attempt tests."""
+
+    return CommandResult(
+        CommandStatus.SUCCEEDED,
+        (CommandExecution(command, 0, "", "", False),),
+        0.1,
+    )
+
+
+def failed_result(command: str = "pytest", exit_code: int = 1) -> CommandResult:
+    """A failed profile-command result for conflict-attempt tests."""
+
+    return CommandResult(
+        CommandStatus.FAILED,
+        (CommandExecution(command, exit_code, "", "boom", False),),
+        0.1,
+    )
+
+
+class FakeCommandRunner:
+    """Serve scripted profile-command results to conflict attempts."""
+
+    def __init__(self, results: list[CommandResult]) -> None:
+        self._results = list(results)
+        self.calls: list[tuple[tuple[str, ...], float, Path, object]] = []
+
+    def run(
+        self,
+        commands: tuple[str, ...],
+        *,
+        timeout: float,
+        cwd: Path,
+        environment: object = None,
+    ) -> CommandResult:
+        self.calls.append((tuple(commands), timeout, cwd, environment))
+        return self._results.pop(0)
+
+
+class FakeConflictExecutor:
+    """Serve one scripted model resolution session to a conflict attempt."""
+
+    def __init__(
+        self,
+        *,
+        status: ModelExecutionStatus = ModelExecutionStatus.SUCCEEDED,
+        calls: list[str] | None = None,
+    ) -> None:
+        self.captured_prompt: str | None = None
+        self._status = status
+        self._calls = calls
+        self.after_execute = None
+
+    async def execute(
+        self,
+        *,
+        issue_body: str,
+        working_directory: Path,
+        issue_number: int | None = None,
+        archive: object = None,
+        attempt_id: str | None = None,
+        branch: str | None = None,
+        base_revision: str | None = None,
+    ) -> ModelExecution:
+        if self._calls is not None:
+            self._calls.append("execute")
+        self.captured_prompt = issue_body
+        if self.after_execute is not None:
+            self.after_execute()
+        return ModelExecution(
+            status=self._status,
+            explanation="stub",
+            stop_reason="end_turn",
+            model_usage=None,
+            observed_models=(),
+            skill_events=(),
         )

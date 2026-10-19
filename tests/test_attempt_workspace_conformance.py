@@ -3,8 +3,9 @@
 ``GitWorkspace`` (temporary bare remote, as the end-to-end handoff test
 does) and ``InMemoryWorkspace`` (the shared fake) both satisfy
 ``AttemptWorkspace``; every test here runs against both so the seam stays
-real. Covers ``seal``, ``commits_added``, ``conflict_state``,
-``commit_handoff_note``, ``handoff_note_commit`` and dirty ``cleanup``.
+real. Covers ``seal``, ``commits_added``, ``files_changed``,
+``conflict_state``, ``commit_handoff_note``, ``handoff_note_commit`` and
+dirty ``cleanup``.
 """
 
 from __future__ import annotations
@@ -254,6 +255,18 @@ def test_commits_added_lists_attempt_commits_newest_first(
         "Second model commit",
         "First model commit",
     ]
+
+
+def test_files_changed_lists_one_commit_touched_paths(
+    attempt: SimpleNamespace,
+) -> None:
+    model_commit(attempt, "first.txt", "one", "First model commit")
+
+    commits = attempt.workspace.commits_added(attempt.prepared)
+    assert commits, "expected at least one commit"
+
+    assert attempt.workspace.files_changed(commits[0].revision) == ("first.txt",)
+    assert attempt.workspace.files_changed("missing-revision") == ()
 
 
 def test_commit_handoff_note_commits_only_the_note(attempt: SimpleNamespace) -> None:

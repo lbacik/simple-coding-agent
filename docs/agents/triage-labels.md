@@ -29,8 +29,11 @@ removing `round-finished` stops automatic continuation at any time.
 `merge-conflict` returns an issue to the queue because the pull request a
 worker already published for it reports merge conflicts with the base
 branch. It is not a triage role: the conflict attempt that follows only
-brings that pull request up to date — no model call runs, no new work is
-done.
+brings that pull request up to date and does no new work — a clean rebase
+plus setup and one profile check pushes directly, while a real rebase
+conflict (or a red check after a clean rebase) runs at most one narrow
+model resolution session under the ordinary model limits, never invoking
+`code-review`.
 
 With `MAX_CONFLICT_ATTEMPTS` above `0`, workers detect the conflict on
 their own: every poll reads the repository's open pull requests in one
@@ -54,7 +57,9 @@ precedence and the stale `merge-conflict` signal is removed at the claim.
 Every conflict attempt removes `merge-conflict` and the assignee, never
 adds `ready-for-agent` or `round-finished`, and posts a result comment
 stamped with a `<!-- conflict-attempt: ... -->` marker carrying the
-outcome (`success`, `skipped`, or a failure kind) and the pushed sha.
+outcome (`success`, `skipped`, or a failure kind), the pushed sha, the
+conflicted files, files the resolution changed outside them, and fix
+commits.
 Those comments are transparent to the automatic-continuation count: they
 neither consume nor reset the budget.
 
