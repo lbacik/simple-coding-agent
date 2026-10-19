@@ -37,7 +37,7 @@ An implementation attempt claimed from `round-finished` without a human requeue:
 _Avoid_: Auto-retry, self requeue
 
 **Conflict requeue**:
-Returning an issue to the queue because the pull request a worker already published for it reports merge conflicts with the base branch. The signal is a manually applied `merge-conflict` label on an otherwise ordinary issue (no `ready-for-agent`, `round-finished`, or `ready-for-human`); with `MAX_CONFLICT_ATTEMPTS=0` (the default) the signal is not part of the queue at all. An issue carrying `ready-for-agent` or `round-finished` alongside `merge-conflict` takes that path instead, and the stale conflict signal is removed at the claim.
+Returning an issue to the queue because the pull request a worker already published for it reports merge conflicts with the base branch. The signal is a `merge-conflict` label on an otherwise ordinary issue (no `ready-for-agent`, `round-finished`, or `ready-for-human`); with `MAX_CONFLICT_ATTEMPTS` above `0` workers apply it themselves — every poll reads the repository's open pull requests and labels the issue behind an `agent/issue-N` branch reporting `CONFLICTING`, so it is eligible in that same poll — and a human may also apply it manually. With `MAX_CONFLICT_ATTEMPTS=0` (the default) the signal is not part of the queue at all and no pull-request query runs. An issue carrying `ready-for-agent` or `round-finished` alongside `merge-conflict` takes that path instead, and the stale conflict signal is removed at the claim.
 _Avoid_: Conflict retry, auto-rebase
 
 **Conflict attempt**:

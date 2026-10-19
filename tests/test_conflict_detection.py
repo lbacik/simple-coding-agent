@@ -19,7 +19,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from simple_coding_agent.attempt_state import AttemptPhase, AttemptStateStore
+from simple_coding_agent.attempt_state import AttemptStateStore
 from simple_coding_agent.command_runner import (
     CommandExecution,
     CommandResult,

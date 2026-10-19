@@ -20,12 +20,16 @@ A handoff releases its issue labelled `round-finished`: with the operator
 setting `MAX_AUTO_CONTINUATIONS=N` (default `0`), a `round-finished` issue
 within budget is claimed automatically ahead of new work, up to N
 continuations in a row before a human requeue is needed again.
-A human-applied `merge-conflict` label returns an issue whose published
-pull request reports conflicts: with the operator setting
-`MAX_CONFLICT_ATTEMPTS` above `0` (default `0`, which disables the path),
-the conflict attempt rebases the published branch onto the base, checks
-it, and force-pushes only when green — no model call runs. An issue
-labelled `ready-for-human` is never eligible.
+A `merge-conflict` label returns an issue whose published pull request
+reports conflicts: with the operator setting `MAX_CONFLICT_ATTEMPTS`
+above `0` (default `0`, which disables the path and makes no pull-request
+query), workers notice the conflict on their own — every poll reads the
+repository's open pull requests and labels an otherwise ordinary issue
+`merge-conflict` when its `agent/issue-N` branch reports `CONFLICTING`,
+so the conflict attempt starts without a human. The conflict attempt
+rebases the published branch onto the base, checks it, and force-pushes
+only when green — no model call runs. A human may also apply the label
+manually. An issue labelled `ready-for-human` is never eligible.
 
 Applying `ready-for-agent` is the human trust boundary: only repository
 collaborators with write access may apply it. The issue body is passed to the
@@ -40,8 +44,8 @@ clone location is `$DATA_DIR/repo/`. Other defaults are `POLL_INTERVAL=60`,
 `LOG_LEVEL=INFO`, `MODEL_TIMEOUT=3600`, `PUBLISH_TIMEOUT=120`,
 `MAX_RETRIES=3`, `MAX_CONSECUTIVE_ERRORS=3`, `MAX_AUTO_CONTINUATIONS=0`
 (no automatic continuation of `round-finished` issues without a human
-requeue), and `MAX_CONFLICT_ATTEMPTS=0` (no conflict requeue of
-`merge-conflict` issues).
+requeue), and `MAX_CONFLICT_ATTEMPTS=0` (no automatic conflict detection and no
+conflict requeue of `merge-conflict` issues).
 
 Use a fine-grained GitHub PAT limited to the configured repository with only
 `contents:write`, `pull-requests:write`, and `issues:write`. Configure provider

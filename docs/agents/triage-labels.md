@@ -28,18 +28,28 @@ removing `round-finished` stops automatic continuation at any time.
 
 `merge-conflict` returns an issue to the queue because the pull request a
 worker already published for it reports merge conflicts with the base
-branch. It is not a triage role: a human applies it to an otherwise
-ordinary issue, and the conflict attempt that follows only brings that
-pull request up to date — no model call runs, no new work is done.
+branch. It is not a triage role: the conflict attempt that follows only
+brings that pull request up to date — no model call runs, no new work is
+done.
+
+With `MAX_CONFLICT_ATTEMPTS` above `0`, workers detect the conflict on
+their own: every poll reads the repository's open pull requests in one
+paged query and adds `merge-conflict` to an otherwise ordinary issue
+(open, unassigned, non-empty body, no open blockers, none of
+`ready-for-agent`, `round-finished`, `ready-for-human`, `merge-conflict`)
+whose `agent/issue-N` branch reports `CONFLICTING`, so the issue is
+eligible in that same poll. Each detection emits a
+`conflict_requeue_detected` event naming the issue, the pull request, and
+the head sha. A human may also apply the label manually with the same
+effect.
 
 With the default `MAX_CONFLICT_ATTEMPTS=0`, the label is not part of the
-queue and a labelled issue waits untouched. With
-`MAX_CONFLICT_ATTEMPTS` above `0`, a `merge-conflict` issue that meets
-the base queue rules (open, unassigned, non-empty body, no open blockers)
-is claimed before automatic continuations and ordinary work; an issue
-labelled `ready-for-human` is excluded. If the issue also carries
-`ready-for-agent` or `round-finished`, those take precedence and the
-stale `merge-conflict` signal is removed at the claim.
+queue, no pull-request query runs, and a labelled issue waits untouched.
+With the setting above `0`, a `merge-conflict` issue that meets
+the base queue rules is claimed before automatic continuations and
+ordinary work; an issue labelled `ready-for-human` is excluded. If the
+issue also carries `ready-for-agent` or `round-finished`, those take
+precedence and the stale `merge-conflict` signal is removed at the claim.
 
 Every conflict attempt removes `merge-conflict` and the assignee, never
 adds `ready-for-agent` or `round-finished`, and posts a result comment

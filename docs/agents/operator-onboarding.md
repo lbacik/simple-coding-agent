@@ -98,6 +98,36 @@ the target repository and an auto-merged PR could otherwise edit the profile
 to grant itself more trust.  See
 [ADR 0004](../adr/0004-pr-auto-merge-operator-setting.md).
 
+## Conflict requeue (`MAX_CONFLICT_ATTEMPTS`)
+
+When a published pull request falls behind the base branch and reports
+merge conflicts, the issue behind it can come back to the queue on its
+own. With `MAX_CONFLICT_ATTEMPTS` above `0` (default `0`, which disables
+the path entirely — no pull-request query runs), every poll reads the
+repository's open pull requests in one paged query and adds the
+`merge-conflict` label to an otherwise ordinary issue (open, unassigned,
+non-empty body, no open blockers, none of `ready-for-agent`,
+`round-finished`, `ready-for-human`, `merge-conflict`) whose
+`agent/issue-N` branch reports `CONFLICTING`. The issue is eligible in
+that same poll, claimed before automatic continuations and ordinary
+work, and each detection emits a `conflict_requeue_detected` event naming
+the issue, the pull request, and the head sha. You may also apply the
+label manually with the same effect.
+
+The conflict attempt that follows only brings the published pull request
+up to date — no model call runs, no new work is done. It rebases the
+published branch onto the base, runs setup plus one profile check, and
+force-pushes only when both are green, re-enabling auto-merge per
+`PR_AUTO_MERGE`. Every conflict attempt removes `merge-conflict` and the
+assignee, never adds a queue label, and posts a result comment stamped
+with a `<!-- conflict-attempt: ... -->` marker. If the entry check finds
+anything other than an open, non-draft, `CONFLICTING` pull request
+against the profile's base branch, the attempt ends `skipped`.
+
+Like the other budgets, the setting is operator-only on purpose: it lives
+in `.env`, never in the repository profile (an unknown profile key is
+refused), so an agent-written PR cannot raise its own conflict budget.
+
 ## `ready-for-agent` trust policy
 
 The `ready-for-agent` label is the trust boundary.  Only repository
