@@ -373,8 +373,8 @@ class GitHubTracker:
         ``ready-for-agent`` or ``round-finished``, which take the ordinary
         path, and never with ``ready-for-human``) and meet the base queue
         rules. With a zero budget this is always False and reads no comments.
-        Per-issue attempt counting arrives with the budget follow-up; today
-        the setting only gates the queue.
+        The consecutive-failure budget is enforced at escalation time, never
+        at claim time: a running streak does not block the next claim.
         """
 
         if self._max_conflict_attempts <= 0:
