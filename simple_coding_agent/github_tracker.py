@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, replace
 from datetime import datetime
 import json
+import os
 import re
 import time
 from typing import Any, Protocol
@@ -13,7 +14,10 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 from simple_coding_agent.publication import PullRequest
-from simple_coding_agent.recovery import count_automatic_continuations
+from simple_coding_agent.recovery import (
+    count_automatic_continuations,
+    count_conflict_failures,
+)
 
 
 READY_FOR_AGENT = "ready-for-agent"
@@ -40,6 +44,26 @@ def conflict_branch_issue_number(head_ref: str) -> int | None:
 
     match = _AGENT_BRANCH_RE.fullmatch(head_ref or "")
     return int(match.group(1)) if match else None
+
+
+def _peer_login_set(peer_logins: Iterable[str] | None) -> frozenset[str]:
+    """Normalize the pool-peer logins whose conflict comments count as the worker's own.
+
+    An explicit constructor value wins; otherwise the ``PEER_LOGINS``
+    environment setting (comma- or space-separated, from the pool work) is
+    read, so the budget keeps counting when several workers share one
+    account. Absent in both places means only the worker's own login
+    counts. Empty logins never count (they would match deleted accounts).
+    """
+
+    if peer_logins is not None:
+        return frozenset(
+            login.strip() for login in peer_logins if login and login.strip()
+        )
+    raw = os.environ.get("PEER_LOGINS", "")
+    return frozenset(
+        part for part in re.split(r"[,\s]+", raw) if part
+    )
 
 
 def is_conflict_detection_eligible(
@@ -296,6 +320,7 @@ class GitHubTracker:
         *,
         max_auto_continuations: int = 0,
         max_conflict_attempts: int = 0,
+        peer_logins: Iterable[str] | None = None,
         event_log: Callable[..., None] = (
             lambda event, detail="", level="INFO", issue_number=None: None
         ),
@@ -316,7 +341,18 @@ class GitHubTracker:
         self._target_repo = target_repo
         self._max_auto_continuations = max_auto_continuations
         self._max_conflict_attempts = max_conflict_attempts
+        self._peer_logins = _peer_login_set(peer_logins)
         self._event_log = event_log
+
+    @property
+    def peer_logins(self) -> frozenset[str]:
+        """Additional logins whose conflict-attempt comments count toward the budget.
+
+        The worker's own login always counts; these pool peers count too.
+        Empty when the pool setting is absent.
+        """
+
+        return self._peer_logins
 
     @property
     def max_auto_continuations(self) -> int:
@@ -633,6 +669,43 @@ class GitHubTracker:
         )
         return count_automatic_continuations(own_bodies_newest_first)
 
+    def conflict_failure_streak(self, issue: TrackerIssue) -> int:
+        """Count consecutive failed conflict attempts on ``issue`` since the last stop.
+
+        Only comments authored by this worker's own GitHub identity (plus
+        any pool-peer login) are examined; any other comment is ignored
+        even if it contains the marker. The streak stops at a successful
+        conflict attempt (it pushed a new sha), an ordinary attempt result,
+        a ``skipped`` result, or the latest escalation comment, so removing
+        ``ready-for-human`` after an escalation requeues with the full
+        budget. With a zero budget this still reads the comments: the
+        budget is enforced at escalation time, never at claim time.
+        """
+
+        viewer = self._transport.viewer()
+        allowed = {viewer.login} | set(self._peer_logins)
+        comments = self._transport.list_issue_comments(self._target_repo, issue.number)
+        own_bodies_newest_first = tuple(
+            comment.body
+            for comment in reversed(comments)
+            # An empty login means a deleted account; never count one by
+            # incidentally matching another deleted account.
+            if comment.author_login and comment.author_login in allowed
+        )
+        return count_conflict_failures(own_bodies_newest_first)
+
+    def escalate_conflict_to_human(self, issue: TrackerIssue) -> None:
+        """Hand a conflict-exhausted issue to a human with ``ready-for-human``.
+
+        The escalating attempt's own result comment is the escalation
+        comment; this only adds the gate label (created in the repository
+        when missing, like the other worker-applied labels). The agent
+        never removes ``ready-for-human``: a human hands the issue back by
+        removing it, which requeues with the full budget.
+        """
+
+        self._transport.add_label(issue.id, READY_FOR_HUMAN)
+
 
 class GitHubGraphQLTransport:
     """GitHub GraphQL transport used by the tracker in production."""
@@ -920,7 +993,7 @@ class GitHubGraphQLTransport:
             query PullRequest($owner: String!, $name: String!, $head: String!) {
               repository(owner: $owner, name: $name) {
                 pullRequests(first: 1, states: OPEN, headRefName: $head) {
-                  nodes { id number url isDraft mergeable baseRefName }
+                  nodes { id number url isDraft mergeable baseRefName headRefOid }
                 }
               }
             }
@@ -1245,6 +1318,7 @@ def _pull_request_from_graphql(value: dict[str, Any]) -> PullRequest:
     draft = value.get("isDraft", False)
     mergeable = value.get("mergeable", "UNKNOWN")
     base_ref = value.get("baseRefName", "")
+    head_sha = value.get("headRefOid", "")
     if isinstance(number, bool) or not isinstance(number, int) or not isinstance(url, str) or not url:
         raise ValueError("invalid pull request")
     if not isinstance(node_id, str):
@@ -1255,4 +1329,6 @@ def _pull_request_from_graphql(value: dict[str, Any]) -> PullRequest:
         raise ValueError("invalid pull request")
     if not isinstance(base_ref, str):
         raise ValueError("invalid pull request")
-    return PullRequest(number, url, node_id, draft, mergeable.upper(), base_ref)
+    if not isinstance(head_sha, str):
+        raise ValueError("invalid pull request")
+    return PullRequest(number, url, node_id, draft, mergeable.upper(), base_ref, head_sha)

@@ -11,6 +11,9 @@ from simple_coding_agent.attempt_state import AttemptPhase, AttemptStateStore
 from simple_coding_agent.attempt_workspace import BranchPusher
 from simple_coding_agent.git_workspace import GitWorkspaceError
 from simple_coding_agent.recovery import (
+    CONFLICT_ESCALATION_MARKER,
+    CONFLICT_OUTCOME_NO_CHANGE,
+    CONFLICT_OUTCOME_SUCCESS,
     REQUEUE_SOURCE_HUMAN,
     conflict_attempt_marker,
     requeue_source_marker,
@@ -113,6 +116,12 @@ class PublicationResult:
     comment_posted: bool = True
     details: str = ""
     merge_result: str | None = None
+    #: The conflict-attempt marker outcome actually published (``""`` for
+    #: ordinary attempts). A success-path push that left the remote head
+    #: unchanged publishes ``no_change`` instead of ``success``.
+    conflict_outcome: str = ""
+    #: Whether the published conflict comment escalated to a human.
+    escalated: bool = False
 
 
 @dataclass(frozen=True)
@@ -131,6 +140,17 @@ class ConflictPublicationRequest:
     ``fix_commits`` the fix commits it added on top. The comment carries no
     requeue-source marker, keeping the attempt transparent to the
     automatic-continuation count.
+
+    ``conflict_index``/``conflict_budget`` render the ``k/N`` standing line
+    every conflict result carries (``conflict_index`` is the resulting
+    consecutive-failure count, or 0 once a success or skip resets the
+    streak; 0 budget omits the line). ``escalate`` marks the attempt whose
+    failure reaches the budget: its own comment becomes the escalation
+    comment. ``conflict_prior`` is the streak before this attempt, so a
+    success-path push that leaves the remote head unchanged can still be
+    reported (and escalated) as ``no_change``. ``failure_output`` is the
+    tail of the last check output (or the failure reason) quoted in the
+    escalation's collapsed section.
     """
 
     issue_number: int
@@ -150,6 +170,11 @@ class ConflictPublicationRequest:
     auto_merge_opt_in: bool = False
     extra_files: tuple[str, ...] = ()
     fix_commits: tuple[str, ...] = ()
+    conflict_index: int = 0
+    conflict_budget: int = 0
+    escalate: bool = False
+    conflict_prior: int = 0
+    failure_output: str = ""
 
 
 class Publisher:
@@ -295,6 +320,8 @@ class Publisher:
         deadline = self._monotonic() + effective_timeout
         outcome = request.outcome
         conflict_outcome = request.conflict_outcome
+        conflict_index = request.conflict_index
+        escalate = request.escalate
         branch_url: str | None = None
         pushed_sha: str | None = None
         details = request.details
@@ -324,8 +351,29 @@ class Publisher:
                     request, outcome, conflict_outcome, branch_url, None, details, None, None
                 )
                 return PublicationResult(
-                    outcome, branch_url, request.pull_request, comment_posted, details
+                    outcome,
+                    branch_url,
+                    request.pull_request,
+                    comment_posted,
+                    details,
+                    None,
+                    conflict_outcome,
+                    escalate,
                 )
+            if (
+                conflict_outcome == CONFLICT_OUTCOME_SUCCESS
+                and pushed_sha
+                and request.pull_request is not None
+                and request.pull_request.head_sha
+                and pushed_sha == request.pull_request.head_sha
+            ):
+                # The green push changed nothing on the remote branch: report
+                # it as ``no_change`` (a failure toward the budget) while the
+                # verified green outcome stands.
+                conflict_outcome = CONFLICT_OUTCOME_NO_CHANGE
+                conflict_index = request.conflict_prior + 1
+                if request.conflict_budget > 0 and conflict_index >= request.conflict_budget:
+                    escalate = True
 
         merge_result: str | None = None
         if request.push_branch and branch_url is not None and request.pull_request is not None:
@@ -345,9 +393,18 @@ class Publisher:
             details,
             merge_result,
             pushed_sha,
+            conflict_index=conflict_index,
+            escalate=escalate,
         )
         return PublicationResult(
-            outcome, branch_url, request.pull_request, comment_posted, details, merge_result
+            outcome,
+            branch_url,
+            request.pull_request,
+            comment_posted,
+            details,
+            merge_result,
+            conflict_outcome,
+            escalate,
         )
 
     def _mark_publishing(self) -> None:

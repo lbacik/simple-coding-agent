@@ -143,6 +143,10 @@ CONFLICT_OUTCOME_MODEL_LIMIT = "model_limit"
 #: amend of the pull request's own commits) instead of adding fixes only on
 #: top (issue #271). An ordinary failure: nothing is pushed.
 CONFLICT_OUTCOME_RESOLUTION_FAILED = "resolution_failed"
+#: A ``success``-path push that left the remote head unchanged: the rebase
+#: applied cleanly and the check passed, but nothing new reached the pull
+#: request. It counts as a failure toward the conflict-attempt budget.
+CONFLICT_OUTCOME_NO_CHANGE = "no_change"
 
 CONFLICT_OUTCOMES = frozenset(
     {
@@ -155,6 +159,7 @@ CONFLICT_OUTCOMES = frozenset(
         CONFLICT_OUTCOME_ERROR,
         CONFLICT_OUTCOME_MODEL_LIMIT,
         CONFLICT_OUTCOME_RESOLUTION_FAILED,
+        CONFLICT_OUTCOME_NO_CHANGE,
     }
 )
 
@@ -240,6 +245,70 @@ def is_conflict_attempt(body: str) -> bool:
     """Whether a comment body carries a conflict-attempt marker."""
 
     return parse_conflict_attempt(body) is not None
+
+
+#: Hidden marker identifying the conflict-attempt result that escalated its
+#: issue to a human. The escalating attempt's own result comment carries it,
+#: so the streak stops there: after a human removes ``ready-for-human`` the
+#: next poll requeues with the full budget.
+CONFLICT_ESCALATION_MARKER = "<!-- conflict-escalation -->"
+
+
+def is_conflict_escalation(body: str) -> bool:
+    """Whether a comment body is the escalation comment of its streak."""
+
+    return CONFLICT_ESCALATION_MARKER in body
+
+
+def is_conflict_failure(body: str) -> bool:
+    """Whether a comment body is a conflict-attempt failure counting toward the budget.
+
+    Failures are an unresolved conflict, a red check, an infrastructure
+    error (setup, push, or unexpected error), ``no_change`` (a push that
+    left the remote head unchanged), and any unknown conflict outcome
+    (including a model-limit or restart-recovery error published as a
+    conflict result). A successful push of a new sha, a ``skipped``
+    result, and an escalation comment are not failures: they stop the
+    streak. A body without a conflict-attempt marker is not a conflict
+    failure either (an ordinary attempt result stops the streak).
+    """
+
+    if is_conflict_escalation(body):
+        return False
+    parsed = parse_conflict_attempt(body)
+    if parsed is None:
+        return False
+    outcome = parsed.get("outcome", "")
+    if outcome == CONFLICT_OUTCOME_SKIPPED:
+        return False
+    if outcome == CONFLICT_OUTCOME_SUCCESS:
+        # A pushed sha of ``none`` means nothing reached the remote branch,
+        # so the attempt changed nothing despite its outcome.
+        return parsed.get("sha", "none") in ("", "none")
+    return True
+
+
+def count_conflict_failures(bodies_newest_first: tuple[str, ...] | list[str]) -> int:
+    """Count consecutive conflict-attempt failures from the newest comment.
+
+    The streak stops at a successful conflict attempt (it pushed a new
+    sha), an ordinary attempt result (an ``agent-attempt`` marker without
+    the conflict marker), a ``skipped`` result, or the latest escalation
+    comment. Any other comment without a conflict-attempt marker also
+    stops the streak. Only the failure rows themselves are counted; the
+    boundary comment that stops the row never is.
+    """
+
+    count = 0
+    for body in bodies_newest_first:
+        if is_conflict_escalation(body):
+            break
+        if not is_conflict_attempt(body):
+            break
+        if not is_conflict_failure(body):
+            break
+        count += 1
+    return count
 
 
 def release_comment_body(

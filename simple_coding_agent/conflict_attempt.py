@@ -28,6 +28,7 @@ from simple_coding_agent.recovery import (
     CONFLICT_OUTCOME_CHECK_FAILED,
     CONFLICT_OUTCOME_ERROR,
     CONFLICT_OUTCOME_MODEL_LIMIT,
+    CONFLICT_OUTCOME_NO_CHANGE,
     CONFLICT_OUTCOME_REBASE_CONFLICT,
     CONFLICT_OUTCOME_RESOLUTION_FAILED,
     CONFLICT_OUTCOME_SETUP_FAILED,
@@ -111,10 +112,11 @@ def base_mismatch_reason(pr: PullRequest, base_branch: str) -> tuple[str, str] |
 def lifecycle_outcome(conflict_outcome: str) -> AttemptOutcome:
     """Map a conflict marker outcome to the lifecycle outcome it finalizes as.
 
-    Success is complete work; skipped ends quietly; a conflicting rebase or
-    a red check is ordinary incompleteness (the branch stays published but
-    conflicting, and the consecutive-error guard must not trip on it); setup
-    and push failures are infrastructure errors, as in the ordinary path.
+    Success is complete work; skipped ends quietly; a conflicting rebase, a
+    red check, or a push that changed nothing is ordinary incompleteness
+    (the branch stays published but conflicting, and the consecutive-error
+    guard must not trip on it); setup and push failures are infrastructure
+    errors, as in the ordinary path.
     """
 
     if conflict_outcome == CONFLICT_OUTCOME_SUCCESS:
@@ -126,6 +128,7 @@ def lifecycle_outcome(conflict_outcome: str) -> AttemptOutcome:
         CONFLICT_OUTCOME_CHECK_FAILED,
         CONFLICT_OUTCOME_MODEL_LIMIT,
         CONFLICT_OUTCOME_RESOLUTION_FAILED,
+        CONFLICT_OUTCOME_NO_CHANGE,
     ):
         return AttemptOutcome.INCOMPLETE
     if conflict_outcome in (
@@ -243,6 +246,51 @@ def check_failed_details(result: object) -> str:
         "The profile check did not pass on the rebased branch; the remote branch "
         f"is left untouched so the pull request stays `CONFLICTING`. Failing command: "
         f"{_failed_command_text(result)}."
+    )
+
+
+#: Per-stream cap for failure output quoted in an escalation comment. Bounded
+#: like the existing result-comment limits, but enough to diagnose the
+#: failure: output is cut from the front so the tail survives.
+FAILURE_OUTPUT_STREAM_LIMIT = 4000
+
+
+def _tail_text(text: object, *, limit: int = FAILURE_OUTPUT_STREAM_LIMIT) -> str:
+    """Keep the end of a command stream, marking front-truncation visibly."""
+
+    value = text if isinstance(text, str) else (text or "")
+    if not value.strip():
+        return "(no output)"
+    if len(value) <= limit:
+        return value
+    return f"...[truncated; showing the last {limit} characters]\n{value[-limit:]}"
+
+
+def failure_output_tail(result: object) -> str:
+    """The tail of the failing command's output for an escalation comment.
+
+    Names the blamed command and quotes the end of both streams, trimmed
+    like existing result comments; linters may report on either stream.
+    ``(no output)`` marks each empty stream so an empty failure stays
+    visible instead of reading as omitted.
+    """
+
+    commands = getattr(result, "commands", ())
+    failed = next(
+        (command for command in commands if getattr(command, "exit_code", 0) != 0),
+        None,
+    )
+    if failed is None and commands:
+        failed = commands[-1]
+    if failed is None:
+        return "(no command ran)"
+    command = getattr(failed, "command", "?")
+    stdout = _tail_text(getattr(failed, "stdout", ""))
+    stderr = _tail_text(getattr(failed, "stderr", ""))
+    return (
+        f"Failing command: `{command}`\n\n"
+        f"stdout (tail):\n```\n{stdout}\n```\n\n"
+        f"stderr (tail):\n```\n{stderr}\n```"
     )
 
 
