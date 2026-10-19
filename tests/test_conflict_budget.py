@@ -14,7 +14,11 @@ from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-from simple_coding_agent.attempt_state import AttemptStateStore
+from simple_coding_agent.attempt_state import (
+    ATTEMPT_KIND_CONFLICT,
+    ATTEMPT_KIND_ORDINARY,
+    AttemptStateStore,
+)
 from simple_coding_agent.command_runner import CommandResult
 from simple_coding_agent.completion import AttemptOutcome
 from simple_coding_agent.config import RepositoryProfile
@@ -408,7 +412,7 @@ def test_success_resets_the_standing_to_zero(tmp_path: Path) -> None:
             issue_number=7,
             branch="agent/issue-7",
             requeue_source="human",
-            is_conflict_claim=True,
+            attempt_kind=ATTEMPT_KIND_CONFLICT,
         ),
         "agent/issue-7",
         "main",
@@ -785,7 +789,7 @@ def test_restart_recovery_publishes_a_counted_conflict_error(tmp_path: Path) -> 
         issue_number=7,
         branch="agent/issue-7",
         requeue_source="human",
-        is_conflict_claim=True,
+        attempt_kind=ATTEMPT_KIND_CONFLICT,
     )
 
     assert lifecycle._reconcile_startup() is AttemptOutcome.INFRASTRUCTURE_ERROR
@@ -800,19 +804,19 @@ def test_restart_recovery_publishes_a_counted_conflict_error(tmp_path: Path) -> 
     )
 
 
-def test_checkpoint_flag_round_trips_and_defaults_false(tmp_path: Path) -> None:
+def test_checkpoint_kind_round_trips_and_defaults_ordinary(tmp_path: Path) -> None:
     store = AttemptStateStore(tmp_path / "store1")
     checkpoint = store.start(
         issue_number=7,
         branch="agent/issue-7",
         requeue_source="human",
-        is_conflict_claim=True,
+        attempt_kind=ATTEMPT_KIND_CONFLICT,
     )
 
-    assert checkpoint.is_conflict_claim is True
-    assert store.read() is not None and store.read().is_conflict_claim is True  # type: ignore[union-attr]
+    assert checkpoint.attempt_kind == ATTEMPT_KIND_CONFLICT
+    assert store.read() is not None and store.read().attempt_kind == ATTEMPT_KIND_CONFLICT  # type: ignore[union-attr]
 
     legacy = AttemptStateStore(tmp_path / "store2")
     legacy.start(issue_number=7, branch="agent/issue-7", requeue_source="human")
 
-    assert legacy.read() is not None and legacy.read().is_conflict_claim is False  # type: ignore[union-attr]
+    assert legacy.read() is not None and legacy.read().attempt_kind == ATTEMPT_KIND_ORDINARY  # type: ignore[union-attr]

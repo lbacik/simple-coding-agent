@@ -12,6 +12,16 @@ from pathlib import Path
 import tempfile
 
 
+#: The attempt kinds recorded on a checkpoint. ``ordinary`` is the default
+#: model-driven implementation attempt; ``conflict`` is a conflict attempt
+#: that only brings an already-published branch up to date. Checkpoints
+#: written before the kind existed read as ``ordinary``.
+ATTEMPT_KIND_ORDINARY = "ordinary"
+ATTEMPT_KIND_CONFLICT = "conflict"
+
+ATTEMPT_KINDS = frozenset({ATTEMPT_KIND_ORDINARY, ATTEMPT_KIND_CONFLICT})
+
+
 class AttemptStateError(RuntimeError):
     """Raised when an implementation-attempt checkpoint cannot be used safely."""
 
@@ -49,7 +59,7 @@ class AttemptCheckpoint:
     requeue_source: str = "human"
     issue_title: str | None = None
     continuation_index: int | None = None
-    is_conflict_claim: bool = False
+    attempt_kind: str = ATTEMPT_KIND_ORDINARY
 
 
 class AttemptStateStore:
@@ -88,7 +98,7 @@ class AttemptStateStore:
         requeue_source: str = "human",
         issue_title: str | None = None,
         continuation_index: int | None = None,
-        is_conflict_claim: bool = False,
+        attempt_kind: str = ATTEMPT_KIND_ORDINARY,
     ) -> AttemptCheckpoint:
         """Record the initial claimed phase for a new implementation attempt.
 
@@ -96,16 +106,18 @@ class AttemptStateStore:
         ``agent-auto-merge`` label at claim time, so recovery keeps the
         claim-time decision instead of re-reading the current labels.
         ``requeue_source`` captures how the attempt was requeued (``human``
-        when the issue carried ``ready-for-agent`` at claim time, otherwise
-        ``automatic``), so every attempt-result comment records the actual
+        when the issue carried ``ready-for-agent`` at claim time,
+        ``automatic`` for an automatic continuation, ``conflict`` for a
+        conflict requeue), so every attempt-result comment records the actual
         reason for the claim even across recovery.
         ``issue_title`` and ``continuation_index`` are computed once at claim
         so telemetry needs no tracker lookup for them; ``None`` means unknown
         (including checkpoints written before this change).
-        ``is_conflict_claim`` captures whether the claim routed to a conflict
-        attempt, so startup recovery publishes a conflict result (which
-        counts toward the conflict-attempt budget) instead of an ordinary
-        one after a restart.
+        ``attempt_kind`` captures whether the claim routed to a conflict
+        attempt (``conflict``) or the ordinary model-driven path
+        (``ordinary``), so startup recovery publishes a conflict result
+        (which counts toward the conflict-attempt budget) instead of an
+        ordinary one after a restart.
         """
 
         if self.read() is not None:
@@ -116,8 +128,8 @@ class AttemptStateStore:
             raise AttemptStateError("Branch must be a non-empty string")
         if not isinstance(auto_merge_opt_in, bool):
             raise AttemptStateError("Auto-merge opt-in must be a boolean")
-        if requeue_source not in ("human", "automatic"):
-            raise AttemptStateError("Requeue source must be 'human' or 'automatic'")
+        if requeue_source not in ("human", "automatic", "conflict"):
+            raise AttemptStateError("Requeue source must be 'human', 'automatic', or 'conflict'")
         if issue_title is not None and not isinstance(issue_title, str):
             raise AttemptStateError("Issue title must be a string or None")
         if continuation_index is not None and (
@@ -126,8 +138,8 @@ class AttemptStateStore:
             or continuation_index < 0
         ):
             raise AttemptStateError("Continuation index must be a non-negative integer or None")
-        if not isinstance(is_conflict_claim, bool):
-            raise AttemptStateError("Conflict-claim flag must be a boolean")
+        if attempt_kind not in ATTEMPT_KINDS:
+            raise AttemptStateError("Attempt kind must be 'ordinary' or 'conflict'")
 
         timestamp = self._next_timestamp()
         checkpoint = AttemptCheckpoint(
@@ -140,7 +152,7 @@ class AttemptStateStore:
             requeue_source=requeue_source,
             issue_title=issue_title,
             continuation_index=continuation_index,
-            is_conflict_claim=is_conflict_claim,
+            attempt_kind=attempt_kind,
         )
         self._write(checkpoint)
         return checkpoint
@@ -167,7 +179,7 @@ class AttemptStateStore:
             requeue_source=checkpoint.requeue_source,
             issue_title=checkpoint.issue_title,
             continuation_index=checkpoint.continuation_index,
-            is_conflict_claim=checkpoint.is_conflict_claim,
+            attempt_kind=checkpoint.attempt_kind,
         )
         self._write(transitioned)
         return transitioned
@@ -236,7 +248,7 @@ def _checkpoint_to_json(checkpoint: AttemptCheckpoint) -> dict[str, bool | int |
         "requeue_source": checkpoint.requeue_source,
         "issue_title": checkpoint.issue_title,
         "continuation_index": checkpoint.continuation_index,
-        "is_conflict_claim": checkpoint.is_conflict_claim,
+        "attempt_kind": checkpoint.attempt_kind,
     }
 
 
@@ -247,6 +259,10 @@ def _checkpoint_from_json(value: object) -> AttemptCheckpoint:
         "requeue_source",
         "issue_title",
         "continuation_index",
+        "attempt_kind",
+        # Checkpoints written before the kind existed carry neither key and
+        # read as ordinary; checkpoints written while the conflict claim was
+        # recorded under ``is_conflict_claim`` map that flag onto the kind.
         "is_conflict_claim",
     }
     if not isinstance(value, dict):
@@ -264,7 +280,16 @@ def _checkpoint_from_json(value: object) -> AttemptCheckpoint:
     requeue_source = value.get("requeue_source", "human")
     issue_title = value.get("issue_title", None)
     continuation_index = value.get("continuation_index", None)
-    is_conflict_claim = value.get("is_conflict_claim", False)
+    attempt_kind = value.get("attempt_kind", None)
+    if attempt_kind is None:
+        # The kind postdates both earlier shapes: checkpoints with no kind
+        # read as ordinary, except ones whose conflict claim was recorded
+        # under the earlier boolean flag, which map onto a conflict kind so
+        # a restart still recovers them as conflict attempts.
+        if value.get("is_conflict_claim", False) is True:
+            attempt_kind = ATTEMPT_KIND_CONFLICT
+        else:
+            attempt_kind = ATTEMPT_KIND_ORDINARY
     if isinstance(issue_number, bool) or not isinstance(issue_number, int) or issue_number <= 0:
         raise ValueError("invalid issue number")
     if not isinstance(branch, str) or not branch.strip():
@@ -275,7 +300,7 @@ def _checkpoint_from_json(value: object) -> AttemptCheckpoint:
         raise ValueError("invalid timestamps")
     if not isinstance(auto_merge_opt_in, bool):
         raise ValueError("invalid auto-merge opt-in")
-    if requeue_source not in ("human", "automatic"):
+    if requeue_source not in ("human", "automatic", "conflict"):
         raise ValueError("invalid requeue source")
     if issue_title is not None and not isinstance(issue_title, str):
         raise ValueError("invalid issue title")
@@ -285,7 +310,9 @@ def _checkpoint_from_json(value: object) -> AttemptCheckpoint:
         or continuation_index < 0
     ):
         raise ValueError("invalid continuation index")
-    if not isinstance(is_conflict_claim, bool):
+    if attempt_kind not in ATTEMPT_KINDS:
+        raise ValueError("invalid attempt kind")
+    if "is_conflict_claim" in value and value["is_conflict_claim"] not in (True, False):
         raise ValueError("invalid conflict-claim flag")
     _parse_timestamp(started_at)
     _parse_timestamp(updated_at)
@@ -299,7 +326,7 @@ def _checkpoint_from_json(value: object) -> AttemptCheckpoint:
         requeue_source=requeue_source,
         issue_title=issue_title,
         continuation_index=continuation_index,
-        is_conflict_claim=is_conflict_claim,
+        attempt_kind=attempt_kind,
     )
 
 

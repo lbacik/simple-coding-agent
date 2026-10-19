@@ -138,8 +138,11 @@ class ConflictPublicationRequest:
     ``conflicted_files`` names the files the rebase conflicted in,
     ``extra_files`` the files a model resolution changed outside them, and
     ``fix_commits`` the fix commits it added on top. The comment carries no
-    requeue-source marker, keeping the attempt transparent to the
-    automatic-continuation count.
+    requeue-source marker (``requeue_source`` is ``None``), keeping the
+    attempt transparent to the automatic-continuation count; startup
+    recovery of a retained conflict attempt sets it to the ``conflict``
+    requeue source so the failure comment records how the attempt was
+    requeued.
 
     ``conflict_index``/``conflict_budget`` render the ``k/N`` standing line
     every conflict result carries (``conflict_index`` is the resulting
@@ -175,6 +178,14 @@ class ConflictPublicationRequest:
     escalate: bool = False
     conflict_prior: int = 0
     failure_output: str = ""
+    #: The requeue source recorded in the result comment (``None`` renders
+    #: no marker, keeping the attempt transparent to the
+    #: automatic-continuation count).
+    requeue_source: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.requeue_source is not None:
+            requeue_source_marker(self.requeue_source)
 
 
 class Publisher:
@@ -730,8 +741,9 @@ def _conflict_result_comment(
     The header names the conflict outcome (``success``, ``skipped``, or a
     failure kind), not the lifecycle outcome. The comment carries the
     attempt marker for publication dedup and the conflict-attempt marker
-    (outcome plus pushed sha), and deliberately no requeue-source marker, so
-    the automatic-continuation count stays transparent to conflict attempts.
+    (outcome plus pushed sha), plus the requeue-source marker only when the
+    request sets one, so ordinary conflict attempts stay transparent to the
+    automatic-continuation count.
     Every result carries the ``k/N`` standing line (omitted only when the
     operator budget is zero). The attempt whose failure reaches the budget
     escalates: its comment gains the human-handoff section (the failure
@@ -802,6 +814,11 @@ def _conflict_result_comment(
         fix_commits=request.fix_commits,
         extra_files=request.extra_files,
     )
+    source_line = (
+        f"\n{requeue_source_marker(request.requeue_source)}"
+        if request.requeue_source is not None
+        else ""
+    )
     return (
         f"## Conflict Attempt Result: {conflict_outcome}\n\n"
         f"**Branch**: {branch}\n"
@@ -819,6 +836,7 @@ def _conflict_result_comment(
         f"{escalation_section}"
         f"{marker}\n"
         f"{conflict_marker}"
+        f"{source_line}"
     )
 
 

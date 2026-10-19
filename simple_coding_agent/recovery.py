@@ -66,16 +66,25 @@ def attempt_marker(attempt_id: str) -> str:
 #: The claim-time reason an attempt was requeued, recorded as a hidden HTML
 #: marker in every attempt-result comment. ``human`` means the issue carried
 #: ``ready-for-agent`` when it was claimed; ``automatic`` means it carried
-#: only ``round-finished`` (an automatic continuation without a human requeue).
+#: only ``round-finished`` (an automatic continuation without a human requeue);
+#: ``conflict`` means it carried ``merge-conflict`` (a conflict requeue that
+#: only brings an already-published branch up to date).
 REQUEUE_SOURCE_HUMAN = "human"
 REQUEUE_SOURCE_AUTOMATIC = "automatic"
+REQUEUE_SOURCE_CONFLICT = "conflict"
+
+REQUEUE_SOURCES = frozenset(
+    {REQUEUE_SOURCE_HUMAN, REQUEUE_SOURCE_AUTOMATIC, REQUEUE_SOURCE_CONFLICT}
+)
 
 
 def requeue_source_marker(source: str) -> str:
     """The durable issue-comment marker recording one attempt's requeue source."""
 
-    if source not in (REQUEUE_SOURCE_HUMAN, REQUEUE_SOURCE_AUTOMATIC):
-        raise ValueError(f"Invalid requeue source {source!r}: must be 'human' or 'automatic'")
+    if source not in REQUEUE_SOURCES:
+        raise ValueError(
+            f"Invalid requeue source {source!r}: must be 'human', 'automatic', or 'conflict'"
+        )
     return f"<!-- requeue-source: {source} -->"
 
 
@@ -86,6 +95,8 @@ def parse_requeue_source(body: str) -> str | None:
     ``None`` (a legacy result, counted as a human requeue).
     """
 
+    if requeue_source_marker(REQUEUE_SOURCE_CONFLICT) in body:
+        return REQUEUE_SOURCE_CONFLICT
     if requeue_source_marker(REQUEUE_SOURCE_AUTOMATIC) in body:
         return REQUEUE_SOURCE_AUTOMATIC
     if requeue_source_marker(REQUEUE_SOURCE_HUMAN) in body:
