@@ -537,9 +537,9 @@ class GitHubGraphQLTransport:
 
         If the label does not exist in the repository yet, it is created
         automatically so the tracker never crashes on uninitialized labels.
-        When another worker creates the same label concurrently, GitHub
+        When another process creates the same label concurrently, GitHub
         rejects the creation as already existing; the existing label is then
-        re-read and applied as if this worker had created it.
+        re-read and applied as if this process had created it.
         """
 
         data = self._execute(
@@ -610,7 +610,7 @@ class GitHubGraphQLTransport:
     def _reread_label_id_after_conflict(
         self, issue_id: str, label: str, error: GitHubTrackerError
     ) -> str:
-        """Re-read the label id created concurrently by another worker."""
+        """Re-read the label id created concurrently by another process."""
 
         data = self._execute(
             """
@@ -871,7 +871,7 @@ def _graphql_error_summary(response_data: object) -> str:
 
 
 def _is_label_already_exists_error(error: GitHubTrackerError) -> bool:
-    """Whether a label-creation failure means another worker won the race."""
+    """Whether a label-creation failure means another process won the race."""
 
     return "already exists" in str(error).lower().replace("_", " ")
 
