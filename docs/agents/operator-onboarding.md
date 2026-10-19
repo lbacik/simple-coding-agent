@@ -124,6 +124,23 @@ with a `<!-- conflict-attempt: ... -->` marker. If the entry check finds
 anything other than an open, non-draft, `CONFLICTING` pull request
 against the profile's base branch, the attempt ends `skipped`.
 
+The same setting bounds the attempts: N consecutive failures on one issue
+(an unresolved conflict, a red check, an infrastructure error, or a push
+that leaves the remote head unchanged) escalate instead of requeueing.
+The attempt whose failure reaches the budget posts the handoff in its own
+result comment — the `k/N` standing, the failure tail or reason in a
+collapsed section, a pull-request link, and a line telling you to remove
+`ready-for-human` to grant N more attempts — and labels the issue
+`ready-for-human` (created when missing), emitting a `conflict_escalated`
+event. Every conflict result carries its `k/N` standing. While the label
+is present the detector will not relabel the issue and the queue will not
+claim it, even with a hand-applied `merge-conflict`; the agent never
+removes the label. Remove `ready-for-human` to hand the issue back: the
+escalation comment stops the streak, so the next poll requeues with the
+full budget and N more failures are needed to escalate again. The budget
+is enforced at escalation, never at claim time. See
+[ADR 0007](../adr/0007-conflict-attempt-budget.md).
+
 Like the other budgets, the setting is operator-only on purpose: it lives
 in `.env`, never in the repository profile (an unknown profile key is
 refused), so an agent-written PR cannot raise its own conflict budget.

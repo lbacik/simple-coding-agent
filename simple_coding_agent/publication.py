@@ -11,6 +11,9 @@ from simple_coding_agent.attempt_state import AttemptPhase, AttemptStateStore
 from simple_coding_agent.attempt_workspace import BranchPusher
 from simple_coding_agent.git_workspace import GitWorkspaceError
 from simple_coding_agent.recovery import (
+    CONFLICT_ESCALATION_MARKER,
+    CONFLICT_OUTCOME_NO_CHANGE,
+    CONFLICT_OUTCOME_SUCCESS,
     REQUEUE_SOURCE_HUMAN,
     conflict_attempt_marker,
     requeue_source_marker,
@@ -113,6 +116,12 @@ class PublicationResult:
     comment_posted: bool = True
     details: str = ""
     merge_result: str | None = None
+    #: The conflict-attempt marker outcome actually published (``""`` for
+    #: ordinary attempts). A success-path push that left the remote head
+    #: unchanged publishes ``no_change`` instead of ``success``.
+    conflict_outcome: str = ""
+    #: Whether the published conflict comment escalated to a human.
+    escalated: bool = False
 
 
 @dataclass(frozen=True)
@@ -131,6 +140,17 @@ class ConflictPublicationRequest:
     ``fix_commits`` the fix commits it added on top. The comment carries no
     requeue-source marker, keeping the attempt transparent to the
     automatic-continuation count.
+
+    ``conflict_index``/``conflict_budget`` render the ``k/N`` standing line
+    every conflict result carries (``conflict_index`` is the resulting
+    consecutive-failure count, or 0 once a success or skip resets the
+    streak; 0 budget omits the line). ``escalate`` marks the attempt whose
+    failure reaches the budget: its own comment becomes the escalation
+    comment. ``conflict_prior`` is the streak before this attempt, so a
+    success-path push that leaves the remote head unchanged can still be
+    reported (and escalated) as ``no_change``. ``failure_output`` is the
+    tail of the last check output (or the failure reason) quoted in the
+    escalation's collapsed section.
     """
 
     issue_number: int
@@ -150,6 +170,11 @@ class ConflictPublicationRequest:
     auto_merge_opt_in: bool = False
     extra_files: tuple[str, ...] = ()
     fix_commits: tuple[str, ...] = ()
+    conflict_index: int = 0
+    conflict_budget: int = 0
+    escalate: bool = False
+    conflict_prior: int = 0
+    failure_output: str = ""
 
 
 class Publisher:
@@ -295,6 +320,8 @@ class Publisher:
         deadline = self._monotonic() + effective_timeout
         outcome = request.outcome
         conflict_outcome = request.conflict_outcome
+        conflict_index = request.conflict_index
+        escalate = request.escalate
         branch_url: str | None = None
         pushed_sha: str | None = None
         details = request.details
@@ -320,12 +347,41 @@ class Publisher:
                 outcome = AttemptOutcome.INFRASTRUCTURE_ERROR
                 conflict_outcome = "push_failed"
                 details = "; ".join((request.details, push_failure)) if request.details else push_failure
+                conflict_index, escalate = _conflict_failure_standing(request)
                 comment_posted = self._post_conflict_result(
-                    request, outcome, conflict_outcome, branch_url, None, details, None, None
+                    request,
+                    outcome,
+                    conflict_outcome,
+                    branch_url,
+                    None,
+                    details,
+                    None,
+                    None,
+                    conflict_index=conflict_index,
+                    escalate=escalate,
                 )
                 return PublicationResult(
-                    outcome, branch_url, request.pull_request, comment_posted, details
+                    outcome,
+                    branch_url,
+                    request.pull_request,
+                    comment_posted,
+                    details,
+                    None,
+                    conflict_outcome,
+                    escalate,
                 )
+            if (
+                conflict_outcome == CONFLICT_OUTCOME_SUCCESS
+                and pushed_sha
+                and request.pull_request is not None
+                and request.pull_request.head_sha
+                and pushed_sha == request.pull_request.head_sha
+            ):
+                # The green push changed nothing on the remote branch: report
+                # it as ``no_change`` (a failure toward the budget) while the
+                # verified green outcome stands.
+                conflict_outcome = CONFLICT_OUTCOME_NO_CHANGE
+                conflict_index, escalate = _conflict_failure_standing(request)
 
         merge_result: str | None = None
         if request.push_branch and branch_url is not None and request.pull_request is not None:
@@ -345,9 +401,18 @@ class Publisher:
             details,
             merge_result,
             pushed_sha,
+            conflict_index=conflict_index,
+            escalate=escalate,
         )
         return PublicationResult(
-            outcome, branch_url, request.pull_request, comment_posted, details, merge_result
+            outcome,
+            branch_url,
+            request.pull_request,
+            comment_posted,
+            details,
+            merge_result,
+            conflict_outcome,
+            escalate,
         )
 
     def _mark_publishing(self) -> None:
@@ -506,6 +571,9 @@ class Publisher:
         details: str,
         merge_result: str | None,
         pushed_sha: str | None,
+        *,
+        conflict_index: int | None = None,
+        escalate: bool | None = None,
     ) -> bool:
         marker = f"<!-- agent-attempt: {request.started_at} -->"
         try:
@@ -524,12 +592,29 @@ class Publisher:
                     marker,
                     merge_result,
                     pushed_sha,
+                    conflict_index=(
+                        request.conflict_index if conflict_index is None else conflict_index
+                    ),
+                    escalate=request.escalate if escalate is None else escalate,
                 ),
             )
             return True
         except Exception:
             # The local result remains authoritative when GitHub is unavailable.
             return False
+
+
+def _conflict_failure_standing(request: ConflictPublicationRequest) -> tuple[int, bool]:
+    """The ``(index, escalate)`` for a conflict failure discovered at publish time.
+
+    A success-path outcome that turns into a failure only once the push is
+    observed (``push_failed``, or ``no_change`` when the remote head did not
+    move) counts one past the pre-publish streak; it escalates when that
+    count reaches the operator budget. A zero budget never escalates.
+    """
+
+    index = request.conflict_prior + 1
+    return index, request.conflict_budget > 0 and index >= request.conflict_budget
 
 
 def _review_lines(request: PublicationRequest) -> list[str]:
@@ -607,6 +692,25 @@ def _short_revisions(revisions: tuple[str, ...], *, length: int = 12) -> tuple[s
     )
 
 
+#: Cap for the failure text quoted in an escalation comment when no
+#: pre-trimmed check-output tail is available. Cut from the front so the
+#: most recent reason survives, like the existing result-comment limits.
+_ESCALATION_FAILURE_LIMIT = 4000
+
+
+def _escalation_failure_text(text: str) -> str:
+    """Trim a fallback escalation failure reason, keeping the tail visible."""
+
+    if not text.strip():
+        return "(no details recorded)"
+    if len(text) <= _ESCALATION_FAILURE_LIMIT:
+        return text
+    return (
+        f"...[truncated; showing the last {_ESCALATION_FAILURE_LIMIT} characters]\n"
+        f"{text[-_ESCALATION_FAILURE_LIMIT:]}"
+    )
+
+
 def _conflict_result_comment(
     request: ConflictPublicationRequest,
     outcome: AttemptOutcome,
@@ -617,6 +721,9 @@ def _conflict_result_comment(
     marker: str,
     merge_result: str | None,
     pushed_sha: str | None,
+    *,
+    conflict_index: int | None = None,
+    escalate: bool | None = None,
 ) -> str:
     """Build the conflict-attempt result comment with its machine-readable marker.
 
@@ -625,8 +732,16 @@ def _conflict_result_comment(
     attempt marker for publication dedup and the conflict-attempt marker
     (outcome plus pushed sha), and deliberately no requeue-source marker, so
     the automatic-continuation count stays transparent to conflict attempts.
+    Every result carries the ``k/N`` standing line (omitted only when the
+    operator budget is zero). The attempt whose failure reaches the budget
+    escalates: its comment gains the human-handoff section (the failure
+    tail or reason in a collapsed section, a link to the pull request, and
+    the hand-back line) plus the hidden escalation marker that stops the
+    streak, so removing ``ready-for-human`` requeues with the full budget.
     """
 
+    effective_index = request.conflict_index if conflict_index is None else conflict_index
+    effective_escalate = request.escalate if escalate is None else escalate
     if branch_url and pushed_sha:
         branch = f"[{request.branch}]({branch_url}) (sha `{pushed_sha}`)"
     elif branch_url:
@@ -635,6 +750,11 @@ def _conflict_result_comment(
         branch = f"`{request.branch}` (not pushed)"
     pr = f"[#{pull_request.number}]({pull_request.url})" if pull_request else "none"
     merge_line = f"**Merge**: {merge_result}\n" if merge_result is not None else ""
+    standing_line = (
+        f"**Conflict attempts**: {effective_index}/{request.conflict_budget}\n"
+        if request.conflict_budget > 0
+        else ""
+    )
     files_line = (
         f"- Conflicted files: {', '.join(request.conflicted_files)}\n"
         if request.conflicted_files
@@ -650,6 +770,30 @@ def _conflict_result_comment(
         if request.fix_commits
         else ""
     )
+    escalation_section = ""
+    if effective_escalate:
+        failure_text = request.failure_output or _escalation_failure_text(
+            details or request.reason
+        )
+        pr_link = (
+            f"[#{pull_request.number}]({pull_request.url})"
+            if pull_request is not None
+            else "none"
+        )
+        escalation_section = (
+            "### Human handoff\n\n"
+            f"The conflict-attempt budget is exhausted "
+            f"({effective_index}/{request.conflict_budget} consecutive failures). "
+            "The issue is labelled `ready-for-human`.\n\n"
+            "<details>\n"
+            "<summary>Failure output (tail)</summary>\n\n"
+            f"{failure_text}\n\n"
+            "</details>\n\n"
+            f"Pull request: {pr_link}\n\n"
+            f"Remove the `ready-for-human` label to hand the issue back "
+            f"for {request.conflict_budget} more attempts.\n\n"
+            f"{CONFLICT_ESCALATION_MARKER}\n\n"
+        )
     conflict_marker = conflict_attempt_marker(
         conflict_outcome,
         sha=pushed_sha,
@@ -663,7 +807,8 @@ def _conflict_result_comment(
         f"**Branch**: {branch}\n"
         f"**PR**: {pr}\n"
         f"{merge_line}"
-        f"**Lifecycle outcome**: {outcome.value}\n\n"
+        f"**Lifecycle outcome**: {outcome.value}\n"
+        f"{standing_line}\n"
         "### Evidence\n"
         f"- Check command: `{request.check_command}` → exit code {request.check_exit_code}\n"
         f"{files_line}"
@@ -671,6 +816,7 @@ def _conflict_result_comment(
         f"{fixes_line}\n"
         "### Details\n"
         f"{details}\n\n"
+        f"{escalation_section}"
         f"{marker}\n"
         f"{conflict_marker}"
     )

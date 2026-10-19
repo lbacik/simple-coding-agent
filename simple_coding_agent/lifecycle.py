@@ -85,6 +85,9 @@ from simple_coding_agent.conflict_attempt import (
     entry_skip_reason as _conflict_entry_skip_reason,
 )
 from simple_coding_agent.conflict_attempt import (
+    failure_output_tail as _conflict_failure_output_tail,
+)
+from simple_coding_agent.conflict_attempt import (
     files_outside_conflict as _conflict_files_outside,
 )
 from simple_coding_agent.conflict_attempt import (
@@ -339,6 +342,10 @@ class AttemptTracker(Protocol):
     def claim_verified(self, issue: TrackerIssue) -> Claim: ...
 
     def automatic_continuation_count(self, issue: TrackerIssue) -> int: ...
+
+    def conflict_failure_streak(self, issue: TrackerIssue) -> int: ...
+
+    def escalate_conflict_to_human(self, issue: TrackerIssue) -> None: ...
 
     def recover_claim(self, issue_number: int) -> Claim | None: ...
 
@@ -2842,6 +2849,88 @@ class AgentLifecycle:
             return 0
         return int(counter(issue))
 
+    def _conflict_failure_streak(self, issue: TrackerIssue) -> int:
+        """The issue's consecutive failed conflict attempts since the last stop.
+
+        Trackers without the seam (older test doubles) read as zero, which
+        keeps the budget disabled-safe: with a zero budget the count is
+        never consulted for escalation.
+        """
+
+        counter = getattr(self._tracker, "conflict_failure_streak", None)
+        if not callable(counter):
+            return 0
+        return int(counter(issue))
+
+    def _stamp_conflict_budget(
+        self, claim: Claim, request: ConflictPublicationRequest
+    ) -> ConflictPublicationRequest:
+        """Stamp the pre-publish budget standing onto a conflict request.
+
+        A ``success`` or ``skipped`` outcome resets the streak to zero; any
+        other outcome counts one past the current streak and escalates when
+        that count reaches the operator budget. The budget is enforced here
+        at escalation time, never at claim time, so lowering it below a
+        running streak escalates on the next failure. A ``success``-path
+        push that leaves the remote head unchanged is still reported (and
+        escalated) as ``no_change`` by publication, from ``conflict_prior``.
+        """
+
+        budget = self._max_conflict_attempts
+        prior = self._conflict_failure_streak(claim.issue)
+        if request.conflict_outcome in (
+            CONFLICT_OUTCOME_SUCCESS,
+            CONFLICT_OUTCOME_SKIPPED,
+        ):
+            index, escalate = 0, False
+        else:
+            index = prior + 1
+            escalate = budget > 0 and index >= budget
+        return replace(
+            request,
+            conflict_prior=prior,
+            conflict_index=index,
+            conflict_budget=budget,
+            escalate=escalate,
+        )
+
+    def _maybe_escalate_conflict_to_human(
+        self, claim: Claim, published: object, escalate: bool
+    ) -> None:
+        """Hand a budget-exhausted issue to a human after its comment posts.
+
+        Only the escalating attempt's own result comment escalates, and only
+        once its comment is confirmed posted: the label (created in the
+        repository when missing) gates both the detector and the queue until
+        a human removes it, which requeues with the full budget. The agent
+        never removes ``ready-for-human``. A label failure is a warning, not
+        a failed attempt: the posted escalation comment still stops the
+        streak, so the next poll requeues instead of looping.
+        """
+
+        if not escalate:
+            return
+        if not getattr(published, "comment_posted", True):
+            return
+        try:
+            escalator = getattr(self._tracker, "escalate_conflict_to_human", None)
+            if callable(escalator):
+                escalator(claim.issue)
+            self._event_log(
+                "conflict_escalated",
+                f"issue #{claim.issue.number}; conflict attempts exhausted; "
+                "labelled ready-for-human",
+                level="WARNING",
+                issue_number=claim.issue.number,
+            )
+        except Exception as error:
+            self._event_log(
+                "conflict_escalation_failed",
+                _exception_detail(error),
+                level="WARNING",
+                issue_number=claim.issue.number,
+            )
+
     def _emit_auto_continuation_claim(
         self, issue_number: int, auto_count: int | None
     ) -> None:
@@ -3453,7 +3542,7 @@ class AgentLifecycle:
                     claim, checkpoint
                 )
                 publication_started_at = self._clock()
-                published = self._publish_conflict_bounded(conflict_request)
+                published = self._publish_conflict_bounded(conflict_request, claim)
                 outcome = published.outcome
                 comment_posted = getattr(published, "comment_posted", True)
                 retain_branch = getattr(published, "branch_url", None) is None and (
@@ -3599,7 +3688,8 @@ class AgentLifecycle:
                 published = self._publish_conflict_bounded(
                     self._conflict_rebase_request(
                         claim, checkpoint, prepared, profile, None, error.conflicted_files
-                    )
+                    ),
+                    claim,
                 )
                 outcome = published.outcome
             else:
@@ -3620,7 +3710,8 @@ class AgentLifecycle:
                 published = self._publish_conflict_bounded(
                     self._conflict_error_request(
                         claim, checkpoint, prepared, profile, _exception_detail(error)
-                    )
+                    ),
+                    claim,
                 )
                 outcome = published.outcome
             else:
@@ -3645,7 +3736,8 @@ class AgentLifecycle:
                     published = self._publish_conflict_bounded(
                         self._conflict_error_request(
                             claim, checkpoint, prepared, profile, _exception_detail(error)
-                        )
+                        ),
+                        claim,
                     )
                     outcome = published.outcome
                 else:
@@ -3886,6 +3978,7 @@ class AgentLifecycle:
                 requeue_source=source,
                 issue_title=claim.issue.title,
                 continuation_index=continuation_index,
+                is_conflict_claim=is_conflict,
             )
             self._attempt_processing = True
             self._telemetry_begin_for_checkpoint(checkpoint)
@@ -4036,6 +4129,7 @@ class AgentLifecycle:
             requeue_source=source,
             issue_title=claim.issue.title,
             continuation_index=continuation_index,
+            is_conflict_claim=_is_conflict_claim(fresh.labels),
         )
         self._attempt_processing = True
         self._telemetry_begin_for_checkpoint(checkpoint)
@@ -4889,39 +4983,62 @@ class AgentLifecycle:
                 if note_commit is not None:
                     note_commit_sha = note_commit.revision
             publication_started_at = self._clock()
-            published = self._publish_bounded(
-                PublicationRequest(
-                    issue_number=claim.issue.number,
-                    issue_title=claim.issue.title,
-                    branch=prepared.branch,
-                    started_at=checkpoint.started_at,
-                    decision=decision,
-                    check_command="not rerun during startup recovery",
-                    check_exit_code=None,
-                    review_cycles=0,
-                    review_findings="not rerun during startup recovery",
-                    details=self._handoff_publication_details(
-                        claim, checkpoint, details, decision.outcome
+            if checkpoint.is_conflict_claim:
+                # A retained conflict attempt recovers as a conflict error
+                # (a failure toward the budget, possibly escalating), never
+                # as an ordinary result: an ordinary marker would stop the
+                # streak and grant a fresh budget the attempt did not earn.
+                published = self._publish_conflict_bounded(
+                    self._conflict_error_request(
+                        claim,
+                        checkpoint,
+                        prepared,
+                        profile,
+                        "Attempt was interrupted by a restart before a result "
+                        "could be verified; the remote branch is left untouched.",
                     ),
-                    base_branch=profile.base_branch,
-                    note_commit_sha=note_commit_sha,
-                    auto_merge_opt_in=_claim_time_opt_in(claim, checkpoint),
-                    requeue_source=_claim_time_requeue_source(claim, checkpoint),
+                    claim,
                 )
-            )
-            outcome = published.outcome
-            comment_posted = getattr(published, "comment_posted", True)
-            retain_branch = (
-                getattr(published, "branch_url", None) is None
-                and has_commits
-                and (
-                    outcome is AttemptOutcome.INFRASTRUCTURE_ERROR
-                    or (
-                        outcome is AttemptOutcome.INCOMPLETE
-                        and decision.publication_path is PublicationPath.PARTIAL
+                outcome = published.outcome
+                comment_posted = getattr(published, "comment_posted", True)
+                retain_branch = (
+                    getattr(published, "branch_url", None) is None
+                    and outcome is AttemptOutcome.INFRASTRUCTURE_ERROR
+                )
+            else:
+                published = self._publish_bounded(
+                    PublicationRequest(
+                        issue_number=claim.issue.number,
+                        issue_title=claim.issue.title,
+                        branch=prepared.branch,
+                        started_at=checkpoint.started_at,
+                        decision=decision,
+                        check_command="not rerun during startup recovery",
+                        check_exit_code=None,
+                        review_cycles=0,
+                        review_findings="not rerun during startup recovery",
+                        details=self._handoff_publication_details(
+                            claim, checkpoint, details, decision.outcome
+                        ),
+                        base_branch=profile.base_branch,
+                        note_commit_sha=note_commit_sha,
+                        auto_merge_opt_in=_claim_time_opt_in(claim, checkpoint),
+                        requeue_source=_claim_time_requeue_source(claim, checkpoint),
                     )
                 )
-            )
+                outcome = published.outcome
+                comment_posted = getattr(published, "comment_posted", True)
+                retain_branch = (
+                    getattr(published, "branch_url", None) is None
+                    and has_commits
+                    and (
+                        outcome is AttemptOutcome.INFRASTRUCTURE_ERROR
+                        or (
+                            outcome is AttemptOutcome.INCOMPLETE
+                            and decision.publication_path is PublicationPath.PARTIAL
+                        )
+                    )
+                )
         except DirtyWorkspaceError as error:
             # Unexplained dirty or untracked work: hold intake and preserve
             # the branch, checkpoint, and entire working tree for inspection.
@@ -4954,12 +5071,25 @@ class AgentLifecycle:
             raise
         except RebaseConflictError as error:
             publication_started_at = self._clock()
-            published = self._publish_rebase_conflict(
-                claim, checkpoint.started_at, prepared, profile, error,
-                timeout=self._handoff_publish_budget(),
-                auto_merge_opt_in=_claim_time_opt_in(claim, checkpoint),
-                requeue_source=_claim_time_requeue_source(claim, checkpoint),
-            )
+            if checkpoint.is_conflict_claim:
+                published = self._publish_conflict_bounded(
+                    self._conflict_rebase_request(
+                        claim,
+                        checkpoint,
+                        prepared,
+                        profile,
+                        None,
+                        error.conflicted_files,
+                    ),
+                    claim,
+                )
+            else:
+                published = self._publish_rebase_conflict(
+                    claim, checkpoint.started_at, prepared, profile, error,
+                    timeout=self._handoff_publish_budget(),
+                    auto_merge_opt_in=_claim_time_opt_in(claim, checkpoint),
+                    requeue_source=_claim_time_requeue_source(claim, checkpoint),
+                )
             outcome = AttemptOutcome.INFRASTRUCTURE_ERROR
             comment_posted = getattr(published, "comment_posted", True)
         except Exception as error:
@@ -4967,12 +5097,24 @@ class AgentLifecycle:
                 "attempt_exception", _exception_detail(error), level="ERROR", issue_number=claim.issue.number
             )
             publication_started_at = self._clock()
-            published = self._publish_terminal(
-                claim, checkpoint.started_at, prepared, profile, AttemptOutcome.INFRASTRUCTURE_ERROR,
-                timeout=self._handoff_publish_budget(),
-                auto_merge_opt_in=_claim_time_opt_in(claim, checkpoint),
-                requeue_source=_claim_time_requeue_source(claim, checkpoint),
-            )
+            if checkpoint.is_conflict_claim:
+                published = self._publish_conflict_bounded(
+                    self._conflict_error_request(
+                        claim,
+                        checkpoint,
+                        prepared,
+                        profile,
+                        _exception_detail(error),
+                    ),
+                    claim,
+                )
+            else:
+                published = self._publish_terminal(
+                    claim, checkpoint.started_at, prepared, profile, AttemptOutcome.INFRASTRUCTURE_ERROR,
+                    timeout=self._handoff_publish_budget(),
+                    auto_merge_opt_in=_claim_time_opt_in(claim, checkpoint),
+                    requeue_source=_claim_time_requeue_source(claim, checkpoint),
+                )
             outcome = AttemptOutcome.INFRASTRUCTURE_ERROR
             comment_posted = getattr(published, "comment_posted", True)
         except BaseException as error:
@@ -4981,12 +5123,24 @@ class AgentLifecycle:
             )
             try:
                 publication_started_at = self._clock()
-                published = self._publish_terminal(
-                    claim, checkpoint.started_at, prepared, profile, AttemptOutcome.INFRASTRUCTURE_ERROR,
-                    timeout=self._handoff_publish_budget(),
-                    auto_merge_opt_in=_claim_time_opt_in(claim, checkpoint),
-                    requeue_source=_claim_time_requeue_source(claim, checkpoint),
-                )
+                if checkpoint.is_conflict_claim:
+                    published = self._publish_conflict_bounded(
+                        self._conflict_error_request(
+                            claim,
+                            checkpoint,
+                            prepared,
+                            profile,
+                            _exception_detail(error),
+                        ),
+                        claim,
+                    )
+                else:
+                    published = self._publish_terminal(
+                        claim, checkpoint.started_at, prepared, profile, AttemptOutcome.INFRASTRUCTURE_ERROR,
+                        timeout=self._handoff_publish_budget(),
+                        auto_merge_opt_in=_claim_time_opt_in(claim, checkpoint),
+                        requeue_source=_claim_time_requeue_source(claim, checkpoint),
+                    )
                 comment_posted = getattr(published, "comment_posted", True)
             except Exception:
                 comment_posted = False
@@ -5619,6 +5773,7 @@ class AgentLifecycle:
                 check_command=check_command,
                 check_exit_code=check_result.exit_code,
                 conflicted_files=tuple(conflicted),
+                failure_output=_conflict_failure_output_tail(check_result),
             )
         self._attempt_state.transition(AttemptPhase.PUSHING)
         self._event_log(
@@ -5771,8 +5926,15 @@ class AgentLifecycle:
         conflicted_files: tuple[str, ...] = (),
         extra_files: tuple[str, ...] = (),
         fix_commits: tuple[str, ...] = (),
+        failure_output: str = "",
     ) -> ConflictPublicationRequest:
-        """Build one conflict publication request from its outcome and evidence."""
+        """Build one conflict publication request from its outcome and evidence.
+
+        ``failure_output`` is the tail of the last check output quoted in
+        the escalation's collapsed section when this attempt is the one
+        whose failure reaches the budget; failures without command output
+        fall back to the reason and details at render time.
+        """
 
         return ConflictPublicationRequest(
             issue_number=claim.issue.number,
@@ -5792,6 +5954,7 @@ class AgentLifecycle:
             auto_merge_opt_in=_claim_time_opt_in(claim, checkpoint),
             extra_files=tuple(extra_files),
             fix_commits=tuple(fix_commits),
+            failure_output=failure_output,
         )
 
     def _conflict_error_request(
@@ -5848,14 +6011,24 @@ class AgentLifecycle:
             conflicted_files=tuple(conflicted_files),
         )
 
-    def _publish_conflict_bounded(self, request: ConflictPublicationRequest):
-        """Publish a conflict attempt, bounding the call by the handoff budget."""
+    def _publish_conflict_bounded(self, request: ConflictPublicationRequest, claim: Claim):
+        """Publish a conflict attempt, bounding the call by the handoff budget.
 
+        The request is stamped with the pre-publish budget standing first
+        (the streak is read here, never at claim time); when the published
+        result escalated and its comment posted, the issue is handed to a
+        human with ``ready-for-human``.
+        """
+
+        stamped = self._stamp_conflict_budget(claim, request)
         budget = self._handoff_publish_budget()
         if budget is None:
-            published = self._publisher.publish_conflict(request)
+            published = self._publisher.publish_conflict(stamped)
         else:
-            published = self._publisher.publish_conflict(request, timeout=budget)
+            published = self._publisher.publish_conflict(stamped, timeout=budget)
+        self._maybe_escalate_conflict_to_human(
+            claim, published, getattr(published, "escalated", stamped.escalate)
+        )
         # Remember the verified result for telemetry (no extra lookup), plus
         # the workspace state observed right after publication. The pull
         # request is also written into the attempt's archive record here, at

@@ -33,6 +33,7 @@ from simple_coding_agent.git_workspace import (
 from simple_coding_agent.github_tracker import (
     MERGE_CONFLICT,
     READY_FOR_AGENT,
+    READY_FOR_HUMAN,
     ROUND_FINISHED,
     Assignment,
     Claim,
@@ -40,6 +41,7 @@ from simple_coding_agent.github_tracker import (
     conflict_branch_issue_number,
     is_conflict_detection_eligible,
 )
+from simple_coding_agent.recovery import count_conflict_failures
 from simple_coding_agent.command_runner import (
     CommandExecution,
     CommandResult,
@@ -456,11 +458,22 @@ class FakeTracker:
         open_pull_requests: dict[str, PullRequest] | None = None,
         max_conflict_attempts: int = 0,
         event_log: Callable[..., None] | None = None,
+        comments: dict[int, list[tuple[str, str]]] | None = None,
+        peer_logins: list[str] | None = None,
     ) -> None:
         self.issues = dict(issues or {})
         self.fifo: list[int] = list(fifo or [])
         self.next_claim = next_claim
         self.auto_counts = dict(auto_counts or {})
+        # Issue comments as ``(author_login, body)`` rows in oldest-first
+        # order, mirroring the production comment listing; the streak reads
+        # them newest first under the same authorship rule.
+        self.comments = {
+            number: list(rows) for number, rows in (comments or {}).items()
+        }
+        self.peer_logins = frozenset(peer_logins or ())
+        # Issue numbers handed to a human through ``ready-for-human``.
+        self.escalated: list[int] = []
         if next_claim is not None:
             self.issues.setdefault(next_claim.issue.number, next_claim.issue)
         self.fetch_errors: dict[int, Exception] = {}
@@ -558,6 +571,28 @@ class FakeTracker:
 
         return self.auto_counts.get(issue.number, 0)
 
+    def conflict_failure_streak(self, issue: TrackerIssue) -> int:
+        """Count consecutive failed conflict attempts from the seeded comments.
+
+        Only rows authored by the worker identity (``agent``) or a seeded
+        peer login are examined, newest first, under the same stopping rule
+        as the production tracker; any other row is ignored.
+        """
+
+        allowed = {"agent"} | set(self.peer_logins)
+        bodies = tuple(
+            body
+            for author, body in reversed(self.comments.get(issue.number, []))
+            if author and author in allowed
+        )
+        return count_conflict_failures(bodies)
+
+    def escalate_conflict_to_human(self, issue: TrackerIssue) -> None:
+        """Record the ``ready-for-human`` handoff, mirroring the production label."""
+
+        self.escalated.append(issue.number)
+        self.added_labels.append((issue.id, READY_FOR_HUMAN))
+
     def claim_verified(self, issue: TrackerIssue) -> Claim:
         if issue.number in self.assign_errors:
             raise self.assign_errors[issue.number]
@@ -601,6 +636,8 @@ class PublishedAttempt:
     branch_url: str | None
     comment_posted: bool = True
     pull_request: object = None
+    conflict_outcome: str = ""
+    escalated: bool = False
 
 
 class FakePublisher:
@@ -679,6 +716,8 @@ class FakePublisher:
             branch_url=branch_url,
             comment_posted=self._comment_posted,
             pull_request=request.pull_request,
+            conflict_outcome=getattr(request, "conflict_outcome", ""),
+            escalated=getattr(request, "escalate", False),
         )
 
 

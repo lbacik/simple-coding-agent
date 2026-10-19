@@ -49,6 +49,7 @@ class AttemptCheckpoint:
     requeue_source: str = "human"
     issue_title: str | None = None
     continuation_index: int | None = None
+    is_conflict_claim: bool = False
 
 
 class AttemptStateStore:
@@ -87,6 +88,7 @@ class AttemptStateStore:
         requeue_source: str = "human",
         issue_title: str | None = None,
         continuation_index: int | None = None,
+        is_conflict_claim: bool = False,
     ) -> AttemptCheckpoint:
         """Record the initial claimed phase for a new implementation attempt.
 
@@ -100,6 +102,10 @@ class AttemptStateStore:
         ``issue_title`` and ``continuation_index`` are computed once at claim
         so telemetry needs no tracker lookup for them; ``None`` means unknown
         (including checkpoints written before this change).
+        ``is_conflict_claim`` captures whether the claim routed to a conflict
+        attempt, so startup recovery publishes a conflict result (which
+        counts toward the conflict-attempt budget) instead of an ordinary
+        one after a restart.
         """
 
         if self.read() is not None:
@@ -120,6 +126,8 @@ class AttemptStateStore:
             or continuation_index < 0
         ):
             raise AttemptStateError("Continuation index must be a non-negative integer or None")
+        if not isinstance(is_conflict_claim, bool):
+            raise AttemptStateError("Conflict-claim flag must be a boolean")
 
         timestamp = self._next_timestamp()
         checkpoint = AttemptCheckpoint(
@@ -132,6 +140,7 @@ class AttemptStateStore:
             requeue_source=requeue_source,
             issue_title=issue_title,
             continuation_index=continuation_index,
+            is_conflict_claim=is_conflict_claim,
         )
         self._write(checkpoint)
         return checkpoint
@@ -158,6 +167,7 @@ class AttemptStateStore:
             requeue_source=checkpoint.requeue_source,
             issue_title=checkpoint.issue_title,
             continuation_index=checkpoint.continuation_index,
+            is_conflict_claim=checkpoint.is_conflict_claim,
         )
         self._write(transitioned)
         return transitioned
@@ -226,12 +236,19 @@ def _checkpoint_to_json(checkpoint: AttemptCheckpoint) -> dict[str, bool | int |
         "requeue_source": checkpoint.requeue_source,
         "issue_title": checkpoint.issue_title,
         "continuation_index": checkpoint.continuation_index,
+        "is_conflict_claim": checkpoint.is_conflict_claim,
     }
 
 
 def _checkpoint_from_json(value: object) -> AttemptCheckpoint:
     _required = {"issue_number", "branch", "phase", "started_at", "updated_at"}
-    _optional = {"auto_merge_opt_in", "requeue_source", "issue_title", "continuation_index"}
+    _optional = {
+        "auto_merge_opt_in",
+        "requeue_source",
+        "issue_title",
+        "continuation_index",
+        "is_conflict_claim",
+    }
     if not isinstance(value, dict):
         raise ValueError("invalid checkpoint shape")
     keys = set(value)
@@ -247,6 +264,7 @@ def _checkpoint_from_json(value: object) -> AttemptCheckpoint:
     requeue_source = value.get("requeue_source", "human")
     issue_title = value.get("issue_title", None)
     continuation_index = value.get("continuation_index", None)
+    is_conflict_claim = value.get("is_conflict_claim", False)
     if isinstance(issue_number, bool) or not isinstance(issue_number, int) or issue_number <= 0:
         raise ValueError("invalid issue number")
     if not isinstance(branch, str) or not branch.strip():
@@ -267,6 +285,8 @@ def _checkpoint_from_json(value: object) -> AttemptCheckpoint:
         or continuation_index < 0
     ):
         raise ValueError("invalid continuation index")
+    if not isinstance(is_conflict_claim, bool):
+        raise ValueError("invalid conflict-claim flag")
     _parse_timestamp(started_at)
     _parse_timestamp(updated_at)
     return AttemptCheckpoint(
@@ -279,6 +299,7 @@ def _checkpoint_from_json(value: object) -> AttemptCheckpoint:
         requeue_source=requeue_source,
         issue_title=issue_title,
         continuation_index=continuation_index,
+        is_conflict_claim=is_conflict_claim,
     )
 
 
