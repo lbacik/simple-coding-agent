@@ -24,6 +24,30 @@ handoff that uses up the budget says a human requeue is needed. Re-applying
 `ready-for-agent` resets the count and grants another N rounds, while
 removing `round-finished` stops automatic continuation at any time.
 
+## `merge-conflict` requeue
+
+`merge-conflict` returns an issue to the queue because the pull request a
+worker already published for it reports merge conflicts with the base
+branch. It is not a triage role: a human applies it to an otherwise
+ordinary issue, and the conflict attempt that follows only brings that
+pull request up to date — no model call runs, no new work is done.
+
+With the default `MAX_CONFLICT_ATTEMPTS=0`, the label is not part of the
+queue and a labelled issue waits untouched. With
+`MAX_CONFLICT_ATTEMPTS` above `0`, a `merge-conflict` issue that meets
+the base queue rules (open, unassigned, non-empty body, no open blockers)
+is claimed before automatic continuations and ordinary work; an issue
+labelled `ready-for-human` is excluded. If the issue also carries
+`ready-for-agent` or `round-finished`, those take precedence and the
+stale `merge-conflict` signal is removed at the claim.
+
+Every conflict attempt removes `merge-conflict` and the assignee, never
+adds `ready-for-agent` or `round-finished`, and posts a result comment
+stamped with a `<!-- conflict-attempt: ... -->` marker carrying the
+outcome (`success`, `skipped`, or a failure kind) and the pushed sha.
+Those comments are transparent to the automatic-continuation count: they
+neither consume nor reset the budget.
+
 ## `agent-auto-merge` opt-in
 
 The `agent-auto-merge` label opts one implementation issue into pull-request

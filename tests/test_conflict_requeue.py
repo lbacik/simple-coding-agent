@@ -48,6 +48,7 @@ from simple_coding_agent.github_tracker import (
     TrackerIssue,
     ineligibility_reason,
 )
+from simple_coding_agent.conflict_attempt import is_conflict_claim
 from simple_coding_agent.lifecycle import AgentLifecycle
 from simple_coding_agent.publication import ConflictPublicationRequest, PullRequest
 from simple_coding_agent.publication import _conflict_result_comment
@@ -474,6 +475,14 @@ def test_ready_for_human_excludes_conflict() -> None:
         ineligibility_reason(labelled, 7, max_conflict_attempts=2)
         == "issue #7 requires human implementation (labelled `ready-for-human`)"
     )
+
+
+def test_conflict_routing_matches_queue_gating() -> None:
+    assert is_conflict_claim(CONFLICT) is True
+    assert is_conflict_claim(CONFLICT | READY) is False
+    assert is_conflict_claim(CONFLICT | ROUND) is False
+    assert is_conflict_claim(CONFLICT | HUMAN) is False
+    assert is_conflict_claim(frozenset()) is False
 
 
 def test_ready_for_agent_takes_precedence_and_clears_label_at_claim() -> None:

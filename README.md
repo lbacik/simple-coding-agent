@@ -7,15 +7,25 @@ driving process owns GitHub calls, publication, cleanup, and polling.
 
 ## GitHub issue trust boundary
 
-The tracker selects only OPEN issues in `TARGET_REPO` that are labelled
-`ready-for-agent`, unassigned, have a non-empty body, and have no open native
-GitHub blockers. It orders eligible issues FIFO by creation date and rechecks
-eligibility immediately before assigning the authenticated GitHub identity.
+The tracker selects only OPEN issues in `TARGET_REPO` that are
+unassigned, have a non-empty body, and have no open native GitHub
+blockers, plus exactly one queue signal: `ready-for-agent` (ordinary
+work), only `round-finished` (an automatic continuation), or only
+`merge-conflict` (a conflict requeue). It orders eligible issues as
+conflict requeues first, then automatic continuations, then ordinary
+work, FIFO by creation date within each group, and rechecks eligibility
+immediately before assigning the authenticated GitHub identity.
 That check-then-set claim assumes one process; it is not a distributed lock.
 A handoff releases its issue labelled `round-finished`: with the operator
 setting `MAX_AUTO_CONTINUATIONS=N` (default `0`), a `round-finished` issue
 within budget is claimed automatically ahead of new work, up to N
 continuations in a row before a human requeue is needed again.
+A human-applied `merge-conflict` label returns an issue whose published
+pull request reports conflicts: with the operator setting
+`MAX_CONFLICT_ATTEMPTS` above `0` (default `0`, which disables the path),
+the conflict attempt rebases the published branch onto the base, checks
+it, and force-pushes only when green — no model call runs. An issue
+labelled `ready-for-human` is never eligible.
 
 Applying `ready-for-agent` is the human trust boundary: only repository
 collaborators with write access may apply it. The issue body is passed to the
@@ -28,9 +38,10 @@ Copy `.env.example` and set `GITHUB_TOKEN`, `META_API_KEY`, and `TARGET_REPO`
 (`owner/repo`). `DATA_DIR` defaults to `~/.simple-coding-agent/`; its default
 clone location is `$DATA_DIR/repo/`. Other defaults are `POLL_INTERVAL=60`,
 `LOG_LEVEL=INFO`, `MODEL_TIMEOUT=3600`, `PUBLISH_TIMEOUT=120`,
-`MAX_RETRIES=3`, `MAX_CONSECUTIVE_ERRORS=3`, and `MAX_AUTO_CONTINUATIONS=0`
+`MAX_RETRIES=3`, `MAX_CONSECUTIVE_ERRORS=3`, `MAX_AUTO_CONTINUATIONS=0`
 (no automatic continuation of `round-finished` issues without a human
-requeue).
+requeue), and `MAX_CONFLICT_ATTEMPTS=0` (no conflict requeue of
+`merge-conflict` issues).
 
 Use a fine-grained GitHub PAT limited to the configured repository with only
 `contents:write`, `pull-requests:write`, and `issues:write`. Configure provider
@@ -98,7 +109,8 @@ python -m simple_coding_agent
 ```
 
 It claims one issue at a time. On every terminal outcome, it posts the result,
-removes only its `ready-for-agent` label and assignment, then removes the
+removes only its queue label (`ready-for-agent`, or `merge-conflict` for a
+conflict attempt) and assignment, then removes the
 checkpoint. If the queue is empty, it sleeps for `POLL_INTERVAL` before polling
 again.
 

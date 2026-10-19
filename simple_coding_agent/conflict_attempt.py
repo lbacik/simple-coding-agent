@@ -16,6 +16,7 @@ from simple_coding_agent.completion import AttemptOutcome
 from simple_coding_agent.github_tracker import (
     MERGE_CONFLICT,
     READY_FOR_AGENT,
+    READY_FOR_HUMAN,
     ROUND_FINISHED,
 )
 from simple_coding_agent.publication import PullRequest
@@ -36,15 +37,17 @@ from simple_coding_agent.recovery import (
 def is_conflict_claim(labels: Container[str]) -> bool:
     """Whether a claim snapshot routes to a conflict attempt.
 
-    ``merge-conflict`` without ``ready-for-agent`` or ``round-finished``:
-    those take the ordinary (or continuation) path instead, and the stale
-    conflict signal is removed at the claim.
+    ``merge-conflict`` without ``ready-for-agent``, ``round-finished`` or
+    ``ready-for-human``: the first two take the ordinary (or continuation)
+    path instead with the stale conflict signal removed at the claim, and
+    a human-gated issue is never a conflict attempt.
     """
 
     return (
         MERGE_CONFLICT in labels
         and READY_FOR_AGENT not in labels
         and ROUND_FINISHED not in labels
+        and READY_FOR_HUMAN not in labels
     )
 
 

@@ -21,11 +21,11 @@ The orchestrator-owned follow-up that asks GitHub to merge a complete implementa
 _Avoid_: Merged issue, human merge
 
 **Eligible issue**:
-An implementation issue that the agent may claim: labelled `ready-for-agent`, OPEN, unassigned, with a non-empty body, and no open native GitHub blockers.
+An implementation issue that the agent may claim: OPEN, unassigned, with a non-empty body, and no open native GitHub blockers, plus exactly one queue signal — `ready-for-agent` (ordinary work), only `round-finished` (an automatic continuation), or only `merge-conflict` (a conflict requeue, and only when the operator sets `MAX_CONFLICT_ATTEMPTS` above `0`). An issue labelled `ready-for-human` is never eligible.
 _Avoid_: Available issue, queued issue
 
 **Runnable queue**:
-The ordered set of eligible issues, sorted FIFO by creation date, from which the agent picks the next issue to attempt.
+The ordered set of eligible issues, from which the agent picks the next issue to attempt: conflict requeues first, then automatic continuations, then ordinary `ready-for-agent` work, FIFO by creation date within each group.
 _Avoid_: Backlog, work queue, job queue
 
 **Claim**:
@@ -36,8 +36,16 @@ _Avoid_: Lock, reservation
 An implementation attempt claimed from `round-finished` without a human requeue: the issue carried only `round-finished` (no `ready-for-agent`) at claim time, so the agent continues the previous round on its own. It is counted by the requeue source recorded in each attempt-result comment.
 _Avoid_: Auto-retry, self requeue
 
+**Conflict requeue**:
+Returning an issue to the queue because the pull request a worker already published for it reports merge conflicts with the base branch. The signal is a manually applied `merge-conflict` label on an otherwise ordinary issue (no `ready-for-agent`, `round-finished`, or `ready-for-human`); with `MAX_CONFLICT_ATTEMPTS=0` (the default) the signal is not part of the queue at all. An issue carrying `ready-for-agent` or `round-finished` alongside `merge-conflict` takes that path instead, and the stale conflict signal is removed at the claim.
+_Avoid_: Conflict retry, auto-rebase
+
+**Conflict attempt**:
+The attempt that follows a conflict requeue: it only brings the published pull request up to date and does no new work — no model call runs. After an entry check (an open, non-draft, `CONFLICTING` pull request against the profile's base branch; anything else ends `skipped`), it rebases the published branch onto the base, runs setup plus one profile check, and force-pushes only when both are green, re-enabling auto-merge per `PR_AUTO_MERGE`. Every conflict attempt removes `merge-conflict` and the assignee, never adds a queue label or a Handoff note, and posts a result comment stamped with a `<!-- conflict-attempt: ... -->` marker carrying the outcome and the pushed sha.
+_Avoid_: Implementation attempt, model turn
+
 **Requeue source**:
-How one implementation attempt was requeued: **human** (the issue carried `ready-for-agent` at claim time) or **automatic** (it carried only `round-finished` at claim time). The source is decided once from the claim snapshot and recorded as a hidden `<!-- requeue-source: ... -->` marker in the attempt-result comment, next to the `<!-- agent-attempt: ... -->` marker. The automatic-continuation count is the number of automatic-requeue result comments in a row from the newest, up to the most recent human-requeue result; a human requeue (including a legacy unmarked result) resets it to zero.
+How one implementation attempt was requeued: **human** (the issue carried `ready-for-agent` at claim time) or **automatic** (it carried only `round-finished` at claim time). The source is decided once from the claim snapshot and recorded as a hidden `<!-- requeue-source: ... -->` marker in the attempt-result comment, next to the `<!-- agent-attempt: ... -->` marker. The automatic-continuation count is the number of automatic-requeue result comments in a row from the newest, up to the most recent human-requeue result; a human requeue (including a legacy unmarked result) resets it to zero. Conflict-attempt result comments are transparent to that count: they are skipped without counting and without stopping the row.
 _Avoid_: Claim reason, retry count
 
 **Attempt outcome**:
