@@ -537,6 +537,9 @@ class GitHubGraphQLTransport:
 
         If the label does not exist in the repository yet, it is created
         automatically so the tracker never crashes on uninitialized labels.
+        When another process creates the same label concurrently, GitHub
+        rejects the creation as already existing; the existing label is then
+        re-read and applied as if this process had created it.
         """
 
         data = self._execute(
@@ -558,7 +561,12 @@ class GitHubGraphQLTransport:
                 label_id = label_obj["id"]
             else:
                 repo_id = repo_node["id"]
-                label_id = self._create_label(repo_id, label)
+                try:
+                    label_id = self._create_label(repo_id, label)
+                except GitHubTrackerError as error:
+                    if not _is_label_already_exists_error(error):
+                        raise
+                    label_id = self._reread_label_id_after_conflict(issue_id, label, error)
         except (KeyError, TypeError) as error:
             raise GitHubTrackerError("GitHub returned an invalid repository label") from error
         self._execute(
@@ -599,6 +607,32 @@ class GitHubGraphQLTransport:
         except (KeyError, TypeError) as error:
             raise GitHubTrackerError(f"GitHub returned an invalid repository label: {error}") from error
 
+    def _reread_label_id_after_conflict(
+        self, issue_id: str, label: str, error: GitHubTrackerError
+    ) -> str:
+        """Re-read the label id created concurrently by another process."""
+
+        data = self._execute(
+            """
+            query RepositoryLabelId($issueId: ID!, $label: String!) {
+              node(id: $issueId) {
+                ... on Issue {
+                  repository { id label(name: $label) { id } }
+                }
+              }
+            }
+            """,
+            {"issueId": issue_id, "label": label},
+        )
+        try:
+            label_obj = data["node"]["repository"].get("label")
+            if label_obj and isinstance(label_obj, dict) and "id" in label_obj:
+                return label_obj["id"]
+        except (KeyError, TypeError, AttributeError):
+            raise GitHubTrackerError(
+                "GitHub returned an invalid repository label"
+            ) from error
+        raise GitHubTrackerError("GitHub returned an invalid repository label") from error
 
     def find_pull_request(self, repository: str, head: str) -> PullRequest | None:
         """Return an existing open PR for an attempt branch, if any."""
@@ -834,6 +868,12 @@ def _graphql_error_summary(response_data: object) -> str:
         if isinstance(error, dict) and isinstance(error.get("message"), str)
     ]
     return "; ".join(messages) if messages else "no error details provided"
+
+
+def _is_label_already_exists_error(error: GitHubTrackerError) -> bool:
+    """Whether a label-creation failure means another process won the race."""
+
+    return "already exists" in str(error).lower().replace("_", " ")
 
 
 def _retry_delay(error: Exception, attempt: int) -> float:

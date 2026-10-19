@@ -491,6 +491,71 @@ def test_graphql_add_label_creates_missing_repository_label_before_adding() -> N
 
 
 
+def test_graphql_add_label_resolves_concurrent_creation_to_existing_label() -> None:
+    calls = iter(
+        [
+            {"node": {"repository": {"id": "repo-id-1", "label": None}}},
+            GitHubTrackerError(
+                "GitHub GraphQL request was rejected: "
+                'A label named "merge-conflict" already exists'
+            ),
+            {"node": {"repository": {"id": "repo-id-1", "label": {"id": "existing-label-id"}}}},
+            {},
+        ]
+    )
+    queries: list[str] = []
+    variables_list: list[dict[str, object]] = []
+
+    def execute(query: str, variables: dict[str, object]) -> dict:
+        queries.append(query)
+        variables_list.append(variables)
+        result = next(calls)
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+    transport = GitHubGraphQLTransport("token")
+    transport._execute = execute  # type: ignore[method-assign]
+
+    transport.add_label("issue-id", "merge-conflict")
+
+    assert "label(name: $label)" in queries[0]
+    assert "createLabel" in queries[1]
+    assert "label(name: $label)" in queries[2]
+    assert "addLabelsToLabelable" in queries[3]
+    assert variables_list[3]["labelId"] == "existing-label-id"
+
+
+def test_graphql_add_label_surfaces_non_conflict_creation_errors() -> None:
+    failure = GitHubTrackerError(
+        "GitHub GraphQL request was rejected: Resource not accessible by integration"
+    )
+    calls = iter(
+        [
+            {"node": {"repository": {"id": "repo-id-1", "label": None}}},
+            failure,
+        ]
+    )
+    queries: list[str] = []
+
+    def execute(query: str, variables: dict[str, object]) -> dict:
+        queries.append(query)
+        result = next(calls)
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+    transport = GitHubGraphQLTransport("token")
+    transport._execute = execute  # type: ignore[method-assign]
+
+    with pytest.raises(GitHubTrackerError) as excinfo:
+        transport.add_label("issue-id", "merge-conflict")
+
+    assert excinfo.value is failure
+    assert len(queries) == 2
+    assert "createLabel" in queries[1]
+
+
 def test_graphql_errors_surface_githubs_own_message(monkeypatch: pytest.MonkeyPatch) -> None:
     payload = json.dumps(
         {"errors": [{"message": "Resource not accessible by integration"}]}
