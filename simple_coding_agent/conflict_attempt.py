@@ -191,8 +191,8 @@ def commit_count_changed_details(
     return (
         f"The model resolution for `{branch}` onto `{base_branch}` changed the "
         f"rebased commit count ({CONFLICT_OUTCOME_RESOLUTION_FAILED}): the pull "
-        f"request carried {expected} commit(s) and now carries {actual} outside "
-        "its fix commits, so commits were squashed, dropped, or amended instead "
+        f"request carried {expected} commit(s) and now carries {actual} in total, "
+        "so commits were squashed, dropped, or amended instead "
         "of adding fixes only on top. The remote branch is left untouched so the "
         "pull request stays `CONFLICTING`."
     )

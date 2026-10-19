@@ -26,11 +26,7 @@ from pathlib import Path
 import pytest
 
 from simple_coding_agent.attempt_state import AttemptStateStore
-from simple_coding_agent.command_runner import (
-    CommandExecution,
-    CommandResult,
-    CommandStatus,
-)
+from simple_coding_agent.command_runner import CommandResult
 from simple_coding_agent.completion import AttemptOutcome
 from simple_coding_agent.config import (
     ConfigurationError,
@@ -51,7 +47,6 @@ from simple_coding_agent.github_tracker import (
 )
 from simple_coding_agent.conflict_attempt import is_conflict_claim
 from simple_coding_agent.lifecycle import AgentLifecycle
-from simple_coding_agent.model_execution import ModelExecution, ModelExecutionStatus
 from simple_coding_agent.publication import ConflictPublicationRequest, PullRequest
 from simple_coding_agent.publication import _conflict_result_comment
 from simple_coding_agent.recovery import (

@@ -14,11 +14,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from simple_coding_agent.attempt_state import AttemptStateStore
-from simple_coding_agent.command_runner import (
-    CommandExecution,
-    CommandResult,
-    CommandStatus,
-)
+from simple_coding_agent.command_runner import CommandResult
 from simple_coding_agent.completion import AttemptOutcome
 from simple_coding_agent.conflict_attempt import (
     base_changes_text,
