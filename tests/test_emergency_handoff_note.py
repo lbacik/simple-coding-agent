@@ -160,6 +160,7 @@ def test_builder_renders_all_sections_in_order_and_validates(tmp_path: Path) -> 
 
     assert _section_order(note) == [
         "Provenance",
+        "Previous complete note",
         "Changes",
         "Last model intent",
         "Activity trail",
@@ -267,6 +268,7 @@ def test_hard_ceiling_produces_a_rich_note_that_validates(tmp_path: Path) -> Non
     assert "- reason: token_hard_ceiling" in note
     for section in (
         "Provenance",
+        "Previous complete note",
         "Changes",
         "Last model intent",
         "Activity trail",

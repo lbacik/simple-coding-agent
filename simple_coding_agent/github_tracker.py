@@ -17,6 +17,7 @@ from simple_coding_agent.publication import PullRequest
 from simple_coding_agent.recovery import (
     count_automatic_continuations,
     count_conflict_failures,
+    filter_prompt_comments,
 )
 
 
@@ -648,6 +649,23 @@ class GitHubTracker:
             # incidentally matching another deleted account.
             if comment.author_login and comment.author_login in (issue.author_login, viewer.login)
         )
+
+    def prompt_comments(self, issue: TrackerIssue) -> tuple[str, ...]:
+        """Trusted comments filtered down to what a starting prompt may carry.
+
+        Every historical generated handoff result is superseded by the
+        replacement Handoff note committed on the resumed branch, so those
+        comments (including their note payloads) never reach the prompt;
+        machine bookkeeping is stripped from generated results that remain.
+        Ordinary human guidance passes through verbatim in order, no matter
+        which login authored it: the filter is structural, so a shared
+        operator/agent identity never excludes human guidance.
+
+        Presentation-only: continuation detection, budget counting, and
+        publication recovery keep reading the unfiltered history.
+        """
+
+        return filter_prompt_comments(self.trusted_comments(issue))
 
     def automatic_continuation_count(self, issue: TrackerIssue) -> int:
         """Count automatic continuations in a row since the last human requeue.

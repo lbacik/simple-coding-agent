@@ -106,6 +106,17 @@ class AttemptWorkspace(Protocol):
         """
         ...
 
+    def handoff_note_content_at_revision(
+        self, revision: str, issue_number: int
+    ) -> str | None:
+        """The Handoff note file as committed at ``revision``.
+
+        ``None`` when the revision or the note file within it cannot be
+        read. Used to surface the last complete note of an earlier round
+        inside an emergency handoff note.
+        """
+        ...
+
     def handoff_note_commit_carries_work(self, revision: str, issue_number: int) -> bool:
         """Whether a note-touching commit is really a work commit.
 

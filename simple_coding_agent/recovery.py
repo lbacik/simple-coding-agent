@@ -13,7 +13,8 @@ record; the CLI and socket only transport requests.
 
 from __future__ import annotations
 
-from collections.abc import Container
+from collections.abc import Container, Iterable
+import re
 
 
 class RecoveryRejectedError(ValueError):
@@ -395,3 +396,104 @@ def describe_hold(
     if attempt_id:
         return f"Retained attempt {attempt_id}: {reason}"
     return reason
+
+
+#: Structural signal of a generated handoff attempt-result comment, modern or
+#: legacy: the result header with the ``handoff`` outcome. Markers
+#: (``agent-attempt``, ``requeue-source``) are not required, so comments
+#: posted before the markers existed are still recognized. Human prose is
+#: never matched: the header is only ever rendered by publication.
+_HANDOFF_RESULT_HEADER_RE = re.compile(
+    r"^#{1,6}\s*Agent Attempt Result:\s*handoff\b", re.MULTILINE
+)
+
+#: Structural signal of any generated attempt-result comment: the ordinary
+#: result header (whatever the outcome), the conflict-attempt header, or one
+#: of the hidden machine markers publication stamps onto its shared comment.
+_GENERATED_RESULT_HEADER_RE = re.compile(
+    r"^#{1,6}\s*(Agent Attempt Result:|Conflict Attempt Result\b)", re.MULTILINE
+)
+_GENERATED_RESULT_MARKER_RES = (
+    "<!-- agent-attempt:",
+    "<!-- conflict-attempt:",
+    "<!-- conflict-escalation -->",
+    "<!-- requeue-source:",
+)
+
+#: Machine bookkeeping lines publication renders onto its shared result
+#: comment. They route humans and machines to the published work (branch, PR,
+#: note commit, merge, conflict standing) or carry the budget standing; none
+#: of them is guidance for the next implementation.
+_BOOKKEEPING_LINE_RES = (
+    re.compile(r"^\*\*(Branch|PR|Handoff note commit|Merge|Conflict attempts)\*\*:"),
+    re.compile(r"^Automatic continuation \d+/\d+ used;"),
+)
+
+#: Any hidden HTML marker, wherever it sits on the line.
+_HIDDEN_MARKER_RE = re.compile(r"<!--.*?-->")
+
+
+def is_generated_handoff_result(body: str) -> bool:
+    """Whether a comment body is a generated handoff attempt-result.
+
+    Structural, never identity-based: the handoff result header identifies
+    the comment no matter who authored it, so a human note that happens to
+    share the agent's login is never mistaken for one (and vice versa).
+    """
+
+    return _HANDOFF_RESULT_HEADER_RE.search(body or "") is not None
+
+
+def is_generated_result_comment(body: str) -> bool:
+    """Whether a comment body is any generated attempt-result comment."""
+
+    text = body or ""
+    if _GENERATED_RESULT_HEADER_RE.search(text) is not None:
+        return True
+    return any(marker in text for marker in _GENERATED_RESULT_MARKER_RES)
+
+
+def strip_result_bookkeeping(body: str) -> str:
+    """Remove machine bookkeeping from a generated result comment.
+
+    Drops the hidden markers, the branch/PR/note-commit/merge/conflict
+    standing lines, and the automatic-continuation standing line, keeping
+    the human-readable evidence and details prose. Blank fallout is
+    collapsed so the remainder stays readable in a prompt.
+    """
+
+    lines: list[str] = []
+    for line in (body or "").splitlines():
+        stripped = _HIDDEN_MARKER_RE.sub("", line)
+        if not stripped.strip():
+            continue
+        if any(pattern.match(stripped.strip()) for pattern in _BOOKKEEPING_LINE_RES):
+            continue
+        lines.append(stripped.rstrip())
+    return "\n".join(lines).strip()
+
+
+def filter_prompt_comments(bodies: Iterable[str]) -> tuple[str, ...]:
+    """Filter trusted comments down to what a starting prompt may carry.
+
+    Generated handoff results are superseded by the replacement Handoff
+    note committed on the resumed branch, so they (including their note
+    payloads) are dropped wholesale. Remaining generated results keep
+    their human-readable prose with the machine bookkeeping stripped.
+    Ordinary human guidance passes through verbatim in its existing order.
+
+    Presentation-only: detection, budget counting, and publication
+    recovery keep reading the unfiltered history.
+    """
+
+    filtered: list[str] = []
+    for body in bodies:
+        if is_generated_handoff_result(body):
+            continue
+        if is_generated_result_comment(body):
+            stripped = strip_result_bookkeeping(body)
+            if stripped:
+                filtered.append(stripped)
+            continue
+        filtered.append(body)
+    return tuple(filtered)

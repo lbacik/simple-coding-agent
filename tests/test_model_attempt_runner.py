@@ -78,8 +78,11 @@ def test_continuation_adds_only_a_pointer_to_the_handoff_note(tmp_path: Path) ->
     assert executor.captured_prompt is not None
     assert (
         "Fix the parser.\n\n"
-        "This is a continued attempt; if it exists, the handoff note from the "
-        "previous attempt is at .agent/handoff/24.md."
+        "This is a continued attempt. Read the current Handoff note at "
+        ".agent/handoff/24.md before implementing: it is the authoritative, "
+        "self-contained record of the previous attempt's state, remaining "
+        "work, and evidence, and it supersedes every historical handoff "
+        "result comment."
     ) in executor.captured_prompt
     assert "## Completion gate" in executor.captured_prompt
     pointer = executor.captured_prompt.index(".agent/handoff/24.md")

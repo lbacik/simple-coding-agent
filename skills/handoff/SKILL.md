@@ -30,6 +30,13 @@ this case:
    `git add .agent/handoff/<issue-number>.md && git commit -m "Handoff note: issue #<issue-number>"`.
 3. Stop.
 
+If a Handoff note already exists at `.agent/handoff/<issue-number>.md`,
+read it first: your note replaces it as the single continuation record, so
+carry forward everything still relevant to continuation — current state,
+still-applicable decisions and constraints, unresolved review findings,
+remaining work, and evidence. Resolved work and obsolete instructions stay
+behind; the next attempt reads only your note, never the old comments.
+
 Do not commit work yourself on this path: sealing commits any uncommitted
 work after the attempt, so the branch ends as the earlier work commits, then
 the note commit, then (if there was uncommitted work) the seal commit.
@@ -48,7 +55,12 @@ path above instead and skip step 1.)
 
 2. **Write the handoff note** at `.agent/handoff/<issue-number>.md`,
    overwriting any note already there (its history remains reachable through
-   Git). Use this structure:
+   Git). When a note is already present, read it first: your note replaces
+   it as the single continuation record, so it must be self-contained —
+   current state, still-relevant decisions and constraints, unresolved
+   review findings, remaining work, and applicable evidence. Resolved work
+   and obsolete instructions do not remain actionable requirements. Use this
+   structure:
 
    ```markdown
    # Handoff note: issue #<issue-number>

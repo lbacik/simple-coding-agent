@@ -267,6 +267,18 @@ review the note and comment, then re-apply `ready-for-agent` to requeue the
 issue (this also clears `round-finished`), or leave it labelled
 `round-finished` to end the attempt sequence.
 
+A continued attempt resumes from the Handoff note file on its branch, not
+from the issue's comment history: the starting prompt excludes every
+historical handoff result comment (including its note payload) and strips
+machine bookkeeping from the generated result comments that remain, while
+ordinary human guidance still reaches the model verbatim in order. Filtering
+is presentation-only — continuation detection, budget counting, and
+publication recovery still read the full history. Each cooperative handoff
+replaces the previous note with a self-contained record (current state,
+still-relevant decisions and constraints, unresolved review findings,
+remaining work, evidence), so a continuation never has to reconcile obsolete
+instructions from older rounds.
+
 `MAX_AUTO_CONTINUATIONS` (default `0`) optionally lets the agent continue a
 `round-finished` issue on its own, up to N automatic continuations in a row,
 claimed ahead of new `ready-for-agent` work. A human requeue resets the
