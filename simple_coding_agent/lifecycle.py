@@ -417,8 +417,10 @@ class ModelAttemptRunner:
             # and publication recovery keep reading the unfiltered feed.
             raw_comments = issue_comments
 
-            def prompt_comments(issue: TrackerIssue) -> tuple[str, ...]:
+            def default_prompt_comments(issue: TrackerIssue) -> tuple[str, ...]:
                 return filter_prompt_comments(raw_comments(issue))
+
+            prompt_comments = default_prompt_comments
 
         self._prompt_comments = prompt_comments
         self._attempt_archive_factory = attempt_archive_factory
