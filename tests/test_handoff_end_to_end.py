@@ -42,7 +42,7 @@ from simple_coding_agent.github_tracker import (
 )
 from simple_coding_agent.lifecycle import AgentLifecycle, LifecycleStatus, ModelAttemptRunner
 from simple_coding_agent.model_execution import ModelExecution, ModelExecutionStatus, SkillEvent
-from simple_coding_agent.publication import Publisher, PullRequest
+from simple_coding_agent.publication import HandoffRecordRef, Publisher, PullRequest
 
 REPO = "octo/example"
 
@@ -1317,6 +1317,36 @@ class FakeGitHub:
 
     def add_comment(self, repository: str, issue_number: int, body: str) -> None:
         self.comments.append(IssueComment(author_login="agent", body=body))
+
+    # Shared handoff-record seam: one discoverable comment per issue,
+    # located through its explicit versioned machine marker and only when
+    # authored by this agent's own login (mirroring production trust).
+    def find_handoff_record(self, repository: str, issue_number: int) -> HandoffRecordRef | None:
+        from simple_coding_agent.recovery import is_handoff_record
+
+        matches = [
+            (index, comment)
+            for index, comment in enumerate(self.comments)
+            if is_handoff_record(comment.body) and comment.author_login == "agent"
+        ]
+        if len(matches) > 1:
+            raise AssertionError("more than one shared handoff comment")
+        if not matches:
+            return None
+        index, comment = matches[0]
+        return HandoffRecordRef(comment_id=f"handoff-{index}", body=comment.body)
+
+    def create_handoff_record(self, repository: str, issue_number: int, body: str) -> str:
+        self.comments.append(IssueComment(author_login="agent", body=body))
+        return f"handoff-{len(self.comments) - 1}"
+
+    def update_handoff_record(self, repository: str, comment_id: str, body: str) -> None:
+        try:
+            index = int(comment_id.removeprefix("handoff-"))
+            assert self.comments[index].author_login == "agent"
+        except (ValueError, AssertionError, IndexError) as error:
+            raise AssertionError(f"unknown handoff comment {comment_id!r}") from error
+        self.comments[index] = IssueComment(author_login="agent", body=body)
 
 
 def issue(
