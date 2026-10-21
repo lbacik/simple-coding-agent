@@ -156,6 +156,7 @@ from simple_coding_agent.recovery import (
     REQUEUE_SOURCE_AUTOMATIC,
     REQUEUE_SOURCE_CONFLICT,
     REQUEUE_SOURCE_HUMAN,
+    filter_prompt_comments,
     requeue_source_for_labels,
 )
 from simple_coding_agent.telemetry import (
@@ -393,6 +394,7 @@ class ModelAttemptRunner:
         model_executor: ModelExecutor,
         acceptance_criteria_satisfied: Callable[[Claim], bool] = lambda claim: True,
         issue_comments: Callable[[TrackerIssue], tuple[str, ...]] = lambda issue: (),
+        prompt_comments: Callable[[TrackerIssue], tuple[str, ...]] | None = None,
         attempt_archive_factory: Callable[[int, str], AttemptArchive] | None = None,
         event_log: Callable[..., None] = (
             lambda event, detail="", level="INFO", issue_number=None: None
