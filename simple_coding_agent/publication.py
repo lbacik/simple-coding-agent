@@ -353,6 +353,20 @@ class Publisher:
             handoff_posted=handoff_posted,
         )
 
+    def handoff_intent(self, attempt_id: str) -> HandoffRecord | None:
+        """Return the persisted shared-record intent for an attempt, if any.
+
+        The first intent saved for an attempt always wins, so a retry after
+        a timeout or restart reuses the stored standing instead of
+        recomputing it. A missing or unreadable store reads as absent (the
+        caller then recomputes, and publication still enforces first-wins).
+        """
+
+        try:
+            return self._handoff_store.load(attempt_id)
+        except Exception:
+            return None
+
     def find_pull_request(self, head: str) -> PullRequest | None:
         """Return the open pull request for an attempt branch, if any.
 

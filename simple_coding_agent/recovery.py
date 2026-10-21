@@ -148,7 +148,7 @@ class AmbiguousContinuationError(ValueError):
 _ATTEMPT_MARKER_RE = re.compile(r"<!--\s*agent-attempt:\s*(.*?)\s*-->")
 
 
-def parse_attempt_id(body: str) -> str | None:
+def parse_comment_attempt_id(body: str) -> str | None:
     """Return the ``<!-- agent-attempt: ... -->`` identity in a comment, if any."""
 
     match = _ATTEMPT_MARKER_RE.search(body or "")
@@ -180,7 +180,13 @@ def _attempt_id_less(first: str, second: str) -> bool:
     return _attempt_id_sort_key(first) < _attempt_id_sort_key(second)
 
 
-def _attempt_id_greater(first: str, second: str) -> bool:
+def attempt_id_greater(first: str, second: str) -> bool:
+    """Whether one attempt ID orders chronologically after another.
+
+    Public so the shared-record publisher and the recovery hold share the
+    same chronological ordering as the accounting resolver.
+    """
+
     return _attempt_id_sort_key(first) > _attempt_id_sort_key(second)
 
 
@@ -253,7 +259,7 @@ def resolve_automatic_continuation_count(
             continue
         if is_conflict_attempt(body):
             continue
-        attempt_id = parse_attempt_id(body)
+        attempt_id = parse_comment_attempt_id(body)
         if attempt_id is None:
             # Unmarked legacy results predate the shared-record era, which
             # the shared count already summarizes; ignore them.
@@ -262,7 +268,7 @@ def resolve_automatic_continuation_count(
             # Overlapping legacy and shared records for the same attempt
             # count once: the shared record already carries it.
             continue
-        if not _attempt_id_greater(attempt_id, shared_attempt):
+        if not attempt_id_greater(attempt_id, shared_attempt):
             # Older than the shared record: already summarized by it.
             continue
         if parse_requeue_source(body) != REQUEUE_SOURCE_AUTOMATIC:
