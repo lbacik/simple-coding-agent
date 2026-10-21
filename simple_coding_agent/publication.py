@@ -10,11 +10,23 @@ from simple_coding_agent.completion import AttemptOutcome, CompletionDecision, P
 from simple_coding_agent.attempt_state import AttemptPhase, AttemptStateStore
 from simple_coding_agent.attempt_workspace import BranchPusher
 from simple_coding_agent.git_workspace import GitWorkspaceError
+from simple_coding_agent.handoff_record import (
+    HANDOFF_RECORD_VERSION,
+    HandoffPublicationStore,
+    HandoffPublicationStoreError,
+    HandoffRecord,
+    MemoryHandoffPublicationStore,
+    build_handoff_record_body,
+    is_newer_attempt,
+    parse_handoff_record,
+    records_match,
+)
 from simple_coding_agent.recovery import (
     CONFLICT_ESCALATION_MARKER,
     CONFLICT_OUTCOME_NO_CHANGE,
     CONFLICT_OUTCOME_SUCCESS,
     REQUEUE_SOURCE_HUMAN,
+    REQUEUE_SOURCES,
     conflict_attempt_marker,
     requeue_source_marker,
 )
@@ -63,6 +75,14 @@ class PullRequest:
     head_sha: str = ""
 
 
+@dataclass(frozen=True)
+class HandoffRecordRef:
+    """The trusted shared handoff comment: its remote id plus its current body."""
+
+    comment_id: str
+    body: str
+
+
 class PublicationTransport(Protocol):
     """GitHub operations that remain callable independently during recovery."""
 
@@ -84,6 +104,12 @@ class PublicationTransport(Protocol):
 
     def add_comment(self, repository: str, issue_number: int, body: str) -> None: ...
 
+    def find_handoff_record(self, repository: str, issue_number: int) -> HandoffRecordRef | None: ...
+
+    def create_handoff_record(self, repository: str, issue_number: int, body: str) -> str: ...
+
+    def update_handoff_record(self, repository: str, comment_id: str, body: str) -> None: ...
+
 
 @dataclass(frozen=True)
 class PublicationRequest:
@@ -104,6 +130,11 @@ class PublicationRequest:
     auto_merge_opt_in: bool = False
     reviews_performed: int = 0
     requeue_source: str = REQUEUE_SOURCE_HUMAN
+    #: The automatic-continuation standing for the shared handoff record
+    #: (the same ``used`` count the legacy handoff comment reports). ``None``
+    #: means no shared record is requested, so handoff publication stays
+    #: legacy-only; only a handoff outcome with a count publishes the record.
+    handoff_continuation_count: int | None = None
 
 
 @dataclass(frozen=True)
@@ -122,6 +153,10 @@ class PublicationResult:
     conflict_outcome: str = ""
     #: Whether the published conflict comment escalated to a human.
     escalated: bool = False
+    #: Whether the shared handoff record is confirmed on the remote issue.
+    #: True for every non-handoff outcome and for legacy-only handoff
+    #: callers; False retains the attempt for recovery.
+    handoff_posted: bool = True
 
 
 @dataclass(frozen=True)
@@ -207,6 +242,7 @@ class Publisher:
         ),
         auto_merge: bool | str = False,
         merge_method: str = "merge",
+        handoff_store: HandoffPublicationStore | MemoryHandoffPublicationStore | None = None,
     ) -> None:
         self._workspace = workspace
         self._github = github
@@ -219,6 +255,9 @@ class Publisher:
         self._event_log = event_log
         self._auto_merge = _normalize_auto_merge(auto_merge)
         self._merge_method = merge_method
+        self._handoff_store = (
+            handoff_store if handoff_store is not None else MemoryHandoffPublicationStore()
+        )
 
     def publish(
         self, request: PublicationRequest, *, timeout: float | None = None
@@ -238,6 +277,7 @@ class Publisher:
         outcome = request.decision.outcome
         branch_url: str | None = None
         pull_request: PullRequest | None = None
+        pushed_sha: str | None = None
         needs_push = request.decision.publication_eligible or (
             outcome in (AttemptOutcome.INCOMPLETE, AttemptOutcome.HANDOFF)
             and request.decision.publication_path is PublicationPath.PARTIAL
@@ -247,7 +287,7 @@ class Publisher:
                 checkpoint = self._attempt_state.read() if self._attempt_state is not None else None
                 if checkpoint is None or checkpoint.phase is not AttemptPhase.PUBLISHING:
                     self._check_deadline(deadline)
-                    self._workspace.push_attempt_branch(
+                    pushed_sha = self._workspace.push_attempt_branch(
                         request.branch, max_retries=self._max_retries, deadline=deadline
                     )
                     self._check_deadline(deadline)
@@ -300,8 +340,17 @@ class Publisher:
         comment_posted = self._post_result(
             request, outcome, branch_url, pull_request, request.details, merge_result
         )
+        handoff_posted = True
+        if outcome is AttemptOutcome.HANDOFF:
+            handoff_posted = self._publish_handoff_record(request, pushed_sha, deadline)
         return PublicationResult(
-            outcome, branch_url, pull_request, comment_posted, request.details, merge_result
+            outcome,
+            branch_url,
+            pull_request,
+            comment_posted,
+            request.details,
+            merge_result,
+            handoff_posted=handoff_posted,
         )
 
     def find_pull_request(self, head: str) -> PullRequest | None:
@@ -613,6 +662,258 @@ class Publisher:
         except Exception:
             # The local result remains authoritative when GitHub is unavailable.
             return False
+
+    def _publish_handoff_record(
+        self,
+        request: PublicationRequest,
+        pushed_sha: str | None,
+        deadline: float,
+    ) -> bool:
+        """Create or update the single discoverable handoff comment for one handoff.
+
+        Returns True only once the intended record is confirmed on the remote
+        issue; any ambiguity (unreadable state, a failed write that cannot be
+        reconciled, or a newer attempt's record already in place) returns
+        False so the lifecycle retains the attempt for recovery. ``None``
+        count or note revision means no shared record was requested, so the
+        handoff stays legacy-only; anything else malformed also returns False.
+        The intended payload is persisted durably before any remote comment
+        write, and the first intent saved for an attempt always wins, so a
+        retry never increments the continuation count again.
+        """
+
+        count = request.handoff_continuation_count
+        note_sha = request.note_commit_sha
+        if count is None or note_sha is None:
+            return True
+        if (
+            isinstance(count, bool)
+            or not isinstance(count, int)
+            or count < 0
+            or request.requeue_source not in REQUEUE_SOURCES
+            or not isinstance(note_sha, str)
+            or not note_sha.strip()
+            or any(character.isspace() for character in note_sha)
+        ):
+            self._event_log(
+                "handoff_record_failed",
+                "the shared handoff record was not requested with a valid"
+                " continuation standing and note revision",
+                level="ERROR",
+                issue_number=request.issue_number,
+            )
+            return False
+        try:
+            verified_sha = pushed_sha
+            if verified_sha is None:
+                # The branch push was already verified on an earlier pass
+                # (PUBLISHING phase): push again to verify the revision the
+                # metadata is about to claim, so the record never names an
+                # unverified sha.
+                self._check_deadline(deadline)
+                verified_sha = self._workspace.push_attempt_branch(
+                    request.branch, max_retries=self._max_retries, deadline=deadline
+                )
+                self._check_deadline(deadline)
+                self._mark_publishing()
+        except (GitWorkspaceError, TimeoutError) as error:
+            self._event_log(
+                "publication_failed",
+                f"Shared handoff branch push failed: {type(error).__name__}: {error}",
+                level="ERROR",
+                issue_number=request.issue_number,
+            )
+            return False
+        except Exception as error:
+            self._event_log(
+                "handoff_record_failed",
+                f"Shared handoff publication is not ready: {_exception_detail(error)}",
+                level="ERROR",
+                issue_number=request.issue_number,
+            )
+            return False
+        try:
+            intent = self._handoff_store.save_if_absent(
+                HandoffRecord(
+                    version=HANDOFF_RECORD_VERSION,
+                    repository=self._repository,
+                    issue_number=request.issue_number,
+                    attempt_id=request.started_at,
+                    requeue_source=request.requeue_source,
+                    continuation_count=count,
+                    branch=request.branch,
+                    branch_sha=verified_sha,
+                    note_sha=note_sha,
+                )
+            )
+        except HandoffPublicationStoreError as error:
+            self._event_log(
+                "handoff_record_failed",
+                f"Shared handoff intent could not be persisted: {error}",
+                level="ERROR",
+                issue_number=request.issue_number,
+            )
+            return False
+        if (
+            intent.branch_sha != verified_sha
+            or intent.note_sha != note_sha
+            or intent.branch != request.branch
+            or intent.issue_number != request.issue_number
+            or intent.repository != self._repository
+        ):
+            # The branch moved under a retained attempt, or the stored intent
+            # belongs to a different record: never publish a revision the
+            # verified branch does not carry.
+            self._event_log(
+                "handoff_record_failed",
+                "the persisted handoff intent no longer matches the verified"
+                " branch revision; the attempt is retained for recovery",
+                level="ERROR",
+                issue_number=request.issue_number,
+            )
+            return False
+        try:
+            existing = self._github.find_handoff_record(
+                self._repository, request.issue_number
+            )
+        except Exception as error:
+            self._event_log(
+                "handoff_record_failed",
+                f"Shared handoff record could not be read: {_exception_detail(error)}",
+                level="ERROR",
+                issue_number=request.issue_number,
+            )
+            return False
+        if existing is None:
+            return self._create_shared_comment(intent, deadline)
+        parsed = parse_handoff_record(existing.body)
+        if parsed is None or parsed.version != HANDOFF_RECORD_VERSION:
+            self._event_log(
+                "handoff_record_failed",
+                "the existing shared handoff comment is unreadable; it is left"
+                " untouched and the attempt is retained for recovery",
+                level="ERROR",
+                issue_number=request.issue_number,
+            )
+            return False
+        if parsed.attempt_id == intent.attempt_id:
+            if records_match(parsed, intent):
+                return True
+            return self._update_shared_comment(existing.comment_id, intent, deadline)
+        if is_newer_attempt(parsed, intent):
+            self._event_log(
+                "handoff_record_failed",
+                "a newer attempt already owns the shared handoff comment;"
+                " the older record is not published over it",
+                level="ERROR",
+                issue_number=request.issue_number,
+            )
+            return False
+        return self._update_shared_comment(existing.comment_id, intent, deadline)
+
+    def _create_shared_comment(self, intent: HandoffRecord, deadline: float) -> bool:
+        """Create the shared comment, confirming a lost response by re-reading."""
+
+        try:
+            self._check_deadline(deadline)
+            self._github.create_handoff_record(
+                self._repository,
+                intent.issue_number,
+                build_handoff_record_body(intent),
+            )
+        except Exception as error:
+            self._event_log(
+                "handoff_record_failed",
+                f"Shared handoff comment could not be created: {_exception_detail(error)}",
+                level="ERROR",
+                issue_number=intent.issue_number,
+            )
+            # The write may have landed before the response was lost: only a
+            # re-read decides between confirmation and retention.
+            return self._confirm_shared_comment(intent)
+        created = self._confirm_shared_comment(intent)
+        if created:
+            self._event_log(
+                "handoff_record_created",
+                f"shared handoff comment for attempt {intent.attempt_id}",
+                level="INFO",
+                issue_number=intent.issue_number,
+            )
+        return created
+
+    def _update_shared_comment(
+        self, comment_id: str, intent: HandoffRecord, deadline: float
+    ) -> bool:
+        """Update the shared comment, confirming a lost response by re-reading."""
+
+        try:
+            self._check_deadline(deadline)
+            self._github.update_handoff_record(
+                self._repository,
+                comment_id,
+                build_handoff_record_body(intent),
+            )
+        except Exception as error:
+            self._event_log(
+                "handoff_record_failed",
+                f"Shared handoff comment could not be updated: {_exception_detail(error)}",
+                level="ERROR",
+                issue_number=intent.issue_number,
+            )
+            # The write may have landed before the response was lost: only a
+            # re-read decides between confirmation and retention.
+            return self._confirm_shared_comment(intent)
+        updated = self._confirm_shared_comment(intent)
+        if updated:
+            self._event_log(
+                "handoff_record_updated",
+                f"shared handoff comment for attempt {intent.attempt_id}",
+                level="INFO",
+                issue_number=intent.issue_number,
+            )
+        return updated
+
+    def _confirm_shared_comment(self, intent: HandoffRecord) -> bool:
+        """Confirm the remote shared comment carries exactly the intended record."""
+
+        try:
+            current = self._github.find_handoff_record(
+                self._repository, intent.issue_number
+            )
+        except Exception as error:
+            self._event_log(
+                "handoff_record_failed",
+                "the shared handoff comment could not be confirmed:"
+                f" {_exception_detail(error)}",
+                level="ERROR",
+                issue_number=intent.issue_number,
+            )
+            return False
+        if current is None:
+            self._event_log(
+                "handoff_record_failed",
+                "the shared handoff comment is absent after publication",
+                level="ERROR",
+                issue_number=intent.issue_number,
+            )
+            return False
+        parsed = parse_handoff_record(current.body)
+        if parsed is not None and records_match(parsed, intent):
+            return True
+        self._event_log(
+            "handoff_record_failed",
+            "the shared handoff comment does not carry the intended attempt"
+            " and revisions after publication",
+            level="ERROR",
+            issue_number=intent.issue_number,
+        )
+        return False
+
+
+def _exception_detail(error: Exception) -> str:
+    """One-line transport detail without leaking credentials."""
+
+    return f"{type(error).__name__}: {error}".strip() or type(error).__name__
 
 
 def _conflict_failure_standing(request: ConflictPublicationRequest) -> tuple[int, bool]:

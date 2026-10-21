@@ -117,6 +117,24 @@ def requeue_source_for_labels(labels: Container[str]) -> str:
     return REQUEUE_SOURCE_HUMAN if "ready-for-agent" in labels else REQUEUE_SOURCE_AUTOMATIC
 
 
+#: The single discoverable handoff record per implementation issue
+#: (issue #282). The shared comment carries one short branch-following link
+#: plus a hidden versioned marker; it never carries the per-attempt
+#: ``agent-attempt`` or ``requeue-source`` markers, keeping it invisible to
+#: the legacy attempt-result readers.
+HANDOFF_RECORD_VERSION = 1
+HANDOFF_RECORD_MARKER_PREFIX = "<!-- handoff-record:"
+
+
+def is_handoff_record(body: str) -> bool:
+    """Whether a comment body carries the shared handoff-record marker."""
+
+    start = body.find(HANDOFF_RECORD_MARKER_PREFIX)
+    if start < 0:
+        return False
+    return body.find("-->", start) >= 0
+
+
 def count_automatic_continuations(bodies_newest_first: tuple[str, ...] | list[str]) -> int:
     """Count automatic-requeue result comments in a row from the newest.
 
@@ -124,11 +142,15 @@ def count_automatic_continuations(bodies_newest_first: tuple[str, ...] | list[st
     counts as a human requeue and also stops the count. Conflict-attempt
     result comments are transparent: they are skipped without counting and
     without stopping the row, so a conflict resolution neither consumes nor
-    resets the automatic-continuation budget.
+    resets the automatic-continuation budget. The shared handoff record is
+    likewise transparent: it is skipped without counting and without stopping
+    the row, so it never reads as an extra legacy attempt-result comment.
     """
 
     count = 0
     for body in bodies_newest_first:
+        if is_handoff_record(body):
+            continue
         if is_conflict_attempt(body):
             continue
         if parse_requeue_source(body) != REQUEUE_SOURCE_AUTOMATIC:
@@ -307,14 +329,18 @@ def count_conflict_failures(bodies_newest_first: tuple[str, ...] | list[str]) ->
     sha), an ordinary attempt result (an ``agent-attempt`` marker without
     the conflict marker), a ``skipped`` result, or the latest escalation
     comment. Any other comment without a conflict-attempt marker also
-    stops the streak. Only the failure rows themselves are counted; the
-    boundary comment that stops the row never is.
+    stops the streak. The shared handoff record is transparent instead: it
+    is skipped without counting and without stopping the streak, so it never
+    reads as an extra legacy attempt-result comment. Only the failure rows
+    themselves are counted; the boundary comment that stops the row never is.
     """
 
     count = 0
     for body in bodies_newest_first:
         if is_conflict_escalation(body):
             break
+        if is_handoff_record(body):
+            continue
         if not is_conflict_attempt(body):
             break
         if not is_conflict_failure(body):
