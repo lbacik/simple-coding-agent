@@ -41,8 +41,9 @@ from simple_coding_agent.github_tracker import (
     TrackerIssue,
 )
 from simple_coding_agent.lifecycle import AgentLifecycle, LifecycleStatus, ModelAttemptRunner
+from simple_coding_agent.handoff_record import parse_handoff_record
 from simple_coding_agent.model_execution import ModelExecution, ModelExecutionStatus, SkillEvent
-from simple_coding_agent.publication import Publisher, PullRequest
+from simple_coding_agent.publication import HandoffRecordRef, Publisher, PullRequest
 
 REPO = "octo/example"
 
@@ -475,9 +476,14 @@ def test_real_handoff_is_produced_pushed_and_labeled_without_a_pull_request(
     assert github.pull_requests == {}
     subjects = remote_branch_subjects(remote, "agent/issue-24")
     assert subjects[:2] == ["Handoff note: issue #24", "Half-finish the parser"]
-    [comment] = github.comments
-    assert "## Agent Attempt Result: handoff" in comment.body
+    assert len(github.comments) == 2  # legacy attempt result + shared handoff record
+    [comment] = [c for c in github.comments if "Agent Attempt Result: handoff" in c.body]
     assert "Halfway done." in comment.body
+    [record_comment] = [c for c in github.comments if "Agent Attempt Result: handoff" not in c.body]
+    record = parse_handoff_record(record_comment.body)
+    assert record is not None
+    assert record.issue_number == 24
+    assert record.branch == "agent/issue-24"
     assert github.removed_labels == [("issue-24", "ready-for-agent")]
     assert github.added_labels == [("issue-24", "round-finished")]
     assert "round-finished" in github.labels
@@ -1092,7 +1098,8 @@ def test_restart_mid_handoff_publication_recovers_as_handoff_not_complete(
     assert result.outcome is AttemptOutcome.HANDOFF
     assert executor.calls == 0
     assert github.pull_requests == {}
-    [comment] = github.comments
+    assert len(github.comments) == 2  # legacy attempt result + shared handoff record
+    [comment] = [c for c in github.comments if "Agent Attempt Result: handoff" in c.body]
     assert "## Agent Attempt Result: handoff" in comment.body
     assert "Halfway done." in comment.body
     assert "round-finished" in github.labels
@@ -1131,7 +1138,7 @@ def test_restart_after_a_successful_handoff_push_before_the_marker_persists(
     result = lifecycle.run_once()
 
     assert result.outcome is AttemptOutcome.HANDOFF
-    assert len(github.comments) == 1  # the already-pushed branch is not re-pushed or double-published
+    assert len(github.comments) == 2  # legacy attempt result + shared handoff record; no double-publish
     assert remote_branch_subjects(remote, "agent/issue-24")[0] == "Handoff note: issue #24"
     assert "round-finished" in github.labels
     assert AttemptStateStore(data_dir).read() is None
@@ -1317,6 +1324,36 @@ class FakeGitHub:
 
     def add_comment(self, repository: str, issue_number: int, body: str) -> None:
         self.comments.append(IssueComment(author_login="agent", body=body))
+
+    # Shared handoff-record seam: one discoverable comment per issue,
+    # located through its explicit versioned machine marker and only when
+    # authored by this agent's own login (mirroring production trust).
+    def find_handoff_record(self, repository: str, issue_number: int) -> HandoffRecordRef | None:
+        from simple_coding_agent.recovery import is_handoff_record
+
+        matches = [
+            (index, comment)
+            for index, comment in enumerate(self.comments)
+            if is_handoff_record(comment.body) and comment.author_login == "agent"
+        ]
+        if len(matches) > 1:
+            raise AssertionError("more than one shared handoff comment")
+        if not matches:
+            return None
+        index, comment = matches[0]
+        return HandoffRecordRef(comment_id=f"handoff-{index}", body=comment.body)
+
+    def create_handoff_record(self, repository: str, issue_number: int, body: str) -> str:
+        self.comments.append(IssueComment(author_login="agent", body=body))
+        return f"handoff-{len(self.comments) - 1}"
+
+    def update_handoff_record(self, repository: str, comment_id: str, body: str) -> None:
+        try:
+            index = int(comment_id.removeprefix("handoff-"))
+            assert self.comments[index].author_login == "agent"
+        except (ValueError, AssertionError, IndexError) as error:
+            raise AssertionError(f"unknown handoff comment {comment_id!r}") from error
+        self.comments[index] = IssueComment(author_login="agent", body=body)
 
 
 def issue(

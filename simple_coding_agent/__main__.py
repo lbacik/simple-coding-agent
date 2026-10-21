@@ -19,6 +19,7 @@ from simple_coding_agent.control_server import ControlServer, socket_path_for
 from simple_coding_agent.finalization import AttemptCompletionStore
 from simple_coding_agent.git_workspace import GitWorkspace
 from simple_coding_agent.github_tracker import GitHubGraphQLTransport, GitHubTracker
+from simple_coding_agent.handoff_record import HandoffPublicationStore
 from simple_coding_agent.lifecycle import AgentLifecycle, AttemptInterruptionHandler, ModelAttemptRunner
 from simple_coding_agent.model_execution import (
     PROMPT_CACHE_MIN_MEASURED_RESPONSES,
@@ -144,6 +145,7 @@ def main() -> None:
             auto_merge=config.pr_auto_merge,
             merge_method=config.pr_merge_method,
             attempt_state=attempt_state,
+            handoff_store=HandoffPublicationStore(config.data_dir),
             event_log=lambda event, detail="", level="INFO", issue_number=None: logger.emit(
                 event, phase="publication", detail=detail, level=level, issue_number=issue_number
             ),

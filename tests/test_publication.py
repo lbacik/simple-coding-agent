@@ -8,7 +8,12 @@ import pytest
 from simple_coding_agent.completion import AttemptOutcome, CompletionDecision, PublicationPath
 from simple_coding_agent.attempt_state import AttemptPhase, AttemptStateStore
 from simple_coding_agent.git_workspace import GitWorkspace, GitWorkspaceError
-from simple_coding_agent.publication import PublicationRequest, Publisher, PullRequest
+from simple_coding_agent.publication import (
+    HandoffRecordRef,
+    PublicationRequest,
+    Publisher,
+    PullRequest,
+)
 
 from test_git_workspace import git, repository_with_main, write_and_commit
 
@@ -305,6 +310,35 @@ class FakeGitHub:
 
     def add_comment(self, repository: str, issue_number: int, body: str) -> None:
         self.comments.append((issue_number, body))
+
+    def find_handoff_record(self, repository: str, issue_number: int) -> HandoffRecordRef | None:
+        from simple_coding_agent.recovery import is_handoff_record
+
+        matches = [
+            (index, body)
+            for index, (number, body) in enumerate(self.comments)
+            if number == issue_number and is_handoff_record(body)
+        ]
+        if len(matches) > 1:
+            raise AssertionError("more than one shared handoff comment")
+        if not matches:
+            return None
+        index, body = matches[0]
+        return HandoffRecordRef(comment_id=f"handoff-{index}", body=body)
+
+    def create_handoff_record(self, repository: str, issue_number: int, body: str) -> str:
+        self.comments.append((issue_number, body))
+        return f"handoff-{len(self.comments) - 1}"
+
+    def update_handoff_record(self, repository: str, comment_id: str, body: str) -> None:
+        # The shared comment is replaced in place: updating never creates
+        # another comment, mirroring the production remote.
+        try:
+            index = int(comment_id.removeprefix("handoff-"))
+            number, _ = self.comments[index]
+        except (ValueError, IndexError) as error:
+            raise AssertionError(f"unknown handoff comment {comment_id!r}") from error
+        self.comments[index] = (number, body)
 
 
 class PushFailingWorkspace:

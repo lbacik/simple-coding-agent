@@ -2222,6 +2222,11 @@ class AgentLifecycle:
                     note_commit_sha=note_sha,
                     auto_merge_opt_in=_claim_time_opt_in(claim, checkpoint),
                     requeue_source=_claim_time_requeue_source(claim, checkpoint),
+                    handoff_continuation_count=(
+                        self._handoff_continuation_used(claim, checkpoint)
+                        if decision.outcome is AttemptOutcome.HANDOFF
+                        else None
+                    ),
                 )
             )
         except Exception as error:
@@ -2235,12 +2240,12 @@ class AgentLifecycle:
         self._archive_pull_request(claim.issue.number, attempt_id, published)
         self._observe_and_remember_workspace_dirty(attempt_id)
         outcome = published.outcome
-        comment_posted = getattr(published, "comment_posted", True)
+        comment_posted = _publication_confirmed(published)
         if not comment_posted:
             return False, (
                 f"recovery retry for attempt {attempt_id} not fulfilled:"
-                " publication is unconfirmed (the result comment could not be"
-                " verified); the hold remains."
+                " publication is unconfirmed (the result comment or the shared"
+                " handoff record could not be verified); the hold remains."
                 f" {hold_suffix}"
             )
         try:
@@ -2897,6 +2902,26 @@ class AgentLifecycle:
         if not callable(counter):
             return 0
         return int(counter(issue))
+
+    def _handoff_continuation_used(
+        self, claim: Claim, checkpoint: AttemptCheckpoint | None
+    ) -> int | None:
+        """The automatic-continuation standing the shared handoff record carries.
+
+        A human requeue (or any non-automatic source, including conflict)
+        stands at zero; an automatic continuation stands one past the current
+        row, matching the ``Automatic continuation k/N used`` line the legacy
+        handoff comment reports. ``None`` means the count could not be read,
+        so the handoff stays legacy-only instead of publishing a guessed
+        standing.
+        """
+
+        if _claim_time_requeue_source(claim, checkpoint) != REQUEUE_SOURCE_AUTOMATIC:
+            return 0
+        try:
+            return self._auto_continuation_count(claim.issue) + 1
+        except Exception:
+            return None
 
     def _conflict_failure_streak(self, issue: TrackerIssue) -> int:
         """The issue's consecutive failed conflict attempts since the last stop.
@@ -3676,10 +3701,15 @@ class AgentLifecycle:
                             note_commit_sha=evidence.note_commit_sha,
                             auto_merge_opt_in=_claim_time_opt_in(claim, checkpoint),
                             requeue_source=_claim_time_requeue_source(claim, checkpoint),
+                            handoff_continuation_count=(
+                                self._handoff_continuation_used(claim, checkpoint)
+                                if evidence.decision.outcome is AttemptOutcome.HANDOFF
+                                else None
+                            ),
                         )
                     )
                     outcome = published.outcome
-                    comment_posted = getattr(published, "comment_posted", True)
+                    comment_posted = _publication_confirmed(published)
                     retain_branch = getattr(published, "branch_url", None) is None and (
                         outcome is AttemptOutcome.INFRASTRUCTURE_ERROR
                         or (
@@ -5091,10 +5121,15 @@ class AgentLifecycle:
                         note_commit_sha=note_commit_sha,
                         auto_merge_opt_in=_claim_time_opt_in(claim, checkpoint),
                         requeue_source=_claim_time_requeue_source(claim, checkpoint),
+                        handoff_continuation_count=(
+                            self._handoff_continuation_used(claim, checkpoint)
+                            if decision.outcome is AttemptOutcome.HANDOFF
+                            else None
+                        ),
                     )
                 )
                 outcome = published.outcome
-                comment_posted = getattr(published, "comment_posted", True)
+                comment_posted = _publication_confirmed(published)
                 retain_branch = (
                     getattr(published, "branch_url", None) is None
                     and has_commits
@@ -6321,6 +6356,21 @@ def _claim_time_requeue_source(claim: Claim, checkpoint: AttemptCheckpoint | Non
         if source in (REQUEUE_SOURCE_HUMAN, REQUEUE_SOURCE_AUTOMATIC, REQUEUE_SOURCE_CONFLICT):
             return source
     return requeue_source_for_labels(claim.issue.labels)
+
+
+def _publication_confirmed(published: object) -> bool:
+    """Whether an attempt's publication is verified and finalizable.
+
+    Both the legacy per-attempt result comment and the shared handoff
+    record (a handoff outcome's second comment) must confirm: an
+    unconfirmed shared record retains the attempt for recovery instead of
+    releasing, cleaning up, and finalizing. Non-handoff outcomes and older
+    publisher doubles report no shared record, which reads as confirmed.
+    """
+
+    return bool(getattr(published, "comment_posted", True)) and bool(
+        getattr(published, "handoff_posted", True)
+    )
 
 
 def _is_conflict_attempt(checkpoint: AttemptCheckpoint | None) -> bool:

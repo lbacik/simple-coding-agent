@@ -13,11 +13,12 @@ from typing import Any, Protocol
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
-from simple_coding_agent.publication import PullRequest
+from simple_coding_agent.publication import HandoffRecordRef, PullRequest
 from simple_coding_agent.recovery import (
     count_automatic_continuations,
     count_conflict_failures,
     filter_prompt_comments,
+    is_handoff_record,
 )
 
 
@@ -637,7 +638,9 @@ class GitHubTracker:
         Trusted means authored by the issue's own author or by this agent's
         GitHub identity (its own attempt-result and handoff comments). Any
         other commenter is excluded, so the model never sees guidance it
-        cannot attribute to someone with write access to the issue.
+        cannot attribute to someone with write access to the issue. The
+        shared handoff record is never trusted: its hidden machine marker is
+        bookkeeping, not model-facing context.
         """
 
         viewer = self._transport.viewer()
@@ -648,6 +651,7 @@ class GitHubTracker:
             # An empty login means a deleted account; never trust one by
             # incidentally matching another deleted account.
             if comment.author_login and comment.author_login in (issue.author_login, viewer.login)
+            and not is_handoff_record(comment.body)
         )
 
     def prompt_comments(self, issue: TrackerIssue) -> tuple[str, ...]:
@@ -1166,6 +1170,86 @@ class GitHubGraphQLTransport:
             {"subjectId": issue_id, "body": body},
         )
 
+    def find_handoff_record(
+        self, repository: str, issue_number: int
+    ) -> HandoffRecordRef | None:
+        """Return the trusted shared handoff comment, if exactly one exists.
+
+        Only comments authored by this agent's own GitHub identity are
+        considered, under the same trust rule as the prompt filter; the
+        shared record is located through its explicit versioned machine
+        marker, never by loose text match. More than one trusted record
+        means ambiguous remote state, which the publisher retains for
+        recovery instead of guessing.
+        """
+
+        owner, name = _repository_parts(repository)
+        viewer_login = self.viewer().login
+        data = self._execute(
+            """
+            query HandoffRecordComments($owner: String!, $name: String!, $number: Int!) {
+              repository(owner: $owner, name: $name) {
+                issue(number: $number) { comments(last: 100) { nodes { id body author { login } } } }
+              }
+            }
+            """,
+            {"owner": owner, "name": name, "number": issue_number},
+        )
+        try:
+            nodes = data["repository"]["issue"]["comments"]["nodes"]
+            matches = [
+                HandoffRecordRef(comment_id=node["id"], body=node["body"])
+                for node in nodes
+                if isinstance(node, dict)
+                and is_handoff_record(node.get("body", ""))
+                and _comment_author(node) == viewer_login
+                and viewer_login
+            ]
+        except (KeyError, TypeError) as error:
+            raise GitHubTrackerError("GitHub returned invalid issue comments") from error
+        if len(matches) > 1:
+            raise GitHubTrackerError(
+                "GitHub returned more than one shared handoff comment"
+            )
+        return matches[0] if matches else None
+
+    def create_handoff_record(
+        self, repository: str, issue_number: int, body: str
+    ) -> str:
+        """Create the shared handoff comment; return the new comment id."""
+
+        owner, name = _repository_parts(repository)
+        issue_id = self._issue_id(owner, name, issue_number)
+        data = self._execute(
+            """
+            mutation CreateHandoffRecord($subjectId: ID!, $body: String!) {
+              addComment(input: {subjectId: $subjectId, body: $body}) { commentEdge { node { id } } }
+            }
+            """,
+            {"subjectId": issue_id, "body": body},
+        )
+        try:
+            return data["addComment"]["commentEdge"]["node"]["id"]
+        except (KeyError, TypeError) as error:
+            raise GitHubTrackerError("GitHub returned an invalid handoff comment") from error
+
+    def update_handoff_record(
+        self, repository: str, comment_id: str, body: str
+    ) -> None:
+        """Replace the body of the shared handoff comment in place."""
+
+        _repository_parts(repository)
+        if not comment_id:
+            raise GitHubTrackerError("Handoff comment id must be a non-empty string")
+        self._execute(
+            """
+            mutation UpdateHandoffRecord($commentId: ID!, $body: String!) {
+              updateIssueComment(input: {id: $commentId, body: $body}) { issueComment { id } }
+            }
+            """,
+            {"commentId": comment_id, "body": body},
+        )
+
     def _repository_id(self, owner: str, name: str) -> str:
         data = self._execute(
             "query RepositoryId($owner: String!, $name: String!) { repository(owner: $owner, name: $name) { id } }",
@@ -1281,6 +1365,16 @@ def _repository_parts(repository: str) -> tuple[str, str]:
     if not owner or not name or "/" in name:
         raise GitHubTrackerError("TARGET_REPO must use the owner/repo format")
     return owner, name
+
+
+def _comment_author(node: dict[str, Any]) -> str:
+    """Author login for a raw issue-comment node; empty when deleted."""
+
+    author = node.get("author")
+    if not isinstance(author, dict):
+        return ""
+    login = author.get("login")
+    return login if isinstance(login, str) else ""
 
 
 def _issue_from_graphql(value: dict[str, Any]) -> TrackerIssue:
