@@ -104,6 +104,7 @@ def main() -> None:
         verifier=VerificationRunner(command_runner),
         evaluator=CompletionEvaluator(config.review_blocking_severities),
         issue_comments=tracker.trusted_comments,
+        prompt_comments=tracker.prompt_comments,
         prompt_redactions=config.credential_redactions,
         model_executor=model_executor,
         attempt_archive_factory=archive_factory,
@@ -155,7 +156,7 @@ def main() -> None:
         max_conflict_attempts=config.max_conflict_attempts,
         command_runner=command_runner,
         conflict_model_executor=model_executor,
-        conflict_issue_comments=tracker.trusted_comments,
+        conflict_issue_comments=tracker.prompt_comments,
         conflict_prompt_redactions=config.credential_redactions,
         event_log=lambda event, detail="", level="INFO", issue_number=None: logger.emit(
             event, phase="polling", detail=detail, level=level, issue_number=issue_number

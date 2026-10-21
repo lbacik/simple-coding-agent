@@ -447,6 +447,22 @@ class GitWorkspace:
         )
         return commits[0] if commits else None
 
+    def handoff_note_content_at_revision(
+        self, revision: str, issue_number: int
+    ) -> str | None:
+        """The Handoff note file as committed at ``revision``.
+
+        ``None`` when the revision is unknown or the note file within it
+        cannot be read.
+        """
+
+        try:
+            return self._git(
+                "show", f"{revision}:{handoff_note_relpath(issue_number)}"
+            )
+        except GitWorkspaceError:
+            return None
+
     def handoff_note_commit_carries_work(self, revision: str, issue_number: int) -> bool:
         """Whether a note-touching commit is really a work commit.
 

@@ -446,6 +446,51 @@ def test_handoff_note_commits_is_empty_without_a_note(
     )
 
 
+def test_handoff_note_commits_with_an_unparseable_attempt_id_includes_earlier_rounds(
+    attempt: SimpleNamespace,
+) -> None:
+    """The emergency previous-note lookup sees every round's notes.
+
+    An unparseable attempt id applies no time bound, so prior rounds'
+    note commits are included alongside this attempt's.
+    """
+
+    prior_round_commit(
+        attempt, ".agent/handoff/24.md", "# Handoff note: issue #24\n", "Handoff note: issue #24"
+    )
+    note = attempt.workspace.commit_handoff_note(24, "# Handoff note: issue #24\n\nnew\n")
+
+    commits = attempt.workspace.handoff_note_commits(
+        attempt.prepared, 24, attempt_id="previous-rounds"
+    )
+
+    assert len(commits) == 2
+    assert commits[0].revision == note.revision
+
+
+def test_handoff_note_content_at_revision_returns_the_committed_note(
+    attempt: SimpleNamespace,
+) -> None:
+    # No trailing newline: the git adapter's command runner strips it.
+    note = attempt.workspace.commit_handoff_note(24, "# Handoff note: issue #24\n\nbody")
+
+    assert (
+        attempt.workspace.handoff_note_content_at_revision(note.revision, 24)
+        == "# Handoff note: issue #24\n\nbody"
+    )
+
+
+def test_handoff_note_content_at_revision_is_none_when_unreadable(
+    attempt: SimpleNamespace,
+) -> None:
+    model_commit(attempt, "work.txt", "work", "Model work")
+
+    assert (
+        attempt.workspace.handoff_note_content_at_revision("missing-revision", 24)
+        is None
+    )
+
+
 def test_handoff_note_commit_carries_work_is_false_for_a_note_only_commit(
     attempt: SimpleNamespace,
 ) -> None:

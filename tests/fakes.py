@@ -29,6 +29,7 @@ from simple_coding_agent.git_workspace import (
     DirtyWorkspaceError,
     GitWorkspaceError,
     PreparedAttempt,
+    attempt_start_epoch,
 )
 from simple_coding_agent.github_tracker import (
     MERGE_CONFLICT,
@@ -155,6 +156,7 @@ class InMemoryWorkspace:
         self.ignored: set[str] = set()
         self.base_ignored: set[str] = set()
         self._commits: list[_RecordedCommit] = []
+        self._snapshots: dict[str, dict[str, str]] = {}
         self._sequence = 0
         self._conflict = ConflictState(in_progress=False)
         # Conflicted files ``prepare_attempt`` reports (and leaves in
@@ -347,11 +349,24 @@ class InMemoryWorkspace:
         self, prepared: PreparedAttempt, issue_number: int, *, attempt_id: str
     ) -> tuple[AttemptCommit, ...]:
         relpath = handoff_note_relpath(issue_number)
+        # Like GitWorkspace, an unparseable attempt id applies no time bound:
+        # prior rounds' note commits are included.
+        unscoped = attempt_start_epoch(attempt_id) is None
         return tuple(
             AttemptCommit(revision=record.revision, subject=record.subject)
             for record in reversed(self._commits)
-            if relpath in record.files and not record.prior_round
+            if relpath in record.files and (unscoped or not record.prior_round)
         )
+
+    def handoff_note_content_at_revision(
+        self, revision: str, issue_number: int
+    ) -> str | None:
+        """The Handoff note file as snapshotted when ``revision`` was recorded."""
+
+        snapshot = self._snapshots.get(revision)
+        if snapshot is None:
+            return None
+        return snapshot.get(handoff_note_relpath(issue_number))
 
     def handoff_note_commit(
         self, prepared: PreparedAttempt, issue_number: int, *, attempt_id: str
@@ -426,6 +441,15 @@ class InMemoryWorkspace:
             ),
         )
         self._commits.append(record)
+        snapshot: dict[str, str] = {}
+        for name in files:
+            path = self.working_directory / name
+            try:
+                if path.is_file():
+                    snapshot[name] = path.read_text()
+            except OSError:
+                continue
+        self._snapshots[record.revision] = snapshot
         if clear_dirty:
             self.dirty.clear()
         return AttemptCommit(revision=record.revision, subject=record.subject)

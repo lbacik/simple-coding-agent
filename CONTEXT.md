@@ -53,11 +53,11 @@ The structured result of an implementation attempt. Exactly one of: `complete` (
 _Avoid_: Status, result code, exit status
 
 **Handoff note**:
-The durable record of a `handoff` outcome: a committed file at a fixed per-issue path (`.agent/handoff/<issue-number>.md`) describing remaining work, plus a verbatim copy posted as an issue comment. The comment copy is what a continuation's starting prompt is enriched with; the file itself is only pointed at, never digested, since it is already reachable on the resumed branch. Its `started_at` field is the attempt id (the attempt checkpoint's `started_at`, the same value as the `<!-- agent-attempt: ... -->` marker): an informational value owned by the driving process, never a gate on the handoff.
+The durable record of a `handoff` outcome: a committed file at a fixed per-issue path (`.agent/handoff/<issue-number>.md`) describing remaining work, plus a verbatim copy posted as an issue comment. A continued attempt's starting prompt excludes every historical handoff result comment (including its note payload) and instructs the model to read the current note file on the resumed branch before implementing: the note is consumed from the local file, never digested from the comment history. Each cooperative handoff writes a self-contained replacement note covering current state, still-relevant decisions and constraints, unresolved review findings, remaining work, and applicable evidence; resolved work and obsolete instructions do not remain actionable requirements. Its `started_at` field is the attempt id (the attempt checkpoint's `started_at`, the same value as the `<!-- agent-attempt: ... -->` marker): an informational value owned by the driving process, never a gate on the handoff.
 _Avoid_: Progress note, status update, summary
 
 **Emergency handoff note**:
-A Handoff note written by the runtime, not the model, when the model reaches a limit without having written one. It states its own provenance and carries only what the runtime can reconstruct (changes, activity, budget facts); it never claims to know what work remains.
+A Handoff note written by the runtime, not the model, when the model reaches a limit without having written one. It states its own provenance and carries only what the runtime can reconstruct (changes, activity, budget facts); it never claims to know what work remains. When an earlier round left a complete note, it preserves that note at its immutable revision as older context, clearly distinguished from the current runtime evidence; a missing or unreadable previous note is said explicitly.
 _Avoid_: Fallback note, synthetic note
 
 **Attempt workspace**:

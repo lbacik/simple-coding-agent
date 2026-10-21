@@ -409,6 +409,18 @@ class ModelAttemptRunner:
         self._model_executor = model_executor
         self._acceptance_criteria_satisfied = acceptance_criteria_satisfied
         self._issue_comments = issue_comments
+        if prompt_comments is None:
+            # The default prompt view filters the raw comment feed: historical
+            # handoff results are superseded by the replacement Handoff note
+            # on the resumed branch, and machine bookkeeping is stripped from
+            # the generated results that remain. Detection, budget counting,
+            # and publication recovery keep reading the unfiltered feed.
+            raw_comments = issue_comments
+
+            def prompt_comments(issue: TrackerIssue) -> tuple[str, ...]:
+                return filter_prompt_comments(raw_comments(issue))
+
+        self._prompt_comments = prompt_comments
         self._attempt_archive_factory = attempt_archive_factory
         self._event_log = event_log
         self._operator_handoff = operator_handoff
@@ -507,7 +519,7 @@ class ModelAttemptRunner:
             failed_baseline = preparation.baseline
         prompt_body = _build_starting_prompt(
             claim.issue.body,
-            self._issue_comments(claim.issue),
+            self._prompt_comments(claim.issue),
             continuation=continuation,
             issue_number=claim.issue.number,
             profile=profile,
@@ -701,6 +713,9 @@ class ModelAttemptRunner:
                     ),
                     session_id=getattr(
                         self._model_executor, "cli_session_id", None
+                    ),
+                    previous_note=_previous_complete_note(
+                        self._workspace, prepared, claim.issue.number
                     ),
                 )
                 self._workspace.commit_handoff_note(claim.issue.number, note_content)
@@ -6621,10 +6636,11 @@ def _build_starting_prompt(
     """Compose the model's starting context from the issue body and trusted comments.
 
     Trusted comments are appended verbatim in the chronological order the
-    tracker already returns them in. A continuation adds only a pointer
-    sentence: the handoff note's own content is never fetched or digested
-    here, since it is already reachable on the resumed branch. A
-    setup-deferred attempt adds the rebase-conflict resolution instruction.
+    tracker already returns them in. A continuation adds a read-first
+    instruction naming the current Handoff note file as authoritative: the
+    note's own content is never fetched or digested here, since it is
+    already reachable on the resumed branch. A setup-deferred attempt adds
+    the rebase-conflict resolution instruction.
 
     A failed pre-model ``baseline`` (only possible on a tolerated continuation
     baseline; a red first-attempt baseline stops before dispatch) adds the
@@ -6638,8 +6654,11 @@ def _build_starting_prompt(
     parts = [issue_body, *comments]
     if continuation:
         parts.append(
-            "This is a continued attempt; if it exists, the handoff note from the "
-            f"previous attempt is at .agent/handoff/{issue_number}.md. "
+            "This is a continued attempt. Read the current Handoff note at "
+            f".agent/handoff/{issue_number}.md before implementing: it is the "
+            "authoritative, self-contained record of the previous attempt's "
+            "state, remaining work, and evidence, and it supersedes every "
+            "historical handoff result comment. "
             "Invoke the `code-review` skill on your changes before finishing, "
             "even when this run only verifies earlier work or fixes formatting: "
             "without a `code-review` invocation in this run the attempt is "
@@ -6758,11 +6777,88 @@ def _classify_handoff_reason(execution: object) -> str:
 
 
 # Bounds for the emergency handoff note: the tool-call trail shows the last
-# 15 calls, file lists show the first 50 entries plus a `+N more` line, and
-# the last assistant text is truncated to about 1,500 characters.
+# 15 calls, file lists show the first 50 entries plus a `+N more` line, the
+# last assistant text is truncated to about 1,500 characters, and a preserved
+# previous note is truncated to about 3,000 characters.
 _EMERGENCY_TOOL_TRAIL_LIMIT = 15
 _EMERGENCY_FILE_LIST_LIMIT = 50
 _EMERGENCY_ASSISTANT_TEXT_LIMIT = 1500
+_EMERGENCY_PREVIOUS_NOTE_LIMIT = 3000
+
+
+@dataclass(frozen=True)
+class _PreviousCompleteNote:
+    """A prior round's Handoff note commit and what it held.
+
+    ``content`` is ``None`` when the revision could not be read: the
+    emergency note then names the revision explicitly instead of pretending
+    the older note describes the current branch.
+    """
+
+    revision: str
+    content: str | None
+
+
+#: Scoping id for the previous-note lookup: unparseable by
+#: ``attempt_start_epoch`` on purpose, so ``handoff_note_commits`` applies no
+#: time bound and returns every round's note commits, newest first.
+_PREVIOUS_NOTE_ATTEMPT_ID = "previous-rounds"
+
+#: Marker the runtime stamps into every note it writes itself, distinguishing
+#: emergency notes (runtime evidence only) from complete ones.
+_RUNTIME_WRITTEN_MARKER = "written by the runtime"
+
+
+def _is_complete_handoff_note(content: str, issue_number: int) -> bool:
+    """Whether ``content`` is a complete note of an earlier round for this issue.
+
+    Complete means it parses with a matching title and ``issue`` field and
+    was not written by the runtime: an emergency note carries only runtime
+    evidence, never a continuation-ready assessment.
+    """
+
+    fields = _parse_handoff_note_fields(content)
+    return (
+        fields.get("title_issue") == str(issue_number)
+        and fields.get("issue") == str(issue_number)
+        and _RUNTIME_WRITTEN_MARKER not in content
+    )
+
+
+def _previous_complete_note(
+    workspace: AttemptWorkspace,
+    prepared: PreparedAttempt,
+    issue_number: int,
+) -> _PreviousCompleteNote | None:
+    """The newest complete Handoff note of an earlier round, if any.
+
+    Never raises: an unreadable history degrades to an absent or unreadable
+    note instead of failing the emergency path.
+    """
+
+    try:
+        commits = workspace.handoff_note_commits(
+            prepared, issue_number, attempt_id=_PREVIOUS_NOTE_ATTEMPT_ID
+        )
+    except Exception:
+        return None
+    unreadable: str | None = None
+    for commit in commits:
+        try:
+            content = workspace.handoff_note_content_at_revision(
+                commit.revision, issue_number
+            )
+        except Exception:
+            content = None
+        if content is None:
+            if unreadable is None:
+                unreadable = commit.revision
+            continue
+        if _is_complete_handoff_note(content, issue_number):
+            return _PreviousCompleteNote(revision=commit.revision, content=content)
+    if unreadable is not None:
+        return _PreviousCompleteNote(revision=unreadable, content=None)
+    return None
 
 
 def _build_emergency_handoff_note(
@@ -6784,6 +6880,7 @@ def _build_emergency_handoff_note(
     token_budget: Mapping[str, Any] | None = None,
     archive_dir: str | None = None,
     session_id: str | None = None,
+    previous_note: _PreviousCompleteNote | None = None,
 ) -> str:
     """Render the runtime-written handoff note for a limit stop without a model note.
 
@@ -6802,6 +6899,7 @@ def _build_emergency_handoff_note(
     )
     sections = [
         ("Provenance", _emergency_provenance(reason, explanation)),
+        ("Previous complete note", _emergency_previous_note(previous_note)),
         (
             "Changes",
             _emergency_changes(
@@ -6848,6 +6946,40 @@ def _emergency_provenance(reason: str, explanation: str) -> str:
         f"The limit that fired was `{reason}`.\n\n"
         "Model's terminal explanation:\n\n"
         f"{_blockquote(detail)}"
+    )
+
+
+def _emergency_previous_note(previous_note: _PreviousCompleteNote | None) -> str:
+    """The last complete note of an earlier round, or why none is shown.
+
+    A found note is quoted verbatim (capped) at its immutable revision and
+    marked as older context, clearly distinguished from the runtime evidence
+    below, which describes the current branch. A missing or unreadable note
+    is said explicitly, so the continuation never mistakes the older note
+    for the current branch state.
+    """
+
+    if previous_note is None:
+        return (
+            "No previous complete Handoff note was found on this branch: "
+            "no earlier round committed a readable, complete note for this issue."
+        )
+    if previous_note.content is None:
+        return (
+            "The previous round's Handoff note commit "
+            f"`{previous_note.revision}` could not be read from this branch, "
+            "so its older context is unavailable; only the runtime evidence "
+            "below describes the current branch."
+        )
+    content = previous_note.content.strip()
+    if len(content) > _EMERGENCY_PREVIOUS_NOTE_LIMIT:
+        content = content[:_EMERGENCY_PREVIOUS_NOTE_LIMIT] + "...[truncated]"
+    return (
+        "The last complete Handoff note "
+        f"(revision `{previous_note.revision}`) is preserved below as older "
+        "context: it describes the branch as an earlier round left it; the "
+        "runtime evidence below describes the current branch.\n\n"
+        f"{_blockquote(content)}"
     )
 
 
