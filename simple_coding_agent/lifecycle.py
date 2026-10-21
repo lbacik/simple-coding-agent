@@ -2203,6 +2203,14 @@ class AgentLifecycle:
                 f" local evidence is missing or invalid"
                 f" ({_exception_detail(error)}); the hold remains. {hold_suffix}"
             )
+        shared_hold = self._recovery_shared_hold(
+            claim.issue.number, attempt_id, decision.outcome
+        )
+        if shared_hold is not None:
+            return False, (
+                f"recovery retry for attempt {attempt_id} not fulfilled:"
+                f" {shared_hold} the hold remains. {hold_suffix}"
+            )
         try:
             published = self._publisher.publish(
                 PublicationRequest(
@@ -2241,6 +2249,16 @@ class AgentLifecycle:
         self._observe_and_remember_workspace_dirty(attempt_id)
         outcome = published.outcome
         comment_posted = _publication_confirmed(published)
+        if not comment_posted and outcome is AttemptOutcome.HANDOFF and getattr(
+            published, "handoff_posted", False
+        ):
+            # The shared handoff record is authoritative: a verified shared
+            # publication confirms the handoff even when no individual
+            # handoff result comment exists (deleted, or never posted).
+            # The branch push behind it was already verified by publication,
+            # so outstanding release/cleanup work can resume without
+            # rerunning the model or changing the outcome.
+            comment_posted = True
         if not comment_posted:
             return False, (
                 f"recovery retry for attempt {attempt_id} not fulfilled:"

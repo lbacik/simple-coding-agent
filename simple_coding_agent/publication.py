@@ -916,6 +916,43 @@ def _exception_detail(error: Exception) -> str:
     return f"{type(error).__name__}: {error}".strip() or type(error).__name__
 
 
+def confirm_shared_handoff(
+    github: PublicationTransport,
+    repository: str,
+    issue_number: int,
+    attempt_id: str,
+    *,
+    branch_sha: str | None = None,
+    note_sha: str | None = None,
+) -> HandoffRecord | None:
+    """Confirm the remote shared handoff record for one attempt, if it matches.
+
+    Returns the verified record when the trusted shared comment exists,
+    parses, and names ``attempt_id`` (with matching ``branch_sha``/``note_sha``
+    when the caller supplies them); otherwise returns ``None``. The per-attempt
+    result comment is never consulted, so recovery can confirm a published
+    handoff from the shared record and verified revisions even when no
+    individual handoff result comment exists. Ambiguous remote state
+    (unreadable transport, multiple records, malformed bodies) reads as
+    ``None`` so the caller retains the attempt instead of guessing.
+    """
+
+    try:
+        existing = github.find_handoff_record(repository, issue_number)
+    except Exception:
+        return None
+    if existing is None:
+        return None
+    parsed = parse_handoff_record(existing.body)
+    if parsed is None or parsed.attempt_id != attempt_id:
+        return None
+    if branch_sha is not None and parsed.branch_sha != branch_sha:
+        return None
+    if note_sha is not None and parsed.note_sha != note_sha:
+        return None
+    return parsed
+
+
 def _conflict_failure_standing(request: ConflictPublicationRequest) -> tuple[int, bool]:
     """The ``(index, escalate)`` for a conflict failure discovered at publish time.
 

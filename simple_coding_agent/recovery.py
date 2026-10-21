@@ -135,6 +135,145 @@ def is_handoff_record(body: str) -> bool:
     return body.find("-->", start) >= 0
 
 
+class AmbiguousContinuationError(ValueError):
+    """The shared handoff metadata cannot be trusted for accounting.
+
+    Raised when the trusted comment history carries more than one shared
+    handoff record, or a shared body that is malformed or uses an
+    unsupported version. Callers must retain the issue for operator repair
+    instead of silently granting a fresh budget.
+    """
+
+
+_ATTEMPT_MARKER_RE = re.compile(r"<!--\s*agent-attempt:\s*(.*?)\s*-->")
+
+
+def parse_attempt_id(body: str) -> str | None:
+    """Return the ``<!-- agent-attempt: ... -->`` identity in a comment, if any."""
+
+    match = _ATTEMPT_MARKER_RE.search(body or "")
+    if match is None:
+        return None
+    value = match.group(1).strip()
+    return value or None
+
+
+def _attempt_id_sort_key(value: str) -> tuple[int, object]:
+    """Order attempt IDs chronologically; unparseable IDs sort as strings.
+
+    Checkpoint IDs are UTC ``started_at`` stamps, so parsed datetimes order
+    correctly even when microseconds are present (plain string comparison
+    misorders ``...00Z`` past ``...00.000001Z``). Unparseable IDs fall back
+    to string order and never match a well-formed shared record.
+    """
+
+    from datetime import datetime
+
+    try:
+        parsed = datetime.fromisoformat(value.removesuffix("Z") + "+00:00")
+    except (ValueError, AttributeError):
+        return (1, value)
+    return (0, parsed)
+
+
+def _attempt_id_less(first: str, second: str) -> bool:
+    return _attempt_id_sort_key(first) < _attempt_id_sort_key(second)
+
+
+def _attempt_id_greater(first: str, second: str) -> bool:
+    return _attempt_id_sort_key(first) > _attempt_id_sort_key(second)
+
+
+def resolve_automatic_continuation_count(
+    bodies_newest_first: tuple[str, ...] | list[str],
+    *,
+    issue_number: int | None = None,
+    repository: str | None = None,
+) -> int:
+    """Resolve the automatic-continuation standing from the shared record.
+
+    The single trusted shared handoff record (issue #283) is authoritative
+    when present: its ``continuation_count`` already encodes the row up to
+    its own attempt, and ordinary non-handoff results newer than that
+    attempt (in attempt-ID order) are reconciled on top so a newer failure
+    or human requeue cannot be hidden by older handoff metadata. An
+    overlapping legacy result for the same attempt counts once (the shared
+    record wins and the duplicate is ignored). Conflict-attempt results
+    stay transparent: they neither consume nor reset the budget.
+
+    With no shared metadata the count initialises from trusted historical
+    result comments using the legacy semantics
+    (:func:`count_automatic_continuations`), so older issues migrate
+    without comment changes. Missing shared metadata alone is not
+    ambiguous: it reads as the legacy count.
+
+    More than one trusted shared body, or any trusted shared body that is
+    malformed or uses an unsupported version, raises
+    :class:`AmbiguousContinuationError`: the history cannot verify the
+    standing, so callers must retain the issue instead of granting a fresh
+    budget. A record naming a different issue or repository than the
+    caller expects is likewise ambiguous.
+    """
+
+    shared_bodies = [body for body in bodies_newest_first if is_handoff_record(body)]
+    if not shared_bodies:
+        return count_automatic_continuations(bodies_newest_first)
+    # Local import: handoff_record imports this module for its markers.
+    from simple_coding_agent.handoff_record import parse_handoff_record
+
+    records = []
+    for body in shared_bodies:
+        record = parse_handoff_record(body)
+        if record is None:
+            raise AmbiguousContinuationError(
+                "the shared handoff record is malformed or uses an unsupported version;"
+                " the standing cannot be verified"
+            )
+        records.append(record)
+    if len(records) != 1 or len(shared_bodies) != 1:
+        raise AmbiguousContinuationError(
+            "more than one shared handoff comment is present;"
+            " the standing cannot be verified"
+        )
+    record = records[0]
+    if issue_number is not None and record.issue_number != issue_number:
+        raise AmbiguousContinuationError(
+            "the shared handoff record names a different issue;"
+            " the standing cannot be verified"
+        )
+    if repository is not None and record.repository != repository:
+        raise AmbiguousContinuationError(
+            "the shared handoff record names a different repository;"
+            " the standing cannot be verified"
+        )
+    shared_attempt = record.attempt_id
+    newer_automatics = 0
+    for body in bodies_newest_first:
+        if is_handoff_record(body):
+            continue
+        if is_conflict_attempt(body):
+            continue
+        attempt_id = parse_attempt_id(body)
+        if attempt_id is None:
+            # Unmarked legacy results predate the shared-record era, which
+            # the shared count already summarizes; ignore them.
+            continue
+        if attempt_id == shared_attempt:
+            # Overlapping legacy and shared records for the same attempt
+            # count once: the shared record already carries it.
+            continue
+        if not _attempt_id_greater(attempt_id, shared_attempt):
+            # Older than the shared record: already summarized by it.
+            continue
+        if parse_requeue_source(body) != REQUEUE_SOURCE_AUTOMATIC:
+            # A newer human requeue (or legacy unmarked result with an ID,
+            # or any newer ordinary result) resets the row: only automatics
+            # after it count, and the older shared standing is hidden.
+            return newer_automatics
+        newer_automatics += 1
+    return record.continuation_count + newer_automatics
+
+
 def count_automatic_continuations(bodies_newest_first: tuple[str, ...] | list[str]) -> int:
     """Count automatic-requeue result comments in a row from the newest.
 

@@ -15,10 +15,11 @@ from urllib.request import Request, urlopen
 
 from simple_coding_agent.publication import HandoffRecordRef, PullRequest
 from simple_coding_agent.recovery import (
-    count_automatic_continuations,
+    AmbiguousContinuationError,
     count_conflict_failures,
     filter_prompt_comments,
     is_handoff_record,
+    resolve_automatic_continuation_count,
 )
 
 
@@ -396,7 +397,13 @@ class GitHubTracker:
             return False
         if not issue.is_continuation_signal or not issue.meets_base_queue_rules:
             return False
-        return self.automatic_continuation_count(issue) < self._max_auto_continuations
+        try:
+            return self.automatic_continuation_count(issue) < self._max_auto_continuations
+        except AmbiguousContinuationError:
+            # Ambiguous shared metadata (duplicates, malformed/unsupported
+            # records) never grants a fresh budget: the issue stays queued
+            # out for operator repair. Transport failures still propagate.
+            return False
 
     def detect_conflict_requeues(
         self, by_number: dict[int, TrackerIssue]
@@ -678,6 +685,16 @@ class GitHubTracker:
         examined; any other comment is ignored even if it contains the
         marker. A human-requeue result (or a legacy unmarked result from
         before the marker existed) resets the count to zero.
+
+        The single trusted shared handoff record is authoritative when
+        present: its standing is reconciled with newer ordinary results in
+        attempt order, so a routine handoff needs no individual result
+        comment. With no shared metadata the count initialises from the
+        trusted historical result comments. Ambiguous shared metadata
+        (duplicates, malformed or unsupported records, or a record for a
+        different issue/repository) raises
+        :class:`AmbiguousContinuationError` instead of granting a fresh
+        budget; callers treat it as unverifiable and retain the issue.
         """
 
         viewer = self._transport.viewer()
@@ -689,7 +706,11 @@ class GitHubTracker:
             # incidentally matching another deleted account.
             if comment.author_login and comment.author_login == viewer.login
         )
-        return count_automatic_continuations(own_bodies_newest_first)
+        return resolve_automatic_continuation_count(
+            own_bodies_newest_first,
+            issue_number=issue.number,
+            repository=self._target_repo,
+        )
 
     def conflict_failure_streak(self, issue: TrackerIssue) -> int:
         """Count consecutive failed conflict attempts on ``issue`` since the last stop.
