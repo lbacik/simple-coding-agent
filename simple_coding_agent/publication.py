@@ -9,7 +9,7 @@ from typing import Callable, Protocol
 from simple_coding_agent.completion import AttemptOutcome, CompletionDecision, PublicationPath
 from simple_coding_agent.attempt_state import AttemptPhase, AttemptStateStore
 from simple_coding_agent.attempt_workspace import BranchPusher
-from simple_coding_agent.git_workspace import GitWorkspaceError
+from simple_coding_agent.git_workspace import BranchMovedSinceClaimError, GitWorkspaceError
 from simple_coding_agent.handoff_record import (
     HANDOFF_RECORD_VERSION,
     HandoffPublicationStore,
@@ -339,12 +339,22 @@ class Publisher:
                 checkpoint = self._attempt_state.read() if self._attempt_state is not None else None
                 if checkpoint is None or checkpoint.phase is not AttemptPhase.PUBLISHING:
                     self._check_deadline(deadline)
-                    pushed_sha = self._workspace.push_attempt_branch(
-                        request.branch, max_retries=self._max_retries, deadline=deadline
-                    )
+                    pushed_sha = self._push_branch(request.branch, deadline=deadline)
                     self._check_deadline(deadline)
                     self._mark_publishing()
                 branch_url = f"https://github.com/{self._repository}/tree/{request.branch}"
+            except BranchMovedSinceClaimError as error:
+                push_failure = f"Partial branch push failed: {type(error).__name__}: {error}"
+                self._event_log(
+                    "publication_failed",
+                    push_failure,
+                    level="ERROR",
+                    issue_number=request.issue_number,
+                )
+                outcome = AttemptOutcome.INFRASTRUCTURE_ERROR
+                details = push_failure
+                comment_posted = self._post_result(request, outcome, branch_url, None, details)
+                return PublicationResult(outcome, branch_url, None, comment_posted, details)
             except (GitWorkspaceError, TimeoutError) as error:
                 push_failure = f"Partial branch push failed: {type(error).__name__}: {error}"
                 self._event_log(
@@ -549,12 +559,44 @@ class Publisher:
                 checkpoint = self._attempt_state.read() if self._attempt_state is not None else None
                 if checkpoint is None or checkpoint.phase is not AttemptPhase.PUBLISHING:
                     self._check_deadline(deadline)
-                    pushed_sha = self._workspace.push_attempt_branch(
-                        request.branch, max_retries=self._max_retries, deadline=deadline
-                    )
+                    pushed_sha = self._push_branch(request.branch, deadline=deadline)
                     self._check_deadline(deadline)
                     self._mark_publishing()
                 branch_url = f"https://github.com/{self._repository}/tree/{request.branch}"
+            except BranchMovedSinceClaimError as error:
+                push_failure = f"Rebased branch push failed: {type(error).__name__}: {error}"
+                self._event_log(
+                    "publication_failed",
+                    push_failure,
+                    level="ERROR",
+                    issue_number=request.issue_number,
+                )
+                outcome = AttemptOutcome.INFRASTRUCTURE_ERROR
+                conflict_outcome = "push_failed"
+                details = "; ".join((request.details, push_failure)) if request.details else push_failure
+                conflict_index, escalate = _conflict_failure_standing(request)
+                comment_posted = self._post_conflict_result(
+                    request,
+                    outcome,
+                    conflict_outcome,
+                    branch_url,
+                    None,
+                    details,
+                    None,
+                    None,
+                    conflict_index=conflict_index,
+                    escalate=escalate,
+                )
+                return PublicationResult(
+                    outcome,
+                    branch_url,
+                    request.pull_request,
+                    comment_posted,
+                    details,
+                    None,
+                    conflict_outcome,
+                    escalate,
+                )
             except (GitWorkspaceError, TimeoutError) as error:
                 push_failure = f"Rebased branch push failed: {type(error).__name__}: {error}"
                 self._event_log(
@@ -633,6 +675,49 @@ class Publisher:
             conflict_outcome,
             escalate,
         )
+
+    def _claim_lease(self) -> tuple[str | None, bool]:
+        """The recorded claim-time lease for the active attempt, if any.
+
+        Returns ``(revision, True)`` when the checkpoint durably records the
+        remote revision observed at attempt start (``None`` when the branch
+        was absent), otherwise ``(None, False)`` so the push falls back to
+        today's observed lease like checkpoints written before the lease.
+        """
+
+        try:
+            checkpoint = self._attempt_state.read() if self._attempt_state is not None else None
+        except Exception:
+            return (None, False)
+        if checkpoint is None:
+            return (None, False)
+        if not getattr(checkpoint, "claim_lease_recorded", False):
+            return (None, False)
+        return (checkpoint.claim_branch_revision, True)
+
+    def _advance_claim_lease(self, revision: str) -> None:
+        """Advance the recorded lease to a revision this attempt just pushed."""
+
+        if self._attempt_state is None:
+            return
+        try:
+            self._attempt_state.advance_claim_lease(revision)
+        except Exception as error:
+            raise GitWorkspaceError(f"Claim lease could not be advanced: {error}") from error
+
+    def _push_branch(self, branch: str, *, deadline: float) -> str:
+        """Push using the recorded claim-time lease when one exists."""
+
+        expected_revision, lease_known = self._claim_lease()
+        pushed = self._workspace.push_attempt_branch(
+            branch,
+            max_retries=self._max_retries,
+            deadline=deadline,
+            expected_revision=expected_revision,
+            lease_known=lease_known,
+        )
+        self._advance_claim_lease(pushed)
+        return pushed
 
     def _mark_publishing(self) -> None:
         """Durably record a verified branch write before any PR write can begin."""
@@ -870,11 +955,17 @@ class Publisher:
                 # metadata is about to claim, so the record never names an
                 # unverified sha.
                 self._check_deadline(deadline)
-                verified_sha = self._workspace.push_attempt_branch(
-                    request.branch, max_retries=self._max_retries, deadline=deadline
-                )
+                verified_sha = self._push_branch(request.branch, deadline=deadline)
                 self._check_deadline(deadline)
                 self._mark_publishing()
+        except BranchMovedSinceClaimError as error:
+            self._event_log(
+                "publication_failed",
+                f"Shared handoff branch push failed: {type(error).__name__}: {error}",
+                level="ERROR",
+                issue_number=request.issue_number,
+            )
+            return False
         except (GitWorkspaceError, TimeoutError) as error:
             self._event_log(
                 "publication_failed",

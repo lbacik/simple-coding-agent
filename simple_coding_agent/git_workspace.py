@@ -62,6 +62,17 @@ class RebaseConflictError(GitWorkspaceError):
         self.conflicted_files = conflicted_files
 
 
+class BranchMovedSinceClaimError(GitWorkspaceError):
+    """Raised when the attempt branch moved since the claim-time lease.
+
+    The remote revision no longer matches the revision observed at attempt
+    start (or the revision this attempt last pushed): another Worker
+    published the shared ``agent/issue-N`` branch while this attempt ran.
+    The push is not retried; the attempt ends as ``infrastructure_error``
+    with ``branch moved since claim`` so a human decides on requeue.
+    """
+
+
 @dataclass(frozen=True)
 class PreparedAttempt:
     """The branch and verified base revision for one implementation attempt."""
@@ -71,6 +82,13 @@ class PreparedAttempt:
     restored_from_remote: bool = False
     rebase_conflicts: tuple[str, ...] = ()
     pre_rebase_revision: str | None = None
+    #: The remote revision of the attempt branch observed while preparing
+    #: (``None`` when the branch was absent). Recorded into the attempt
+    #: checkpoint as the claim-time lease. ``remote_branch_known`` is False
+    #: for values constructed without an observation (older test doubles),
+    #: which must fall back to today's observed lease.
+    remote_branch_revision: str | None = None
+    remote_branch_known: bool = False
 
 
 @dataclass(frozen=True)
@@ -255,6 +273,8 @@ class GitWorkspace:
             restored_from_remote=remote_branch_revision is not None,
             rebase_conflicts=rebase_conflicts,
             pre_rebase_revision=pre_rebase_revision,
+            remote_branch_revision=remote_branch_revision,
+            remote_branch_known=True,
         )
 
     def _ensure_verified_base(self, base_branch: str) -> str:
@@ -589,18 +609,46 @@ class GitWorkspace:
                 continue
 
     def push_attempt_branch(
-        self, branch: str, *, max_retries: int, deadline: float | None = None
+        self,
+        branch: str,
+        *,
+        max_retries: int,
+        deadline: float | None = None,
+        expected_revision: str | None = None,
+        lease_known: bool = False,
     ) -> str:
-        """Push an attempt branch using an explicit, observed force-with-lease.
+        """Push an attempt branch using a claim-time force-with-lease.
 
-        The operation is independently callable during recovery.  A failed
-        push is first reconciled with the remote because the server may have
-        accepted it before the client lost its response.
+        When ``lease_known`` holds, ``expected_revision`` is the remote
+        revision observed at attempt start (``None`` when the branch was
+        absent) and every push uses it as the lease, without refetching
+        first. After each own successful push the caller advances the
+        recorded lease to the pushed revision, so later pushes in the same
+        attempt succeed. When ``lease_known`` is false (checkpoints written
+        before the lease existed), the lease falls back to today's observed
+        revision, fetched right before each push as before.
+
+        A failed push is first reconciled with the remote because the server
+        may have accepted it before the client lost its response. A push
+        that fails while the remote differs from the claim-time lease raises
+        :class:`BranchMovedSinceClaimError` without retrying: another Worker
+        published the shared branch while this attempt ran.
         """
 
         if max_retries <= 0:
             raise GitWorkspaceError("Push retry count must be positive")
+        if lease_known:
+            if expected_revision is not None and (
+                not isinstance(expected_revision, str)
+                or not expected_revision.strip()
+                or any(character.isspace() for character in expected_revision)
+            ):
+                raise GitWorkspaceError("Claim lease revision must be a non-empty string or None")
         local_revision = self._revision(branch, remote=False)
+        if lease_known:
+            return self._push_with_claim_lease(
+                branch, local_revision, expected_revision, max_retries=max_retries, deadline=deadline
+            )
         last_error: GitWorkspaceError | None = None
         for attempt in range(max_retries):
             if deadline is not None and time.monotonic() >= deadline:
@@ -624,6 +672,56 @@ class GitWorkspace:
                         return local_revision
                 except GitWorkspaceError:
                     pass
+                if attempt + 1 < max_retries:
+                    delay = min(2 * 2**attempt, 30)
+                    if deadline is not None and time.monotonic() + delay >= deadline:
+                        raise GitWorkspaceError("PUBLISH_TIMEOUT exceeded while retrying push") from error
+                    self._sleeper(delay)
+        raise GitWorkspaceError("Attempt branch could not be pushed safely") from last_error
+
+    def _push_with_claim_lease(
+        self,
+        branch: str,
+        local_revision: str,
+        expected_revision: str | None,
+        *,
+        max_retries: int,
+        deadline: float | None,
+    ) -> str:
+        """Push using the recorded claim-time lease, without refetching first."""
+
+        expected = expected_revision or ""
+        last_error: GitWorkspaceError | None = None
+        for attempt in range(max_retries):
+            if deadline is not None and time.monotonic() >= deadline:
+                raise GitWorkspaceError("PUBLISH_TIMEOUT exceeded while pushing")
+            try:
+                self._git(
+                    "push",
+                    f"--force-with-lease={branch}:{expected}",
+                    "origin",
+                    f"{branch}:refs/heads/{branch}",
+                )
+                if self._remote_branch_revision(branch) == local_revision:
+                    return local_revision
+                raise GitWorkspaceError("Pushed branch does not match the local revision")
+            except BranchMovedSinceClaimError:
+                raise
+            except GitWorkspaceError as error:
+                last_error = error
+                try:
+                    current = self._remote_branch_revision(branch)
+                except GitWorkspaceError:
+                    current = "__unreadable__"
+                if current == local_revision:
+                    return local_revision
+                if current != "__unreadable__" and current != expected_revision:
+                    observed = "absent" if current is None else current
+                    wanted = "absent" if expected_revision is None else expected_revision
+                    raise BranchMovedSinceClaimError(
+                        f"branch moved since claim: remote {branch} is {observed}, "
+                        f"claim-time lease was {wanted}"
+                    ) from error
                 if attempt + 1 < max_retries:
                     delay = min(2 * 2**attempt, 30)
                     if deadline is not None and time.monotonic() + delay >= deadline:

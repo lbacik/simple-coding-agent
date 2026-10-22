@@ -60,6 +60,12 @@ class AttemptCheckpoint:
     issue_title: str | None = None
     continuation_index: int | None = None
     attempt_kind: str = ATTEMPT_KIND_ORDINARY
+    #: The remote revision of the attempt branch observed at attempt start
+    #: (``None`` when the branch was absent). ``claim_lease_recorded`` is
+    #: ``False`` for checkpoints written before the lease existed, which must
+    #: fall back to today's observed lease instead of the recorded value.
+    claim_branch_revision: str | None = None
+    claim_lease_recorded: bool = False
 
 
 class AttemptStateStore:
@@ -180,9 +186,74 @@ class AttemptStateStore:
             issue_title=checkpoint.issue_title,
             continuation_index=checkpoint.continuation_index,
             attempt_kind=checkpoint.attempt_kind,
+            claim_branch_revision=checkpoint.claim_branch_revision,
+            claim_lease_recorded=checkpoint.claim_lease_recorded,
         )
         self._write(transitioned)
         return transitioned
+
+    def record_claim_lease(self, revision: str | None) -> AttemptCheckpoint:
+        """Durably record the remote revision observed at attempt start.
+
+        ``revision`` is the observed remote sha of the attempt branch, or
+        ``None`` when the branch was absent. Only the first recording wins:
+        recovery must keep the original lease instead of overwriting it with
+        a later observation. Returns the stored checkpoint.
+        """
+
+        checkpoint = self.read()
+        if checkpoint is None:
+            raise AttemptStateError("No implementation attempt is active")
+        _validate_claim_lease(revision)
+        if checkpoint.claim_lease_recorded:
+            return checkpoint
+        recorded = AttemptCheckpoint(
+            issue_number=checkpoint.issue_number,
+            branch=checkpoint.branch,
+            phase=checkpoint.phase,
+            started_at=checkpoint.started_at,
+            updated_at=self._next_timestamp(),
+            auto_merge_opt_in=checkpoint.auto_merge_opt_in,
+            requeue_source=checkpoint.requeue_source,
+            issue_title=checkpoint.issue_title,
+            continuation_index=checkpoint.continuation_index,
+            attempt_kind=checkpoint.attempt_kind,
+            claim_branch_revision=revision,
+            claim_lease_recorded=True,
+        )
+        self._write(recorded)
+        return recorded
+
+    def advance_claim_lease(self, revision: str) -> AttemptCheckpoint:
+        """Advance the recorded lease to a revision this attempt just pushed.
+
+        Called after each own successful push so later pushes in the same
+        attempt use the new revision as their lease. Requires a non-empty
+        revision; records the lease when an older checkpoint never stored one.
+        """
+
+        checkpoint = self.read()
+        if checkpoint is None:
+            raise AttemptStateError("No implementation attempt is active")
+        _validate_claim_lease(revision)
+        if revision is None:
+            raise AttemptStateError("Claim lease advance requires a revision")
+        advanced = AttemptCheckpoint(
+            issue_number=checkpoint.issue_number,
+            branch=checkpoint.branch,
+            phase=checkpoint.phase,
+            started_at=checkpoint.started_at,
+            updated_at=self._next_timestamp(),
+            auto_merge_opt_in=checkpoint.auto_merge_opt_in,
+            requeue_source=checkpoint.requeue_source,
+            issue_title=checkpoint.issue_title,
+            continuation_index=checkpoint.continuation_index,
+            attempt_kind=checkpoint.attempt_kind,
+            claim_branch_revision=revision,
+            claim_lease_recorded=True,
+        )
+        self._write(advanced)
+        return advanced
 
     def delete(self) -> None:
         """Remove the active checkpoint after its lifecycle cleanup completes."""
@@ -237,6 +308,15 @@ def _as_utc(value: datetime) -> datetime:
     return value.astimezone(UTC)
 
 
+def _validate_claim_lease(revision: str | None) -> None:
+    if revision is None:
+        return
+    if not isinstance(revision, str) or not revision.strip():
+        raise AttemptStateError("Claim lease revision must be a non-empty string or None")
+    if any(character.isspace() for character in revision):
+        raise AttemptStateError("Claim lease revision must not contain whitespace")
+
+
 def _checkpoint_to_json(checkpoint: AttemptCheckpoint) -> dict[str, bool | int | str | None]:
     return {
         "issue_number": checkpoint.issue_number,
@@ -249,6 +329,8 @@ def _checkpoint_to_json(checkpoint: AttemptCheckpoint) -> dict[str, bool | int |
         "issue_title": checkpoint.issue_title,
         "continuation_index": checkpoint.continuation_index,
         "attempt_kind": checkpoint.attempt_kind,
+        "claim_branch_revision": checkpoint.claim_branch_revision,
+        "claim_lease_recorded": checkpoint.claim_lease_recorded,
     }
 
 
@@ -264,6 +346,10 @@ def _checkpoint_from_json(value: object) -> AttemptCheckpoint:
         # read as ordinary; checkpoints written while the conflict claim was
         # recorded under ``is_conflict_claim`` map that flag onto the kind.
         "is_conflict_claim",
+        # Checkpoints written before the claim lease carry neither key and
+        # read as unrecorded, so recovery falls back to today's observed lease.
+        "claim_branch_revision",
+        "claim_lease_recorded",
     }
     if not isinstance(value, dict):
         raise ValueError("invalid checkpoint shape")
@@ -314,6 +400,28 @@ def _checkpoint_from_json(value: object) -> AttemptCheckpoint:
         raise ValueError("invalid attempt kind")
     if "is_conflict_claim" in value and value["is_conflict_claim"] not in (True, False):
         raise ValueError("invalid conflict-claim flag")
+    if "claim_lease_recorded" in value:
+        claim_lease_recorded = value["claim_lease_recorded"]
+    else:
+        claim_lease_recorded = False
+    if "claim_branch_revision" in value:
+        claim_branch_revision = value["claim_branch_revision"]
+    else:
+        claim_branch_revision = None
+    if not isinstance(claim_lease_recorded, bool):
+        raise ValueError("invalid claim lease flag")
+    if claim_branch_revision is not None:
+        if (
+            not isinstance(claim_branch_revision, str)
+            or not claim_branch_revision.strip()
+            or any(character.isspace() for character in claim_branch_revision)
+        ):
+            raise ValueError("invalid claim lease revision")
+    if not claim_lease_recorded:
+        # Checkpoints written before the lease existed carry neither key;
+        # a stray revision without the recorded flag reads as unrecorded so
+        # recovery falls back to today's observed lease.
+        claim_branch_revision = None
     _parse_timestamp(started_at)
     _parse_timestamp(updated_at)
     return AttemptCheckpoint(
@@ -327,6 +435,8 @@ def _checkpoint_from_json(value: object) -> AttemptCheckpoint:
         issue_title=issue_title,
         continuation_index=continuation_index,
         attempt_kind=attempt_kind,
+        claim_branch_revision=claim_branch_revision,
+        claim_lease_recorded=claim_lease_recorded,
     )
 
 
