@@ -531,8 +531,10 @@ class ModelExecutor:
 
     Token soft-threshold policy: once the ledger budget crosses the soft
     threshold, every running subagent (including background ones) is
-    stopped: subsequent subagent tool calls are denied and the cancelled
-    ids are recorded in a ``token_soft_threshold_subagents_stopped`` event.
+    stopped: subsequent subagent tool calls are denied for the rest of the
+    run -- including after the handoff note commit is observed -- and the
+    cancelled ids are recorded in a
+    ``token_soft_threshold_subagents_stopped`` event.
     Only the main thread is steered toward the ``handoff`` skill after the
     crossing; new subagent launches from the main thread are denied. The
     handoff instruction is delivered on the next tool boundary once no
@@ -542,16 +544,18 @@ class ModelExecutor:
     to the working tree is left as is for the normal dirty-work
     preservation.
 
-    The tool gate stays active until the handoff note commit is observed on
-    the branch, not just until the ``handoff`` skill is invoked: invoking
-    the skill is the first step of the handoff, and an auto-compaction
-    inside the remaining window must not reopen implementation work. While
-    the gate is active only handoff work stays allowed (the ``handoff``
-    skill, ``Write``/``Edit`` under ``.agent/handoff/``, and
-    ``_is_handoff_command`` Bash). Deleting or moving the note while the
-    handoff is pending is denied with a message naming the next step. A
-    compaction during a pending handoff re-arms the handoff instruction so
-    it is re-sent at the next tool boundary.
+    The main-thread tool gate stays active until the handoff note commit is
+    observed on the branch, not just until the ``handoff`` skill is invoked:
+    invoking the skill is the first step of the handoff, and an
+    auto-compaction inside the remaining window must not reopen
+    implementation work. While the gate is active only handoff work stays
+    allowed (the ``handoff`` skill, ``Write``/``Edit`` under
+    ``.agent/handoff/``, and ``_is_handoff_command`` Bash). Deleting or
+    moving the note while the handoff is pending is denied with a message
+    naming the next step. A compaction during a pending handoff re-arms the
+    handoff instruction so it is re-sent at the next tool boundary. Stopped
+    subagents stay denied after the note commit so a late subagent boundary
+    cannot overwrite the valid note.
     """
 
     def __init__(
@@ -2577,45 +2581,48 @@ class ModelExecutor:
                 return _deny("At most two code-review repair cycles are allowed.")
         if not self._soft_threshold_crossed:
             self._track_subagent_seen(hook_input)
+        # Stopped subagents stay denied for the rest of the run once the
+        # threshold has crossed, including after the handoff note commit is
+        # observed: a late subagent boundary must not overwrite the valid
+        # note. The main-thread gate below releases on the note commit.
+        if self._soft_threshold_crossed and not _is_main_thread(hook_input):
+            agent_id = _hook_agent_id(hook_input)
+            if agent_id is not None and agent_id not in self._stopped_subagent_ids:
+                self._stopped_subagent_ids.append(agent_id)
+            return _cost_deny(
+                "Subagent work is stopped after the token soft threshold.",
+                self._issue_number,
+            )
         # The gate stays active until the handoff note commit is on the branch:
         # invoking the skill is the first step of the handoff, not its end,
         # and an auto-compaction inside the remaining window must not reopen
         # implementation work.
         if self._soft_threshold_crossed and not self._handoff_note_committed:
-            if not _is_main_thread(hook_input):
-                agent_id = _hook_agent_id(hook_input)
-                if agent_id is not None and agent_id not in self._stopped_subagent_ids:
-                    self._stopped_subagent_ids.append(agent_id)
+            tool_name = _hook_field(hook_input, "tool_name")
+            if tool_name == "Skill" and _skill_name(hook_input) == "handoff":
+                pass
+            elif tool_name == "Agent" or (
+                tool_name == "Task" and _is_subagent_launch(hook_input)
+            ):
                 return _cost_deny(
-                    "Subagent work is stopped after the token soft threshold.",
-                    self._issue_number,
+                    "New subagent launches are disabled.", self._issue_number
                 )
-            else:
-                tool_name = _hook_field(hook_input, "tool_name")
-                if tool_name == "Skill" and _skill_name(hook_input) == "handoff":
-                    pass
-                elif tool_name == "Agent" or (
-                    tool_name == "Task" and _is_subagent_launch(hook_input)
-                ):
+            elif tool_name in ("Edit", "Write"):
+                file_path = str(_hook_field(hook_input, "tool_input", {}).get("file_path", ""))
+                if ".agent/handoff" not in file_path:
                     return _cost_deny(
-                        "New subagent launches are disabled.", self._issue_number
+                        "Further implementation work is disabled.",
+                        self._issue_number,
                     )
-                elif tool_name in ("Edit", "Write"):
-                    file_path = str(_hook_field(hook_input, "tool_input", {}).get("file_path", ""))
-                    if ".agent/handoff" not in file_path:
-                        return _cost_deny(
-                            "Further implementation work is disabled.",
-                            self._issue_number,
-                        )
-                elif tool_name == "Bash":
-                    command = str(_hook_field(hook_input, "tool_input", {}).get("command", ""))
-                    if _deletes_handoff_note(command):
-                        return _note_delete_deny(self._issue_number)
-                    if not _is_handoff_command(command):
-                        return _cost_deny(
-                            "Further implementation work is disabled.",
-                            self._issue_number,
-                        )
+            elif tool_name == "Bash":
+                command = str(_hook_field(hook_input, "tool_input", {}).get("command", ""))
+                if _deletes_handoff_note(command):
+                    return _note_delete_deny(self._issue_number)
+                if not _is_handoff_command(command):
+                    return _cost_deny(
+                        "Further implementation work is disabled.",
+                        self._issue_number,
+                    )
         if self._operator_context_delivered:
             tool_name = _hook_field(hook_input, "tool_name")
             if tool_name == "Skill":
@@ -2655,9 +2662,13 @@ class ModelExecutor:
         the stop is blocked once with a corrective message; afterwards the
         model may still finish without a review and the attempt is classified
         ``incomplete`` with the evaluator's reason reported. Runs with no new
-        commits (or no commit provider) are never nudged.
+        commits (or no commit provider) are never nudged. A handoff run whose
+        note is already committed is never nudged: the nudge must not keep a
+        handoff run alive for another round after the handoff is done.
         """
 
+        if self._soft_threshold_crossed and self._handoff_note_committed:
+            return {}
         if self._review_nudge_sent or self._review_count > 0:
             return {}
         if self._new_commits_count() <= 0:
