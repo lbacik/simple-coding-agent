@@ -159,6 +159,17 @@ class PublicationRequest:
     #: a notified handoff still posts it (deduplicated) with the current
     #: standing; in ``verbose`` mode every handoff posts regardless.
     handoff_notify: bool = False
+    #: The profile check steps in run order. The comment reports only the
+    #: outcome (plus the single failing step), never the joined script, so
+    #: these exist to render the ``K/M`` position of a failure.
+    check_steps: tuple[str, ...] = ()
+    #: The one profile check step that failed, and its 1-based position in
+    #: ``check_steps``. ``None`` when the check passed or never ran.
+    check_failed_step: str | None = None
+    check_failed_index: int | None = None
+    #: Why the check never ran (``"not rerun during recovery retry"`` and
+    #: friends). ``None`` renders a bare ``Check: not run``.
+    check_not_run_reason: str | None = None
 
 
 @dataclass(frozen=True)
@@ -247,6 +258,15 @@ class ConflictPublicationRequest:
     #: no marker, keeping the attempt transparent to the
     #: automatic-continuation count).
     requeue_source: str | None = None
+    #: The profile check steps in run order, for the ``K/M`` position of a
+    #: failure. The comment reports only the outcome, never the joined script.
+    check_steps: tuple[str, ...] = ()
+    #: The one profile check step that failed, and its 1-based position in
+    #: ``check_steps``. ``None`` when the check passed or never ran.
+    check_failed_step: str | None = None
+    check_failed_index: int | None = None
+    #: Why the check never ran. ``None`` renders a bare ``Check: not run``.
+    check_not_run_reason: str | None = None
 
     def __post_init__(self) -> None:
         if self.requeue_source is not None:
@@ -1126,13 +1146,97 @@ def _review_lines(request: PublicationRequest) -> list[str]:
     return lines
 
 
+#: Max collapsed length for a failing check step quoted inline in a result
+#: comment or pull-request body. The step is collapsed to one line and cut
+#: here so it can never break the comment's markdown, no matter how long
+#: the profile's real check script is.
+_CHECK_STEP_LIMIT = 200
+
+
+def _collapse_check_step(step: object) -> str:
+    """Collapse a failing check step to one short inline-code-safe line."""
+
+    collapsed = " ".join(str(step).split())
+    if not collapsed:
+        return "(empty step)"
+    collapsed = collapsed.replace("`", "'")
+    if len(collapsed) > _CHECK_STEP_LIMIT:
+        return collapsed[:_CHECK_STEP_LIMIT].rstrip() + "…"
+    return collapsed
+
+
+def _check_evidence_line(
+    *,
+    check_command: str = "not run",
+    check_exit_code: int | None = None,
+    check_steps: tuple[str, ...] = (),
+    check_failed_step: str | None = None,
+    check_failed_index: int | None = None,
+    check_not_run_reason: str | None = None,
+) -> str:
+    """Render the outcome-only Evidence check line.
+
+    The joined profile check command is never quoted: it is identical on
+    every attempt and already lives in the profile configuration. A pass
+    reports its exit, a failure names only the one failing step with its
+    ``K/M`` position (collapsed and truncated), and an attempt that never
+    ran the check reports ``not run`` with its reason where there is one,
+    never ``exit code None``. A check that ran but has no exit timed out.
+    """
+
+    if check_exit_code is not None:
+        if check_exit_code == 0:
+            return "- Check: passed (exit 0)"
+        if check_failed_step is not None:
+            step = _collapse_check_step(check_failed_step)
+            if check_steps and check_failed_index is not None:
+                return (
+                    f"- Check: failed (exit {check_exit_code})"
+                    f" at step {check_failed_index}/{len(check_steps)}: `{step}`"
+                )
+            return f"- Check: failed (exit {check_exit_code}): `{step}`"
+        return f"- Check: failed (exit {check_exit_code})"
+    if check_failed_step is not None:
+        step = _collapse_check_step(check_failed_step)
+        if check_steps and check_failed_index is not None:
+            return (
+                "- Check: failed (timed out)"
+                f" at step {check_failed_index}/{len(check_steps)}: `{step}`"
+            )
+        return f"- Check: failed (timed out): `{step}`"
+    reason = check_not_run_reason
+    if (
+        reason is None
+        and isinstance(check_command, str)
+        and check_command != "not run"
+        and check_command.startswith("not ")
+    ):
+        reason = check_command
+    if reason and str(reason).strip():
+        return f"- Check: not run ({str(reason).strip()})"
+    return "- Check: not run"
+
+
+def _request_check_line(request: object) -> str:
+    """Render the Evidence check line for either publication request type."""
+
+    return _check_evidence_line(
+        check_command=getattr(request, "check_command", "not run"),
+        check_exit_code=getattr(request, "check_exit_code", None),
+        check_steps=tuple(getattr(request, "check_steps", ()) or ()),
+        check_failed_step=getattr(request, "check_failed_step", None),
+        check_failed_index=getattr(request, "check_failed_index", None),
+        check_not_run_reason=getattr(request, "check_not_run_reason", None),
+    )
+
+
 def _pull_request_body(request: PublicationRequest) -> str:
     return (
         f"Closes #{request.issue_number}\n\n"
         "## Summary\n"
         f"{request.details}\n\n"
         "## Evidence\n"
-        f"- Check: exit code {request.check_exit_code}\n"
+        f"{_request_check_line(request)}\n"
         + "\n".join(_review_lines(request))
         + "\n\n"
         "---\n"
@@ -1166,7 +1270,7 @@ def _result_comment(
         f"{merge_line}"
         f"{commit_line}\n"
         "### Evidence\n"
-        f"- Check command: `{request.check_command}` → exit code {request.check_exit_code}\n"
+        f"{_request_check_line(request)}\n"
         f"{review_lines}\n"
         f"- Review findings: {request.review_findings}\n\n"
         "### Details\n"
@@ -1308,7 +1412,7 @@ def _conflict_result_comment(
         f"**Lifecycle outcome**: {outcome.value}\n"
         f"{standing_line}\n"
         "### Evidence\n"
-        f"- Check command: `{request.check_command}` → exit code {request.check_exit_code}\n"
+        f"{_request_check_line(request)}\n"
         f"{files_line}"
         f"{extra_line}"
         f"{fixes_line}\n"

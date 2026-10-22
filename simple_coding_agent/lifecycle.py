@@ -261,6 +261,16 @@ class AttemptEvidence:
     details: str
     note_commit_sha: str | None = None
     reviews_performed: int = 0
+    #: The profile check steps in run order, for the ``K/M`` position of a
+    #: failure in the published result comment.
+    check_steps: tuple[str, ...] = ()
+    #: The one profile check step that failed, and its 1-based position in
+    #: ``check_steps``. Set even when the exit code is missing (a timeout);
+    #: ``None`` when the check passed or never ran.
+    check_failed_step: str | None = None
+    check_failed_index: int | None = None
+    #: Why the check never ran. ``None`` renders a bare ``Check: not run``.
+    check_not_run_reason: str | None = None
 
 
 #: The handoff-note reason an operator ``handoff now`` request requires.
@@ -2220,8 +2230,9 @@ class AgentLifecycle:
                     branch=prepared.branch,
                     started_at=attempt_id,
                     decision=decision,
-                    check_command="not rerun during recovery retry",
+                    check_command="not run",
                     check_exit_code=None,
+                    check_not_run_reason="not rerun during recovery retry",
                     review_cycles=0,
                     review_findings="not rerun during recovery retry",
                     details=self._handoff_publication_details(
@@ -2699,8 +2710,9 @@ class AgentLifecycle:
                         PublicationPath.NONE,
                         (body,),
                     ),
-                    check_command="not run during recovery release",
+                    check_command="not run",
                     check_exit_code=None,
+                    check_not_run_reason="not run during recovery release",
                     review_cycles=0,
                     review_findings="not run during recovery release",
                     details=body,
@@ -3887,6 +3899,10 @@ class AgentLifecycle:
                             decision=evidence.decision,
                             check_command=evidence.check_command,
                             check_exit_code=evidence.check_exit_code,
+                            check_steps=evidence.check_steps,
+                            check_failed_step=evidence.check_failed_step,
+                            check_failed_index=evidence.check_failed_index,
+                            check_not_run_reason=evidence.check_not_run_reason,
                             review_cycles=evidence.review_cycles,
                             reviews_performed=evidence.reviews_performed,
                             review_findings=evidence.review_findings,
@@ -5313,8 +5329,9 @@ class AgentLifecycle:
                         branch=prepared.branch,
                         started_at=checkpoint.started_at,
                         decision=decision,
-                        check_command="not rerun during startup recovery",
+                        check_command="not run",
                         check_exit_code=None,
+                        check_not_run_reason="not rerun during startup recovery",
                         review_cycles=0,
                         review_findings="not rerun during startup recovery",
                         details=self._handoff_publication_details(
@@ -5774,6 +5791,7 @@ class AgentLifecycle:
                 push_branch=True,
                 check_command=check_command,
                 check_exit_code=check_result.exit_code,
+                check_steps=tuple(profile.check),
             ),
             prepared,
             profile,
@@ -6072,6 +6090,7 @@ class AgentLifecycle:
             self._event_log(
                 "conflict_check_failed", detail, level="WARNING", issue_number=issue_number
             )
+            failed_step, failed_index = _check_failure_step(check_result)
             return self._build_conflict_request(
                 claim,
                 checkpoint,
@@ -6084,6 +6103,9 @@ class AgentLifecycle:
                 push_branch=False,
                 check_command=check_command,
                 check_exit_code=check_result.exit_code,
+                check_steps=tuple(profile.check),
+                check_failed_step=failed_step,
+                check_failed_index=failed_index,
                 conflicted_files=tuple(conflicted),
                 failure_output=_conflict_failure_output_tail(check_result),
             )
@@ -6127,6 +6149,7 @@ class AgentLifecycle:
             push_branch=True,
             check_command=check_command,
             check_exit_code=check_result.exit_code,
+            check_steps=tuple(profile.check),
             conflicted_files=tuple(conflicted),
             extra_files=extra_files,
             fix_commits=fix_revisions,
@@ -6235,6 +6258,10 @@ class AgentLifecycle:
         push_branch: bool,
         check_command: str = "not run",
         check_exit_code: int | None = None,
+        check_steps: tuple[str, ...] = (),
+        check_failed_step: str | None = None,
+        check_failed_index: int | None = None,
+        check_not_run_reason: str | None = None,
         conflicted_files: tuple[str, ...] = (),
         extra_files: tuple[str, ...] = (),
         fix_commits: tuple[str, ...] = (),
@@ -6265,6 +6292,10 @@ class AgentLifecycle:
             pull_request=pull_request,
             check_command=check_command,
             check_exit_code=check_exit_code,
+            check_steps=tuple(check_steps),
+            check_failed_step=check_failed_step,
+            check_failed_index=check_failed_index,
+            check_not_run_reason=check_not_run_reason,
             conflicted_files=tuple(conflicted_files),
             auto_merge_opt_in=_claim_time_opt_in(claim, checkpoint),
             extra_files=tuple(extra_files),
@@ -6721,6 +6752,26 @@ def _emit_handoff_note_events(
         )
 
 
+def _check_failure_step(result: object) -> tuple[str | None, int | None]:
+    """Name the failed check step and its 1-based position.
+
+    The first command with a non-zero exit wins (a timeout leaves its
+    command with ``exit_code None``, which also sorts as failed); when
+    every command exited cleanly the last one is blamed instead, mirroring
+    :func:`completion._select_failed_command`. ``(None, None)`` means no
+    command ran.
+    """
+
+    commands = tuple(getattr(result, "commands", ()) or ())
+    for index, command in enumerate(commands):
+        if getattr(command, "exit_code", 0) != 0:
+            return str(getattr(command, "command", "?")), index + 1
+    if commands:
+        last = commands[-1]
+        return str(getattr(last, "command", "?")), len(commands)
+    return None, None
+
+
 def _attempt_evidence(
     decision: CompletionDecision,
     profile: RepositoryProfile,
@@ -6731,15 +6782,24 @@ def _attempt_evidence(
     note_commit_sha: str | None = None,
     reviews_performed: int = 0,
 ) -> AttemptEvidence:
+    steps = tuple(profile.check)
+    exit_code = getattr(final_check, "exit_code", None)
+    failed_step: str | None = None
+    failed_index: int | None = None
+    if final_check is not None and exit_code != 0:
+        failed_step, failed_index = _check_failure_step(final_check)
     return AttemptEvidence(
         decision=decision,
         check_command=" && ".join(profile.check),
-        check_exit_code=getattr(final_check, "exit_code", None),
+        check_exit_code=exit_code,
         review_cycles=review_cycles,
         review_findings=review_findings,
         details=details,
         note_commit_sha=note_commit_sha,
         reviews_performed=reviews_performed,
+        check_steps=steps,
+        check_failed_step=failed_step,
+        check_failed_index=failed_index,
     )
 
 
