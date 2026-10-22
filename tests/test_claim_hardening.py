@@ -13,8 +13,12 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import pytest
+
+if TYPE_CHECKING:
+    from simple_coding_agent.lifecycle import AgentLifecycle, AttemptEvidence
 
 import simple_coding_agent.github_tracker as tracker_module
 from simple_coding_agent.completion import AttemptOutcome, CompletionDecision, PublicationPath
@@ -305,7 +309,9 @@ def test_claim_verified_winner_removes_round_finished(
 # ---------------------------------------------------------------------------
 
 
-def make_lifecycle(tmp_path: Path, issues: dict[int, TrackerIssue], *, fifo: list[int]):
+def make_lifecycle(
+    tmp_path: Path, issues: dict[int, TrackerIssue], *, fifo: list[int]
+) -> tuple[AgentLifecycle, FakeTracker, ControlStore, list[tuple]]:
     from simple_coding_agent.attempt_state import AttemptStateStore
     from simple_coding_agent.lifecycle import AgentLifecycle
 
@@ -335,7 +341,7 @@ def make_lifecycle(tmp_path: Path, issues: dict[int, TrackerIssue], *, fifo: lis
     return lifecycle, tracker, store, events
 
 
-def _evidence():
+def _evidence() -> AttemptEvidence:
     from simple_coding_agent.lifecycle import AttemptEvidence
 
     return AttemptEvidence(
