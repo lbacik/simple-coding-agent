@@ -220,9 +220,9 @@ def test_managed_settings_prices_the_meta_model_at_meta_rates() -> None:
         f"managed-settings.json must hold a modelPricing override for {META_MODEL}"
     )
     rates = overrides[META_MODEL]
-    assert rates["input"] == 1.25, "Meta input rate must be $1.25 per million tokens"
-    assert rates["cacheRead"] == 0.15, "Meta cached-input rate must be $0.15 per million tokens"
-    assert rates["output"] == 4.25, "Meta output rate must be $4.25 per million tokens"
+    assert rates["input"] == 0.10, "Meta input rate must be $0.10 per million tokens"
+    assert rates["cacheRead"] == 0.002, "Meta cached-input rate must be $0.002 per million tokens"
+    assert rates["output"] == 0.20, "Meta output rate must be $0.20 per million tokens"
 
 
 def test_managed_settings_pricing_row_has_all_cli_required_keys() -> None:
