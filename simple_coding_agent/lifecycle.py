@@ -134,6 +134,8 @@ from simple_coding_agent.github_tracker import (
     Claim,
     ClaimLostError,
     TrackerIssue,
+    claim_marker_label,
+    claim_marker_labels,
     ineligibility_reason,
 )
 from simple_coding_agent.model_execution import ModelExecutionStatus, ModelExecutor, OperatorHandoff, ToolCallRecord
@@ -2800,17 +2802,20 @@ class AgentLifecycle:
             )
         if not self_assigned:
             holders = ", ".join(getattr(fresh, "assignee_logins", ()) or ())
+            marker_detail = _foreign_marker_detail(
+                getattr(self._tracker, "worker_id", ""), fresh
+            )
             if holders:
                 return (
                     f"issue #{checkpoint.issue_number} shows conflicting"
                     f" assignment changes (assigned to another assignee:"
-                    f" {holders}); the retry"
+                    f" {holders}{marker_detail}); the retry"
                     " must not overwrite them and requires operator repair."
                 )
             return (
                 f"issue #{checkpoint.issue_number} shows conflicting"
                 " assignment changes (it is assigned to another assignee,"
-                " no longer this agent); the"
+                f" no longer this agent{marker_detail}); the"
                 " retry must not overwrite them and requires operator repair."
             )
         return None
@@ -7831,6 +7836,28 @@ def _checkpoint_hold_detail(error: Exception) -> str:
         " inspection; issue intake is held until it is repaired or"
         " removed by an operator."
     )
+
+
+def _foreign_marker_detail(worker_id: object, fresh: TrackerIssue) -> str:
+    """Name another Worker's claim markers blocking a recovery retry.
+
+    With ``WORKER_ID`` set, a shared login carrying only another Worker's
+    ``claimed-by:*`` label is claimed by another assignee even though the
+    login matches: name those markers so the hold says whose claim blocks
+    the retry. Anything else (no worker id, no markers, or an unreadable
+    label set) reads as no detail.
+    """
+
+    if not isinstance(worker_id, str) or not worker_id:
+        return ""
+    try:
+        markers = sorted(claim_marker_labels(getattr(fresh, "labels", ()) or ()))
+        foreign = [marker for marker in markers if marker != claim_marker_label(worker_id)]
+    except Exception:
+        return ""
+    if not foreign:
+        return ""
+    return f"; claimed by another worker ({', '.join(foreign)})"
 
 
 def _check_recovery_request_id(request_id: object) -> None:

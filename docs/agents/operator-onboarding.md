@@ -170,6 +170,44 @@ off (no worker affinity); `is_self_assigned`, `recover_claim`,
 `release_attempt`, and `release_handoff` stay per worker. Human
 collaborators other than the issue author are never trusted.
 
+## Shared-login worker pool (`WORKER_ID`)
+
+By default a worker claims by GitHub login alone, which assumes one process
+per login. To run several workers on one login, run one container per worker
+— each with its own `DATA_DIR` (which holds that worker's durable checkpoint)
+— and set a distinct `WORKER_ID` per worker. The value must use `[a-z0-9-]`,
+at most 32 characters (the `claimed-by:<worker-id>` marker label limit is 50
+characters); anything else fails at startup with a configuration error. When
+`WORKER_ID` is unset, behaviour is exactly as before and no `claimed-by:*`
+label is ever written.
+
+With `WORKER_ID` set, a claimant is a (login, worker id) pair. After
+assigning, the worker adds its `claimed-by:<worker-id>` marker label (created
+in the repository when missing, like the other worker-applied labels), then
+re-reads after the settle delay and yields when it sees another assignee or
+another worker's marker. Yielding removes only the loser's own marker and
+leaves the shared assignment while the winner's marker exists; when both
+racers yield, the last one out also removes the now-unmarked assignment, so
+the issue returns to the runnable queue for a later poll. An issue carrying
+any `claimed-by:*` label is never eligible on any claim path. Release is
+ordered per remote re-read: queue labels first, then the worker's own marker,
+then the login's assignment only when no `claimed-by:*` marker remains.
+
+A login assigned with only another worker's marker counts as claimed by
+another assignee everywhere: priority targets for it end `not fulfilled` and
+fall back to FIFO, and recovery retry holds for operator repair naming the
+blocking marker. Restart recovery removes the worker's own marker as part of
+release.
+
+A lost `/data` directory or a changed `WORKER_ID` leaves the marker and the
+assignment for a human — there is no startup sweep and no TTL. To repair by
+hand, remove the stale label and, if the issue should requeue, the assignment:
+
+```shell
+gh issue edit <number> --remove-label "claimed-by:<old-worker-id>"
+gh issue edit <number> --remove-assignee <login>
+```
+
 ## `ready-for-agent` trust policy
 
 The `ready-for-agent` label is the trust boundary.  Only repository

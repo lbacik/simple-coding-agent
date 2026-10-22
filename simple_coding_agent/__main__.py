@@ -84,6 +84,7 @@ def main() -> None:
         config.target_repo,
         max_auto_continuations=config.max_auto_continuations,
         max_conflict_attempts=config.max_conflict_attempts,
+        worker_id=config.worker_id,
         event_log=lambda event, detail="", level="INFO", issue_number=None: logger.emit(
             event, phase="polling", detail=detail, level=level, issue_number=issue_number
         ),
