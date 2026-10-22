@@ -61,10 +61,11 @@ def test_dockerfile_does_not_mount_docker_socket() -> None:
     )
 
 
-def test_dockerfile_installs_pinned_python_sdk() -> None:
+def test_dockerfile_installs_python_sdk_through_pyproject() -> None:
     content = _dockerfile()
-    assert "claude-agent-sdk==0.2.163" in content, (
-        "Dockerfile must install claude-agent-sdk==0.2.163"
+    assert "pip install --no-cache-dir -e ." in content, (
+        "Dockerfile must install the project, and with it the pinned "
+        "claude-agent-sdk, from pyproject.toml"
     )
 
 
