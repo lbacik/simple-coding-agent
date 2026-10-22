@@ -37,7 +37,7 @@ def handoff_comment(payload: str, *, marker: str, source: str = "automatic") -> 
         "**PR**: none\n"
         "**Handoff note commit**: `abc123def456`\n\n"
         "### Evidence\n"
-        "- Check command: `pytest` → exit code None\n"
+        "- Check: not run\n"
         "- Reviews performed: 0\n"
         "- code-review was not run\n"
         "- Review findings: not run\n\n"
