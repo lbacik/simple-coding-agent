@@ -18,7 +18,11 @@ from simple_coding_agent.completion import (
 from simple_coding_agent.config import RepositoryProfile
 from simple_coding_agent.github_tracker import Assignment, Claim, TrackerIssue
 from simple_coding_agent.git_workspace import PreparedAttempt, RebaseConflictError
-from simple_coding_agent.lifecycle import ModelAttemptRunner, _build_starting_prompt
+from simple_coding_agent.lifecycle import (
+    ModelAttemptRunner,
+    _build_starting_prompt,
+    _command_failure_detail,
+)
 from simple_coding_agent.model_execution import (
     ModelExecution,
     ModelExecutionStatus,
@@ -1431,3 +1435,88 @@ def test_setup_failure_emits_completion_decided(tmp_path: Path) -> None:
     decided = [detail for event, _, detail in events if event == "completion_decided"]
     assert len(decided) == 1
     assert "outcome=infrastructure_error" in decided[0]
+
+
+def test_command_failure_detail_prefers_stderr_over_stdout() -> None:
+    """Non-empty stderr keeps the historic detail exactly (no stdout mixing)."""
+
+    detail = _command_failure_detail(
+        failed_baseline(command="ruff check", exit_code=1, stdout="noise", stderr="boom")
+    )
+
+    assert "boom" in detail
+    assert "noise" not in detail
+
+
+def test_command_failure_detail_falls_back_to_stdout_when_stderr_empty() -> None:
+    """Stdout-only tools (ruff, linters) still surface their findings."""
+
+    detail = _command_failure_detail(
+        failed_baseline(
+            command="ruff check",
+            exit_code=1,
+            stdout="F811 redefinition of unused name",
+            stderr="   ",
+        )
+    )
+
+    assert "F811 redefinition of unused name" in detail
+
+
+def test_command_failure_detail_with_no_output_keeps_command_and_code() -> None:
+    detail = _command_failure_detail(
+        failed_baseline(command="ruff check", exit_code=1, stdout="", stderr="")
+    )
+
+    assert detail == "`ruff check` (exit 1): "
+
+
+def test_command_failure_detail_respects_limit_on_stdout_fallback() -> None:
+    detail = _command_failure_detail(
+        failed_baseline(
+            command="ruff check",
+            exit_code=1,
+            stdout="x" * 5000,
+            stderr="",
+        ),
+        limit=100,
+    )
+
+    assert len(detail) <= 100
+    assert "x" in detail
+
+
+def test_baseline_check_failed_event_carries_stdout_when_stderr_empty(
+    tmp_path: Path, workspace: InMemoryWorkspace
+) -> None:
+    """Lifecycle: a stdout-only baseline failure keeps its message in the event."""
+
+    executor = FakeModelExecutor()
+    events: list[tuple[str, str, str]] = []
+    verifier = FakeVerifier(
+        baseline_succeeded=False,
+        baseline_commands=(
+            SimpleNamespace(
+                command="ruff check",
+                exit_code=1,
+                stdout="F811 redefinition of unused name",
+                stderr="",
+                timed_out=False,
+            ),
+        ),
+    )
+    runner = build_runner(
+        tmp_path,
+        model_executor=executor,
+        workspace=workspace,
+        verifier=verifier,
+        event_log=lambda event, detail="", level="INFO", issue_number=None: events.append(
+            (event, level, detail)
+        ),
+    )
+
+    runner(claim(issue_number=24, issue_body="Fix the parser."), profile(), FakePrepared())
+
+    failed = [detail for event, _, detail in events if event == "baseline_check_failed"]
+    assert len(failed) == 1
+    assert "F811 redefinition of unused name" in failed[0]
