@@ -32,6 +32,7 @@ from simple_coding_agent.git_workspace import (
     attempt_start_epoch,
 )
 from simple_coding_agent.github_tracker import (
+    CLAIM_MARKER_PREFIX,
     MERGE_CONFLICT,
     READY_FOR_AGENT,
     READY_FOR_HUMAN,
@@ -492,6 +493,7 @@ class FakeTracker:
         event_log: Callable[..., None] | None = None,
         comments: dict[int, list[tuple[str, str]]] | None = None,
         peer_logins: list[str] | None = None,
+        worker_id: str = "",
     ) -> None:
         self.issues = dict(issues or {})
         self.fifo: list[int] = list(fifo or [])
@@ -529,6 +531,11 @@ class FakeTracker:
         self.open_pull_requests = dict(open_pull_requests or {})
         self.has_pull_request_listing = open_pull_requests is not None
         self.max_conflict_attempts = max_conflict_attempts
+        # Optional per-Worker id for shared-login pool tests: mirrors the
+        # production tracker's ``claimed-by:<worker-id>`` marker behaviour
+        # (marker add on claim, marker-aware self/recover/release). Empty
+        # keeps the historical login-only behaviour exactly.
+        self.worker_id = worker_id
         self._event_log = (
             event_log
             if event_log is not None
@@ -595,20 +602,92 @@ class FakeTracker:
             found = self.issues.get(number)
             if found is None:  # pragma: no cover - tests seed the queue from issues
                 raise AssertionError(f"FakeTracker fifo issue #{number} is not seeded")
+            if self.worker_id:
+                found = self._mark_shared_claim(number, found)
             if number in self.claim_race:
                 others = self.claim_race[number]
-                self.yielded.append(number)
-                holders = ", ".join(others) if others else "unknown"
-                self._event_log(
-                    "claim_lost",
-                    f"issue #{number} claimed by another assignee"
-                    f" ({holders}); yielding",
-                    level="WARNING",
-                    issue_number=number,
-                )
-                continue
+                if self.worker_id:
+                    foreign = self._foreign_markers(found)
+                    if self._yield_shared_claim(number, found, others + foreign):
+                        continue
+                else:
+                    self.yielded.append(number)
+                    holders = ", ".join(others) if others else "unknown"
+                    self._event_log(
+                        "claim_lost",
+                        f"issue #{number} claimed by another assignee"
+                        f" ({holders}); yielding",
+                        level="WARNING",
+                        issue_number=number,
+                    )
+                    continue
+            elif self.worker_id and self._foreign_markers(found):
+                if self._yield_shared_claim(number, found, self._foreign_markers(found)):
+                    continue
             return Claim(issue=found, assignment=Assignment(issue_id=found.id, assignee_id="agent-id"))
         return None
+
+    @property
+    def _own_marker(self) -> str:
+        """This fake Worker's ``claimed-by:<worker-id>`` marker label."""
+
+        return f"{CLAIM_MARKER_PREFIX}{self.worker_id}"
+
+    def _foreign_markers(self, issue: TrackerIssue) -> tuple[str, ...]:
+        """Another Worker's marker labels on ``issue`` (own marker excluded)."""
+
+        own = self._own_marker
+        return tuple(
+            sorted(
+                label
+                for label in issue.labels
+                if label.startswith(CLAIM_MARKER_PREFIX) and label != own
+            )
+        )
+
+    def _mark_shared_claim(self, number: int, found: TrackerIssue) -> TrackerIssue:
+        """Model a shared-login claim: assign plus own marker (worker tests)."""
+
+        assignees = found.assignee_logins
+        if "agent" not in assignees:
+            assignees = assignees + ("agent",)
+        labels = found.labels | {self._own_marker}
+        updated = replace(found, assignee_logins=assignees, labels=labels)
+        self.issues[number] = updated
+        if self._own_marker not in found.labels:
+            self.added_labels.append((found.id, self._own_marker))
+        return updated
+
+    def _yield_shared_claim(
+        self, number: int, found: TrackerIssue, claimants: tuple[str, ...]
+    ) -> bool:
+        """Yield a lost shared-login claim; always True (continue the queue)."""
+
+        self.yielded.append(number)
+        holders = ", ".join(claimants) if claimants else "unknown"
+        self._event_log(
+            "claim_lost",
+            f"issue #{number} claimed by another assignee"
+            f" ({holders}); yielding",
+            level="WARNING",
+            issue_number=number,
+        )
+        current = self.issues.get(number, found)
+        own = self._own_marker
+        if own in current.labels:
+            current = replace(current, labels=current.labels - {own})
+            self.removed_labels.append((current.id, own))
+        if "agent" in current.assignee_logins and not any(
+            label.startswith(CLAIM_MARKER_PREFIX) for label in current.labels
+        ):
+            current = replace(
+                current,
+                assignee_logins=tuple(
+                    login for login in current.assignee_logins if login != "agent"
+                ),
+            )
+        self.issues[number] = current
+        return True
 
     def fetch_issue(self, number: int) -> TrackerIssue | None:
         if number in self.fetch_errors:
@@ -616,7 +695,11 @@ class FakeTracker:
         return self.issues.get(number)
 
     def is_self_assigned(self, issue: TrackerIssue) -> bool:
-        return "agent" in issue.assignee_logins
+        if "agent" not in issue.assignee_logins:
+            return False
+        if not self.worker_id:
+            return True
+        return self._own_marker in issue.labels
 
     def automatic_continuation_count(self, issue: TrackerIssue) -> int:
         """The recorded automatic-continuation count for ``issue`` (default 0).
@@ -669,8 +752,16 @@ class FakeTracker:
     def claim_verified(self, issue: TrackerIssue) -> Claim:
         if issue.number in self.assign_errors:
             raise self.assign_errors[issue.number]
+        current_issue = issue
+        if self.worker_id:
+            stored = self.issues.get(issue.number, issue)
+            current_issue = self._mark_shared_claim(issue.number, stored)
         if issue.number in self.claim_race:
             others = self.claim_race[issue.number]
+            if self.worker_id:
+                foreign = self._foreign_markers(current_issue)
+                self._yield_shared_claim(issue.number, current_issue, others + foreign)
+                raise ClaimLostError(issue.number, others + foreign)
             self.yielded.append(issue.number)
             holders = ", ".join(others) if others else "unknown"
             self._event_log(
@@ -681,6 +772,10 @@ class FakeTracker:
                 issue_number=issue.number,
             )
             raise ClaimLostError(issue.number, others)
+        if self.worker_id and self._foreign_markers(current_issue):
+            foreign = self._foreign_markers(current_issue)
+            self._yield_shared_claim(issue.number, current_issue, foreign)
+            raise ClaimLostError(issue.number, foreign)
         current = self.issues.get(issue.number)
         assert current is not None
         if ROUND_FINISHED in current.labels:
@@ -699,13 +794,71 @@ class FakeTracker:
         found = self.issues.get(issue_number)
         if found is None:
             return None
+        if self.worker_id:
+            if "agent" not in found.assignee_logins:
+                return None
+            if self._own_marker not in found.labels and any(
+                label.startswith(CLAIM_MARKER_PREFIX) for label in found.labels
+            ):
+                return None
         return Claim(issue=found, assignment=Assignment(issue_id=found.id, assignee_id="agent-id"))
 
     def release_attempt(self, issue_number: int, label: str, assignee_id: str) -> None:
         self.cleanup.append((issue_number, label, assignee_id))
+        if not self.worker_id:
+            return
+        found = self.issues.get(issue_number)
+        if found is None:
+            return
+        if label in found.labels:
+            found = replace(found, labels=found.labels - {label})
+            self.removed_labels.append((found.id, label))
+        found = self._release_own_shared_marker(found)
+        if "agent" in found.assignee_logins and not any(
+            label.startswith(CLAIM_MARKER_PREFIX) for label in found.labels
+        ):
+            found = replace(
+                found,
+                assignee_logins=tuple(
+                    login for login in found.assignee_logins if login != "agent"
+                ),
+            )
+        self.issues[issue_number] = found
 
     def release_handoff(self, issue_number: int, assignee_id: str) -> None:
         self.cleanup.append((issue_number, "round-finished", assignee_id))
+        if not self.worker_id:
+            return
+        found = self.issues.get(issue_number)
+        if found is None:
+            return
+        if READY_FOR_AGENT in found.labels:
+            found = replace(found, labels=found.labels - {READY_FOR_AGENT})
+            self.removed_labels.append((found.id, READY_FOR_AGENT))
+        if ROUND_FINISHED not in found.labels:
+            found = replace(found, labels=found.labels | {ROUND_FINISHED})
+            self.added_labels.append((found.id, ROUND_FINISHED))
+        found = self._release_own_shared_marker(found)
+        if "agent" in found.assignee_logins and not any(
+            label.startswith(CLAIM_MARKER_PREFIX) for label in found.labels
+        ):
+            found = replace(
+                found,
+                assignee_logins=tuple(
+                    login for login in found.assignee_logins if login != "agent"
+                ),
+            )
+        self.issues[issue_number] = found
+
+    def _release_own_shared_marker(self, issue: TrackerIssue) -> TrackerIssue:
+        """Remove this fake Worker's own claim marker, recording the removal."""
+
+        own = self._own_marker
+        if own not in issue.labels:
+            return issue
+        updated = replace(issue, labels=issue.labels - {own})
+        self.removed_labels.append((updated.id, own))
+        return updated
 
 
 # ---------------------------------------------------------------------------

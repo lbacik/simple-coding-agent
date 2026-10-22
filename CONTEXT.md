@@ -21,7 +21,7 @@ The orchestrator-owned follow-up that asks GitHub to merge a complete implementa
 _Avoid_: Merged issue, human merge
 
 **Eligible issue**:
-An implementation issue that the agent may claim: OPEN, unassigned, with a non-empty body, and no open native GitHub blockers, plus exactly one queue signal — `ready-for-agent` (ordinary work), only `round-finished` (an automatic continuation), or only `merge-conflict` (a conflict requeue, and only when the operator sets `MAX_CONFLICT_ATTEMPTS` above `0`). An issue labelled `ready-for-human` is never eligible.
+An implementation issue that the agent may claim: OPEN, unassigned, carrying no Claim marker, with a non-empty body, and no open native GitHub blockers, plus exactly one queue signal — `ready-for-agent` (ordinary work), only `round-finished` (an automatic continuation), or only `merge-conflict` (a conflict requeue, and only when the operator sets `MAX_CONFLICT_ATTEMPTS` above `0`). An issue labelled `ready-for-human` is never eligible.
 _Avoid_: Available issue, queued issue
 
 **Runnable queue**:
@@ -29,8 +29,16 @@ The ordered set of eligible issues, from which the agent picks the next issue to
 _Avoid_: Backlog, work queue, job queue
 
 **Claim**:
-Reserving an eligible issue by assigning the agent's GitHub identity as the issue assignee, then re-reading the issue after a short settle delay to verify the Worker's identity is the issue's only assignee. A claimed issue is no longer eligible for other sessions. A Worker that sees another assignee (another Worker or a human) on re-read yields: it removes only its own assignment and leaves labels, comments, and checkpoints untouched, so the issue returns to the Runnable queue for a later poll.
+Reserving an eligible issue for one claimant — the Worker's GitHub identity, or its (login, Worker id) pair when `WORKER_ID` is set — by assigning the agent's GitHub identity as the issue assignee (and, with a Worker id, adding the Worker's Claim marker), then re-reading the issue after a short settle delay to verify the claimant is the issue's only assignee. A claimed issue is no longer eligible for other sessions. A Worker that sees another claimant on re-read — another assignee (another Worker or a human), or, with a Worker id, another Worker's Claim marker — yields: it removes only its own assignment and its own marker and leaves queue labels, comments, and checkpoints untouched, so the issue returns to the Runnable queue for a later poll. Release removes the Worker's own marker first and the shared assignment only when no Worker's Claim marker remains.
 _Avoid_: Lock, reservation
+
+**Worker id**:
+The optional per-Worker identity within a shared-login pool (`WORKER_ID`, `[a-z0-9-]`, at most 32 characters; unset means claim by login alone). With a shared GitHub login the assignment is idempotent, so the Worker id is what tells pool Workers apart: a claimant is a (login, Worker id) pair, and the login assigned with only another Worker's Claim marker counts as claimed by another assignee.
+_Avoid_: Username, assignee
+
+**Claim marker**:
+The `claimed-by:<worker-id>` label a pooled Worker adds right after assigning, which its poolmates treat as its claim on the shared login. The marker decides races (a Worker that sees another Worker's marker yields), blocks eligibility (an issue carrying any marker is never eligible), and gates release (the shared assignment goes only when no marker remains). A marker left behind by a lost `/data` directory or a changed Worker id is removed by hand; there is no startup sweep and no TTL.
+_Avoid_: Claim label, lock file
 
 **Automatic continuation**:
 An implementation attempt claimed from `round-finished` without a human requeue: the issue carried only `round-finished` (no `ready-for-agent`) at claim time, so the agent continues the previous round on its own. Its standing is carried by the single shared handoff comment (reconciled with newer ordinary results in attempt order, so a routine handoff needs no individual result comment); issues without shared metadata count the requeue source recorded in each attempt-result comment instead. A human requeue resets the count; ambiguous shared metadata retains the issue for operator repair instead of granting more rounds.

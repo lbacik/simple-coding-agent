@@ -16,6 +16,20 @@ conflict requeues first, then automatic continuations, then ordinary
 work, FIFO by creation date within each group, and rechecks eligibility
 immediately before assigning the authenticated GitHub identity.
 That check-then-set claim assumes one process; it is not a distributed lock.
+Several Workers may still share one GitHub login as a pool: give each Worker
+its own container and `DATA_DIR`, and a distinct `WORKER_ID` (`[a-z0-9-]`,
+at most 32 characters; anything else fails at startup). A claimant is then
+a (login, Worker id) pair: after assigning, the Worker adds its
+`claimed-by:<worker-id>` marker label (created in the repository when
+missing) and, after the settle delay, yields when it sees another assignee
+or another Worker's marker — both Workers yielding is accepted, and the
+issue returns to the queue for a later poll. An issue carrying any
+`claimed-by:*` label is never eligible. Release removes the Worker's own
+marker first and the shared assignment only when no marker remains, so a
+yielding loser never strands the winner's claim. A lost `/data` directory
+or a changed `WORKER_ID` leaves the marker and the assignment for a human:
+remove the stale `claimed-by:<old-id>` label (and the assignment, if the
+issue should requeue) by hand; there is no startup sweep and no TTL.
 A handoff releases its issue labelled `round-finished`: with the operator
 setting `MAX_AUTO_CONTINUATIONS=N` (default `0`), a `round-finished` issue
 within budget is claimed automatically ahead of new work, up to N
@@ -53,7 +67,9 @@ clone location is `$DATA_DIR/repo/`. Other defaults are `POLL_INTERVAL=60`,
 requeue), and `MAX_CONFLICT_ATTEMPTS=0` (no automatic conflict detection and no
 conflict requeue of `merge-conflict` issues), and `HANDOFF_COMMENT_MODE=link`
 (one shared handoff comment per issue; `verbose` keeps the historical
-per-attempt result comments for troubleshooting).
+per-attempt result comments for troubleshooting), and `WORKER_ID` unset
+(claim by login alone; set a distinct id per Worker to share one GitHub
+login as a pool).
 
 When several instances with different GitHub logins work one queue, set
 `PEER_LOGINS` to the comma- or space-separated logins of the other workers
@@ -151,6 +167,10 @@ The service runs as a single-instance, sequential-worker process.  Do not
 scale it beyond one replica.  The `agent_data` volume preserves the repository
 clone, state files, and logs through container replacement.  Installed skills
 are baked into the image at build time and are therefore also preserved.
+To run a shared-login pool instead, run one container per Worker — each with
+its own `DATA_DIR` (which holds that Worker's durable checkpoint) and a
+distinct `WORKER_ID` on the same GitHub login; see
+[Shared-login worker pool](docs/agents/operator-onboarding.md#shared-login-worker-pool-worker_id).
 
 For a one-shot run (useful for testing or manual invocation):
 

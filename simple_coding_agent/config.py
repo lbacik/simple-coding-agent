@@ -26,6 +26,8 @@ class ProfileError(ValueError):
 
 
 _TARGET_REPOSITORY = re.compile(r"^[^/\s]+/[^/\s]+$")
+_WORKER_ID = re.compile(r"^[a-z0-9-]+$")
+_MAX_WORKER_ID_LENGTH = 32
 _LOG_LEVELS = frozenset({"CRITICAL", "ERROR", "WARNING", "INFO", "DEBUG"})
 _DEFAULT_MODEL_NAME = "muse-spark-1.3-contributor"
 _DEFAULT_MODEL_BASE_URL = "https://api.meta.ai"
@@ -111,6 +113,7 @@ class RuntimeConfig:
     max_auto_continuations: int = 0
     max_conflict_attempts: int = 0
     handoff_comment_mode: str = _DEFAULT_HANDOFF_COMMENT_MODE
+    worker_id: str = ""
 
     @property
     def soft_threshold_tokens(self) -> int:
@@ -224,6 +227,7 @@ def load_runtime_config(environ: Mapping[str, str] | None = None) -> RuntimeConf
         max_auto_continuations=_non_negative_integer(values, "MAX_AUTO_CONTINUATIONS", 0),
         max_conflict_attempts=_non_negative_integer(values, "MAX_CONFLICT_ATTEMPTS", 0),
         handoff_comment_mode=_handoff_comment_mode(values),
+        worker_id=_worker_id(values),
     )
     _warn_when_claude_code_version_is_set(values)
     _warn_when_claude_agent_sdk_version_is_set(values)
@@ -421,6 +425,26 @@ def _merge_method(values: Mapping[str, str]) -> str:
     if value not in _MERGE_METHODS:
         raise ConfigurationError("PR_MERGE_METHOD must be merge, squash, or rebase")
     return value
+
+
+def _worker_id(values: Mapping[str, str]) -> str:
+    """The optional per-Worker id for a shared-login pool (``WORKER_ID``).
+
+    Empty (unset or blank) means this worker claims by login alone, exactly
+    as before. A set value must use ``[a-z0-9-]`` and fit in 32 characters
+    so the ``claimed-by:<worker-id>`` marker label stays within the 50
+    character label limit; anything else fails at startup.
+    """
+
+    raw = values.get("WORKER_ID", "")
+    worker_id = raw.strip()
+    if not worker_id:
+        return ""
+    if len(worker_id) > _MAX_WORKER_ID_LENGTH or not _WORKER_ID.fullmatch(worker_id):
+        raise ConfigurationError(
+            "WORKER_ID must use [a-z0-9-], at most 32 characters"
+        )
+    return worker_id
 
 
 def _handoff_comment_mode(values: Mapping[str, str]) -> str:

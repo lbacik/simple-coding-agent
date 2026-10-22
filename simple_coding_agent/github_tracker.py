@@ -41,14 +41,42 @@ MERGE_CONFLICT_LABEL_DESCRIPTION = (
 #: runnable queue instead of being worked twice. Always on; no config knob.
 CLAIM_SETTLE_DELAY_SECONDS = 2.5
 
+#: Prefix of the per-Worker claim marker label. With ``WORKER_ID`` set, a
+#: claimant is a ``(login, worker id)`` pair: after assigning, the worker
+#: also adds ``claimed-by:<worker-id>`` (``add_label`` creates it when
+#: missing), so workers sharing one login can still tell each other apart.
+#: The prefix is 11 characters, leaving room for a 32 character worker id
+#: within the 50 character label limit.
+CLAIM_MARKER_PREFIX = "claimed-by:"
+
+
+def claim_marker_label(worker_id: str) -> str:
+    """The claim marker label owned by ``worker_id``."""
+
+    return f"{CLAIM_MARKER_PREFIX}{worker_id}"
+
+
+def claim_marker_labels(labels: Iterable[str]) -> frozenset[str]:
+    """The ``claimed-by:*`` marker labels within ``labels``."""
+
+    return frozenset(label for label in labels if label.startswith(CLAIM_MARKER_PREFIX))
+
+
+def has_claim_marker(labels: Iterable[str]) -> bool:
+    """Whether ``labels`` carry any Worker's claim marker."""
+
+    return any(label.startswith(CLAIM_MARKER_PREFIX) for label in labels)
+
 
 class ClaimLostError(RuntimeError):
-    """A post-assign verification found another assignee on the issue.
+    """A post-assign verification found another claimant on the issue.
 
     Raised when the settle-window re-read shows an assignee other than this
-    worker: the worker already removed its own assignment and yielded, so the
-    caller must not remove labels, comment, or start a checkpoint. Carries
-    the issue number and the other assignees seen at verification time.
+    worker (or, with ``WORKER_ID`` set, another Worker's ``claimed-by:*``
+    marker): the worker already yielded, so the caller must not remove
+    labels, comment, or start a checkpoint. Carries the issue number and
+    the other claimants seen at verification time (assignee logins, plus
+    foreign marker labels when a Worker id is set).
     """
 
     def __init__(self, issue_number: int, other_assignees: tuple[str, ...]) -> None:
@@ -183,6 +211,8 @@ def ineligibility_reason(
     if issue.assignee_logins:
         holders = ", ".join(issue.assignee_logins)
         return f"issue #{number} is already assigned to {holders}"
+    if has_claim_marker(issue.labels):
+        return f"issue #{number} is claimed by another worker (labelled `claimed-by:*`)"
     if not issue.body.strip():
         return f"issue #{number} has an empty body"
     if issue.blocked_by != 0:
@@ -212,12 +242,19 @@ class TrackerIssue:
 
     @property
     def is_eligible(self) -> bool:
-        """Whether this issue belongs in the runnable queue."""
+        """Whether this issue belongs in the runnable queue.
+
+        Any ``claimed-by:*`` marker makes the issue ineligible, even with no
+        assignee: the marker covers the window between the shared-login
+        assignment going away and the last Worker's label going away, and a
+        stale marker left for a human must never be claimed over.
+        """
 
         return (
             self.state == "OPEN"
             and READY_FOR_AGENT in self.labels
             and not self.assignee_logins
+            and not has_claim_marker(self.labels)
             and bool(self.body.strip())
             and self.blocked_by == 0
         )
@@ -227,12 +264,15 @@ class TrackerIssue:
         """The runnable-queue rules shared by ordinary and continuation issues.
 
         Open, unassigned, with a non-empty body and no open native blockers;
-        the queue label itself is checked separately.
+        the queue label itself is checked separately. Any ``claimed-by:*``
+        marker fails the rules, so no claim path (ordinary, continuation, or
+        conflict) takes an issue another Worker still marks.
         """
 
         return (
             self.state == "OPEN"
             and not self.assignee_logins
+            and not has_claim_marker(self.labels)
             and bool(self.body.strip())
             and self.blocked_by == 0
         )
@@ -362,6 +402,7 @@ class GitHubTracker:
         max_auto_continuations: int = 0,
         max_conflict_attempts: int = 0,
         peer_logins: Iterable[str] | None = None,
+        worker_id: str = "",
         event_log: Callable[..., None] = (
             lambda event, detail="", level="INFO", issue_number=None: None
         ),
@@ -378,11 +419,20 @@ class GitHubTracker:
             or max_conflict_attempts < 0
         ):
             raise GitHubTrackerError("MAX_CONFLICT_ATTEMPTS must be a non-negative integer")
+        if not isinstance(worker_id, str):
+            raise GitHubTrackerError("WORKER_ID must be a string")
+        if worker_id and (
+            len(worker_id) > 32
+            or worker_id != worker_id.strip()
+            or not re.fullmatch(r"[a-z0-9-]+", worker_id)
+        ):
+            raise GitHubTrackerError("WORKER_ID must use [a-z0-9-], at most 32 characters")
         self._transport = transport
         self._target_repo = target_repo
         self._max_auto_continuations = max_auto_continuations
         self._max_conflict_attempts = max_conflict_attempts
         self._peer_logins = _peer_login_set(peer_logins)
+        self._worker_id = worker_id
         self._event_log = event_log
 
     @property
@@ -396,6 +446,32 @@ class GitHubTracker:
         """
 
         return self._peer_logins
+
+    @property
+    def worker_id(self) -> str:
+        """This Worker's id within a shared-login pool ("" when unset).
+
+        With a shared GitHub login a claimant is a ``(login, worker id)``
+        pair: the login assignment alone is idempotent and cannot tell pool
+        Workers apart, so each Worker additionally marks its claim with
+        ``claimed-by:<worker-id>``. Empty means claim by login alone.
+        """
+
+        return self._worker_id
+
+    @property
+    def _own_marker(self) -> str | None:
+        """This Worker's claim marker label, or ``None`` when unset."""
+
+        return claim_marker_label(self._worker_id) if self._worker_id else None
+
+    def _other_markers(self, labels: frozenset[str]) -> tuple[str, ...]:
+        """Another Worker's marker labels within ``labels``."""
+
+        own = self._own_marker
+        return tuple(
+            sorted(label for label in claim_marker_labels(labels) if label != own)
+        )
 
     @property
     def max_auto_continuations(self) -> int:
@@ -558,20 +634,35 @@ class GitHubTracker:
         lost), never ordinary ineligibility: the caller must hold it for
         reconciliation instead of marking the priority ``not fulfilled``.
         With distinct worker logins a concurrent claim shows as another
-        assignee, not as self-assignment.
+        assignee, not as self-assignment. With ``WORKER_ID`` set, self
+        means the login is assigned *and* this Worker's own
+        ``claimed-by:<worker-id>`` label is present: the shared login
+        assigned with only another Worker's marker is claimed by another
+        assignee, handled like any other assignee.
         """
 
-        return self._transport.viewer().login in issue.assignee_logins
+        login = self._transport.viewer().login
+        if login not in issue.assignee_logins:
+            return False
+        own = self._own_marker
+        if own is None:
+            return True
+        return own in issue.labels
 
     def _verify_claim(self, issue: TrackerIssue, identity: GitHubIdentity) -> TrackerIssue:
-        """Wait out the assign settle window, then yield if anyone else is assigned.
+        """Wait out the assign settle window, then yield if anyone else claimed it.
 
         Re-reads the issue after :data:`CLAIM_SETTLE_DELAY_SECONDS` and
         yields when any assignee other than this worker is present (another
-        worker or a human). Yielding removes only this worker's own
-        assignment: no label changes, no issue comment, no checkpoint (this
+        worker or a human) or, with ``WORKER_ID`` set, when another Worker's
+        ``claimed-by:*`` marker is present (the shared login assignment is
+        idempotent and cannot tell pool Workers apart). Both Workers yielding
+        is accepted: each loser removes only its own marker and leaves the
+        shared assignment while the winner's marker exists, so the issue
+        returns to the runnable queue for a later poll (liveness only).
+        Yielding never changes queue labels, comments, or checkpoints (this
         runs before ``attempt_state.start``). Emits a ``claim_lost`` event
-        carrying the issue number and the other assignees, then raises
+        carrying the issue number and the other claimants, then raises
         :class:`ClaimLostError`. The winner's snapshot is returned so stale
         labels can be removed after verification.
         """
@@ -590,9 +681,10 @@ class GitHubTracker:
         others = tuple(
             login for login in fresh.assignee_logins if login != identity.login
         )
-        if others:
-            self._transport.remove_assignee(fresh.id, identity.id)
-            holders = ", ".join(others)
+        foreign_markers = self._other_markers(fresh.labels) if self._worker_id else ()
+        if others or foreign_markers:
+            claimants = others + foreign_markers
+            holders = ", ".join(claimants)
             self._event_log(
                 "claim_lost",
                 f"issue #{issue.number} claimed by another assignee"
@@ -600,8 +692,41 @@ class GitHubTracker:
                 level="WARNING",
                 issue_number=issue.number,
             )
-            raise ClaimLostError(issue.number, others)
+            self._yield_losing_claim(fresh, identity)
+            raise ClaimLostError(issue.number, claimants)
         return fresh
+
+    def _yield_losing_claim(
+        self, fresh: TrackerIssue, identity: GitHubIdentity
+    ) -> None:
+        """Release a lost claim without touching queue labels.
+
+        Each step is idempotent and preceded by a re-read: first remove this
+        Worker's own ``claimed-by:<worker-id>`` marker (a no-op without
+        ``WORKER_ID``), then remove the login's assignment only when no
+        ``claimed-by:*`` marker remains. A loser therefore never strands the
+        winner's claim, and when both racers yield the last one out also
+        removes the now-unmarked assignment, returning the issue to the
+        queue.
+        """
+
+        own = self._own_marker
+        if own is None:
+            self._transport.remove_assignee(fresh.id, identity.id)
+            return
+        current = self._transport.get_issue(self._target_repo, fresh.number)
+        if current is None:
+            return
+        if own in current.labels:
+            self._transport.remove_label(current.id, own)
+        current = self._transport.get_issue(self._target_repo, fresh.number)
+        if current is None:
+            return
+        if (
+            identity.login in current.assignee_logins
+            and not has_claim_marker(current.labels)
+        ):
+            self._transport.remove_assignee(current.id, identity.id)
 
     def _remove_stale_claim_labels(self, verified: TrackerIssue) -> None:
         """Remove the stale queue labels the verified winner must clear.
@@ -627,17 +752,24 @@ class GitHubTracker:
         The caller re-fetched the issue and confirmed eligibility immediately
         before this call, so no second eligibility read happens here: the
         existing assignment-based claim check runs exactly once. After
-        assigning, the claim is verified through the shared settle-window
-        helper: when another assignee is seen, this worker removes only its
-        own assignment, emits ``claim_lost``, and raises
-        :class:`ClaimLostError` without touching labels. Only the verified
-        winner removes a stale ``round-finished`` label, as in
+        assigning (and, with ``WORKER_ID`` set, adding this Worker's
+        ``claimed-by:<worker-id>`` marker), the claim is verified through
+        the shared settle-window helper: when another assignee or another
+        Worker's marker is seen, this worker yields as in
+        :meth:`_yield_losing_claim`, emits ``claim_lost``, and raises
+        :class:`ClaimLostError` without touching queue labels. Only the
+        verified winner removes a stale ``round-finished`` label, as in
         :meth:`claim_next`. The returned claim carries the pre-removal
         snapshot, as before; only the settle delay is new.
         """
 
         identity = self._transport.viewer()
         assignment = self._transport.assign_issue(issue.id, identity.id)
+        own = self._own_marker
+        if own is not None:
+            # The marker label is created in the repository when missing,
+            # like every other worker-applied label.
+            self._transport.add_label(issue.id, own)
         verified = self._verify_claim(issue, identity)
         self._remove_stale_claim_labels(verified)
         return Claim(issue=issue, assignment=assignment)
@@ -645,9 +777,11 @@ class GitHubTracker:
     def claim_next(self) -> Claim | None:
         """Claim the first issue that remains eligible at assignment time.
 
-        Each candidate is assigned, then verified through the shared
-        settle-window helper: when another assignee (another worker or a
-        human) is seen, this worker removes only its own assignment, emits
+        Each candidate is assigned (and, with ``WORKER_ID`` set, marked with
+        this Worker's ``claimed-by:<worker-id>`` label), then verified
+        through the shared settle-window helper: when another assignee
+        (another worker or a human) or another Worker's marker is seen, this
+        worker yields as in :meth:`_yield_losing_claim`, emits
         ``claim_lost``, and continues with the next candidate in the same
         cycle. Only the verified winner removes a stale ``round-finished``
         label, so two workers yielding never strands the issue without its
@@ -672,6 +806,9 @@ class GitHubTracker:
             ):
                 continue
             assignment = self._transport.assign_issue(current.id, identity.id)
+            own = self._own_marker
+            if own is not None:
+                self._transport.add_label(current.id, own)
             try:
                 verified = self._verify_claim(current, identity)
             except ClaimLostError:
@@ -684,12 +821,32 @@ class GitHubTracker:
         return None
 
     def recover_claim(self, issue_number: int) -> Claim | None:
-        """Reconstruct this agent's claim for checkpoint-based cleanup only."""
+        """Reconstruct this agent's claim for checkpoint-based cleanup only.
+
+        Without ``WORKER_ID`` the claim is reconstructed whenever the issue
+        still exists, as before. With ``WORKER_ID`` set, the login must be
+        assigned and this Worker's own ``claimed-by:<worker-id>`` label must
+        be present, unless no ``claimed-by:*`` marker remains at all (this
+        Worker's own partial release removed its marker but crashed before
+        the conditional assignment removal, so finishing the release is
+        safe). A shared login carrying only another Worker's marker belongs
+        to another claimant and reconstructs to ``None``, handled like
+        another assignee. A lost ``/data`` directory or a changed
+        ``WORKER_ID`` leaves the label and the assignment for a human; there
+        is no startup sweep and no TTL.
+        """
 
         current = self._transport.get_issue(self._target_repo, issue_number)
         if current is None:
             return None
         identity = self._transport.viewer()
+        if self._worker_id:
+            if identity.login not in current.assignee_logins:
+                return None
+            own = self._own_marker
+            assert own is not None
+            if own not in current.labels and has_claim_marker(current.labels):
+                return None
         return Claim(current, Assignment(issue_id=current.id, assignee_id=identity.id))
 
     def release_attempt(self, issue_number: int, label: str, assignee_id: str) -> None:
@@ -697,7 +854,11 @@ class GitHubTracker:
 
         Each remote field is re-read immediately before its mutation, so a
         restart after a partial cleanup neither removes a human's work nor
-        repeats an already-completed operation.
+        repeats an already-completed operation. With ``WORKER_ID`` set, the
+        own ``claimed-by:<worker-id>`` marker is removed after the queue
+        label, and the login's assignment is removed only when no
+        ``claimed-by:*`` marker remains, so releasing while another Worker's
+        marker is present leaves the shared assignment for the winner.
         """
 
         current = self._transport.get_issue(self._target_repo, issue_number)
@@ -705,11 +866,15 @@ class GitHubTracker:
             return
         if label in current.labels:
             self._transport.remove_label(current.id, label)
+        if not self._release_own_marker(issue_number):
+            return
         current = self._transport.get_issue(self._target_repo, issue_number)
         if current is None:
             return
         identity = self._transport.viewer()
-        if identity.login in current.assignee_logins:
+        if identity.login in current.assignee_logins and not (
+            self._worker_id and has_claim_marker(current.labels)
+        ):
             self._transport.remove_assignee(current.id, assignee_id)
 
     def release_handoff(self, issue_number: int, assignee_id: str) -> None:
@@ -718,7 +883,10 @@ class GitHubTracker:
         Each remote field is re-read immediately before its mutation, exactly
         like ``release_attempt``, so a restart between steps resumes from the
         first unconfirmed one without repeating an already-completed write or
-        prematurely releasing a human's requeue signal.
+        prematurely releasing a human's requeue signal. With ``WORKER_ID``
+        set, the own ``claimed-by:<worker-id>`` marker is removed after the
+        queue labels, and the login's assignment is removed only when no
+        ``claimed-by:*`` marker remains.
         """
 
         current = self._transport.get_issue(self._target_repo, issue_number)
@@ -731,12 +899,34 @@ class GitHubTracker:
             return
         if ROUND_FINISHED not in current.labels:
             self._transport.add_label(current.id, ROUND_FINISHED)
+        if not self._release_own_marker(issue_number):
+            return
         current = self._transport.get_issue(self._target_repo, issue_number)
         if current is None:
             return
         identity = self._transport.viewer()
-        if identity.login in current.assignee_logins:
+        if identity.login in current.assignee_logins and not (
+            self._worker_id and has_claim_marker(current.labels)
+        ):
             self._transport.remove_assignee(current.id, assignee_id)
+
+    def _release_own_marker(self, issue_number: int) -> bool:
+        """Remove this Worker's claim marker after a fresh re-read.
+
+        Returns False when the issue is gone (the release is over), True
+        otherwise. Without ``WORKER_ID`` this is a no-op returning True, so
+        no ``claimed-by:*`` label is ever written or removed.
+        """
+
+        own = self._own_marker
+        if own is None:
+            return True
+        current = self._transport.get_issue(self._target_repo, issue_number)
+        if current is None:
+            return False
+        if own in current.labels:
+            self._transport.remove_label(current.id, own)
+        return True
 
     def trusted_comments(self, issue: TrackerIssue) -> tuple[str, ...]:
         """Chronologically ordered bodies of comments trusted for the model's prompt.
