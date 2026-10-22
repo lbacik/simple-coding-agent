@@ -78,7 +78,7 @@ AGENT_WORKER_MARKER_PREFIX = "<!-- agent-worker:"
 def worker_marker(worker_id: str) -> str:
     """The durable issue-comment marker recording one attempt's Worker."""
 
-    return f"<!-- agent-worker: {worker_id} -->"
+    return f"<!-- agent-worker: {(worker_id or '').strip()} -->"
 
 
 _WORKER_MARKER_RE = re.compile(re.escape(AGENT_WORKER_MARKER_PREFIX) + r"\s*(.*?)\s*-->")

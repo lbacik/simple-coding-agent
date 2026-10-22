@@ -2482,7 +2482,7 @@ class AgentLifecycle:
             saved_at=saved_at,
             branch=branch,
             requeue_source=source,
-            worker_id=getattr(self._tracker, "worker_id", "") or "",
+            worker_id=self._request_worker_id(),
         )
         confirmed = self._confirm_release_comment(
             claim, marker, comment_body, attempt_id, requeue_source=source
@@ -6401,7 +6401,7 @@ class AgentLifecycle:
             fix_commits=tuple(fix_commits),
             failure_output=failure_output,
             requeue_source=requeue_source,
-            worker_id=getattr(self._tracker, "worker_id", "") or "",
+            worker_id=self._request_worker_id(),
         )
 
     def _conflict_error_request(
@@ -6519,7 +6519,7 @@ class AgentLifecycle:
             base_branch=base_branch,
             auto_merge_opt_in=auto_merge_opt_in,
             requeue_source=requeue_source,
-            worker_id=getattr(self._tracker, "worker_id", "") or "",
+            worker_id=self._request_worker_id(),
         )
         if timeout is None:
             published = self._publisher.publish(request)
