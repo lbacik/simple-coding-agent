@@ -176,10 +176,6 @@ def _attempt_id_sort_key(value: str) -> tuple[int, object]:
     return (0, parsed)
 
 
-def _attempt_id_less(first: str, second: str) -> bool:
-    return _attempt_id_sort_key(first) < _attempt_id_sort_key(second)
-
-
 def attempt_id_greater(first: str, second: str) -> bool:
     """Whether one attempt ID orders chronologically after another.
 

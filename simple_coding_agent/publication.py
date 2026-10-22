@@ -942,12 +942,14 @@ def confirm_shared_handoff(
     """Confirm the remote shared handoff record for one attempt, if it matches.
 
     Returns the verified record when the trusted shared comment exists,
-    parses, and names ``attempt_id`` (with matching ``branch_sha``/``note_sha``
-    when the caller supplies them); otherwise returns ``None``. The per-attempt
+    parses, and names this issue, repository and ``attempt_id`` (with
+    matching ``branch_sha``/``note_sha`` when the caller supplies them);
+    otherwise returns ``None``. The per-attempt
     result comment is never consulted, so recovery can confirm a published
     handoff from the shared record and verified revisions even when no
     individual handoff result comment exists. Ambiguous remote state
-    (unreadable transport, multiple records, malformed bodies) reads as
+    (unreadable transport, multiple records, malformed bodies, or a record
+    naming a different issue or repository) reads as
     ``None`` so the caller retains the attempt instead of guessing.
     """
 
@@ -959,6 +961,8 @@ def confirm_shared_handoff(
         return None
     parsed = parse_handoff_record(existing.body)
     if parsed is None or parsed.attempt_id != attempt_id:
+        return None
+    if parsed.issue_number != issue_number or parsed.repository != repository:
         return None
     if branch_sha is not None and parsed.branch_sha != branch_sha:
         return None

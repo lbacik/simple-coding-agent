@@ -69,6 +69,7 @@ def shared_body(
     issue_number: int = 24,
     repository: str = REPO,
     source: str = REQUEUE_SOURCE_AUTOMATIC,
+    note_sha: str = "c" * 40,
 ) -> str:
     return build_handoff_record_body(
         HandoffRecord(
@@ -80,7 +81,7 @@ def shared_body(
             continuation_count=count,
             branch=f"agent/issue-{issue_number}",
             branch_sha="b" * 40,
-            note_sha="c" * 40,
+            note_sha=note_sha,
         )
     )
 
@@ -367,6 +368,31 @@ def test_confirm_shared_handoff_rejects_mismatches_and_ambiguity() -> None:
     assert (
         confirm_shared_handoff(
             _RecordTransport(HandoffRecordRef(comment_id="c1", body="broken")),
+            REPO,
+            24,
+            A1,
+        )
+        is None
+    )
+
+
+def test_confirm_shared_handoff_rejects_foreign_issue_or_repo() -> None:
+    foreign_issue = shared_body(A1, 1, issue_number=25, source=REQUEUE_SOURCE_HUMAN)
+    assert (
+        confirm_shared_handoff(
+            _RecordTransport(HandoffRecordRef(comment_id="c1", body=foreign_issue)),
+            REPO,
+            24,
+            A1,
+        )
+        is None
+    )
+    foreign_repo = shared_body(
+        A1, 1, repository="octo/other", source=REQUEUE_SOURCE_HUMAN
+    )
+    assert (
+        confirm_shared_handoff(
+            _RecordTransport(HandoffRecordRef(comment_id="c1", body=foreign_repo)),
             REPO,
             24,
             A1,
@@ -744,14 +770,16 @@ def _shared_retry_lifecycle(tmp_path: Path, make_github, *, comment_posted: bool
     assert checkpoint is not None
 
     workspace = InMemoryWorkspace(tmp_path / "workspace", issue_number=24)
-    workspace.commit_handoff_note(24, _note_content(checkpoint.started_at))
+    note_commit = workspace.commit_handoff_note(
+        24, _note_content(checkpoint.started_at)
+    )
 
     publisher = FakePublisher(
         outcome=AttemptOutcome.HANDOFF,
         comment_posted=comment_posted,
         handoff_posted=True,
     )
-    publisher._github = make_github(checkpoint.started_at)  # type: ignore[attr-defined]
+    publisher._github = make_github(checkpoint.started_at, note_commit.revision)  # type: ignore[attr-defined]
     publisher._repository = REPO  # type: ignore[attr-defined]
     lifecycle = AgentLifecycle(
         tracker=FakeTracker(issues={24: _recovery_issue()}),
@@ -771,11 +799,13 @@ def _shared_retry_lifecycle(tmp_path: Path, make_github, *, comment_posted: bool
 
 
 def test_retry_rereads_shared_record_when_the_seam_exists(tmp_path: Path) -> None:
-    def make_github(attempt_id: str) -> _HoldGitHub:
+    def make_github(attempt_id: str, note_sha: str) -> _HoldGitHub:
         return _HoldGitHub(
             HandoffRecordRef(
                 comment_id="c1",
-                body=shared_body(attempt_id, 0, source=REQUEUE_SOURCE_HUMAN),
+                body=shared_body(
+                    attempt_id, 0, source=REQUEUE_SOURCE_HUMAN, note_sha=note_sha
+                ),
             )
         )
 
@@ -790,8 +820,83 @@ def test_retry_rereads_shared_record_when_the_seam_exists(tmp_path: Path) -> Non
 
 def test_retry_holds_when_the_flag_has_no_shared_record(tmp_path: Path) -> None:
     lifecycle, checkpoint = _shared_retry_lifecycle(
-        tmp_path, lambda attempt_id: _HoldGitHub(None), comment_posted=False
+        tmp_path, lambda attempt_id, note_sha: _HoldGitHub(None), comment_posted=False
     )
     record = lifecycle.submit_recovery_retry("req-flag-only", checkpoint.started_at)
     assert record.acknowledgement is not CommandAcknowledgement.COMPLETED
     assert AttemptStateStore(tmp_path).read() is not None
+
+
+def test_retry_holds_when_shared_note_revision_mismatches(tmp_path: Path) -> None:
+    def make_github(attempt_id: str, note_sha: str) -> _HoldGitHub:
+        return _HoldGitHub(
+            HandoffRecordRef(
+                comment_id="c1",
+                body=shared_body(
+                    attempt_id,
+                    0,
+                    source=REQUEUE_SOURCE_HUMAN,
+                    note_sha="0" * 40,
+                ),
+            )
+        )
+
+    lifecycle, checkpoint = _shared_retry_lifecycle(
+        tmp_path, make_github, comment_posted=False
+    )
+    record = lifecycle.submit_recovery_retry("req-note-mismatch", checkpoint.started_at)
+    assert record.acknowledgement is not CommandAcknowledgement.COMPLETED
+    assert AttemptStateStore(tmp_path).read() is not None
+    assert len(AttemptCompletionStore(tmp_path).read_all()) == 0
+
+
+class _ScriptedGitHub:
+    """A shared-record seam that replays a scripted find sequence."""
+
+    def __init__(self, script: list) -> None:
+        self._script = list(script)
+
+    def find_handoff_record(self, repository: str, issue_number: int):
+        result = self._script.pop(0)
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+
+def test_retry_lost_response_then_heal_replays_same_budget(tmp_path: Path) -> None:
+    seen: list = []
+
+    def make_github(attempt_id: str, note_sha: str) -> _ScriptedGitHub:
+        ref = HandoffRecordRef(
+            comment_id="c1",
+            body=shared_body(
+                attempt_id, 0, source=REQUEUE_SOURCE_HUMAN, note_sha=note_sha
+            ),
+        )
+        seen.append(ref)
+        # The pre-publish hold sees the record, but the post-publish
+        # confirmation loses the response: the retry must retain the
+        # attempt instead of treating the flag as proof.
+        return _ScriptedGitHub([ref, None])
+
+    lifecycle, checkpoint = _shared_retry_lifecycle(
+        tmp_path, make_github, comment_posted=False
+    )
+    held = lifecycle.submit_recovery_retry("req-lost", checkpoint.started_at)
+    assert held.acknowledgement is not CommandAcknowledgement.COMPLETED
+    assert AttemptStateStore(tmp_path).read() is not None
+    assert len(AttemptCompletionStore(tmp_path).read_all()) == 0
+
+    # The record is readable again: repeating the retry replays the same
+    # computed standing instead of consuming the budget twice, and the
+    # attempt finalizes exactly once.
+    lifecycle._publisher._github = _HoldGitHub(seen[0])  # type: ignore[attr-defined]
+    done = lifecycle.submit_recovery_retry("req-healed", checkpoint.started_at)
+    assert done.acknowledgement is CommandAcknowledgement.COMPLETED
+    counts = [
+        request.handoff_continuation_count  # type: ignore[attr-defined]
+        for request in lifecycle._publisher.requests  # type: ignore[attr-defined]
+    ]
+    assert len(counts) == 2
+    assert counts[0] == counts[1]
+    assert len(AttemptCompletionStore(tmp_path).read_all()) == 1

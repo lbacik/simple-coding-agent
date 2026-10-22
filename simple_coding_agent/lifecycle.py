@@ -2260,9 +2260,10 @@ class AgentLifecycle:
             # so outstanding release/cleanup work can resume without
             # rerunning the model or changing the outcome. The confirmation
             # is re-read from the remote record (not trusted from the
-            # in-memory flag alone) whenever the publisher exposes the seam.
+            # in-memory flag alone) and bound to the handoff note revision
+            # this retry published, whenever the publisher exposes the seam.
             if self._confirm_shared_handoff_for_retry(
-                claim.issue.number, attempt_id
+                claim.issue.number, attempt_id, note_sha
             ):
                 comment_posted = True
         if not comment_posted:
@@ -2754,6 +2755,20 @@ class AgentLifecycle:
             )
         return None
 
+    def _shared_record_seam(self) -> tuple[object, str] | None:
+        """The shared-record lookup seam, or ``None`` when absent.
+
+        Returns the ``(github, repository)`` pair backing
+        ``find_handoff_record``. Publishers without the seam (older test
+        doubles) read as absent and callers skip the shared-record check.
+        """
+
+        github = getattr(self._publisher, "_github", None)
+        repository = getattr(self._publisher, "_repository", None) or self._repository
+        if not callable(getattr(github, "find_handoff_record", None)):
+            return None
+        return (github, repository)
+
     def _recovery_shared_hold(
         self, issue_number: int, attempt_id: str, outcome: AttemptOutcome
     ) -> str | None:
@@ -2772,11 +2787,11 @@ class AgentLifecycle:
         remote record, or an older record this retry may update) proceeds.
         """
 
-        github = getattr(self._publisher, "_github", None)
-        repository = getattr(self._publisher, "_repository", None) or self._repository
-        find = getattr(github, "find_handoff_record", None)
-        if not callable(find):
+        seam = self._shared_record_seam()
+        if seam is None:
             return None
+        github, repository = seam
+        find = getattr(github, "find_handoff_record", None)
         try:
             existing = find(repository, issue_number)
         except Exception as error:
@@ -2818,26 +2833,37 @@ class AgentLifecycle:
         return None
 
     def _confirm_shared_handoff_for_retry(
-        self, issue_number: int, attempt_id: str
+        self, issue_number: int, attempt_id: str, note_sha: str | None = None
     ) -> bool:
         """Independently confirm the shared handoff record during recovery retry.
 
-        Re-reads the remote record for this attempt (with no required
-        revisions: the just-completed publication already verified them)
-        instead of trusting the in-memory publication flag alone, so a
-        confirmed handoff resumes release and cleanup even when its
-        individual result comment is missing. Publishers without the
-        shared-record seam (older test doubles) keep trusting the verified
-        flag, which stands alone there.
+        Re-reads the remote record for this attempt and issue, bound to the
+        handoff note revision this retry just published (when one was
+        committed), instead of trusting the in-memory publication flag
+        alone, so a confirmed handoff resumes release and cleanup even
+        when its individual result comment is missing. The branch push
+        behind the record stays verified by publication itself (the record
+        is first-wins per attempt and ``handoff_posted`` is only set once
+        the push is verified), so no local branch comparison second-guesses
+        it here. Publishers without the shared-record seam (older test
+        doubles) keep trusting the verified flag, which stands alone
+        there. Any verification failure reads as unconfirmed so the retry
+        retains the attempt instead of guessing.
         """
 
-        github = getattr(self._publisher, "_github", None)
-        repository = getattr(self._publisher, "_repository", None) or self._repository
-        if not callable(getattr(github, "find_handoff_record", None)):
+        seam = self._shared_record_seam()
+        if seam is None:
             return True
+        github, repository = seam
         try:
             return (
-                confirm_shared_handoff(github, repository, issue_number, attempt_id)
+                confirm_shared_handoff(
+                    github,
+                    repository,
+                    issue_number,
+                    attempt_id,
+                    note_sha=note_sha,
+                )
                 is not None
             )
         except Exception:
