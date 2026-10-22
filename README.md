@@ -51,7 +51,9 @@ clone location is `$DATA_DIR/repo/`. Other defaults are `POLL_INTERVAL=60`,
 `MAX_RETRIES=3`, `MAX_CONSECUTIVE_ERRORS=3`, `MAX_AUTO_CONTINUATIONS=0`
 (no automatic continuation of `round-finished` issues without a human
 requeue), and `MAX_CONFLICT_ATTEMPTS=0` (no automatic conflict detection and no
-conflict requeue of `merge-conflict` issues).
+conflict requeue of `merge-conflict` issues), and `HANDOFF_COMMENT_MODE=link`
+(one shared handoff comment per issue; `verbose` keeps the historical
+per-attempt result comments for troubleshooting).
 
 Use a fine-grained GitHub PAT limited to the configured repository with only
 `contents:write`, `pull-requests:write`, and `issues:write`. Configure provider
