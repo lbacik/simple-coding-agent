@@ -2224,6 +2224,7 @@ class AgentLifecycle:
             prepared = self._workspace.prepare_attempt(
                 base_branch=profile.base_branch, issue_number=claim.issue.number
             )
+            self._record_claim_lease(prepared, claim.issue.number)
         except DirtyWorkspaceError as error:
             self._remember_workspace_dirty(attempt_id, True)
             return False, (
@@ -3899,6 +3900,7 @@ class AgentLifecycle:
                 prepared = self._workspace.prepare_attempt(
                     base_branch=profile.base_branch, issue_number=claim.issue.number
                 )
+                self._record_claim_lease(prepared, claim.issue.number)
                 rebase_conflicts = tuple(prepared.rebase_conflicts or ())
                 prepared_detail = (
                     f"branch={prepared.branch}; base_branch={profile.base_branch}"
@@ -5273,6 +5275,7 @@ class AgentLifecycle:
             prepared = self._workspace.prepare_attempt(
                 base_branch=profile.base_branch, issue_number=claim.issue.number
             )
+            self._record_claim_lease(prepared, claim.issue.number)
             if checkpoint.phase is AttemptPhase.MODEL_RUNNING:
                 commits = self._workspace.commits_added(prepared)
                 has_commits = bool(commits)
@@ -5726,6 +5729,7 @@ class AgentLifecycle:
         prepared = self._workspace.prepare_attempt(
             base_branch=profile.base_branch, issue_number=issue_number
         )
+        self._record_claim_lease(prepared, issue_number)
         self._event_log(
             "workspace_prepared",
             f"branch={prepared.branch}; base_branch={profile.base_branch}",

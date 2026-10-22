@@ -207,24 +207,11 @@ class AttemptStateStore:
         _validate_claim_lease(revision)
         if checkpoint.claim_lease_recorded:
             return checkpoint
-        recorded = AttemptCheckpoint(
-            issue_number=checkpoint.issue_number,
-            branch=checkpoint.branch,
-            phase=checkpoint.phase,
-            started_at=checkpoint.started_at,
-            updated_at=self._next_timestamp(),
-            auto_merge_opt_in=checkpoint.auto_merge_opt_in,
-            requeue_source=checkpoint.requeue_source,
-            issue_title=checkpoint.issue_title,
-            continuation_index=checkpoint.continuation_index,
-            attempt_kind=checkpoint.attempt_kind,
-            claim_branch_revision=revision,
-            claim_lease_recorded=True,
-        )
+        recorded = _with_claim_lease(checkpoint, revision, updated_at=self._next_timestamp())
         self._write(recorded)
         return recorded
 
-    def advance_claim_lease(self, revision: str) -> AttemptCheckpoint:
+    def advance_claim_lease(self, revision: str | None) -> AttemptCheckpoint:
         """Advance the recorded lease to a revision this attempt just pushed.
 
         Called after each own successful push so later pushes in the same
@@ -235,23 +222,10 @@ class AttemptStateStore:
         checkpoint = self.read()
         if checkpoint is None:
             raise AttemptStateError("No implementation attempt is active")
-        _validate_claim_lease(revision)
         if revision is None:
             raise AttemptStateError("Claim lease advance requires a revision")
-        advanced = AttemptCheckpoint(
-            issue_number=checkpoint.issue_number,
-            branch=checkpoint.branch,
-            phase=checkpoint.phase,
-            started_at=checkpoint.started_at,
-            updated_at=self._next_timestamp(),
-            auto_merge_opt_in=checkpoint.auto_merge_opt_in,
-            requeue_source=checkpoint.requeue_source,
-            issue_title=checkpoint.issue_title,
-            continuation_index=checkpoint.continuation_index,
-            attempt_kind=checkpoint.attempt_kind,
-            claim_branch_revision=revision,
-            claim_lease_recorded=True,
-        )
+        _validate_claim_lease(revision)
+        advanced = _with_claim_lease(checkpoint, revision, updated_at=self._next_timestamp())
         self._write(advanced)
         return advanced
 
@@ -306,6 +280,27 @@ def _as_utc(value: datetime) -> datetime:
     if value.tzinfo is None:
         raise AttemptStateError("Attempt timestamp must include a timezone")
     return value.astimezone(UTC)
+
+
+def _with_claim_lease(
+    checkpoint: AttemptCheckpoint, revision: str | None, *, updated_at: datetime
+) -> AttemptCheckpoint:
+    """Copy ``checkpoint`` with the claim-time lease set to ``revision``."""
+
+    return AttemptCheckpoint(
+        issue_number=checkpoint.issue_number,
+        branch=checkpoint.branch,
+        phase=checkpoint.phase,
+        started_at=checkpoint.started_at,
+        updated_at=updated_at,
+        auto_merge_opt_in=checkpoint.auto_merge_opt_in,
+        requeue_source=checkpoint.requeue_source,
+        issue_title=checkpoint.issue_title,
+        continuation_index=checkpoint.continuation_index,
+        attempt_kind=checkpoint.attempt_kind,
+        claim_branch_revision=revision,
+        claim_lease_recorded=True,
+    )
 
 
 def _validate_claim_lease(revision: str | None) -> None:

@@ -35,6 +35,16 @@ from simple_coding_agent.recovery import (
 _SUCCEEDED_BUT_UNPUBLISHED = "Implementation succeeded but publication failed."
 
 
+class ClaimLeaseError(GitWorkspaceError):
+    """Durable lease bookkeeping failed after a successful branch push.
+
+    The push itself landed, but the checkpoint could not advance its
+    recorded claim-time lease to the pushed revision. Reported distinctly
+    from a push failure so the event log and result comment name the
+    bookkeeping that failed, not the push that already succeeded.
+    """
+
+
 #: The issue label opting one implementation into auto-merge when the
 #: operator runs with ``PR_AUTO_MERGE=label``. Like ``ready-for-agent`` it
 #: sits on the collaborator trust boundary: only writers can apply it. It is
@@ -339,7 +349,9 @@ class Publisher:
                 checkpoint = self._attempt_state.read() if self._attempt_state is not None else None
                 if checkpoint is None or checkpoint.phase is not AttemptPhase.PUBLISHING:
                     self._check_deadline(deadline)
-                    pushed_sha = self._push_branch(request.branch, deadline=deadline)
+                    pushed_sha = self._push_branch(
+                        request.branch, deadline=deadline, issue_number=request.issue_number
+                    )
                     self._check_deadline(deadline)
                     self._mark_publishing()
                 branch_url = f"https://github.com/{self._repository}/tree/{request.branch}"
@@ -353,6 +365,24 @@ class Publisher:
                 )
                 outcome = AttemptOutcome.INFRASTRUCTURE_ERROR
                 details = push_failure
+                comment_posted = self._post_result(request, outcome, branch_url, None, details)
+                return PublicationResult(outcome, branch_url, None, comment_posted, details)
+            except ClaimLeaseError as error:
+                advance_failure = f"Claim lease advance failed: {type(error).__name__}: {error}"
+                self._event_log(
+                    "publication_failed",
+                    advance_failure,
+                    level="ERROR",
+                    issue_number=request.issue_number,
+                )
+                if outcome is AttemptOutcome.INCOMPLETE and not request.decision.publication_eligible:
+                    # Like a partial push failure, a failed final check stays
+                    # reported as incomplete; the lease failure is secondary
+                    # and must not hide the evaluator's reason.
+                    details = "; ".join((*request.decision.reasons, advance_failure))
+                else:
+                    outcome = AttemptOutcome.INFRASTRUCTURE_ERROR
+                    details = advance_failure
                 comment_posted = self._post_result(request, outcome, branch_url, None, details)
                 return PublicationResult(outcome, branch_url, None, comment_posted, details)
             except (GitWorkspaceError, TimeoutError) as error:
@@ -400,15 +430,25 @@ class Publisher:
         if outcome is None:
             outcome = AttemptOutcome.INFRASTRUCTURE_ERROR
         if outcome is AttemptOutcome.HANDOFF and self._handoff_comment_mode == "link":
-            return self._publish_handoff_link_mode(
-                request, outcome, branch_url, pull_request, pushed_sha, deadline, merge_result
-            )
+            try:
+                return self._publish_handoff_link_mode(
+                    request, outcome, branch_url, pull_request, pushed_sha, deadline, merge_result
+                )
+            except BranchMovedSinceClaimError as error:
+                return self._moved_handoff_result(
+                    request, branch_url, pull_request, merge_result, error
+                )
         comment_posted = self._post_result(
             request, outcome, branch_url, pull_request, request.details, merge_result
         )
         handoff_posted = True
         if outcome is AttemptOutcome.HANDOFF:
-            handoff_posted = self._publish_handoff_record(request, pushed_sha, deadline)
+            try:
+                handoff_posted = self._publish_handoff_record(request, pushed_sha, deadline)
+            except BranchMovedSinceClaimError as error:
+                return self._moved_handoff_result(
+                    request, branch_url, pull_request, merge_result, error
+                )
         return PublicationResult(
             outcome,
             branch_url,
@@ -417,6 +457,47 @@ class Publisher:
             request.details,
             merge_result,
             handoff_posted=handoff_posted,
+        )
+
+    def _moved_handoff_result(
+        self,
+        request: PublicationRequest,
+        branch_url: str | None,
+        pull_request: PullRequest | None,
+        merge_result: str | None,
+        error: BranchMovedSinceClaimError,
+    ) -> PublicationResult:
+        """End a handoff whose verification push lost the claim-time lease.
+
+        Another Worker published the shared branch while this attempt ran:
+        like every other lease rejection the attempt ends as
+        infrastructure_error with "branch moved since claim" in the details
+        and the event log, a posted result comment, and release as today --
+        never retained for recovery, never retried.
+        """
+
+        move_failure = f"Shared handoff branch push failed: {type(error).__name__}: {error}"
+        self._event_log(
+            "publication_failed",
+            move_failure,
+            level="ERROR",
+            issue_number=request.issue_number,
+        )
+        comment_posted = self._post_result(
+            request,
+            AttemptOutcome.INFRASTRUCTURE_ERROR,
+            branch_url,
+            pull_request,
+            move_failure,
+            merge_result,
+        )
+        return PublicationResult(
+            AttemptOutcome.INFRASTRUCTURE_ERROR,
+            branch_url,
+            pull_request,
+            comment_posted,
+            move_failure,
+            merge_result,
         )
 
     def _publish_handoff_link_mode(
@@ -559,7 +640,9 @@ class Publisher:
                 checkpoint = self._attempt_state.read() if self._attempt_state is not None else None
                 if checkpoint is None or checkpoint.phase is not AttemptPhase.PUBLISHING:
                     self._check_deadline(deadline)
-                    pushed_sha = self._push_branch(request.branch, deadline=deadline)
+                    pushed_sha = self._push_branch(
+                        request.branch, deadline=deadline, issue_number=request.issue_number
+                    )
                     self._check_deadline(deadline)
                     self._mark_publishing()
                 branch_url = f"https://github.com/{self._repository}/tree/{request.branch}"
@@ -574,6 +657,48 @@ class Publisher:
                 outcome = AttemptOutcome.INFRASTRUCTURE_ERROR
                 conflict_outcome = "push_failed"
                 details = "; ".join((request.details, push_failure)) if request.details else push_failure
+                conflict_index, escalate = _conflict_failure_standing(request)
+                comment_posted = self._post_conflict_result(
+                    request,
+                    outcome,
+                    conflict_outcome,
+                    branch_url,
+                    None,
+                    details,
+                    None,
+                    None,
+                    conflict_index=conflict_index,
+                    escalate=escalate,
+                )
+                return PublicationResult(
+                    outcome,
+                    branch_url,
+                    request.pull_request,
+                    comment_posted,
+                    details,
+                    None,
+                    conflict_outcome,
+                    escalate,
+                )
+            except ClaimLeaseError as error:
+                # The rebased branch landed but the lease bookkeeping failed:
+                # keep the ``push_failed`` marker (publication did not
+                # complete) while naming the advance, not the push, in the
+                # details and the event log.
+                advance_failure = f"Claim lease advance failed: {type(error).__name__}: {error}"
+                self._event_log(
+                    "publication_failed",
+                    advance_failure,
+                    level="ERROR",
+                    issue_number=request.issue_number,
+                )
+                outcome = AttemptOutcome.INFRASTRUCTURE_ERROR
+                conflict_outcome = "push_failed"
+                details = (
+                    "; ".join((request.details, advance_failure))
+                    if request.details
+                    else advance_failure
+                )
                 conflict_index, escalate = _conflict_failure_standing(request)
                 comment_posted = self._post_conflict_result(
                     request,
@@ -676,18 +801,28 @@ class Publisher:
             escalate,
         )
 
-    def _claim_lease(self) -> tuple[str | None, bool]:
+    def _claim_lease(self, issue_number: int) -> tuple[str | None, bool]:
         """The recorded claim-time lease for the active attempt, if any.
 
         Returns ``(revision, True)`` when the checkpoint durably records the
         remote revision observed at attempt start (``None`` when the branch
         was absent), otherwise ``(None, False)`` so the push falls back to
         today's observed lease like checkpoints written before the lease.
+        A checkpoint that cannot be read also falls back, with a warning:
+        failing the whole attempt when a safe observed lease exists would
+        discard work for a bookkeeping read.
         """
 
         try:
             checkpoint = self._attempt_state.read() if self._attempt_state is not None else None
-        except Exception:
+        except Exception as error:
+            self._event_log(
+                "claim_lease_read_failed",
+                f"the claim-time lease could not be read: {error};"
+                " falling back to today's observed lease",
+                level="WARNING",
+                issue_number=issue_number,
+            )
             return (None, False)
         if checkpoint is None:
             return (None, False)
@@ -703,12 +838,12 @@ class Publisher:
         try:
             self._attempt_state.advance_claim_lease(revision)
         except Exception as error:
-            raise GitWorkspaceError(f"Claim lease could not be advanced: {error}") from error
+            raise ClaimLeaseError(f"Claim lease could not be advanced: {error}") from error
 
-    def _push_branch(self, branch: str, *, deadline: float) -> str:
+    def _push_branch(self, branch: str, *, deadline: float, issue_number: int) -> str:
         """Push using the recorded claim-time lease when one exists."""
 
-        expected_revision, lease_known = self._claim_lease()
+        expected_revision, lease_known = self._claim_lease(issue_number)
         pushed = self._workspace.push_attempt_branch(
             branch,
             max_retries=self._max_retries,
@@ -955,17 +1090,18 @@ class Publisher:
                 # metadata is about to claim, so the record never names an
                 # unverified sha.
                 self._check_deadline(deadline)
-                verified_sha = self._push_branch(request.branch, deadline=deadline)
+                verified_sha = self._push_branch(
+                    request.branch, deadline=deadline, issue_number=request.issue_number
+                )
                 self._check_deadline(deadline)
                 self._mark_publishing()
-        except BranchMovedSinceClaimError as error:
-            self._event_log(
-                "publication_failed",
-                f"Shared handoff branch push failed: {type(error).__name__}: {error}",
-                level="ERROR",
-                issue_number=request.issue_number,
-            )
-            return False
+        except BranchMovedSinceClaimError:
+            # Another Worker published the shared branch while this attempt
+            # ran: the handoff must end as infrastructure_error (result
+            # comment and release, no retry, no retain) rather than read as
+            # an unconfirmed shared record. Re-raised for the publish paths
+            # to convert.
+            raise
         except (GitWorkspaceError, TimeoutError) as error:
             self._event_log(
                 "publication_failed",

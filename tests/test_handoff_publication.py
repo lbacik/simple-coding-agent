@@ -17,7 +17,7 @@ from pathlib import Path
 
 from simple_coding_agent.attempt_state import AttemptPhase, AttemptStateStore
 from simple_coding_agent.completion import AttemptOutcome, CompletionDecision, PublicationPath
-from simple_coding_agent.git_workspace import GitWorkspaceError
+from simple_coding_agent.git_workspace import BranchMovedSinceClaimError, GitWorkspaceError
 from simple_coding_agent.handoff_record import (
     HandoffPublicationStore,
     MemoryHandoffPublicationStore,
@@ -393,7 +393,15 @@ def test_automatic_continuation_standing_rides_in_the_hidden_record(tmp_path: Pa
 
 
 class PushFailingWorkspace:
-    def push_attempt_branch(self, branch: str, *, max_retries: int, deadline: float | None = None) -> str:
+    def push_attempt_branch(
+        self,
+        branch: str,
+        *,
+        max_retries: int,
+        deadline: float | None = None,
+        expected_revision: str | None = None,
+        lease_known: bool = False,
+    ) -> str:
         raise GitWorkspaceError("remote hung up unexpectedly")
 
 
@@ -509,3 +517,63 @@ def test_unconfirmed_shared_record_retains_the_attempt(tmp_path: Path) -> None:
     # Cleanup runs but retains the branch; the checkpoint stays for recovery.
     assert workspace.cleanup_calls == [("main", True)]
     assert state.read() is not None
+
+
+class BranchMovedWorkspace:
+    """A pusher double whose remote moved since the claim-time lease."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def push_attempt_branch(
+        self,
+        branch: str,
+        *,
+        max_retries: int,
+        deadline: float | None = None,
+        expected_revision: str | None = None,
+        lease_known: bool = False,
+    ) -> str:
+        self.calls += 1
+        raise BranchMovedSinceClaimError(
+            f"branch moved since claim: remote {branch} is rival-sha,"
+            " claim-time lease was absent"
+        )
+
+
+def test_moved_handoff_branch_ends_as_infrastructure_error_without_retain(
+    tmp_path: Path,
+) -> None:
+    workspace, prepared = prepared_branch(tmp_path)
+    github = HandoffGitHub()
+    store = MemoryHandoffPublicationStore()
+    state = AttemptStateStore(tmp_path / "state")
+    state.start(issue_number=23, branch=prepared.branch)
+    for phase in (AttemptPhase.SETUP, AttemptPhase.MODEL_RUNNING, AttemptPhase.PUSHING, AttemptPhase.PUBLISHING):
+        state.transition(phase)
+    state.record_claim_lease(None)
+    events: list[tuple[str, str, str, int | None]] = []
+    moved = BranchMovedWorkspace()
+
+    result = Publisher(
+        moved,
+        github,
+        "octo/example",
+        attempt_state=state,
+        handoff_store=store,
+        event_log=lambda event, detail="", level="INFO", issue_number=None: events.append(
+            (event, detail, level, issue_number)
+        ),
+    ).publish(handoff_request(prepared.branch))
+
+    assert result.outcome is AttemptOutcome.INFRASTRUCTURE_ERROR
+    assert moved.calls == 1
+    assert "branch moved since claim" in result.details
+    assert "Shared handoff branch push failed" in result.details
+    assert len(github.comments) == 1
+    assert "branch moved since claim" in github.comments[0][1]
+    assert shared_bodies(github) == []
+    assert any(
+        event == "publication_failed" and "branch moved since claim" in detail
+        for event, detail, _, _ in events
+    )

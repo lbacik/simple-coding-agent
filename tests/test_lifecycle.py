@@ -641,6 +641,7 @@ def test_logs_every_stage_from_claiming_the_issue_to_dispatching_the_model(
         "workspace_prepared_for_profile_read",
         "profile_loaded",
         "workspace_prepared",
+        "claim_lease_recorded",
         "attempt_phase_transitioned",
     ]
     assert all(issue_number == 24 for _, issue_number in events[1:])
@@ -1050,3 +1051,45 @@ def test_classify_handoff_reason_prefers_structured_signals_over_explanation() -
         )
         == "time_limit"
     )
+
+
+def test_live_attempt_records_the_claim_time_lease_at_start(tmp_path: Path) -> None:
+    claim = Claim(issue(24), Assignment("issue-24", "agent-id"))
+    tracker = FakeTracker(next_claim=claim)
+    workspace = InMemoryWorkspace(tmp_path / "repo", issue_number=24)
+    publisher = FakePublisher()
+    events: list[tuple[str, str, str, int | None]] = []
+    observed: dict[str, object] = {}
+
+    def run_workflow(received_claim: Claim, profile: object, prepared: object) -> AttemptEvidence:
+        checkpoint = AttemptStateStore(tmp_path).read()
+        assert checkpoint is not None
+        observed["lease_recorded"] = checkpoint.claim_lease_recorded
+        observed["revision"] = checkpoint.claim_branch_revision
+        return AttemptEvidence(
+            decision=CompletionDecision(None, True, PublicationPath.COMPLETE, ("ready",)),
+            check_command="pytest",
+            check_exit_code=0,
+            review_cycles=1,
+            review_findings="all clear",
+            details="Implemented the lifecycle.",
+        )
+
+    lifecycle = AgentLifecycle(
+        tracker=tracker,
+        attempt_state=AttemptStateStore(tmp_path),
+        workspace=workspace,
+        profile_loader=lambda _: profile(),
+        publisher=publisher,
+        attempt_runner=run_workflow,
+        event_log=lambda event, detail="", level="INFO", issue_number=None: events.append(
+            (event, detail, level, issue_number)
+        ),
+    )
+
+    result = lifecycle.run_once()
+
+    assert result.outcome is AttemptOutcome.COMPLETE
+    # The in-memory workspace observes an absent remote branch at start.
+    assert observed == {"lease_recorded": True, "revision": None}
+    assert ("claim_lease_recorded", "branch=agent/issue-24; lease=absent", "INFO", 24) in events

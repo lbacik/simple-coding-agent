@@ -7,6 +7,7 @@ import subprocess
 import pytest
 
 from simple_coding_agent.git_workspace import (
+    BranchMovedSinceClaimError,
     DirtyWorkspaceError,
     GitWorkspace,
     GitWorkspaceError,
@@ -760,3 +761,127 @@ def run_command(
     return subprocess.run(
         command, cwd=cwd, env=env, check=True, text=True, capture_output=True
     ).stdout.strip()
+
+
+def test_records_the_remote_branch_observed_while_preparing(tmp_path: Path) -> None:
+    remote, _ = repository_with_main(tmp_path)
+    workspace = GitWorkspace(tmp_path / "clone", str(remote), token_provider=lambda: "token")
+
+    absent = workspace.prepare_attempt(base_branch="main", issue_number=23)
+
+    assert absent.remote_branch_known is True
+    assert absent.remote_branch_revision is None
+
+    write_and_commit(tmp_path / "clone", "feature.txt", "done", "Implement feature")
+    workspace.push_attempt_branch(absent.branch, max_retries=1)
+
+    rival = GitWorkspace(tmp_path / "rival", str(remote), token_provider=lambda: "token")
+    observed = rival.prepare_attempt(base_branch="main", issue_number=23)
+
+    assert observed.remote_branch_known is True
+    assert observed.remote_branch_revision == git(tmp_path / "clone", "rev-parse", "agent/issue-23")
+
+
+def test_claim_time_push_rejects_a_branch_moved_after_attempt_start(tmp_path: Path) -> None:
+    remote, _ = repository_with_main(tmp_path)
+    push_commands: list[tuple[str, ...]] = []
+
+    def counting_run(command: tuple[str, ...], cwd: Path | None, env: dict[str, str]) -> str:
+        if command[1] == "push":
+            push_commands.append(command)
+        return run_command(command, cwd=cwd, env=env)
+
+    workspace = GitWorkspace(
+        tmp_path / "clone",
+        str(remote),
+        token_provider=lambda: "token",
+        run=counting_run,
+        sleeper=lambda _: None,
+    )
+    prepared = workspace.prepare_attempt(base_branch="main", issue_number=23)
+    write_and_commit(tmp_path / "clone", "feature.txt", "done", "Implement feature")
+    workspace.push_attempt_branch(
+        prepared.branch,
+        max_retries=3,
+        expected_revision=prepared.remote_branch_revision,
+        lease_known=True,
+    )
+
+    # Another Worker publishes the shared branch while this attempt runs.
+    rival = GitWorkspace(tmp_path / "rival", str(remote), token_provider=lambda: "token")
+    rival.prepare_attempt(base_branch="main", issue_number=23)
+    write_and_commit(tmp_path / "rival", "rival.txt", "rival", "Rival work")
+    rival.push_attempt_branch("agent/issue-23", max_retries=1)
+
+    # This attempt commits more work and pushes with its stale claim-time lease.
+    write_and_commit(tmp_path / "clone", "more.txt", "more", "Continue feature")
+    with pytest.raises(BranchMovedSinceClaimError, match="branch moved since claim"):
+        workspace.push_attempt_branch(
+            prepared.branch,
+            max_retries=3,
+            expected_revision=prepared.remote_branch_revision,
+            lease_known=True,
+        )
+
+    # The lease rejection is not retried: one push for the first success and
+    # exactly one for the rejected push.
+    assert len(push_commands) == 2
+
+
+def test_claim_time_push_succeeds_when_the_lease_advances_after_each_push(
+    tmp_path: Path,
+) -> None:
+    remote, _ = repository_with_main(tmp_path)
+    commands: list[tuple[str, ...]] = []
+
+    def recording_run(command: tuple[str, ...], cwd: Path | None, env: dict[str, str]) -> str:
+        commands.append(command)
+        return run_command(command, cwd=cwd, env=env)
+
+    workspace = GitWorkspace(
+        tmp_path / "clone", str(remote), token_provider=lambda: "token", run=recording_run
+    )
+    prepared = workspace.prepare_attempt(base_branch="main", issue_number=23)
+    write_and_commit(tmp_path / "clone", "feature.txt", "done", "Implement feature")
+
+    first = workspace.push_attempt_branch(
+        prepared.branch, max_retries=1, expected_revision=None, lease_known=True
+    )
+    write_and_commit(tmp_path / "clone", "more.txt", "more", "Continue feature")
+    second = workspace.push_attempt_branch(
+        prepared.branch, max_retries=1, expected_revision=first, lease_known=True
+    )
+
+    pushes = [command for command in commands if command[1] == "push"]
+    assert pushes[0][2] == "--force-with-lease=agent/issue-23:"
+    assert pushes[1][2] == f"--force-with-lease=agent/issue-23:{first}"
+    # The claim-time path never refetches before pushing: the recorded lease
+    # is the lease, not a fresh observation.
+    assert ("git", "fetch", "origin", "agent/issue-23") not in commands
+    assert second == git(tmp_path / "clone", "rev-parse", "HEAD")
+    assert second == git(tmp_path / "clone", "ls-remote", "origin", "refs/heads/agent/issue-23")
+
+
+def test_claim_time_push_overwrites_a_branch_observed_at_attempt_start(
+    tmp_path: Path,
+) -> None:
+    remote, _ = repository_with_main(tmp_path)
+    first = GitWorkspace(tmp_path / "first", str(remote), token_provider=lambda: "token")
+    first.prepare_attempt(base_branch="main", issue_number=23)
+    write_and_commit(tmp_path / "first", "feature.txt", "done", "Implement feature")
+    first.push_attempt_branch("agent/issue-23", max_retries=1)
+
+    # A fresh single-Worker attempt observes the published branch at start
+    # and may still push onto it: only movement *during* the attempt blocks.
+    workspace = GitWorkspace(tmp_path / "clone", str(remote), token_provider=lambda: "token")
+    prepared = workspace.prepare_attempt(base_branch="main", issue_number=23)
+    write_and_commit(tmp_path / "clone", "more.txt", "more", "Continue feature")
+
+    pushed = workspace.push_attempt_branch(
+        prepared.branch,
+        max_retries=1,
+        expected_revision=prepared.remote_branch_revision,
+        lease_known=True,
+    )
+
+    assert pushed == git(tmp_path / "clone", "rev-parse", "HEAD")

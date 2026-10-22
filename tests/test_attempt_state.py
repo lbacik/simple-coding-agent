@@ -248,3 +248,128 @@ def test_start_rejects_an_unknown_requeue_source(tmp_path: Path) -> None:
 
     with pytest.raises(AttemptStateError, match="Requeue source"):
         store.start(issue_number=42, branch="agent/issue-42", requeue_source="sometimes")
+
+
+def test_claim_lease_defaults_to_unrecorded(tmp_path: Path) -> None:
+    store = AttemptStateStore(tmp_path)
+    store.start(issue_number=42, branch="agent/issue-42")
+
+    checkpoint = store.read()
+
+    assert checkpoint is not None
+    assert checkpoint.claim_branch_revision is None
+    assert checkpoint.claim_lease_recorded is False
+
+
+def test_record_claim_lease_stores_the_observed_remote_revision(tmp_path: Path) -> None:
+    store = AttemptStateStore(tmp_path)
+    store.start(issue_number=42, branch="agent/issue-42")
+
+    recorded = store.record_claim_lease("abc123")
+
+    assert recorded.claim_branch_revision == "abc123"
+    assert recorded.claim_lease_recorded is True
+    assert store.read() == recorded
+
+
+def test_record_claim_lease_stores_an_absent_branch(tmp_path: Path) -> None:
+    store = AttemptStateStore(tmp_path)
+    store.start(issue_number=42, branch="agent/issue-42")
+
+    recorded = store.record_claim_lease(None)
+
+    assert recorded.claim_branch_revision is None
+    assert recorded.claim_lease_recorded is True
+
+
+def test_record_claim_lease_keeps_the_first_recording(tmp_path: Path) -> None:
+    store = AttemptStateStore(tmp_path)
+    store.start(issue_number=42, branch="agent/issue-42")
+    store.record_claim_lease("first")
+
+    rerecorded = store.record_claim_lease("second")
+
+    assert rerecorded.claim_branch_revision == "first"
+    assert rerecorded.claim_lease_recorded is True
+
+
+def test_advance_claim_lease_moves_to_the_pushed_revision(tmp_path: Path) -> None:
+    store = AttemptStateStore(tmp_path)
+    store.start(issue_number=42, branch="agent/issue-42")
+    store.record_claim_lease(None)
+
+    advanced = store.advance_claim_lease("pushed-sha")
+
+    assert advanced.claim_branch_revision == "pushed-sha"
+    assert advanced.claim_lease_recorded is True
+    assert store.read() == advanced
+
+
+def test_advance_claim_lease_records_a_lease_for_an_older_checkpoint(tmp_path: Path) -> None:
+    store = AttemptStateStore(tmp_path)
+    store.start(issue_number=42, branch="agent/issue-42")
+
+    advanced = store.advance_claim_lease("pushed-sha")
+
+    assert advanced.claim_branch_revision == "pushed-sha"
+    assert advanced.claim_lease_recorded is True
+
+
+def test_claim_lease_survives_transitions_and_reopening(tmp_path: Path) -> None:
+    store = AttemptStateStore(tmp_path)
+    store.start(issue_number=42, branch="agent/issue-42")
+    store.record_claim_lease("abc123")
+    store.transition(AttemptPhase.SETUP)
+
+    reopened = AttemptStateStore(tmp_path).read()
+
+    assert reopened is not None
+    assert reopened.claim_branch_revision == "abc123"
+    assert reopened.claim_lease_recorded is True
+
+
+def test_checkpoint_without_a_claim_lease_reads_as_unrecorded(tmp_path: Path) -> None:
+    path = tmp_path / "state" / "attempt.json"
+    path.parent.mkdir()
+    path.write_text(
+        '{"branch": "agent/issue-42", "issue_number": 42, "phase": "claimed",'
+        ' "started_at": "2026-09-20T13:00:00Z", "updated_at": "2026-09-20T13:00:00Z"}'
+    )
+
+    checkpoint = AttemptStateStore(tmp_path).read()
+
+    assert checkpoint is not None
+    assert checkpoint.claim_branch_revision is None
+    assert checkpoint.claim_lease_recorded is False
+
+
+def test_checkpoint_with_a_claim_lease_but_no_flag_reads_as_unrecorded(tmp_path: Path) -> None:
+    path = tmp_path / "state" / "attempt.json"
+    path.parent.mkdir()
+    path.write_text(
+        '{"branch": "agent/issue-42", "issue_number": 42, "phase": "claimed",'
+        ' "started_at": "2026-09-20T13:00:00Z", "updated_at": "2026-09-20T13:00:00Z",'
+        ' "claim_branch_revision": "abc123"}'
+    )
+
+    checkpoint = AttemptStateStore(tmp_path).read()
+
+    assert checkpoint is not None
+    assert checkpoint.claim_branch_revision is None
+    assert checkpoint.claim_lease_recorded is False
+
+
+def test_record_claim_lease_rejects_a_blank_revision(tmp_path: Path) -> None:
+    store = AttemptStateStore(tmp_path)
+    store.start(issue_number=42, branch="agent/issue-42")
+
+    with pytest.raises(AttemptStateError, match="non-empty"):
+        store.record_claim_lease("  ")
+
+
+def test_advance_claim_lease_rejects_an_absent_revision(tmp_path: Path) -> None:
+    store = AttemptStateStore(tmp_path)
+    store.start(issue_number=42, branch="agent/issue-42")
+
+    with pytest.raises(AttemptStateError, match="advance requires a revision"):
+        store.advance_claim_lease(None)

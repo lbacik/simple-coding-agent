@@ -673,11 +673,18 @@ class GitWorkspace:
                 except GitWorkspaceError:
                     pass
                 if attempt + 1 < max_retries:
-                    delay = min(2 * 2**attempt, 30)
-                    if deadline is not None and time.monotonic() + delay >= deadline:
-                        raise GitWorkspaceError("PUBLISH_TIMEOUT exceeded while retrying push") from error
-                    self._sleeper(delay)
+                    self._push_retry_delay(attempt, deadline, error)
         raise GitWorkspaceError("Attempt branch could not be pushed safely") from last_error
+
+    def _push_retry_delay(
+        self, attempt: int, deadline: float | None, error: GitWorkspaceError
+    ) -> None:
+        """Sleep before the next push retry, failing fast past the deadline."""
+
+        delay = min(2 * 2**attempt, 30)
+        if deadline is not None and time.monotonic() + delay >= deadline:
+            raise GitWorkspaceError("PUBLISH_TIMEOUT exceeded while retrying push") from error
+        self._sleeper(delay)
 
     def _push_with_claim_lease(
         self,
@@ -723,10 +730,7 @@ class GitWorkspace:
                         f"claim-time lease was {wanted}"
                     ) from error
                 if attempt + 1 < max_retries:
-                    delay = min(2 * 2**attempt, 30)
-                    if deadline is not None and time.monotonic() + delay >= deadline:
-                        raise GitWorkspaceError("PUBLISH_TIMEOUT exceeded while retrying push") from error
-                    self._sleeper(delay)
+                    self._push_retry_delay(attempt, deadline, error)
         raise GitWorkspaceError("Attempt branch could not be pushed safely") from last_error
 
     def _fetch_remote_branch(self, branch: str) -> str | None:
