@@ -4416,6 +4416,17 @@ class AgentLifecycle:
                     f"Issue #{target_number} has an ambiguous assignment to"
                     " this agent; the priority stays pending until reconciled."
                 )
+            if fresh is not None:
+                # With WORKER_ID set, the shared login assigned with only
+                # another Worker's marker reads as "already assigned" above
+                # even though the claimant is another worker: name the
+                # blocking marker exactly like the recovery retry does, so
+                # the record says whose claim won the target.
+                marker_detail = _foreign_marker_detail(
+                    getattr(self._tracker, "worker_id", ""), fresh
+                )
+                if marker_detail:
+                    reason = f"{reason}{marker_detail}"
             store.fail_next_issue(reason)
             self._event_log(
                 "next_issue_not_fulfilled",

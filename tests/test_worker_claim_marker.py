@@ -615,3 +615,81 @@ def test_settle_delay_still_applies_with_a_worker_id(
     assert tracker.claim_next() is not None
 
     assert calls == [CLAIM_SETTLE_DELAY_SECONDS]
+
+
+def test_priority_target_with_only_a_foreign_marker_falls_back_to_fifo(
+    tmp_path: Path,
+) -> None:
+    """A priority target the winner claimed first ends ``not fulfilled``.
+
+    Worker B wins the race after the priority is accepted (the shared-login
+    assignment plus only B's marker): the target revalidates as claimed by
+    another assignee, so the priority ends ``not fulfilled`` and the same
+    cycle falls back to FIFO.
+    """
+    from simple_coding_agent.attempt_state import AttemptStateStore
+    from simple_coding_agent.completion import (
+        AttemptOutcome,
+        CompletionDecision,
+        PublicationPath,
+    )
+    from simple_coding_agent.control import CommandAcknowledgement, ControlStore
+    from simple_coding_agent.lifecycle import AgentLifecycle, AttemptEvidence
+
+    events: list[tuple] = []
+
+    def event_log(
+        event: str,
+        detail: str = "",
+        level: str = "INFO",
+        issue_number: int | None = None,
+    ) -> None:
+        events.append((event, detail, level, issue_number))
+
+    tracker = FakeTracker(
+        issues={24: issue(24), 25: issue(25)},
+        fifo=[25],
+        worker_id="worker-a",
+        event_log=event_log,
+    )
+    store = ControlStore(tmp_path)
+    lifecycle = AgentLifecycle(
+        tracker=tracker,  # type: ignore[arg-type]
+        attempt_state=AttemptStateStore(tmp_path),
+        workspace=InMemoryWorkspace(tmp_path / "repo"),
+        profile_loader=lambda _: type("Profile", (), {"base_branch": "main"})(),
+        publisher=FakePublisher(),
+        attempt_runner=lambda received_claim, profile, prepared: AttemptEvidence(
+            decision=CompletionDecision(
+                AttemptOutcome.COMPLETE, True, PublicationPath.COMPLETE, ("ready",)
+            ),
+            check_command="pytest",
+            check_exit_code=0,
+            review_cycles=1,
+            review_findings="all clear",
+            details="Implemented.",
+        ),
+        control_store=store,
+        sleeper=lambda seconds: None,
+        event_log=event_log,
+    )
+    lifecycle.submit_next_issue("req-next", 24)
+    # Worker B wins after acceptance: shared-login assignment plus only B's
+    # marker, so the target is this login assigned to another claimant.
+    tracker.issues[24] = issue(
+        24,
+        labels=frozenset({"ready-for-agent", "claimed-by:worker-b"}),
+        assignee_logins=("agent",),
+    )
+
+    result = lifecycle.run_once()
+
+    assert result.status.value == "attempted"
+    assert tracker.fifo_claims == [25]
+    failed = store.get_command("req-next")
+    assert failed is not None
+    assert failed.acknowledgement is CommandAcknowledgement.NOT_FULFILLED
+    assert "already assigned to agent" in failed.detail
+    assert "claimed by another worker (claimed-by:worker-b)" in failed.detail
+    not_fulfilled = [row for row in events if row[0] == "next_issue_not_fulfilled"]
+    assert not_fulfilled and not_fulfilled[0][3] == 24
