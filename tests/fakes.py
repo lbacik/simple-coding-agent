@@ -38,6 +38,7 @@ from simple_coding_agent.github_tracker import (
     ROUND_FINISHED,
     Assignment,
     Claim,
+    ClaimLostError,
     TrackerIssue,
     conflict_branch_issue_number,
     is_conflict_detection_eligible,
@@ -502,6 +503,14 @@ class FakeTracker:
             self.issues.setdefault(next_claim.issue.number, next_claim.issue)
         self.fetch_errors: dict[int, Exception] = {}
         self.assign_errors: dict[int, Exception] = {}
+        # Contended issues for claim-race simulation: issue number to the
+        # other assignees seen at verification time. ``claim_next`` yields
+        # them (emitting ``claim_lost`` with no label changes) and continues
+        # with the next candidate; ``claim_verified`` raises
+        # ``ClaimLostError`` so the priority fails terminally to FIFO.
+        self.claim_race: dict[int, tuple[str, ...]] = {}
+        # Issues whose own assignment was removed after yielding.
+        self.yielded: list[int] = []
         self.claimed: list[int] = []
         self.fifo_claims: list[int] = []
         self.claimed_verified: list[int] = []
@@ -572,15 +581,27 @@ class FakeTracker:
             claim, self.next_claim = self.next_claim, None
             self.claimed.append(claim.issue.number)
             return claim
-        if not self.fifo:
-            return None
-        number = self.fifo.pop(0)
-        self.fifo_claims.append(number)
-        self.claimed.append(number)
-        found = self.issues.get(number)
-        if found is None:  # pragma: no cover - tests seed the queue from issues
-            raise AssertionError(f"FakeTracker fifo issue #{number} is not seeded")
-        return Claim(issue=found, assignment=Assignment(issue_id=found.id, assignee_id="agent-id"))
+        while self.fifo:
+            number = self.fifo.pop(0)
+            self.fifo_claims.append(number)
+            self.claimed.append(number)
+            found = self.issues.get(number)
+            if found is None:  # pragma: no cover - tests seed the queue from issues
+                raise AssertionError(f"FakeTracker fifo issue #{number} is not seeded")
+            if number in self.claim_race:
+                others = self.claim_race[number]
+                self.yielded.append(number)
+                holders = ", ".join(others) if others else "unknown"
+                self._event_log(
+                    "claim_lost",
+                    f"issue #{number} claimed by another assignee"
+                    f" ({holders}); yielding",
+                    level="WARNING",
+                    issue_number=number,
+                )
+                continue
+            return Claim(issue=found, assignment=Assignment(issue_id=found.id, assignee_id="agent-id"))
+        return None
 
     def fetch_issue(self, number: int) -> TrackerIssue | None:
         if number in self.fetch_errors:
@@ -639,6 +660,18 @@ class FakeTracker:
     def claim_verified(self, issue: TrackerIssue) -> Claim:
         if issue.number in self.assign_errors:
             raise self.assign_errors[issue.number]
+        if issue.number in self.claim_race:
+            others = self.claim_race[issue.number]
+            self.yielded.append(issue.number)
+            holders = ", ".join(others) if others else "unknown"
+            self._event_log(
+                "claim_lost",
+                f"issue #{issue.number} claimed by another assignee"
+                f" ({holders}); yielding",
+                level="WARNING",
+                issue_number=issue.number,
+            )
+            raise ClaimLostError(issue.number, others)
         current = self.issues.get(issue.number)
         assert current is not None
         if ROUND_FINISHED in current.labels:

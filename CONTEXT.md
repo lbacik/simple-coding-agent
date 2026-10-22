@@ -29,7 +29,7 @@ The ordered set of eligible issues, from which the agent picks the next issue to
 _Avoid_: Backlog, work queue, job queue
 
 **Claim**:
-Reserving an eligible issue by assigning the agent's GitHub identity as the issue assignee, after verifying the assignee is still empty. A claimed issue is no longer eligible for other sessions.
+Reserving an eligible issue by assigning the agent's GitHub identity as the issue assignee, then re-reading the issue after a short settle delay to verify the Worker's identity is the issue's only assignee. A claimed issue is no longer eligible for other sessions. A Worker that sees another assignee (another Worker or a human) on re-read yields: it removes only its own assignment and leaves labels, comments, and checkpoints untouched, so the issue returns to the Runnable queue for a later poll.
 _Avoid_: Lock, reservation
 
 **Automatic continuation**:

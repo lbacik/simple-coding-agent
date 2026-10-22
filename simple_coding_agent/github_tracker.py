@@ -35,6 +35,30 @@ MERGE_CONFLICT_LABEL_DESCRIPTION = (
     "Agent PR has merge conflicts; queued for a Conflict attempt"
 )
 
+#: Settle delay between assigning an issue to this worker and re-reading it
+#: to verify the claim. Two workers assigning at the same time both see the
+#: other assignee after this window and yield, so the issue returns to the
+#: runnable queue instead of being worked twice. Always on; no config knob.
+CLAIM_SETTLE_DELAY_SECONDS = 2.5
+
+
+class ClaimLostError(RuntimeError):
+    """A post-assign verification found another assignee on the issue.
+
+    Raised when the settle-window re-read shows an assignee other than this
+    worker: the worker already removed its own assignment and yielded, so the
+    caller must not remove labels, comment, or start a checkpoint. Carries
+    the issue number and the other assignees seen at verification time.
+    """
+
+    def __init__(self, issue_number: int, other_assignees: tuple[str, ...]) -> None:
+        holders = ", ".join(other_assignees) if other_assignees else "unknown"
+        super().__init__(
+            f"issue #{issue_number} claimed by another assignee ({holders})"
+        )
+        self.issue_number = issue_number
+        self.other_assignees = other_assignees
+
 #: Published attempt branches, and the issue number each one belongs to. The
 #: detector takes the issue number from this branch name, never from
 #: ``Closes #N`` in the pull request body, which links nothing off the
@@ -514,47 +538,106 @@ class GitHubTracker:
 
         A priority target that revalidates as self-assigned is an ambiguous
         prior assignment (it was unassigned when the priority was accepted,
-        and only this process claims through the serialized boundary), never
-        ordinary ineligibility: the caller must hold it for reconciliation
-        instead of marking the priority ``not fulfilled``.
+        and this worker's own assignment went through while its reply was
+        lost), never ordinary ineligibility: the caller must hold it for
+        reconciliation instead of marking the priority ``not fulfilled``.
+        With distinct worker logins a concurrent claim shows as another
+        assignee, not as self-assignment.
         """
 
         return self._transport.viewer().login in issue.assignee_logins
+
+    def _verify_claim(self, issue: TrackerIssue, identity: GitHubIdentity) -> TrackerIssue:
+        """Wait out the assign settle window, then yield if anyone else is assigned.
+
+        Re-reads the issue after :data:`CLAIM_SETTLE_DELAY_SECONDS` and
+        yields when any assignee other than this worker is present (another
+        worker or a human). Yielding removes only this worker's own
+        assignment: no label changes, no issue comment, no checkpoint (this
+        runs before ``attempt_state.start``). Emits a ``claim_lost`` event
+        carrying the issue number and the other assignees, then raises
+        :class:`ClaimLostError`. The winner's snapshot is returned so stale
+        labels can be removed after verification.
+        """
+
+        time.sleep(CLAIM_SETTLE_DELAY_SECONDS)
+        fresh = self._transport.get_issue(self._target_repo, issue.number)
+        if fresh is None:
+            self._event_log(
+                "claim_lost",
+                f"issue #{issue.number} claimed by another assignee (issue"
+                " unavailable on re-read); yielding",
+                level="WARNING",
+                issue_number=issue.number,
+            )
+            raise ClaimLostError(issue.number, ())
+        others = tuple(
+            login for login in fresh.assignee_logins if login != identity.login
+        )
+        if others:
+            self._transport.remove_assignee(fresh.id, identity.id)
+            holders = ", ".join(others)
+            self._event_log(
+                "claim_lost",
+                f"issue #{issue.number} claimed by another assignee"
+                f" ({holders}); yielding",
+                level="WARNING",
+                issue_number=issue.number,
+            )
+            raise ClaimLostError(issue.number, others)
+        return fresh
+
+    def _remove_stale_claim_labels(self, verified: TrackerIssue) -> None:
+        """Remove the stale queue labels the verified winner must clear.
+
+        Runs only after the settle-window verification succeeded, so a
+        yielding worker never changes labels. A stale ``round-finished`` is
+        always cleared; a stale ``merge-conflict`` goes only when the
+        ordinary or continuation path takes precedence over the conflict
+        signal (a conflict-path claim keeps the label until the conflict
+        attempt itself finishes).
+        """
+
+        if ROUND_FINISHED in verified.labels:
+            self._transport.remove_label(verified.id, ROUND_FINISHED)
+        if MERGE_CONFLICT in verified.labels and (
+            READY_FOR_AGENT in verified.labels or ROUND_FINISHED in verified.labels
+        ):
+            self._transport.remove_label(verified.id, MERGE_CONFLICT)
 
     def claim_verified(self, issue: TrackerIssue) -> Claim:
         """Assign an already revalidated priority target.
 
         The caller re-fetched the issue and confirmed eligibility immediately
         before this call, so no second eligibility read happens here: the
-        existing assignment-based claim check runs exactly once. A stale
-        ``round-finished`` label is removed as in :meth:`claim_next`.
+        existing assignment-based claim check runs exactly once. After
+        assigning, the claim is verified through the shared settle-window
+        helper: when another assignee is seen, this worker removes only its
+        own assignment, emits ``claim_lost``, and raises
+        :class:`ClaimLostError` without touching labels. Only the verified
+        winner removes a stale ``round-finished`` label, as in
+        :meth:`claim_next`. The returned claim carries the pre-removal
+        snapshot, as before; only the settle delay is new.
         """
 
         identity = self._transport.viewer()
         assignment = self._transport.assign_issue(issue.id, identity.id)
-        if ROUND_FINISHED in issue.labels:
-            self._transport.remove_label(issue.id, ROUND_FINISHED)
-        if MERGE_CONFLICT in issue.labels and (
-            READY_FOR_AGENT in issue.labels or ROUND_FINISHED in issue.labels
-        ):
-            # An ordinary or continuation claim on an issue that also carries
-            # ``merge-conflict``: those paths take precedence, so the stale
-            # conflict signal is removed at the claim. A conflict-path claim
-            # keeps the label until the conflict attempt itself finishes.
-            self._transport.remove_label(issue.id, MERGE_CONFLICT)
+        verified = self._verify_claim(issue, identity)
+        self._remove_stale_claim_labels(verified)
         return Claim(issue=issue, assignment=assignment)
 
     def claim_next(self) -> Claim | None:
         """Claim the first issue that remains eligible at assignment time.
 
-        This deliberately uses a check-then-set operation. The configured agent
-        is a single process, so it is not presented as a distributed lock.
-
-        A stale ``round-finished`` label from a prior handoff is removed here,
-        regardless of this attempt's eventual outcome, so it never lingers
-        across repeated handoff/continue cycles. The returned claim still
-        carries the pre-removal issue snapshot, so callers can detect that a
-        continuation was expected even after the label is gone.
+        Each candidate is assigned, then verified through the shared
+        settle-window helper: when another assignee (another worker or a
+        human) is seen, this worker removes only its own assignment, emits
+        ``claim_lost``, and continues with the next candidate in the same
+        cycle. Only the verified winner removes a stale ``round-finished``
+        label, so two workers yielding never strands the issue without its
+        queue signal; the issue simply returns to the runnable queue and a
+        later poll wins. The returned claim carries the pre-removal
+        candidate snapshot, as before; only the settle delay is new.
         """
 
         queue = self.runnable_queue()
@@ -573,14 +656,14 @@ class GitHubTracker:
             ):
                 continue
             assignment = self._transport.assign_issue(current.id, identity.id)
-            if ROUND_FINISHED in current.labels:
-                self._transport.remove_label(current.id, ROUND_FINISHED)
-            if MERGE_CONFLICT in current.labels and (
-                READY_FOR_AGENT in current.labels or ROUND_FINISHED in current.labels
-            ):
-                # The ordinary (or continuation) path takes precedence over
-                # the conflict signal, so the stale label goes at the claim.
-                self._transport.remove_label(current.id, MERGE_CONFLICT)
+            try:
+                verified = self._verify_claim(current, identity)
+            except ClaimLostError:
+                # Another assignee won this candidate (the helper already
+                # removed only our assignment and emitted ``claim_lost``):
+                # continue with the next candidate in the same cycle.
+                continue
+            self._remove_stale_claim_labels(verified)
             return Claim(issue=current, assignment=assignment)
         return None
 
