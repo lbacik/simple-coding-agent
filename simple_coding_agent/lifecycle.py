@@ -6771,13 +6771,14 @@ def _log_completion_decision(
 
 
 def _command_failure_detail(result: object, *, limit: int = 4000) -> str:
-    """Surface the failing command and its stderr for the live event stream."""
+    """Surface the failing command and its output for the live event stream."""
 
     failed = _select_failed_command(result)
     if failed is None:
         return "timed out before any command ran"
     stderr = (getattr(failed, "stderr", "") or "").strip()
-    detail = f"`{getattr(failed, 'command', '')}` (exit {getattr(failed, 'exit_code', None)}): {stderr}"
+    output = stderr or (getattr(failed, "stdout", "") or "").strip()
+    detail = f"`{getattr(failed, 'command', '')}` (exit {getattr(failed, 'exit_code', None)}): {output}"
     return detail[:limit]
 
 
