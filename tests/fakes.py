@@ -591,8 +591,27 @@ class FakeTracker:
         return "agent" in issue.assignee_logins
 
     def automatic_continuation_count(self, issue: TrackerIssue) -> int:
-        """The recorded automatic-continuation count for ``issue`` (default 0)."""
+        """The recorded automatic-continuation count for ``issue`` (default 0).
 
+        When seeded ``comments`` exist for the issue, the shared-aware
+        resolver runs over them (like the production tracker), so tests can
+        exercise shared-record authority, migration, and ambiguity. Otherwise
+        the recorded ``auto_counts`` value is returned for legacy tests.
+        """
+
+        if issue.number in self.comments:
+            from simple_coding_agent.recovery import resolve_automatic_continuation_count
+
+            bodies = tuple(
+                body
+                for author, body in reversed(self.comments[issue.number])
+                if author and author == "agent"
+            )
+            return resolve_automatic_continuation_count(
+                bodies,
+                issue_number=issue.number,
+                repository=None,
+            )
         return self.auto_counts.get(issue.number, 0)
 
     def conflict_failure_streak(self, issue: TrackerIssue) -> int:

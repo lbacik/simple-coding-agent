@@ -353,6 +353,20 @@ class Publisher:
             handoff_posted=handoff_posted,
         )
 
+    def handoff_intent(self, attempt_id: str) -> HandoffRecord | None:
+        """Return the persisted shared-record intent for an attempt, if any.
+
+        The first intent saved for an attempt always wins, so a retry after
+        a timeout or restart reuses the stored standing instead of
+        recomputing it. A missing or unreadable store reads as absent (the
+        caller then recomputes, and publication still enforces first-wins).
+        """
+
+        try:
+            return self._handoff_store.load(attempt_id)
+        except Exception:
+            return None
+
     def find_pull_request(self, head: str) -> PullRequest | None:
         """Return the open pull request for an attempt branch, if any.
 
@@ -914,6 +928,47 @@ def _exception_detail(error: Exception) -> str:
     """One-line transport detail without leaking credentials."""
 
     return f"{type(error).__name__}: {error}".strip() or type(error).__name__
+
+
+def confirm_shared_handoff(
+    github: PublicationTransport,
+    repository: str,
+    issue_number: int,
+    attempt_id: str,
+    *,
+    branch_sha: str | None = None,
+    note_sha: str | None = None,
+) -> HandoffRecord | None:
+    """Confirm the remote shared handoff record for one attempt, if it matches.
+
+    Returns the verified record when the trusted shared comment exists,
+    parses, and names this issue, repository and ``attempt_id`` (with
+    matching ``branch_sha``/``note_sha`` when the caller supplies them);
+    otherwise returns ``None``. The per-attempt
+    result comment is never consulted, so recovery can confirm a published
+    handoff from the shared record and verified revisions even when no
+    individual handoff result comment exists. Ambiguous remote state
+    (unreadable transport, multiple records, malformed bodies, or a record
+    naming a different issue or repository) reads as
+    ``None`` so the caller retains the attempt instead of guessing.
+    """
+
+    try:
+        existing = github.find_handoff_record(repository, issue_number)
+    except Exception:
+        return None
+    if existing is None:
+        return None
+    parsed = parse_handoff_record(existing.body)
+    if parsed is None or parsed.attempt_id != attempt_id:
+        return None
+    if parsed.issue_number != issue_number or parsed.repository != repository:
+        return None
+    if branch_sha is not None and parsed.branch_sha != branch_sha:
+        return None
+    if note_sha is not None and parsed.note_sha != note_sha:
+        return None
+    return parsed
 
 
 def _conflict_failure_standing(request: ConflictPublicationRequest) -> tuple[int, bool]:

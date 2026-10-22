@@ -143,6 +143,7 @@ from simple_coding_agent.publication import (
     ConflictPublicationRequest,
     PublicationRequest,
     PullRequest,
+    confirm_shared_handoff,
 )
 from simple_coding_agent.recovery import (
     CONFLICT_OUTCOME_CHECK_FAILED,
@@ -2203,6 +2204,14 @@ class AgentLifecycle:
                 f" local evidence is missing or invalid"
                 f" ({_exception_detail(error)}); the hold remains. {hold_suffix}"
             )
+        shared_hold = self._recovery_shared_hold(
+            claim.issue.number, attempt_id, decision.outcome
+        )
+        if shared_hold is not None:
+            return False, (
+                f"recovery retry for attempt {attempt_id} not fulfilled:"
+                f" {shared_hold} the hold remains. {hold_suffix}"
+            )
         try:
             published = self._publisher.publish(
                 PublicationRequest(
@@ -2241,6 +2250,22 @@ class AgentLifecycle:
         self._observe_and_remember_workspace_dirty(attempt_id)
         outcome = published.outcome
         comment_posted = _publication_confirmed(published)
+        if not comment_posted and outcome is AttemptOutcome.HANDOFF and getattr(
+            published, "handoff_posted", False
+        ):
+            # The shared handoff record is authoritative: a verified shared
+            # publication confirms the handoff even when no individual
+            # handoff result comment exists (deleted, or never posted).
+            # The branch push behind it was already verified by publication,
+            # so outstanding release/cleanup work can resume without
+            # rerunning the model or changing the outcome. The confirmation
+            # is re-read from the remote record (not trusted from the
+            # in-memory flag alone) and bound to the handoff note revision
+            # this retry published, whenever the publisher exposes the seam.
+            if self._confirm_shared_handoff_for_retry(
+                claim.issue.number, attempt_id, note_sha
+            ):
+                comment_posted = True
         if not comment_posted:
             return False, (
                 f"recovery retry for attempt {attempt_id} not fulfilled:"
@@ -2730,6 +2755,120 @@ class AgentLifecycle:
             )
         return None
 
+    def _shared_record_seam(self) -> tuple[object, str] | None:
+        """The shared-record lookup seam, or ``None`` when absent.
+
+        Returns the ``(github, repository)`` pair backing
+        ``find_handoff_record``. Publishers without the seam (older test
+        doubles) read as absent and callers skip the shared-record check.
+        """
+
+        github = getattr(self._publisher, "_github", None)
+        repository = getattr(self._publisher, "_repository", None) or self._repository
+        if not callable(getattr(github, "find_handoff_record", None)):
+            return None
+        return (github, repository)
+
+    def _recovery_shared_hold(
+        self, issue_number: int, attempt_id: str, outcome: AttemptOutcome
+    ) -> str | None:
+        """Detect a shared handoff record that blocks a recovery retry.
+
+        Returns a hold reason, or ``None`` when no shared record blocks the
+        retry. Publishers without the ``find_handoff_record`` seam (older
+        test doubles) skip the check. An unreadable remote state, an
+        unparseable (or unsupported) record, a record naming a different
+        issue or repository, or a record owned by a newer attempt all hold
+        the retry: an older retained checkpoint never overwrites a newer
+        shared record and is never treated as published merely because its
+        own record was superseded. A record naming this attempt while the
+        inferred outcome is not a handoff likewise holds: a confirmed
+        handoff is never changed into another outcome. Anything else (no
+        remote record, or an older record this retry may update) proceeds.
+        """
+
+        seam = self._shared_record_seam()
+        if seam is None:
+            return None
+        github, repository = seam
+        find = getattr(github, "find_handoff_record", None)
+        try:
+            existing = find(repository, issue_number)
+        except Exception as error:
+            return (
+                "shared handoff record is ambiguous"
+                f" ({_exception_detail(error)}); the retry must not replay"
+                " a side effect it cannot verify."
+            )
+        if existing is None:
+            # No remote record: the migration path creates it on republication.
+            return None
+        from simple_coding_agent.handoff_record import parse_handoff_record
+
+        parsed = parse_handoff_record(getattr(existing, "body", "") or "")
+        if parsed is None:
+            return (
+                "shared handoff record is unreadable; it is left untouched"
+                " and the retry requires operator repair."
+            )
+        if parsed.issue_number != issue_number or parsed.repository != repository:
+            return (
+                "shared handoff record names a different issue or repository;"
+                " the retry requires operator repair."
+            )
+        from simple_coding_agent import recovery as recovery_module
+
+        if recovery_module.attempt_id_greater(parsed.attempt_id, attempt_id):
+            return (
+                "a newer attempt already owns the shared handoff record;"
+                " the older retained attempt must not overwrite it and is"
+                " not treated as published."
+            )
+        if parsed.attempt_id == attempt_id and outcome is not AttemptOutcome.HANDOFF:
+            return (
+                "the shared handoff record already confirms a handoff for"
+                " this attempt; the retry must not change it into another"
+                " outcome and requires operator repair."
+            )
+        return None
+
+    def _confirm_shared_handoff_for_retry(
+        self, issue_number: int, attempt_id: str, note_sha: str | None = None
+    ) -> bool:
+        """Independently confirm the shared handoff record during recovery retry.
+
+        Re-reads the remote record for this attempt and issue, bound to the
+        handoff note revision this retry just published (when one was
+        committed), instead of trusting the in-memory publication flag
+        alone, so a confirmed handoff resumes release and cleanup even
+        when its individual result comment is missing. The branch push
+        behind the record stays verified by publication itself (the record
+        is first-wins per attempt and ``handoff_posted`` is only set once
+        the push is verified), so no local branch comparison second-guesses
+        it here. Publishers without the shared-record seam (older test
+        doubles) keep trusting the verified flag, which stands alone
+        there. Any verification failure reads as unconfirmed so the retry
+        retains the attempt instead of guessing.
+        """
+
+        seam = self._shared_record_seam()
+        if seam is None:
+            return True
+        github, repository = seam
+        try:
+            return (
+                confirm_shared_handoff(
+                    github,
+                    repository,
+                    issue_number,
+                    attempt_id,
+                    note_sha=note_sha,
+                )
+                is not None
+            )
+        except Exception:
+            return False
+
     def _recovery_snapshot_locked(
         self, checkpoint: AttemptCheckpoint | None
     ) -> dict | None:
@@ -2919,9 +3058,40 @@ class AgentLifecycle:
         if _claim_time_requeue_source(claim, checkpoint) != REQUEUE_SOURCE_AUTOMATIC:
             return 0
         try:
+            stored = self._stored_handoff_continuation(checkpoint)
+            if stored is not None:
+                return stored
             return self._auto_continuation_count(claim.issue) + 1
         except Exception:
             return None
+
+    def _stored_handoff_continuation(
+        self, checkpoint: AttemptCheckpoint | None
+    ) -> int | None:
+        """The previously computed standing for this attempt, if one persists.
+
+        The first intent saved for an attempt always wins, so a retry after
+        a timeout or restart reuses the stored standing instead of
+        recomputing (and never consumes the budget twice). Publishers
+        without the seam (older test doubles) read as absent, and a missing
+        or invalid stored count falls back to a fresh computation.
+        """
+
+        if checkpoint is None:
+            return None
+        intent_of = getattr(self._publisher, "handoff_intent", None)
+        if not callable(intent_of):
+            return None
+        try:
+            intent = intent_of(checkpoint.started_at)
+        except Exception:
+            return None
+        if intent is None:
+            return None
+        count = getattr(intent, "continuation_count", None)
+        if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+            return None
+        return count
 
     def _conflict_failure_streak(self, issue: TrackerIssue) -> int:
         """The issue's consecutive failed conflict attempts since the last stop.

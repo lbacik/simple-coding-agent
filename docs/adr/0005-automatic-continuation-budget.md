@@ -59,3 +59,30 @@ budget by relabelling, only a human requeue grants more rounds.
   `round-finished` stops the sequence at any time.
 - No new token scope is needed: eligibility reads reuse the issue and
   comment reads the tracker already performs.
+
+## Shared handoff record as the accounting authority (issue #283)
+
+The decision above derived all automatic-continuation standing from the
+per-attempt result comments, so a routine handoff without its own result
+comment left no verifiable standing. The single shared handoff comment
+(issue #282) is now authoritative instead: it carries the
+`continuation_count` for its own attempt, and ordinary non-handoff results
+newer than that attempt reconcile against it in attempt-ID order, so a
+newer failure or human requeue cannot be hidden by older handoff metadata.
+An overlapping legacy result for the same attempt counts once; conflict
+attempts stay transparent (they neither consume nor reset the row); a
+human requeue resets the standing from the existing claim-time signal.
+
+The publication's intended count is computed once and retried with the same
+value: the first persisted intent for an attempt always wins, so
+confirming or replaying the same attempt never consumes the budget twice.
+Issues without shared metadata migrate from the trusted historical result
+comments using the previous semantics, and historical comments stay
+intact. Missing, deleted, malformed, or unsupported metadata never
+silently grants a fresh budget: accounting falls back to verifiable legacy
+evidence, and anything still unverifiable (duplicate or unreadable shared
+records, or a record naming a different issue or repository) retains the
+issue for operator repair instead of granting more rounds. Recovery
+confirms a published handoff from the shared record and verified revisions
+even with no individual result comment, and an older retained checkpoint
+never overwrites a newer shared record.

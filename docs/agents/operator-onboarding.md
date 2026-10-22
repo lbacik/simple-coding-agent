@@ -285,7 +285,13 @@ claimed ahead of new `ready-for-agent` work. A human requeue resets the
 count and grants another N rounds; removing `round-finished` stops the
 sequence at any time. Every handoff result comment then reports where the
 issue stands (`k/N used`, and whether a human requeue is now needed), and
-each automatic claim emits an `auto_continuation_claimed` event. The setting
+each automatic claim emits an `auto_continuation_claimed` event. A routine
+handoff needs no individual result comment: the single shared handoff
+comment carries the standing, reconciled with newer ordinary results, and
+the published count is computed once and retried unchanged. Older issues
+without shared metadata count their historical result comments instead;
+duplicate, unreadable, or mismatched shared metadata never grants a fresh
+budget — the issue stays queued out for operator repair. The setting
 is operator-only on purpose: it lives in `.env`, never in the repository
 profile (an unknown profile key is refused), so an agent-written PR cannot
 raise its own round limit. See
@@ -503,8 +509,14 @@ an operator clears it:
 
 - `/usr/local/bin/agentctl recovery retry <attempt-id>` rechecks local and
   remote evidence and retries only the unconfirmed publication, release,
-  cleanup, and accounting steps. It never reruns the model. Ambiguous
-  remote state, conflicting human changes, and persistent failures keep the
+  cleanup, and accounting steps. It never reruns the model. A published
+  handoff is confirmed from the shared handoff record and verified
+  revisions even when its individual result comment is missing, and the
+  retry resumes the outstanding release and cleanup without changing the
+  confirmed outcome. Ambiguous
+  remote state (including an unreadable shared handoff record, or a newer
+  record that supersedes the retained attempt), conflicting human changes,
+  and persistent failures keep the
   hold.
 - `/usr/local/bin/agentctl recovery release <attempt-id> --saved-at
   <path-or-url>` abandons the attempt after you secured its work elsewhere.

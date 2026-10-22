@@ -110,12 +110,17 @@ def records_match(first: HandoffRecord, second: HandoffRecord) -> bool:
 def is_newer_attempt(candidate: HandoffRecord, baseline: HandoffRecord) -> bool:
     """Whether ``candidate`` was published by a later attempt than ``baseline``.
 
-    Attempt IDs are the checkpoints' UTC ``started_at`` stamps, which sort
-    chronologically in string order; a later claim always carries a greater
-    ID because claims are serialized and timestamps strictly increase.
+    Attempt IDs are the checkpoints' UTC ``started_at`` stamps, ordered
+    chronologically (parsed as datetimes, so microseconds order correctly
+    where plain string comparison misorders them); a later claim always
+    carries a greater ID because claims are serialized and timestamps
+    strictly increase.
     """
 
-    return candidate.attempt_id > baseline.attempt_id
+    # Local import: this module is imported by recovery at load time.
+    from simple_coding_agent.recovery import attempt_id_greater
+
+    return attempt_id_greater(candidate.attempt_id, baseline.attempt_id)
 
 
 def handoff_note_blob_url(repository: str, branch: str, issue_number: int) -> str:
