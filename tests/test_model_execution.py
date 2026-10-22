@@ -3411,6 +3411,106 @@ def test_cost_guard_releases_after_the_handoff_note_commit(tmp_path: Path) -> No
     )
 
 
+def test_stopped_subagent_stays_denied_after_the_handoff_note_commit(
+    tmp_path: Path,
+) -> None:
+    """A stopped subagent cannot overwrite the valid handoff note (issue #280)."""
+
+    repo, _, _ = _snapshot_repo(tmp_path, issue_number=24)
+    executor, events, pre_hook, post_hook = _hooked_executor_204(tmp_path, repo)
+
+    # A subagent is running when the threshold crosses, so it is stopped.
+    assert (
+        asyncio.run(
+            pre_hook(
+                {"tool_name": "Read", "tool_input": {"file_path": "src/a.py"}, "agent_id": "sub-1"},
+                None,
+                {},
+            )
+        )
+        == {}
+    )
+    executor._ledger.start_thread("sub-1", kind="subagent", prompt_chars=0)
+    executor._ledger_threads.add("sub-1")
+    executor._ledger.observe_response("sub-1", "r-big", 0)
+    executor._ledger.observe_usage("sub-1", "r-big", {"input_tokens": 900_000})
+    executor._check_limits("sub-1")
+    assert executor._soft_threshold_crossed is True
+    assert "sub-1" in executor._stopped_subagent_ids
+    _invoke_handoff_skill_204(pre_hook)
+
+    # The main thread writes and commits the valid note.
+    assert (
+        asyncio.run(
+            pre_hook(
+                {"tool_name": "Write", "tool_input": {"file_path": ".agent/handoff/24.md"}},
+                None,
+                {},
+            )
+        )
+        == {}
+    )
+    (repo / ".agent" / "handoff" / "24.md").parent.mkdir(parents=True, exist_ok=True)
+    (repo / ".agent" / "handoff" / "24.md").write_text("# Handoff note: issue #24\n")
+    commit_command = 'git add .agent/handoff/24.md && git commit -m "Handoff note: issue #24"'
+    assert (
+        asyncio.run(
+            pre_hook({"tool_name": "Bash", "tool_input": {"command": commit_command}}, None, {})
+        )
+        == {}
+    )
+    _git(repo, "add", ".agent/handoff/24.md")
+    _git(repo, "commit", "-m", "Handoff note: issue #24")
+    asyncio.run(
+        post_hook(
+            {
+                "tool_name": "Bash",
+                "tool_input": {"command": commit_command},
+                "tool_response": "ok",
+            },
+            "c1",
+            {},
+        )
+    )
+    assert executor._handoff_note_committed is True
+
+    # The stopped subagent stays denied, including handoff-shaped writes.
+    for hook_input in (
+        {"tool_name": "Write", "tool_input": {"file_path": ".agent/handoff/24.md"}, "agent_id": "sub-1"},
+        {"tool_name": "Write", "tool_input": {"file_path": ".agent/handoff/issue-24-c7-docs.md"}, "agent_id": "sub-1"},
+        {"tool_name": "Skill", "tool_input": {"skill": "handoff"}, "agent_id": "sub-1"},
+        {"tool_name": "Bash", "tool_input": {"command": commit_command}, "agent_id": "sub-1"},
+        {"tool_name": "Read", "tool_input": {"file_path": "src/a.py"}, "agent_id": "sub-1"},
+    ):
+        denied = asyncio.run(pre_hook(hook_input, None, {}))
+        assert denied["hookSpecificOutput"]["permissionDecision"] == "deny", hook_input
+
+    # The main-thread gate is still released after the note commit.
+    assert (
+        asyncio.run(
+            pre_hook({"tool_name": "Edit", "tool_input": {"file_path": "src/a.py"}}, None, {})
+        )
+        == {}
+    )
+
+
+def test_review_nudge_is_skipped_once_the_handoff_note_is_committed(
+    tmp_path: Path,
+) -> None:
+    """The review nudge must not keep a handoff run alive for another round."""
+
+    captured: list[FakeClient] = []
+    executor = stop_hook_client(tmp_path, captured)
+    asyncio.run(executor.execute(issue_body="Fix it.", working_directory=tmp_path))
+    stop_hook = captured[0].options.hooks["Stop"][0].hooks[0]
+    executor.set_new_commits_provider(lambda: 1)
+    executor._soft_threshold_crossed = True
+    executor._handoff_note_committed = True
+
+    assert asyncio.run(stop_hook({"stop_hook_active": False}, None, {})) == {}
+    assert executor._review_nudge_sent is False
+
+
 def test_carried_over_note_commit_does_not_release_the_gate(tmp_path: Path) -> None:
     """A note from an earlier round never releases a new round's gate."""
 
