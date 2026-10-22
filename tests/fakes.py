@@ -622,18 +622,20 @@ class FakeTracker:
         """The recorded automatic-continuation count for ``issue`` (default 0).
 
         When seeded ``comments`` exist for the issue, the shared-aware
-        resolver runs over them (like the production tracker), so tests can
-        exercise shared-record authority, migration, and ambiguity. Otherwise
+        resolver runs over them (like the production tracker, counting the
+        worker identity plus seeded peer logins), so tests can exercise
+        shared-record authority, migration, and ambiguity. Otherwise
         the recorded ``auto_counts`` value is returned for legacy tests.
         """
 
         if issue.number in self.comments:
             from simple_coding_agent.recovery import resolve_automatic_continuation_count
 
+            allowed = {"agent"} | set(self.peer_logins)
             bodies = tuple(
                 body
                 for author, body in reversed(self.comments[issue.number])
-                if author and author == "agent"
+                if author and author in allowed
             )
             return resolve_automatic_continuation_count(
                 bodies,

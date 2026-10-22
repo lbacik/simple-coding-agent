@@ -55,6 +55,16 @@ conflict requeue of `merge-conflict` issues), and `HANDOFF_COMMENT_MODE=link`
 (one shared handoff comment per issue; `verbose` keeps the historical
 per-attempt result comments for troubleshooting).
 
+When several instances with different GitHub logins work one queue, set
+`PEER_LOGINS` to the comma- or space-separated logins of the other workers
+(empty by default). Each worker then treats its peers' attempt-result and
+handoff-note comments as its own: they enter the starting prompt, count as
+the historical continuation signal, and share the per-issue
+`MAX_AUTO_CONTINUATIONS` budget (and the conflict-attempt budget), so two
+alternating workers cannot exceed it. The worker's own login may appear in
+the list and is ignored, so one value serves every worker. A shared account
+needs no peers; peers are for different logins.
+
 Use a fine-grained GitHub PAT limited to the configured repository with only
 `contents:write`, `pull-requests:write`, and `issues:write`. Configure provider
 spending controls in Meta: SDK `max_budget_usd=5` is only a circuit breaker.

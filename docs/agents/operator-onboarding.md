@@ -145,6 +145,31 @@ Like the other budgets, the setting is operator-only on purpose: it lives
 in `.env`, never in the repository profile (an unknown profile key is
 refused), so an agent-written PR cannot raise its own conflict budget.
 
+## Worker pool with different logins (`PEER_LOGINS`)
+
+When several instances with different GitHub logins work one queue, set
+`PEER_LOGINS` to the comma- or space-separated logins of the other workers
+(empty by default, which keeps today's single-worker behaviour). The
+worker's own login may appear in the list and is ignored, so one value
+serves every worker. A shared account needs no peers; peers are for
+different logins.
+
+With peers configured, one set — the worker's own login plus its peers —
+drives the cross-worker trust: a peer's attempt-result and handoff-note
+comments enter a continuation's starting prompt exactly like the worker's
+own; a peer's handoff/incomplete result comment counts as the historical
+continuation signal (so `continuation_branch_missing` is reported across
+workers); and the automatic-continuation streak counts result comments of
+all workers, newest first, stopping at the latest human requeue whichever
+worker wrote it — `MAX_AUTO_CONTINUATIONS` stays a per-issue budget, and
+the conflict-attempt budget uses the same set.
+
+Unchanged: a pull request found by branch name is adopted without an author
+check; any worker may claim a `round-finished` issue another worker handed
+off (no worker affinity); `is_self_assigned`, `recover_claim`,
+`release_attempt`, and `release_handoff` stay per worker. Human
+collaborators other than the issue author are never trusted.
+
 ## `ready-for-agent` trust policy
 
 The `ready-for-agent` label is the trust boundary.  Only repository
