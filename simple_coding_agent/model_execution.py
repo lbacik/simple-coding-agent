@@ -114,6 +114,17 @@ _HANDOFF_SKILL_TOOL_HINT = (
     " `SKILL.md`, because reading it does not register the handoff."
 )
 
+#: How the handoff note itself is produced while a handoff guard is active.
+#: Shared by the cost, limit and operator handoff prompts so the model never
+#: reads a Bash denial as "no writes at all": the note goes through the
+#: ``Write`` (or ``Edit``) tool, ``git add``/``git commit`` run in Bash, and
+#: Bash itself cannot create or modify files until the note commit lands.
+_HANDOFF_NOTE_TOOL_HINT = (
+    "Create or edit the handoff note with the `Write` (or `Edit`) tool, then"
+    " commit it with `git add` + `git commit` in Bash. Bash cannot create or"
+    " modify files while the handoff is pending."
+)
+
 
 def _attempt_id_sentence(attempt_id: str | None) -> str:
     """Name the attempt id every handoff instruction must carry.
@@ -274,8 +285,11 @@ def _token_handoff_steps(issue_number: int | None) -> str:
         "1. Do not run diagnostic commands; the state above is current.\n"
         "2. Do not commit work yourself. Sealing will commit any uncommitted"
         " work after the attempt.\n"
-        "3. Write the handoff note using the pre-filled header above verbatim,"
-        " and fill in Summary, Remaining work and Evidence.\n"
+        "3. Create or edit the handoff note at"
+        f" `.agent/handoff/{note_label}.md` with the `Write` (or `Edit`) tool,"
+        " using the pre-filled header above verbatim, and fill in Summary,"
+        " Remaining work and Evidence. Bash cannot create or modify files"
+        " while the handoff is pending.\n"
         f"4. In one `Bash` call, run `git add .agent/handoff/{note_label}.md"
         f" && git commit -m \"Handoff note: issue #{note_label}\"`.\n"
         "5. Stop."
@@ -292,7 +306,7 @@ def _cost_handoff_instruction(
         "This attempt is approaching its token budget. Invoke the `handoff` skill now "
         "to preserve your progress cooperatively instead of continuing further work. "
         f"{_HANDOFF_SKILL_TOOL_HINT} {_handoff_target(issue_number)}"
-        f"{_attempt_id_sentence(attempt_id)}"
+        f"{_attempt_id_sentence(attempt_id)} {_HANDOFF_NOTE_TOOL_HINT}"
     )
     if snapshot is None:
         return base
@@ -310,7 +324,7 @@ def _cost_handoff_followup_prompt(
         "Invoke the `handoff` skill now to preserve your progress: commit any outstanding "
         "work, then write and commit the handoff note. Do not attempt further implementation "
         f"work. {_HANDOFF_SKILL_TOOL_HINT} {_handoff_target(issue_number)}"
-        f"{_attempt_id_sentence(attempt_id)}"
+        f"{_attempt_id_sentence(attempt_id)} {_HANDOFF_NOTE_TOOL_HINT}"
     )
     if snapshot is None:
         return base
@@ -320,7 +334,7 @@ def _cost_handoff_followup_prompt(
         "write and commit the handoff note, leaving any uncommitted work alone. "
         "Do not attempt further implementation "
         f"work. {_HANDOFF_SKILL_TOOL_HINT} {_handoff_target(issue_number)}"
-        f"{_attempt_id_sentence(attempt_id)}"
+        f"{_attempt_id_sentence(attempt_id)} {_HANDOFF_NOTE_TOOL_HINT}"
     )
     return f"{token_base}\n\n{snapshot}\n\n{_token_handoff_steps(issue_number)}"
 
@@ -336,7 +350,7 @@ def _operator_handoff_instruction(
         " commit it separately as the final commit. Do not start another"
         f" implementation step. {_HANDOFF_SKILL_TOOL_HINT}"
         f" {_handoff_target(issue_number)}"
-        f"{_attempt_id_sentence(attempt_id)}"
+        f"{_attempt_id_sentence(attempt_id)} {_HANDOFF_NOTE_TOOL_HINT}"
     )
 
 
@@ -348,7 +362,7 @@ def _limit_handoff_followup_prompt(
         "preserve your progress: commit any outstanding work, then write and commit "
         f"the handoff note. Do not attempt further implementation work. {_HANDOFF_SKILL_TOOL_HINT}"
         f" {_handoff_target(issue_number)}"
-        f"{_attempt_id_sentence(attempt_id)}"
+        f"{_attempt_id_sentence(attempt_id)} {_HANDOFF_NOTE_TOOL_HINT}"
     )
 
 
@@ -362,15 +376,18 @@ def _operator_handoff_followup_prompt(
         " the handoff note with `reason: operator_request` and commit it separately"
         " as the final commit. Do not attempt further implementation work."
         f" {_HANDOFF_SKILL_TOOL_HINT} {_handoff_target(issue_number)}"
-        f"{_attempt_id_sentence(attempt_id)}"
+        f"{_attempt_id_sentence(attempt_id)} {_HANDOFF_NOTE_TOOL_HINT}"
     )
 
 
 #: Appended to every soft-threshold denial so the model knows what stays allowed.
 _COST_ALLOWED_COMMANDS = (
     "Still allowed: `git status`, `git diff`, `git add`, `git commit`, `git log`,"
-    " `git rev-parse`, `git rev-list`, `git branch --show-current`, and writing the"
-    " handoff note under `.agent/handoff/`. A compound command (`&&`, `;`, `|`) is"
+    " `git rev-parse`, `git rev-list`, `git branch --show-current`, and committing"
+    " a handoff note created with the `Write` (or `Edit`) tool under"
+    " `.agent/handoff/`. Bash cannot create or modify files after the threshold:"
+    " write the note with the `Write`/`Edit` tool, then run `git add` +"
+    " `git commit`. A compound command (`&&`, `;`, `|`) is"
     " denied as a whole if any part of it is not allowed, so split it up."
 )
 
@@ -2569,7 +2586,10 @@ class ModelExecutor:
                 agent_id = _hook_agent_id(hook_input)
                 if agent_id is not None and agent_id not in self._stopped_subagent_ids:
                     self._stopped_subagent_ids.append(agent_id)
-                return _cost_deny("Subagent work is stopped after the token soft threshold.")
+                return _cost_deny(
+                    "Subagent work is stopped after the token soft threshold.",
+                    self._issue_number,
+                )
             else:
                 tool_name = _hook_field(hook_input, "tool_name")
                 if tool_name == "Skill" and _skill_name(hook_input) == "handoff":
@@ -2577,43 +2597,48 @@ class ModelExecutor:
                 elif tool_name == "Agent" or (
                     tool_name == "Task" and _is_subagent_launch(hook_input)
                 ):
-                    return _cost_deny("New subagent launches are disabled.")
+                    return _cost_deny(
+                        "New subagent launches are disabled.", self._issue_number
+                    )
                 elif tool_name in ("Edit", "Write"):
                     file_path = str(_hook_field(hook_input, "tool_input", {}).get("file_path", ""))
                     if ".agent/handoff" not in file_path:
-                        return _cost_deny("Further implementation work is disabled.")
+                        return _cost_deny(
+                            "Further implementation work is disabled.",
+                            self._issue_number,
+                        )
                 elif tool_name == "Bash":
                     command = str(_hook_field(hook_input, "tool_input", {}).get("command", ""))
                     if _deletes_handoff_note(command):
                         return _note_delete_deny(self._issue_number)
                     if not _is_handoff_command(command):
-                        return _cost_deny("Further implementation work is disabled.")
+                        return _cost_deny(
+                            "Further implementation work is disabled.",
+                            self._issue_number,
+                        )
         if self._operator_context_delivered:
             tool_name = _hook_field(hook_input, "tool_name")
             if tool_name == "Skill":
                 if _skill_name(hook_input) != "handoff":
-                    return _deny(
-                        "Operator handoff in progress. Further implementation work is"
-                        " disabled. Invoke the `handoff` skill now to preserve your"
-                        " progress."
+                    return _operator_deny(
+                        "Only the `handoff` skill stays allowed.",
+                        self._issue_number,
                     )
             elif tool_name in ("Edit", "Write"):
                 file_path = str(_hook_field(hook_input, "tool_input", {}).get("file_path", ""))
                 if ".agent/handoff" not in file_path:
-                    return _deny(
-                        "Operator handoff in progress. Further implementation work is"
-                        " disabled. Invoke the `handoff` skill now to preserve your"
-                        " progress."
+                    return _operator_deny(
+                        "Further implementation work is disabled.",
+                        self._issue_number,
                     )
             elif tool_name == "Bash":
                 command = str(_hook_field(hook_input, "tool_input", {}).get("command", ""))
                 if _deletes_handoff_note(command):
                     return _operator_note_delete_deny(self._issue_number)
                 if not _is_handoff_command(command):
-                    return _deny(
-                        "Operator handoff in progress. Further implementation work is"
-                        " disabled. Invoke the `handoff` skill now to preserve your"
-                        " progress."
+                    return _operator_deny(
+                        "Further implementation work is disabled.",
+                        self._issue_number,
                     )
         return await publication_guard(hook_input, tool_use_id, context)
 
@@ -3024,14 +3049,18 @@ def _deny(reason: str) -> dict[str, Any]:
     }
 
 
-def _cost_deny(restriction: str) -> dict[str, Any]:
+def _cost_deny(restriction: str, issue_number: int | None = None) -> dict[str, Any]:
     """Deny with the shared cost-guard wording for the given restriction."""
 
+    path, _ = _handoff_note_commit_line(issue_number)
     return _deny(
         "Token soft threshold reached. "
         f"{restriction} "
         "You must invoke the `handoff` skill now to preserve your progress. "
-        f"{_COST_ALLOWED_COMMANDS}"
+        f"{_COST_ALLOWED_COMMANDS} "
+        f"Create or edit the handoff note at `{path}` with the `Write` (or `Edit`)"
+        " tool — Bash cannot create or modify files while the handoff is"
+        " pending — then commit it with `git add` + `git commit` in Bash."
     )
 
 
@@ -3066,6 +3095,22 @@ def _operator_note_delete_deny(issue_number: int | None) -> dict[str, Any]:
     )
 
 
+def _operator_deny(
+    restriction: str, issue_number: int | None = None
+) -> dict[str, Any]:
+    """Deny with the shared operator-handoff wording for the given restriction."""
+
+    path, _ = _handoff_note_commit_line(issue_number)
+    return _deny(
+        "Operator handoff in progress. "
+        f"{restriction} "
+        "Invoke the `handoff` skill now to preserve your progress. "
+        f"Create or edit the handoff note at `{path}` with the `Write` (or `Edit`)"
+        " tool — Bash cannot create or modify files while the handoff is"
+        " pending — then commit it with `git add` + `git commit` in Bash."
+    )
+
+
 #: Path marker shared by every handoff note (``.agent/handoff/<n>.md``).
 _HANDOFF_NOTE_MARKER = ".agent/handoff"
 
@@ -3094,10 +3139,15 @@ def _deletes_handoff_note(command: str) -> bool:
     and ``git rm``/``git mv``/``git clean`` touching that path count, however
     the invocation is wrapped (``env``/``command`` prefixes, ``-C`` flags,
     ``sh -c`` nesting). Anything else (including the note's own
-    ``git add``/``git commit``) does not.
+    ``git add``/``git commit``) does not. An unparseable command never counts
+    as a deletion: the allowlist check denies it separately.
     """
 
-    for segment in _shell_segments(command):
+    try:
+        segments = _shell_segments(command)
+    except ValueError:
+        return False
+    for segment in segments:
         if not segment:
             continue
         index = 0
@@ -3322,16 +3372,25 @@ def _with_agent_id(payload: Any, agent_id: str | None) -> Any:
 
 
 def _is_publication_command(command: str) -> bool:
-    for segment in _shell_segments(command):
+    try:
+        segments = _shell_segments(command)
+    except ValueError:
+        return False
+    for segment in segments:
         if _is_prohibited_invocation(segment):
             return True
     return False
 
 
-def _shell_segments(command: str) -> tuple[list[str], ...]:
+def _shell_tokens(command: str) -> list[str]:
+    """Split ``command`` the way the handoff guards do (may raise ``ValueError``)."""
+
     lexer = shlex.shlex(command, posix=True, punctuation_chars=";&|")
     lexer.whitespace_split = True
-    tokens = list(lexer)
+    return list(lexer)
+
+
+def _segments_from_tokens(tokens: list[str]) -> tuple[list[str], ...]:
     segments: list[list[str]] = [[]]
     for token in tokens:
         if token and set(token) <= {";", "&", "|"}:
@@ -3340,6 +3399,10 @@ def _shell_segments(command: str) -> tuple[list[str], ...]:
         else:
             segments[-1].append(token)
     return tuple(segment for segment in segments if segment)
+
+
+def _shell_segments(command: str) -> tuple[list[str], ...]:
+    return _segments_from_tokens(_shell_tokens(command))
 
 
 def _is_prohibited_invocation(tokens: list[str]) -> bool:
@@ -3377,9 +3440,148 @@ _READONLY_OUTPUT_FILTERS = frozenset(
 _COST_OUTPUT_REDIRECT = re.compile(r"\d*>&\d+")
 
 
+def _is_allowed_redirect_target(target: str | None) -> bool:
+    """Whether an output redirect target stays writable while a handoff is pending."""
+
+    if not isinstance(target, str) or not target:
+        return False
+    if target == "/dev/null":
+        return True
+    return _token_targets_handoff_note(target)
+
+
+def _read_redirect_target(text: str, index: int) -> tuple[str | None, int]:
+    """Read one shell word at ``index`` as a redirect target, honouring quotes."""
+
+    size = len(text)
+    if index >= size or text[index] in ";|&<>()\n":
+        return None, index
+    parts: list[str] = []
+    seen = False
+    pos = index
+    in_single = False
+    in_double = False
+    escaped = False
+    while pos < size:
+        char = text[pos]
+        if escaped:
+            parts.append(char)
+            seen = True
+            escaped = False
+            pos += 1
+            continue
+        if in_single:
+            if char == "'":
+                in_single = False
+            else:
+                parts.append(char)
+                seen = True
+            pos += 1
+            continue
+        if in_double:
+            if char == '"':
+                in_double = False
+            elif char == "\\":
+                escaped = True
+            else:
+                parts.append(char)
+                seen = True
+            pos += 1
+            continue
+        if char == "\\":
+            escaped = True
+            pos += 1
+            continue
+        if char == "'":
+            in_single = True
+            pos += 1
+            continue
+        if char == '"':
+            in_double = True
+            pos += 1
+            continue
+        if char in " \t\n;&|<>()":
+            break
+        # A second `>` starts the next redirect (`>a>b` truncates both).
+        if char == ">":
+            break
+        parts.append(char)
+        seen = True
+        pos += 1
+    target = "".join(parts)
+    return (target if seen and target else None), pos
+
+
+def _has_disallowed_output_redirect(command: str) -> bool:
+    """Whether ``command`` redirects output anywhere but the note dir or /dev/null.
+
+    Scanned quote-aware on the raw command so attached forms (`>file`,
+    `2>err.log`, `x>file`) are caught while quoted text (`echo "a > b"`)
+    stays untouched. Input redirects (`<`, `<<`) are not output and are
+    ignored; stderr duplication (`2>&1`) is stripped before this runs, so it
+    stays allowed.
+    """
+
+    size = len(command)
+    pos = 0
+    in_single = False
+    in_double = False
+    escaped = False
+    while pos < size:
+        char = command[pos]
+        if escaped:
+            escaped = False
+            pos += 1
+            continue
+        if in_single:
+            if char == "'":
+                in_single = False
+            pos += 1
+            continue
+        if in_double:
+            if char == '"':
+                in_double = False
+            elif char == "\\":
+                escaped = True
+            pos += 1
+            continue
+        if char == "\\":
+            escaped = True
+            pos += 1
+            continue
+        if char == "'":
+            in_single = True
+            pos += 1
+            continue
+        if char == '"':
+            in_double = True
+            pos += 1
+            continue
+        if char != ">":
+            pos += 1
+            continue
+        end = pos + 1
+        while end < size and command[end] in ">|":
+            end += 1
+        cursor = end
+        while cursor < size and command[cursor] in " \t":
+            cursor += 1
+        target, cursor = _read_redirect_target(command, cursor)
+        if not _is_allowed_redirect_target(target):
+            return True
+        pos = cursor
+    return False
+
+
 def _is_handoff_command(command: str) -> bool:
-    command = _COST_OUTPUT_REDIRECT.sub("", command)
-    for segment in _shell_segments(command):
+    stripped = _COST_OUTPUT_REDIRECT.sub("", command)
+    if _has_disallowed_output_redirect(stripped):
+        return False
+    try:
+        segments = _shell_segments(stripped)
+    except ValueError:
+        return False
+    for segment in segments:
         if not segment:
             continue
         index = 0
