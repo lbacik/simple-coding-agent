@@ -39,10 +39,10 @@ _DEFAULT_MODEL_STREAM_IDLE_TIMEOUT_MS = 60000
 #: the installed SDK against at startup. This is defined in code, not read
 #: from the environment: the Claude Agent SDK exports ``CLAUDE_AGENT_SDK_VERSION``
 #: into every CLI process it starts, so an inherited value must never become
-#: the expectation. Bump this together with the ``claude-agent-sdk==`` pins in
-#: ``pyproject.toml`` and the ``Dockerfile`` after validating an upgrade; the
+#: the expectation. Bump this together with the ``claude-agent-sdk==`` pin in
+#: ``pyproject.toml`` after validating an upgrade; the
 #: ``test_expected_sdk_version_matches_dependency_pin`` test guards the drift.
-EXPECTED_CLAUDE_AGENT_SDK_VERSION = "0.2.163"
+EXPECTED_CLAUDE_AGENT_SDK_VERSION = "0.2.172"
 _DEFAULT_HANDOFF_RESERVE_TURNS = 6
 _MAX_HANDOFF_RESERVE_TURNS = 20
 

@@ -59,7 +59,7 @@ Use a fine-grained GitHub PAT limited to the configured repository with only
 `contents:write`, `pull-requests:write`, and `issues:write`. Configure provider
 spending controls in Meta: SDK `max_budget_usd=5` is only a circuit breaker.
 The agent uses only `muse-spark-1.3-contributor`; no fallback model is set.
-The pinned runtime is `claude-agent-sdk==0.2.163` together with the Claude
+The pinned runtime is `claude-agent-sdk==0.2.172` together with the Claude
 Code CLI bundled inside it; pinning the SDK pins the CLI.
 
 The model backend is configured through operator settings that default to
@@ -74,12 +74,12 @@ and `MODEL_STREAM_IDLE_TIMEOUT_MS` (default `60000`).
 
 The image ships a managed-settings file (`docker/managed-settings.json`,
 installed at `/etc/claude-code/managed-settings.json`) with a `modelPricing`
-override for `muse-spark-1.3-contributor` at Meta's published rates ($1.25
-input, $0.15 cached input, $4.25 output per million tokens), so the SDK's
+override for `muse-spark-1.3-contributor` at Meta's published rates ($0.10
+input, $0.002 cached input, $0.20 output per million tokens), so the SDK's
 `total_cost_usd` and the `max_budget_usd` backstop reflect Meta's rates
-instead of the CLI's default-model rates (about 4x higher). The override row
+instead of the CLI's default-model rates (50-250x higher). The override row
 keys (`input`, `output`, `cacheRead`, `cacheWrite`) are USD-per-million-token
-rates, verified against the pinned CLI 2.1.286 bundle (its pricing-row
+rates, verified against the pinned CLI 2.1.308 bundle (its pricing-row
 compiler maps exactly these four keys onto the internal per-token costs) and
 the [`modelPricing` settings reference](https://code.claude.com/docs/en/settings-reference).
 Meta publishes no cache-write rate and reports zero cache-creation tokens, so

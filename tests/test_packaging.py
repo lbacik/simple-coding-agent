@@ -61,10 +61,11 @@ def test_dockerfile_does_not_mount_docker_socket() -> None:
     )
 
 
-def test_dockerfile_installs_pinned_python_sdk() -> None:
+def test_dockerfile_installs_python_sdk_through_pyproject() -> None:
     content = _dockerfile()
-    assert "claude-agent-sdk==0.2.163" in content, (
-        "Dockerfile must install claude-agent-sdk==0.2.163"
+    assert "pip install --no-cache-dir -e ." in content, (
+        "Dockerfile must install the project, and with it the pinned "
+        "claude-agent-sdk, from pyproject.toml"
     )
 
 
@@ -219,9 +220,9 @@ def test_managed_settings_prices_the_meta_model_at_meta_rates() -> None:
         f"managed-settings.json must hold a modelPricing override for {META_MODEL}"
     )
     rates = overrides[META_MODEL]
-    assert rates["input"] == 1.25, "Meta input rate must be $1.25 per million tokens"
-    assert rates["cacheRead"] == 0.15, "Meta cached-input rate must be $0.15 per million tokens"
-    assert rates["output"] == 4.25, "Meta output rate must be $4.25 per million tokens"
+    assert rates["input"] == 0.10, "Meta input rate must be $0.10 per million tokens"
+    assert rates["cacheRead"] == 0.002, "Meta cached-input rate must be $0.002 per million tokens"
+    assert rates["output"] == 0.20, "Meta output rate must be $0.20 per million tokens"
 
 
 def test_managed_settings_pricing_row_has_all_cli_required_keys() -> None:
@@ -588,7 +589,7 @@ class TestDockerSmoke:
             text=True,
         )
         assert result.returncode == 0
-        assert result.stdout.strip() == "0.2.163", (
+        assert result.stdout.strip() == "0.2.172", (
             f"SDK version mismatch: {result.stdout.strip()}"
         )
 
@@ -605,7 +606,7 @@ class TestDockerSmoke:
             text=True,
         )
         assert result.returncode == 0
-        assert result.stdout.strip() == "2.1.286", (
+        assert result.stdout.strip() == "2.1.308", (
             f"Bundled CLI version mismatch: {result.stdout.strip()}"
         )
 

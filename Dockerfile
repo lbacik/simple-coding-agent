@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1
 # Unattended single-repository coding agent.
 #
-# Pinned runtime: claude-agent-sdk==0.2.163 with its bundled Claude Code CLI
+# Pinned runtime: claude-agent-sdk (pin in pyproject.toml) with its bundled Claude Code CLI
 # Dedicated agent user: UID 1000, HOME=/home/agent
 # Persistent data root: /data  (mount as a named volume)
 
@@ -53,11 +53,9 @@ WORKDIR /app
 COPY pyproject.toml ./
 COPY simple_coding_agent/ ./simple_coding_agent/
 
-# Pinned Python runtime
-RUN pip install --no-cache-dir \
-    "claude-agent-sdk==0.2.163" \
-    "PyYAML>=6.0,<7" \
-    && pip install --no-cache-dir -e .
+# Python runtime: dependencies, including the pinned claude-agent-sdk, come
+# from pyproject.toml.
+RUN pip install --no-cache-dir -e .
 
 # The control entry point is installed by `pip install -e .` (via the
 # `agentctl` project script) as root, so it lands at its absolute path.
@@ -74,7 +72,7 @@ RUN npm install --global agent-installer@0.7.2
 # Managed settings (root-owned): Meta model pricing for the CLI cost ledger.
 # The pinned CLI reads managed settings from /etc/claude-code/ on Linux and
 # prices muse-spark-1.3-contributor with its default-model rates ($5 input /
-# $25 output / $0.50 cache read per MTok, ~4x Meta's rates) unless overridden
+# $25 output / $0.50 cache read per MTok, 50-250x Meta's rates) unless overridden
 # here. Row keys (input, output, cacheRead, cacheWrite) are USD-per-million-
 # token rates per the pinned CLI's modelPricing schema; see README.md.
 # Anthropic models are intentionally absent, so they keep the CLI price table.
