@@ -146,6 +146,7 @@ def main() -> None:
             merge_method=config.pr_merge_method,
             attempt_state=attempt_state,
             handoff_store=HandoffPublicationStore(config.data_dir),
+            handoff_comment_mode=config.handoff_comment_mode,
             event_log=lambda event, detail="", level="INFO", issue_number=None: logger.emit(
                 event, phase="publication", detail=detail, level=level, issue_number=issue_number
             ),
