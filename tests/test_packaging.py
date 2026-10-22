@@ -589,7 +589,7 @@ class TestDockerSmoke:
             text=True,
         )
         assert result.returncode == 0
-        assert result.stdout.strip() == "0.2.163", (
+        assert result.stdout.strip() == "0.2.172", (
             f"SDK version mismatch: {result.stdout.strip()}"
         )
 
@@ -606,7 +606,7 @@ class TestDockerSmoke:
             text=True,
         )
         assert result.returncode == 0
-        assert result.stdout.strip() == "2.1.286", (
+        assert result.stdout.strip() == "2.1.308", (
             f"Bundled CLI version mismatch: {result.stdout.strip()}"
         )
 

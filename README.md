@@ -79,7 +79,7 @@ input, $0.15 cached input, $4.25 output per million tokens), so the SDK's
 `total_cost_usd` and the `max_budget_usd` backstop reflect Meta's rates
 instead of the CLI's default-model rates (about 4x higher). The override row
 keys (`input`, `output`, `cacheRead`, `cacheWrite`) are USD-per-million-token
-rates, verified against the pinned CLI 2.1.286 bundle (its pricing-row
+rates, verified against the pinned CLI 2.1.308 bundle (its pricing-row
 compiler maps exactly these four keys onto the internal per-token costs) and
 the [`modelPricing` settings reference](https://code.claude.com/docs/en/settings-reference).
 Meta publishes no cache-write rate and reports zero cache-creation tokens, so
