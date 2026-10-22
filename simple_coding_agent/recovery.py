@@ -64,6 +64,62 @@ def attempt_marker(attempt_id: str) -> str:
     return f"<!-- agent-attempt: {attempt_id} -->"
 
 
+#: The per-Worker identity recorded in every attempt-result comment when the
+#: operator runs a shared-login pool with ``WORKER_ID`` set (issue #301).
+#: The visible ``Worker: <id>`` line sits next to the existing outcome
+#: details and the hidden marker sits next to the existing
+#: ``<!-- agent-attempt: ... -->`` markers. Without ``WORKER_ID`` neither is
+#: rendered, keeping the comment byte-for-byte identical to today. Existing
+#: marker parsers match their own literal markers only, so this marker is
+#: transparent to them by construction.
+AGENT_WORKER_MARKER_PREFIX = "<!-- agent-worker:"
+
+
+def worker_marker(worker_id: str) -> str:
+    """The durable issue-comment marker recording one attempt's Worker."""
+
+    return f"<!-- agent-worker: {worker_id} -->"
+
+
+_WORKER_MARKER_RE = re.compile(re.escape(AGENT_WORKER_MARKER_PREFIX) + r"\s*(.*?)\s*-->")
+
+
+def parse_agent_worker(body: str | None) -> str | None:
+    """Return the ``<!-- agent-worker: ... -->`` identity in a comment, if any."""
+
+    if not body:
+        return None
+    match = _WORKER_MARKER_RE.search(body)
+    if match is None:
+        return None
+    value = match.group(1).strip()
+    return value or None
+
+
+def worker_line(worker_id: str) -> str:
+    """The visible Worker line for an attempt-result comment, or empty."""
+
+    cleaned = (worker_id or "").strip()
+    if not cleaned:
+        return ""
+    return f"Worker: {cleaned}"
+
+
+def worker_blocks(worker_id: str) -> tuple[str, str]:
+    """The visible line block and hidden marker block for one Worker.
+
+    Returns ``(line_block, marker_block)``, each either empty (no
+    ``WORKER_ID``) or terminated with a newline so callers can splice them
+    next to the existing outcome details and ``agent-attempt`` marker without
+    changing any other byte.
+    """
+
+    cleaned = (worker_id or "").strip()
+    if not cleaned:
+        return ("", "")
+    return (f"{worker_line(cleaned)}\n", f"{worker_marker(cleaned)}\n")
+
+
 #: The claim-time reason an attempt was requeued, recorded as a hidden HTML
 #: marker in every attempt-result comment. ``human`` means the issue carried
 #: ``ready-for-agent`` when it was claimed; ``automatic`` means it carried
@@ -499,19 +555,25 @@ def release_comment_body(
     saved_at: str,
     branch: str,
     requeue_source: str = REQUEUE_SOURCE_HUMAN,
+    worker_id: str = "",
 ) -> str:
     """Build the abandonment comment for ``recovery release``.
 
     The comment states the actual attempt outcome and the failure, records
     where the operator secured the work, and never claims a successful
-    handoff or an unpublished branch as a success.
+    handoff or an unpublished branch as a success. With ``worker_id`` set
+    the comment carries the visible ``Worker:`` line and the hidden
+    ``agent-worker`` marker; without it the comment is byte-for-byte the
+    legacy body.
     """
 
     marker = attempt_marker(attempt_id)
     source_marker = requeue_source_marker(requeue_source)
+    worker_block, worker_marker_block = worker_blocks(worker_id)
     return (
         f"## Agent Attempt Result: {actual_outcome}\n\n"
-        f"**Branch**: `{branch}` (retained work secured by the operator; not published as a success)\n\n"
+        f"**Branch**: `{branch}` (retained work secured by the operator; not published as a success)\n"
+        f"{worker_block}\n"
         "### Outcome\n"
         f"The attempt `{attempt_id}` for issue #{issue_number} did not complete"
         f" finalization and was explicitly released by the operator.\n\n"
@@ -522,6 +584,7 @@ def release_comment_body(
         "This release does not claim a successful handoff and does not"
         " requeue the issue.\n\n"
         f"{marker}\n"
+        f"{worker_marker_block}"
         f"{source_marker}"
     )
 
@@ -589,11 +652,13 @@ _GENERATED_RESULT_MARKER_RES = (
 
 #: Machine bookkeeping lines publication renders onto its shared result
 #: comment. They route humans and machines to the published work (branch, PR,
-#: note commit, merge, conflict standing) or carry the budget standing; none
-#: of them is guidance for the next implementation.
+#: note commit, merge, conflict standing), name the Worker that wrote the
+#: attempt, or carry the budget standing; none of them is guidance for the
+#: next implementation.
 _BOOKKEEPING_LINE_RES = (
     re.compile(r"^\*\*(Branch|PR|Handoff note commit|Merge|Conflict attempts)\*\*:"),
     re.compile(r"^Automatic continuation \d+/\d+ used;"),
+    re.compile(r"^Worker:"),
 )
 
 #: Any hidden HTML marker, wherever it sits on the line.
@@ -612,7 +677,12 @@ def is_generated_handoff_result(body: str) -> bool:
 
 
 def is_generated_result_comment(body: str) -> bool:
-    """Whether a comment body is any generated attempt-result comment."""
+    """Whether a comment body is any generated attempt-result comment.
+
+    The ``agent-worker`` marker never identifies a result on its own: it is
+    transparent to detection and only ever rides along with a header or an
+    existing machine marker.
+    """
 
     text = body or ""
     if _GENERATED_RESULT_HEADER_RE.search(text) is not None:
@@ -623,8 +693,9 @@ def is_generated_result_comment(body: str) -> bool:
 def strip_result_bookkeeping(body: str) -> str:
     """Remove machine bookkeeping from a generated result comment.
 
-    Drops the hidden markers, the branch/PR/note-commit/merge/conflict
-    standing lines, and the automatic-continuation standing line, keeping
+    Drops the hidden markers (including the transparent ``agent-worker``
+    marker), the branch/PR/note-commit/merge/conflict standing lines, the
+    Worker line, and the automatic-continuation standing line, keeping
     the human-readable evidence and details prose. Blank fallout is
     collapsed so the remainder stays readable in a prompt.
     """

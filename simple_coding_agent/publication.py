@@ -29,6 +29,7 @@ from simple_coding_agent.recovery import (
     REQUEUE_SOURCES,
     conflict_attempt_marker,
     requeue_source_marker,
+    worker_blocks,
 )
 
 
@@ -180,6 +181,10 @@ class PublicationRequest:
     #: Why the check never ran (``"not rerun during recovery retry"`` and
     #: friends). ``None`` renders a bare ``Check: not run``.
     check_not_run_reason: str | None = None
+    #: The per-Worker id for a shared-login pool (``WORKER_ID``). Empty renders
+    #: neither the visible ``Worker:`` line nor the hidden ``agent-worker``
+    #: marker, keeping the comment byte-for-byte identical to today.
+    worker_id: str = ""
 
 
 @dataclass(frozen=True)
@@ -277,6 +282,10 @@ class ConflictPublicationRequest:
     check_failed_index: int | None = None
     #: Why the check never ran. ``None`` renders a bare ``Check: not run``.
     check_not_run_reason: str | None = None
+    #: The per-Worker id for a shared-login pool (``WORKER_ID``). Empty renders
+    #: neither the visible ``Worker:`` line nor the hidden ``agent-worker``
+    #: marker, keeping the comment byte-for-byte identical to today.
+    worker_id: str = ""
 
     def __post_init__(self) -> None:
         if self.requeue_source is not None:
@@ -1490,12 +1499,14 @@ def _result_comment(
     merge_line = f"**Merge**: {merge_result}\n" if merge_result is not None else ""
     review_lines = "\n".join(_review_lines(request))
     source_marker = requeue_source_marker(request.requeue_source)
+    worker_block, worker_marker_block = worker_blocks(getattr(request, "worker_id", ""))
     return (
         f"## Agent Attempt Result: {outcome.value}\n\n"
         f"**Branch**: {branch}\n"
         f"**PR**: {pr}\n"
         f"{merge_line}"
-        f"{commit_line}\n"
+        f"{commit_line}"
+        f"{worker_block}\n"
         "### Evidence\n"
         f"{_request_check_line(request)}\n"
         f"{review_lines}\n"
@@ -1503,6 +1514,7 @@ def _result_comment(
         "### Details\n"
         f"{details}\n\n"
         f"{marker}\n"
+        f"{worker_marker_block}"
         f"{source_marker}"
     )
 
@@ -1555,7 +1567,9 @@ def _conflict_result_comment(
     attempt marker for publication dedup and the conflict-attempt marker
     (outcome plus pushed sha), plus the requeue-source marker only when the
     request sets one, so ordinary conflict attempts stay transparent to the
-    automatic-continuation count.
+    automatic-continuation count. With ``worker_id`` set the comment also
+    carries the visible ``Worker:`` line and the hidden ``agent-worker``
+    marker; without it the comment is byte-for-byte the legacy body.
     Every result carries the ``k/N`` standing line (omitted only when the
     operator budget is zero). The attempt whose failure reaches the budget
     escalates: its comment gains the human-handoff section (the failure
@@ -1631,13 +1645,15 @@ def _conflict_result_comment(
         if request.requeue_source is not None
         else ""
     )
+    worker_block, worker_marker_block = worker_blocks(getattr(request, "worker_id", ""))
     return (
         f"## Conflict Attempt Result: {conflict_outcome}\n\n"
         f"**Branch**: {branch}\n"
         f"**PR**: {pr}\n"
         f"{merge_line}"
         f"**Lifecycle outcome**: {outcome.value}\n"
-        f"{standing_line}\n"
+        f"{standing_line}"
+        f"{worker_block}\n"
         "### Evidence\n"
         f"{_request_check_line(request)}\n"
         f"{files_line}"
@@ -1647,6 +1663,7 @@ def _conflict_result_comment(
         f"{details}\n\n"
         f"{escalation_section}"
         f"{marker}\n"
+        f"{worker_marker_block}"
         f"{conflict_marker}"
         f"{source_line}"
     )
