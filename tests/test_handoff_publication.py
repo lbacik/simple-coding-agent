@@ -158,7 +158,7 @@ def test_first_handoff_creates_one_shared_comment_with_branch_following_link(tmp
     workspace, prepared = prepared_branch(tmp_path)
     github = HandoffGitHub()
 
-    result = Publisher(workspace, github, "octo/example").publish(handoff_request(prepared.branch))
+    result = Publisher(workspace, github, "octo/example", handoff_comment_mode="verbose").publish(handoff_request(prepared.branch))
 
     assert result.outcome is AttemptOutcome.HANDOFF
     assert result.handoff_posted is True
@@ -186,7 +186,7 @@ def test_first_handoff_creates_one_shared_comment_with_branch_following_link(tmp
 def test_second_handoff_updates_the_same_shared_comment(tmp_path: Path) -> None:
     workspace, prepared = prepared_branch(tmp_path)
     github = HandoffGitHub()
-    publisher = Publisher(workspace, github, "octo/example")
+    publisher = Publisher(workspace, github, "octo/example", handoff_comment_mode="verbose")
 
     first = publisher.publish(handoff_request(prepared.branch))
     write_and_commit(tmp_path / "clone", "more.txt", "more", "Continue publication")
@@ -216,7 +216,12 @@ def test_failed_push_before_publication_claims_no_revision(tmp_path: Path) -> No
         state.transition(phase)
 
     result = Publisher(
-        PushFailingWorkspace(), github, "octo/example", attempt_state=state, handoff_store=store
+        PushFailingWorkspace(),
+        github,
+        "octo/example",
+        attempt_state=state,
+        handoff_store=store,
+        handoff_comment_mode="verbose",
     ).publish(handoff_request(prepared.branch))
 
     assert result.handoff_posted is False
@@ -231,7 +236,7 @@ def test_failed_push_before_publication_claims_no_revision(tmp_path: Path) -> No
 def test_failed_update_retains_the_attempt_without_touching_the_record(tmp_path: Path) -> None:
     workspace, prepared = prepared_branch(tmp_path)
     github = HandoffGitHub(fail_update=True)
-    publisher = Publisher(workspace, github, "octo/example")
+    publisher = Publisher(workspace, github, "octo/example", handoff_comment_mode="verbose")
 
     assert publisher.publish(handoff_request(prepared.branch)).handoff_posted is True
     original = shared_bodies(github)[0]
@@ -250,7 +255,7 @@ def test_failed_update_retains_the_attempt_without_touching_the_record(tmp_path:
 def test_successful_update_with_a_lost_response_confirms_by_rereading(tmp_path: Path) -> None:
     workspace, prepared = prepared_branch(tmp_path)
     github = HandoffGitHub()
-    publisher = Publisher(workspace, github, "octo/example")
+    publisher = Publisher(workspace, github, "octo/example", handoff_comment_mode="verbose")
 
     assert publisher.publish(handoff_request(prepared.branch)).handoff_posted is True
     github.update_after_write = True
@@ -271,7 +276,7 @@ def test_successful_create_with_a_lost_response_confirms_by_rereading(tmp_path: 
     workspace, prepared = prepared_branch(tmp_path)
     github = HandoffGitHub(create_after_write=True)
 
-    result = Publisher(workspace, github, "octo/example").publish(handoff_request(prepared.branch))
+    result = Publisher(workspace, github, "octo/example", handoff_comment_mode="verbose").publish(handoff_request(prepared.branch))
 
     assert result.handoff_posted is True
     assert len(shared_bodies(github)) == 1
@@ -282,7 +287,7 @@ def test_failed_create_without_a_write_retains_the_attempt(tmp_path: Path) -> No
     workspace, prepared = prepared_branch(tmp_path)
     github = HandoffGitHub(fail_create=True)
 
-    result = Publisher(workspace, github, "octo/example").publish(handoff_request(prepared.branch))
+    result = Publisher(workspace, github, "octo/example", handoff_comment_mode="verbose").publish(handoff_request(prepared.branch))
 
     assert result.handoff_posted is False
     assert shared_bodies(github) == []
@@ -294,14 +299,22 @@ def test_retry_after_restart_reuses_the_persisted_intent(tmp_path: Path) -> None
     data_dir = tmp_path / "data"
 
     first = Publisher(
-        workspace, github, "octo/example", handoff_store=HandoffPublicationStore(data_dir)
+        workspace,
+        github,
+        "octo/example",
+        handoff_store=HandoffPublicationStore(data_dir),
+        handoff_comment_mode="verbose",
     ).publish(handoff_request(prepared.branch, count=1))
     assert first.handoff_posted is True
 
     # After a restart the caller recomputes a different standing, but the
     # first persisted intent wins: no second comment, no incremented count.
     restarted = Publisher(
-        workspace, github, "octo/example", handoff_store=HandoffPublicationStore(data_dir)
+        workspace,
+        github,
+        "octo/example",
+        handoff_store=HandoffPublicationStore(data_dir),
+        handoff_comment_mode="verbose",
     ).publish(handoff_request(prepared.branch, count=5))
     assert restarted.handoff_posted is True
     assert len(shared_bodies(github)) == 1
@@ -315,7 +328,9 @@ def test_timeout_retry_confirms_without_recomputing_the_standing(tmp_path: Path)
     workspace, prepared = prepared_branch(tmp_path)
     github = HandoffGitHub(fail_find=True)
     store = MemoryHandoffPublicationStore()
-    publisher = Publisher(workspace, github, "octo/example", handoff_store=store)
+    publisher = Publisher(
+        workspace, github, "octo/example", handoff_store=store, handoff_comment_mode="verbose"
+    )
 
     assert publisher.publish(handoff_request(prepared.branch, count=1)).handoff_posted is False
     # The intent was persisted before the remote write failed; the retry
@@ -335,7 +350,7 @@ def test_timeout_retry_confirms_without_recomputing_the_standing(tmp_path: Path)
 def test_newer_attempt_record_is_never_overwritten(tmp_path: Path) -> None:
     workspace, prepared = prepared_branch(tmp_path)
     github = HandoffGitHub()
-    publisher = Publisher(workspace, github, "octo/example")
+    publisher = Publisher(workspace, github, "octo/example", handoff_comment_mode="verbose")
 
     assert publisher.publish(
         handoff_request(prepared.branch, started_at=ATTEMPT_TWO, note_sha=NOTE_TWO, count=2)
@@ -352,7 +367,7 @@ def test_ambiguous_remote_state_retains_the_attempt(tmp_path: Path) -> None:
     workspace, prepared = prepared_branch(tmp_path)
     github = HandoffGitHub(fail_find=True)
 
-    result = Publisher(workspace, github, "octo/example").publish(handoff_request(prepared.branch))
+    result = Publisher(workspace, github, "octo/example", handoff_comment_mode="verbose").publish(handoff_request(prepared.branch))
 
     assert result.handoff_posted is False
     # The legacy comment still posts; only the shared-record step is held.

@@ -2236,6 +2236,10 @@ class AgentLifecycle:
                         if decision.outcome is AttemptOutcome.HANDOFF
                         else None
                     ),
+                    handoff_notify=(
+                        decision.outcome is AttemptOutcome.HANDOFF
+                        and self._handoff_needs_notification(claim, checkpoint)
+                    ),
                 )
             )
         except Exception as error:
@@ -3352,6 +3356,31 @@ class AgentLifecycle:
             " continue automatically."
         )
 
+    def _handoff_needs_notification(
+        self, claim: Claim, checkpoint: AttemptCheckpoint | None
+    ) -> bool:
+        """Whether this handoff needs an explicit notification comment.
+
+        True only when the automatic-continuation budget is exhausted by
+        this handoff (the issue stops and needs a human requeue). Routine
+        handoffs stay quiet in ``link`` mode; a failed or ambiguous shared
+        publication notifies independently of this flag. An unreadable
+        count notifies rather than silently suppressing, so a stopped
+        issue is never hidden. A zero budget never notifies here: the
+        default human-controlled requeue needs no standing line.
+        """
+
+        budget = self._max_auto_continuations
+        if budget <= 0:
+            return False
+        try:
+            count_before = self._auto_continuation_count(claim.issue)
+        except Exception:
+            return True
+        source = _claim_time_requeue_source(claim, checkpoint)
+        used = count_before + 1 if source == REQUEUE_SOURCE_AUTOMATIC else 0
+        return used >= budget
+
     def get_command(self, request_id: str) -> CommandRecord | None:
         """Return one command's current durable acknowledgement."""
 
@@ -3875,6 +3904,10 @@ class AgentLifecycle:
                                 self._handoff_continuation_used(claim, checkpoint)
                                 if evidence.decision.outcome is AttemptOutcome.HANDOFF
                                 else None
+                            ),
+                            handoff_notify=(
+                                evidence.decision.outcome is AttemptOutcome.HANDOFF
+                                and self._handoff_needs_notification(claim, checkpoint)
                             ),
                         )
                     )
@@ -5295,6 +5328,10 @@ class AgentLifecycle:
                             self._handoff_continuation_used(claim, checkpoint)
                             if decision.outcome is AttemptOutcome.HANDOFF
                             else None
+                        ),
+                        handoff_notify=(
+                            decision.outcome is AttemptOutcome.HANDOFF
+                            and self._handoff_needs_notification(claim, checkpoint)
                         ),
                     )
                 )

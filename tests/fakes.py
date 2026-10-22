@@ -682,6 +682,7 @@ class PublishedAttempt:
     conflict_outcome: str = ""
     escalated: bool = False
     handoff_posted: bool = True
+    comment_suppressed: bool = False
 
 
 class FakePublisher:
@@ -693,7 +694,10 @@ class FakePublisher:
     to pin publication behaviour, and ``comment_posted=False`` to simulate
     an unconfirmed result comment. Pass ``pull_request`` (a ``PullRequest``)
     to simulate a published pull request. Pass ``handoff_posted=False`` to
-    simulate an unconfirmed shared handoff record. Per-call publication
+    simulate an unconfirmed shared handoff record, and
+    ``comment_suppressed=True`` to simulate a routine ``link``-mode handoff
+    whose individual result comment was intentionally suppressed once the
+    shared record was confirmed. Per-call publication
     budgets arrive via the ``timeout`` keyword (like the production
     publisher) and are recorded on ``timeouts``.
     """
@@ -707,6 +711,7 @@ class FakePublisher:
         branch_url: str | None = _DEFAULT_BRANCH_URL,
         comment_posted: bool = True,
         handoff_posted: bool = True,
+        comment_suppressed: bool = False,
         pull_request: object = None,
         pull_requests: dict[str, object] | None = None,
     ) -> None:
@@ -714,6 +719,7 @@ class FakePublisher:
         self._branch_url = branch_url
         self._comment_posted = comment_posted
         self._handoff_posted = handoff_posted
+        self._comment_suppressed = comment_suppressed
         self._pull_request = pull_request
         self._pull_requests = dict(pull_requests or {})
         self.requests: list[object] = []
@@ -737,6 +743,7 @@ class FakePublisher:
             comment_posted=self._comment_posted,
             pull_request=self._pull_request,
             handoff_posted=self._handoff_posted,
+            comment_suppressed=self._comment_suppressed,
         )
 
     def find_pull_request(self, head: str) -> object | None:

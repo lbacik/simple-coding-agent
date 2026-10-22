@@ -32,6 +32,8 @@ _DEFAULT_MODEL_BASE_URL = "https://api.meta.ai"
 _DEFAULT_MODEL_AUTH_MODE = "auth_token"
 _MODEL_AUTH_MODES = frozenset({"auth_token", "api_key"})
 _MERGE_METHODS = frozenset({"merge", "squash", "rebase"})
+_HANDOFF_COMMENT_MODES = frozenset({"link", "verbose"})
+_DEFAULT_HANDOFF_COMMENT_MODE = "link"
 _DEFAULT_MODEL_STREAM_IDLE_TIMEOUT_MS = 60000
 #: The single approved agent-SDK release that provenance verification checks
 #: the installed SDK against at startup. This is defined in code, not read
@@ -108,6 +110,7 @@ class RuntimeConfig:
     pr_merge_method: str = "merge"
     max_auto_continuations: int = 0
     max_conflict_attempts: int = 0
+    handoff_comment_mode: str = _DEFAULT_HANDOFF_COMMENT_MODE
 
     @property
     def soft_threshold_tokens(self) -> int:
@@ -220,6 +223,7 @@ def load_runtime_config(environ: Mapping[str, str] | None = None) -> RuntimeConf
         pr_merge_method=_merge_method(values),
         max_auto_continuations=_non_negative_integer(values, "MAX_AUTO_CONTINUATIONS", 0),
         max_conflict_attempts=_non_negative_integer(values, "MAX_CONFLICT_ATTEMPTS", 0),
+        handoff_comment_mode=_handoff_comment_mode(values),
     )
     _warn_when_claude_code_version_is_set(values)
     _warn_when_claude_agent_sdk_version_is_set(values)
@@ -416,6 +420,13 @@ def _merge_method(values: Mapping[str, str]) -> str:
     value = values.get("PR_MERGE_METHOD", "merge").strip().lower()
     if value not in _MERGE_METHODS:
         raise ConfigurationError("PR_MERGE_METHOD must be merge, squash, or rebase")
+    return value
+
+
+def _handoff_comment_mode(values: Mapping[str, str]) -> str:
+    value = values.get("HANDOFF_COMMENT_MODE", _DEFAULT_HANDOFF_COMMENT_MODE).strip().lower()
+    if value not in _HANDOFF_COMMENT_MODES:
+        raise ConfigurationError("HANDOFF_COMMENT_MODE must be link or verbose")
     return value
 
 

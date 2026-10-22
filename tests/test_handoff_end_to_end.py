@@ -1203,7 +1203,17 @@ def build_lifecycle(
         model_executor=executor,
         issue_comments=tracker.trusted_comments,
     )
-    publisher = Publisher(workspace, github, REPO, attempt_state=attempt_state, sleeper=lambda _: None)
+    # These mechanics tests pin verbose mode: they assert the historical
+    # per-attempt handoff result comments alongside the shared record.
+    # Link-mode suppression is covered in test_handoff_comment_mode.py.
+    publisher = Publisher(
+        workspace,
+        github,
+        REPO,
+        attempt_state=attempt_state,
+        sleeper=lambda _: None,
+        handoff_comment_mode="verbose",
+    )
     return AgentLifecycle(
         tracker=tracker,
         attempt_state=attempt_state,

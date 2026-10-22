@@ -288,7 +288,26 @@ issue stands (`k/N used`, and whether a human requeue is now needed), and
 each automatic claim emits an `auto_continuation_claimed` event. A routine
 handoff needs no individual result comment: the single shared handoff
 comment carries the standing, reconciled with newer ordinary results, and
-the published count is computed once and retried unchanged. Older issues
+the published count is computed once and retried unchanged. `HANDOFF_COMMENT_MODE`
+(default `link`) selects this one-comment experience: the first handoff
+creates the short shared comment and later routine handoffs update its
+hidden record without posting an individual result comment or copying the
+note body into GitHub, while the visible branch link keeps showing the
+latest note. Set `HANDOFF_COMMENT_MODE=verbose` to retain the historical
+per-attempt handoff result comments (including the note body) for
+troubleshooting. Both modes use identical shared bookkeeping and
+continuation context, both post explicit deduplicated notifications when
+human action is needed (an exhausted automatic-continuation budget, an
+actionable failure, or an unconfirmed shared record — always with the
+current standing), and both keep normal completion reporting; a suppressed
+routine comment never blocks release once the shared record and revisions
+are confirmed, and a failed or ambiguous publication is never reported as
+confirmed. Switching modes between attempts creates no second shared
+comment, resets no budget, duplicates no recorded attempt, and leaves
+existing comments intact. Like the continuation budget, the setting is
+operator-only: it lives in `.env`, never in the repository profile (an
+unknown profile key is refused), so an agent-written PR cannot change it.
+Older issues
 without shared metadata count their historical result comments instead;
 duplicate, unreadable, or mismatched shared metadata never grants a fresh
 budget — the issue stays queued out for operator repair. The setting

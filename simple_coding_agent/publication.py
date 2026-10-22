@@ -50,6 +50,24 @@ AUTO_MERGE_SKIPPED = (
 
 _AUTO_MERGE_MODES = frozenset({"false", "true", "label"})
 
+#: The operator-visible handoff comment experience. ``link`` (the default)
+#: posts one short shared comment per issue and updates its hidden record on
+#: later routine handoffs without an individual result comment; ``verbose``
+#: keeps the historical per-attempt result comment alongside the same shared
+#: record for troubleshooting. Both modes share bookkeeping, continuation
+#: counting, and recovery.
+HANDOFF_COMMENT_MODES = frozenset({"link", "verbose"})
+_DEFAULT_HANDOFF_COMMENT_MODE = "link"
+
+
+def _normalize_handoff_comment_mode(value: str) -> str:
+    """Normalize the handoff comment mode, rejecting anything but link|verbose."""
+
+    normalized = str(value).strip().lower() if isinstance(value, str) else ""
+    if normalized not in HANDOFF_COMMENT_MODES:
+        raise ValueError(f"handoff_comment_mode must be one of {sorted(HANDOFF_COMMENT_MODES)}")
+    return normalized
+
 
 def _normalize_auto_merge(value: bool | str) -> str:
     """Normalize the auto-merge mode, accepting the legacy boolean form."""
@@ -135,6 +153,12 @@ class PublicationRequest:
     #: means no shared record is requested, so handoff publication stays
     #: legacy-only; only a handoff outcome with a count publishes the record.
     handoff_continuation_count: int | None = None
+    #: True when this handoff needs an explicit human-action notification
+    #: (for example an exhausted automatic-continuation budget). In ``link``
+    #: mode a routine handoff suppresses its individual result comment, but
+    #: a notified handoff still posts it (deduplicated) with the current
+    #: standing; in ``verbose`` mode every handoff posts regardless.
+    handoff_notify: bool = False
 
 
 @dataclass(frozen=True)
@@ -157,6 +181,12 @@ class PublicationResult:
     #: True for every non-handoff outcome and for legacy-only handoff
     #: callers; False retains the attempt for recovery.
     handoff_posted: bool = True
+    #: True when a routine handoff result comment was intentionally
+    #: suppressed in ``link`` mode. ``comment_posted`` stays True so a
+    #: suppressed routine never blocks release once the shared record and
+    #: revisions are confirmed; a failed or ambiguous shared publication
+    #: still reports ``handoff_posted=False`` and retains the attempt.
+    comment_suppressed: bool = False
 
 
 @dataclass(frozen=True)
@@ -243,6 +273,7 @@ class Publisher:
         auto_merge: bool | str = False,
         merge_method: str = "merge",
         handoff_store: HandoffPublicationStore | MemoryHandoffPublicationStore | None = None,
+        handoff_comment_mode: str = _DEFAULT_HANDOFF_COMMENT_MODE,
     ) -> None:
         self._workspace = workspace
         self._github = github
@@ -255,6 +286,7 @@ class Publisher:
         self._event_log = event_log
         self._auto_merge = _normalize_auto_merge(auto_merge)
         self._merge_method = merge_method
+        self._handoff_comment_mode = _normalize_handoff_comment_mode(handoff_comment_mode)
         self._handoff_store = (
             handoff_store if handoff_store is not None else MemoryHandoffPublicationStore()
         )
@@ -337,6 +369,10 @@ class Publisher:
 
         if outcome is None:
             outcome = AttemptOutcome.INFRASTRUCTURE_ERROR
+        if outcome is AttemptOutcome.HANDOFF and self._handoff_comment_mode == "link":
+            return self._publish_handoff_link_mode(
+                request, outcome, branch_url, pull_request, pushed_sha, deadline, merge_result
+            )
         comment_posted = self._post_result(
             request, outcome, branch_url, pull_request, request.details, merge_result
         )
@@ -351,6 +387,95 @@ class Publisher:
             request.details,
             merge_result,
             handoff_posted=handoff_posted,
+        )
+
+    def _publish_handoff_link_mode(
+        self,
+        request: PublicationRequest,
+        outcome: AttemptOutcome,
+        branch_url: str | None,
+        pull_request: PullRequest | None,
+        pushed_sha: str | None,
+        deadline: float,
+        merge_result: str | None = None,
+    ) -> PublicationResult:
+        """Publish a handoff in ``link`` mode: shared record first, routine quiet.
+
+        The single shared comment is always attempted first. A routine
+        handoff suppresses its individual result comment once the shared
+        record (and its verified revisions) is confirmed, so the visible
+        branch link keeps showing the latest note without copying the note
+        body into GitHub. An explicit notification still posts
+        (deduplicated) when human action is needed -- ``handoff_notify``
+        (for example an exhausted continuation budget), a legacy-only
+        handoff with no shared record requested, or a failed/ambiguous
+        shared publication -- and normal completion reporting is unchanged.
+        A suppressed routine never reports confirmation on its own: the
+        result still requires ``handoff_posted``, so a failed shared write
+        retains the attempt instead of finalizing.
+        """
+
+        shared_requested = (
+            request.handoff_continuation_count is not None
+            and request.note_commit_sha is not None
+        )
+        handoff_posted = self._publish_handoff_record(request, pushed_sha, deadline)
+        needs_notification = bool(
+            request.handoff_notify or not shared_requested or not handoff_posted
+        )
+        if needs_notification:
+            comment_posted = self._post_result(
+                request, outcome, branch_url, pull_request, request.details, merge_result
+            )
+            if not shared_requested:
+                self._event_log(
+                    "handoff_comment_verbose_fallback",
+                    "handoff published without a shared record request;"
+                    " the individual result comment was posted",
+                    level="INFO",
+                    issue_number=request.issue_number,
+                )
+            elif not handoff_posted:
+                self._event_log(
+                    "handoff_notification_posted",
+                    "the shared handoff record is unconfirmed; an explicit"
+                    " notification comment was posted",
+                    level="WARNING",
+                    issue_number=request.issue_number,
+                )
+            else:
+                self._event_log(
+                    "handoff_notification_posted",
+                    "human action is needed; an explicit notification comment"
+                    " was posted with the current standing",
+                    level="WARNING",
+                    issue_number=request.issue_number,
+                )
+            return PublicationResult(
+                outcome,
+                branch_url,
+                pull_request,
+                comment_posted,
+                request.details,
+                merge_result,
+                handoff_posted=handoff_posted,
+            )
+        self._event_log(
+            "handoff_comment_suppressed",
+            f"routine handoff for attempt {request.started_at} published to the"
+            " shared record without an individual result comment",
+            level="INFO",
+            issue_number=request.issue_number,
+        )
+        return PublicationResult(
+            outcome,
+            branch_url,
+            pull_request,
+            True,
+            request.details,
+            merge_result,
+            handoff_posted=handoff_posted,
+            comment_suppressed=True,
         )
 
     def handoff_intent(self, attempt_id: str) -> HandoffRecord | None:
