@@ -24,8 +24,11 @@ diagnostic commands to re-derive it.
 The handoff then takes at most two tool calls, and work is not committed in
 this case:
 
-1. Write `.agent/handoff/<issue-number>.md` using the pre-filled header
-   verbatim, and fill in Summary, Remaining work and Evidence.
+1. Create or edit `.agent/handoff/<issue-number>.md` with the `Write` tool
+   (use `Edit` to update an existing note), using the pre-filled header
+   verbatim, and fill in Summary, Remaining work and Evidence. Bash cannot
+   create or modify files while the handoff is pending, so always use
+   `Write`/`Edit` for the note.
 2. In one `Bash` call, run
    `git add .agent/handoff/<issue-number>.md && git commit -m "Handoff note: issue #<issue-number>"`.
 3. Stop.
@@ -53,9 +56,12 @@ path above instead and skip step 1.)
    note commit (step 3) — the note commit must be separate and must be the
    last commit on the branch.
 
-2. **Write the handoff note** at `.agent/handoff/<issue-number>.md`,
+2. **Write the handoff note** at `.agent/handoff/<issue-number>.md` with the
+   `Write` tool (use `Edit` to update an existing note),
    overwriting any note already there (its history remains reachable through
-   Git). When a note is already present, read it first: your note replaces
+   Git). Bash cannot create or modify files while the handoff is pending, so
+   always use `Write`/`Edit` for the note, then commit it with `git add` +
+   `git commit` in Bash. When a note is already present, read it first: your note replaces
    it as the single continuation record, so it must be self-contained —
    current state, still-relevant decisions and constraints, unresolved
    review findings, remaining work, and applicable evidence. Resolved work
