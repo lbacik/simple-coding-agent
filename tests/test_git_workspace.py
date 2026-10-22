@@ -856,10 +856,11 @@ def test_claim_time_push_succeeds_when_the_lease_advances_after_each_push(
     assert pushes[0][2] == "--force-with-lease=agent/issue-23:"
     assert pushes[1][2] == f"--force-with-lease=agent/issue-23:{first}"
     # The claim-time path never refetches before pushing: the recorded lease
-    # is the lease, not a fresh observation.
-    assert ("git", "fetch", "origin", "agent/issue-23") not in commands
+    # is the lease, not a fresh observation. The single fetch is the one
+    # prepare_attempt performs at attempt start to observe the lease.
+    assert commands.count(("git", "fetch", "origin", "agent/issue-23")) == 1
     assert second == git(tmp_path / "clone", "rev-parse", "HEAD")
-    assert second == git(tmp_path / "clone", "ls-remote", "origin", "refs/heads/agent/issue-23")
+    assert second == git(tmp_path / "clone", "ls-remote", "origin", "refs/heads/agent/issue-23").split()[0]
 
 
 def test_claim_time_push_overwrites_a_branch_observed_at_attempt_start(

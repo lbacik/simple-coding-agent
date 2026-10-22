@@ -640,8 +640,8 @@ def test_logs_every_stage_from_claiming_the_issue_to_dispatching_the_model(
         "issue_claimed",
         "workspace_prepared_for_profile_read",
         "profile_loaded",
-        "workspace_prepared",
         "claim_lease_recorded",
+        "workspace_prepared",
         "attempt_phase_transitioned",
     ]
     assert all(issue_number == 24 for _, issue_number in events[1:])
