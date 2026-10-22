@@ -2285,6 +2285,7 @@ class AgentLifecycle:
                     note_commit_sha=note_sha,
                     auto_merge_opt_in=_claim_time_opt_in(claim, checkpoint),
                     requeue_source=_claim_time_requeue_source(claim, checkpoint),
+                    worker_id=self._request_worker_id(),
                     handoff_continuation_count=(
                         self._handoff_continuation_used(claim, checkpoint)
                         if decision.outcome is AttemptOutcome.HANDOFF
@@ -2481,6 +2482,7 @@ class AgentLifecycle:
             saved_at=saved_at,
             branch=branch,
             requeue_source=source,
+            worker_id=self._request_worker_id(),
         )
         confirmed = self._confirm_release_comment(
             claim, marker, comment_body, attempt_id, requeue_source=source
@@ -2761,6 +2763,7 @@ class AgentLifecycle:
                     details=body,
                     base_branch="main",
                     requeue_source=requeue_source,
+                    worker_id=self._request_worker_id(),
                 )
             )
         except Exception:
@@ -3106,6 +3109,16 @@ class AgentLifecycle:
         if not callable(counter):
             return 0
         return int(counter(issue))
+
+    def _request_worker_id(self) -> str:
+        """The per-Worker id stamping attempt-result comments, or empty.
+
+        Read from the tracker (which carries the operator's ``WORKER_ID``),
+        so every comment path shares one seam. Trackers without the
+        attribute read as unset, keeping the comment byte-for-byte legacy.
+        """
+
+        return getattr(self._tracker, "worker_id", "") or ""
 
     def _handoff_continuation_used(
         self, claim: Claim, checkpoint: AttemptCheckpoint | None
@@ -3966,6 +3979,7 @@ class AgentLifecycle:
                             note_commit_sha=evidence.note_commit_sha,
                             auto_merge_opt_in=_claim_time_opt_in(claim, checkpoint),
                             requeue_source=_claim_time_requeue_source(claim, checkpoint),
+                            worker_id=self._request_worker_id(),
                             handoff_continuation_count=(
                                 self._handoff_continuation_used(claim, checkpoint)
                                 if evidence.decision.outcome is AttemptOutcome.HANDOFF
@@ -5422,6 +5436,7 @@ class AgentLifecycle:
                         note_commit_sha=note_commit_sha,
                         auto_merge_opt_in=_claim_time_opt_in(claim, checkpoint),
                         requeue_source=_claim_time_requeue_source(claim, checkpoint),
+                        worker_id=self._request_worker_id(),
                         handoff_continuation_count=(
                             self._handoff_continuation_used(claim, checkpoint)
                             if decision.outcome is AttemptOutcome.HANDOFF
@@ -6358,6 +6373,8 @@ class AgentLifecycle:
         fall back to the reason and details at render time. ``requeue_source``
         records the requeue source in the result comment (``None`` renders no
         marker); only startup recovery of a retained conflict attempt sets it.
+        The Worker's ``worker_id`` is read from the tracker, so conflict
+        result comments carry the same attribution as ordinary results.
         """
 
         return ConflictPublicationRequest(
@@ -6384,6 +6401,7 @@ class AgentLifecycle:
             fix_commits=tuple(fix_commits),
             failure_output=failure_output,
             requeue_source=requeue_source,
+            worker_id=self._request_worker_id(),
         )
 
     def _conflict_error_request(
@@ -6501,6 +6519,7 @@ class AgentLifecycle:
             base_branch=base_branch,
             auto_merge_opt_in=auto_merge_opt_in,
             requeue_source=requeue_source,
+            worker_id=self._request_worker_id(),
         )
         if timeout is None:
             published = self._publisher.publish(request)
