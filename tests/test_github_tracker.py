@@ -172,6 +172,48 @@ def test_trusted_comments_never_matches_a_deleted_account_by_empty_login() -> No
     assert trusted == ()
 
 
+def test_trusted_comments_includes_peer_logins_in_order() -> None:
+    transport = FakeCommentTransport(
+        comments=(
+            IssueComment(author_login="reporter", body="please also handle timeouts"),
+            IssueComment(author_login="pool-mate", body="## Agent Attempt Result: handoff"),
+            IssueComment(author_login="random-passerby", body="+1"),
+            IssueComment(author_login="agent", body="## Agent Attempt Result: incomplete"),
+        )
+    )
+
+    tracker = GitHubTracker(transport, "octo/example", peer_logins=["pool-mate"])
+    trusted = tracker.trusted_comments(issue(1, author_login="reporter"))
+
+    assert trusted == (
+        "please also handle timeouts",
+        "## Agent Attempt Result: handoff",
+        "## Agent Attempt Result: incomplete",
+    )
+
+
+def test_trusted_comments_reads_peer_logins_from_the_environment(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    monkeypatch.setenv("PEER_LOGINS", "pool-mate, other-mate")
+    transport = FakeCommentTransport(
+        comments=(IssueComment(author_login="other-mate", body="peer note"),)
+    )
+
+    trusted = GitHubTracker(transport, "octo/example").trusted_comments(issue(1))
+
+    assert trusted == ("peer note",)
+
+
+def test_trusted_comments_ignores_the_own_login_in_peer_logins() -> None:
+    transport = FakeCommentTransport(
+        comments=(IssueComment(author_login="agent", body="own note"),)
+    )
+
+    tracker = GitHubTracker(transport, "octo/example", peer_logins=["agent"])
+    trusted = tracker.trusted_comments(issue(1))
+
+    assert trusted == ("own note",)
+
+
 def test_automatic_continuation_count_is_zero_with_no_history() -> None:
     transport = FakeCommentTransport(comments=())
 
@@ -244,11 +286,143 @@ def test_automatic_continuation_count_ignores_a_deleted_account_by_empty_login()
     assert GitHubTracker(transport, "octo/example").automatic_continuation_count(issue(1)) == 0
 
 
+def test_automatic_continuation_count_counts_peer_results() -> None:
+    transport = FakeCommentTransport(
+        comments=(
+            IssueComment(author_login="agent", body=result_body("automatic", "first")),
+            IssueComment(author_login="pool-mate", body=result_body("automatic", "second")),
+        )
+    )
+
+    tracker = GitHubTracker(transport, "octo/example", peer_logins=["pool-mate"])
+
+    assert tracker.automatic_continuation_count(issue(1)) == 2
+
+
+def test_automatic_continuation_count_stops_at_a_peer_human_requeue() -> None:
+    transport = FakeCommentTransport(
+        comments=(
+            IssueComment(author_login="agent", body=result_body("automatic", "first")),
+            IssueComment(author_login="pool-mate", body=result_body("human", "second")),
+            IssueComment(author_login="agent", body=result_body("automatic", "third")),
+        )
+    )
+
+    tracker = GitHubTracker(transport, "octo/example", peer_logins=["pool-mate"])
+
+    assert tracker.automatic_continuation_count(issue(1)) == 1
+
+
+def test_automatic_continuation_count_ignores_the_own_login_in_peer_logins() -> None:
+    transport = FakeCommentTransport(
+        comments=(IssueComment(author_login="agent", body=result_body("automatic", "first")),)
+    )
+
+    tracker = GitHubTracker(transport, "octo/example", peer_logins=["agent"])
+
+    assert tracker.automatic_continuation_count(issue(1)) == 1
+
+
 def result_body(source: str, attempt_id: str) -> str:
     return (
         f"## Agent Attempt Result: complete\n<!-- agent-attempt: {attempt_id} -->\n"
         f"{requeue_source_marker(source)}"
     )
+
+
+def test_find_handoff_record_trusts_explicit_peer_logins() -> None:
+    from simple_coding_agent.github_tracker import GitHubGraphQLTransport
+
+    transport = GitHubGraphQLTransport("token", peer_logins=["pool-mate"])
+
+    def _execute(query: str, variables: dict[str, object]) -> dict:
+        if "Viewer" in query:
+            return {"viewer": {"id": "viewer-id", "login": "agent"}}
+        return {
+            "repository": {
+                "issue": {
+                    "comments": {
+                        "nodes": [
+                            {
+                                "id": "comment-1",
+                                "body": "<!-- handoff-record: version=1 -->",
+                                "author": {"login": "pool-mate"},
+                            }
+                        ]
+                    }
+                }
+            }
+        }
+
+    transport._execute = _execute  # type: ignore[method-assign]
+
+    record = transport.find_handoff_record("octo/example", 1)
+
+    assert record is not None
+    assert record.comment_id == "comment-1"
+
+
+def test_find_handoff_record_reads_peer_logins_from_the_environment(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    from simple_coding_agent.github_tracker import GitHubGraphQLTransport
+
+    monkeypatch.setenv("PEER_LOGINS", "pool-mate")
+    transport = GitHubGraphQLTransport("token")
+
+    def _execute(query: str, variables: dict[str, object]) -> dict:
+        if "Viewer" in query:
+            return {"viewer": {"id": "viewer-id", "login": "agent"}}
+        return {
+            "repository": {
+                "issue": {
+                    "comments": {
+                        "nodes": [
+                            {
+                                "id": "comment-1",
+                                "body": "<!-- handoff-record: version=1 -->",
+                                "author": {"login": "pool-mate"},
+                            }
+                        ]
+                    }
+                }
+            }
+        }
+
+    transport._execute = _execute  # type: ignore[method-assign]
+
+    record = transport.find_handoff_record("octo/example", 1)
+
+    assert record is not None
+    assert record.comment_id == "comment-1"
+
+
+def test_find_handoff_record_still_ignores_other_logins(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    from simple_coding_agent.github_tracker import GitHubGraphQLTransport
+
+    monkeypatch.setenv("PEER_LOGINS", "pool-mate")
+    transport = GitHubGraphQLTransport("token")
+
+    def _execute(query: str, variables: dict[str, object]) -> dict:
+        if "Viewer" in query:
+            return {"viewer": {"id": "viewer-id", "login": "agent"}}
+        return {
+            "repository": {
+                "issue": {
+                    "comments": {
+                        "nodes": [
+                            {
+                                "id": "comment-1",
+                                "body": "<!-- handoff-record: version=1 -->",
+                                "author": {"login": "random-passerby"},
+                            }
+                        ]
+                    }
+                }
+            }
+        }
+
+    transport._execute = _execute  # type: ignore[method-assign]
+
+    assert transport.find_handoff_record("octo/example", 1) is None
 
 
 def test_lists_issue_comments_with_author_login_via_graphql() -> None:

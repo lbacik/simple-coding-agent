@@ -74,13 +74,15 @@ def conflict_branch_issue_number(head_ref: str) -> int | None:
 
 
 def _peer_login_set(peer_logins: Iterable[str] | None) -> frozenset[str]:
-    """Normalize the pool-peer logins whose conflict comments count as the worker's own.
+    """Normalize the pool-peer logins that count as the worker's own.
 
     An explicit constructor value wins; otherwise the ``PEER_LOGINS``
-    environment setting (comma- or space-separated, from the pool work) is
-    read, so the budget keeps counting when several workers share one
-    account. Absent in both places means only the worker's own login
-    counts. Empty logins never count (they would match deleted accounts).
+    environment setting (comma- or space-separated logins of the other
+    workers sharing one queue with different logins) is read. Absent in
+    both places means only the worker's own login counts. The worker's
+    own login may appear in the setting and is ignored there, so one
+    list serves every worker. Empty logins never count (they would match
+    deleted accounts).
     """
 
     if peer_logins is not None:
@@ -90,6 +92,18 @@ def _peer_login_set(peer_logins: Iterable[str] | None) -> frozenset[str]:
     raw = os.environ.get("PEER_LOGINS", "")
     return frozenset(
         part for part in re.split(r"[,\s]+", raw) if part
+    )
+
+
+def _trusted_agent_logins(viewer_login: str, peer_logins: frozenset[str]) -> frozenset[str]:
+    """The agent logins trusted as the worker's own: itself plus its peers.
+
+    Empty logins never count (they would match deleted accounts); the
+    worker's own login inside the peer set changes nothing.
+    """
+
+    return frozenset(
+        login for login in ({viewer_login} | set(peer_logins)) if login
     )
 
 
@@ -373,9 +387,11 @@ class GitHubTracker:
 
     @property
     def peer_logins(self) -> frozenset[str]:
-        """Additional logins whose conflict-attempt comments count toward the budget.
+        """Peer worker logins trusted as the worker's own, from ``PEER_LOGINS``.
 
-        The worker's own login always counts; these pool peers count too.
+        The worker's own login always counts alongside these pool peers;
+        the set drives trusted comments, continuation detection, the
+        automatic-continuation count, and the conflict-attempt budget.
         Empty when the pool setting is absent.
         """
 
@@ -725,22 +741,24 @@ class GitHubTracker:
     def trusted_comments(self, issue: TrackerIssue) -> tuple[str, ...]:
         """Chronologically ordered bodies of comments trusted for the model's prompt.
 
-        Trusted means authored by the issue's own author or by this agent's
-        GitHub identity (its own attempt-result and handoff comments). Any
-        other commenter is excluded, so the model never sees guidance it
-        cannot attribute to someone with write access to the issue. The
-        shared handoff record is never trusted: its hidden machine marker is
-        bookkeeping, not model-facing context.
+        Trusted means authored by the issue's own author or by an agent
+        identity (this worker's own GitHub login plus its ``PEER_LOGINS``
+        pool peers: their attempt-result and handoff comments count as
+        the worker's own). Any other commenter is excluded, so the model
+        never sees guidance it cannot attribute to someone with write
+        access to the issue. The shared handoff record is never trusted:
+        its hidden machine marker is bookkeeping, not model-facing context.
         """
 
         viewer = self._transport.viewer()
+        allowed = _trusted_agent_logins(viewer.login, self._peer_logins)
         comments = self._transport.list_issue_comments(self._target_repo, issue.number)
         return tuple(
             comment.body
             for comment in comments
             # An empty login means a deleted account; never trust one by
             # incidentally matching another deleted account.
-            if comment.author_login and comment.author_login in (issue.author_login, viewer.login)
+            if comment.author_login and (comment.author_login == issue.author_login or comment.author_login in allowed)
             and not is_handoff_record(comment.body)
         )
 
@@ -764,10 +782,12 @@ class GitHubTracker:
     def automatic_continuation_count(self, issue: TrackerIssue) -> int:
         """Count automatic continuations in a row since the last human requeue.
 
-        Only comments written by this agent's own GitHub identity are
-        examined; any other comment is ignored even if it contains the
-        marker. A human-requeue result (or a legacy unmarked result from
-        before the marker existed) resets the count to zero.
+        Only comments written by an agent identity (this worker's own
+        GitHub login plus its ``PEER_LOGINS`` pool peers) are examined;
+        any other comment is ignored even if it contains the marker. A
+        human-requeue result (or a legacy unmarked result from before the
+        marker existed) resets the count to zero, whichever worker wrote
+        it, so alternating workers cannot multiply the budget.
 
         The single trusted shared handoff record is authoritative when
         present: its standing is reconciled with newer ordinary results in
@@ -781,13 +801,14 @@ class GitHubTracker:
         """
 
         viewer = self._transport.viewer()
+        allowed = _trusted_agent_logins(viewer.login, self._peer_logins)
         comments = self._transport.list_issue_comments(self._target_repo, issue.number)
         own_bodies_newest_first = tuple(
             comment.body
             for comment in reversed(comments)
             # An empty login means a deleted account; never count one by
             # incidentally matching another deleted account.
-            if comment.author_login and comment.author_login == viewer.login
+            if comment.author_login and comment.author_login in allowed
         )
         return resolve_automatic_continuation_count(
             own_bodies_newest_first,
@@ -809,7 +830,7 @@ class GitHubTracker:
         """
 
         viewer = self._transport.viewer()
-        allowed = {viewer.login} | set(self._peer_logins)
+        allowed = _trusted_agent_logins(viewer.login, self._peer_logins)
         comments = self._transport.list_issue_comments(self._target_repo, issue.number)
         own_bodies_newest_first = tuple(
             comment.body
@@ -838,9 +859,20 @@ class GitHubGraphQLTransport:
 
     _endpoint = "https://api.github.com/graphql"
 
-    def __init__(self, token: str, *, max_retries: int = 3) -> None:
+    def __init__(
+        self,
+        token: str,
+        *,
+        max_retries: int = 3,
+        peer_logins: Iterable[str] | None = None,
+    ) -> None:
         self._token = token
         self._max_retries = max_retries
+        # Explicit peer logins win; when absent the ``PEER_LOGINS``
+        # environment setting is read at lookup time, like the tracker.
+        self._explicit_peer_logins = (
+            None if peer_logins is None else _peer_login_set(peer_logins)
+        )
 
     def list_issues(self, repository: str, cursor: str | None) -> IssuePage:
         owner, name = _repository_parts(repository)
@@ -1279,16 +1311,24 @@ class GitHubGraphQLTransport:
     ) -> HandoffRecordRef | None:
         """Return the trusted shared handoff comment, if exactly one exists.
 
-        Only comments authored by this agent's own GitHub identity are
-        considered, under the same trust rule as the prompt filter; the
-        shared record is located through its explicit versioned machine
-        marker, never by loose text match. More than one trusted record
-        means ambiguous remote state, which the publisher retains for
-        recovery instead of guessing.
+        Only comments authored by an agent identity (this worker's own
+        GitHub login plus its ``PEER_LOGINS`` pool peers) are considered,
+        under the same trust rule as the prompt filter, so a worker
+        continuing another worker's handoff updates the same shared
+        record; the shared record is located through its explicit
+        versioned machine marker, never by loose text match. More than
+        one trusted record means ambiguous remote state, which the
+        publisher retains for recovery instead of guessing.
         """
 
         owner, name = _repository_parts(repository)
         viewer_login = self.viewer().login
+        peers = (
+            self._explicit_peer_logins
+            if self._explicit_peer_logins is not None
+            else _peer_login_set(None)
+        )
+        allowed = _trusted_agent_logins(viewer_login, peers)
         data = self._execute(
             """
             query HandoffRecordComments($owner: String!, $name: String!, $number: Int!) {
@@ -1306,8 +1346,7 @@ class GitHubGraphQLTransport:
                 for node in nodes
                 if isinstance(node, dict)
                 and is_handoff_record(node.get("body", ""))
-                and _comment_author(node) == viewer_login
-                and viewer_login
+                and _comment_author(node) in allowed
             ]
         except (KeyError, TypeError) as error:
             raise GitHubTrackerError("GitHub returned invalid issue comments") from error
