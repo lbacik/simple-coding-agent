@@ -223,8 +223,15 @@ class InMemoryWorkspace:
                 branch=self._branch,
                 base_revision=self._base_revision,
                 rebase_conflicts=tuple(self.prepare_conflicts),
+                remote_branch_revision=None,
+                remote_branch_known=True,
             )
-        return PreparedAttempt(branch=self._branch, base_revision=self._base_revision)
+        return PreparedAttempt(
+            branch=self._branch,
+            base_revision=self._base_revision,
+            remote_branch_revision=None,
+            remote_branch_known=True,
+        )
 
     def is_clean(self) -> bool:
         return not (self.dirty - self.ignored - self.base_ignored)

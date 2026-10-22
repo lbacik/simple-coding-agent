@@ -156,5 +156,11 @@ class BranchPusher(Protocol):
     """
 
     def push_attempt_branch(
-        self, branch: str, *, max_retries: int, deadline: float | None = None
+        self,
+        branch: str,
+        *,
+        max_retries: int,
+        deadline: float | None = None,
+        expected_revision: str | None = None,
+        lease_known: bool = False,
     ) -> str: ...

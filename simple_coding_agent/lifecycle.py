@@ -1954,6 +1954,45 @@ class AgentLifecycle:
                 issue_number=issue_number,
             )
 
+    def _record_claim_lease(self, prepared: PreparedAttempt, issue_number: int) -> None:
+        """Durably record the claim-time lease observed while preparing; never raises.
+
+        The first recording wins: recovery keeps the original lease instead
+        of overwriting it with a later observation, so pushes keep using the
+        revision observed at attempt start. Checkpoints without a recorded
+        lease (older versions) fall back to today's observed lease in the
+        publisher. Values without an observation (older test doubles) record
+        nothing.
+        """
+
+        try:
+            current = self._attempt_state.read()
+        except Exception:
+            return
+        if current is None:
+            return
+        if getattr(current, "claim_lease_recorded", False):
+            return
+        if not getattr(prepared, "remote_branch_known", False):
+            return
+        try:
+            self._attempt_state.record_claim_lease(prepared.remote_branch_revision)
+        except Exception as error:
+            self._event_log(
+                "claim_lease_record_failed",
+                f"the claim-time lease could not be recorded: {error}",
+                level="WARNING",
+                issue_number=issue_number,
+            )
+            return
+        self._event_log(
+            "claim_lease_recorded",
+            f"branch={prepared.branch}; lease="
+            f"{'absent' if prepared.remote_branch_revision is None else prepared.remote_branch_revision}",
+            level="INFO",
+            issue_number=issue_number,
+        )
+
     def _remember_workspace_dirty(self, attempt_id: str, dirty: bool) -> None:
         """Remember the workspace-dirty state for telemetry (never raises)."""
 
@@ -2185,6 +2224,7 @@ class AgentLifecycle:
             prepared = self._workspace.prepare_attempt(
                 base_branch=profile.base_branch, issue_number=claim.issue.number
             )
+            self._record_claim_lease(prepared, claim.issue.number)
         except DirtyWorkspaceError as error:
             self._remember_workspace_dirty(attempt_id, True)
             return False, (
@@ -3860,6 +3900,7 @@ class AgentLifecycle:
                 prepared = self._workspace.prepare_attempt(
                     base_branch=profile.base_branch, issue_number=claim.issue.number
                 )
+                self._record_claim_lease(prepared, claim.issue.number)
                 rebase_conflicts = tuple(prepared.rebase_conflicts or ())
                 prepared_detail = (
                     f"branch={prepared.branch}; base_branch={profile.base_branch}"
@@ -5234,6 +5275,7 @@ class AgentLifecycle:
             prepared = self._workspace.prepare_attempt(
                 base_branch=profile.base_branch, issue_number=claim.issue.number
             )
+            self._record_claim_lease(prepared, claim.issue.number)
             if checkpoint.phase is AttemptPhase.MODEL_RUNNING:
                 commits = self._workspace.commits_added(prepared)
                 has_commits = bool(commits)
@@ -5687,6 +5729,7 @@ class AgentLifecycle:
         prepared = self._workspace.prepare_attempt(
             base_branch=profile.base_branch, issue_number=issue_number
         )
+        self._record_claim_lease(prepared, issue_number)
         self._event_log(
             "workspace_prepared",
             f"branch={prepared.branch}; base_branch={profile.base_branch}",

@@ -6,8 +6,12 @@ from pathlib import Path
 import pytest
 
 from simple_coding_agent.completion import AttemptOutcome, CompletionDecision, PublicationPath
-from simple_coding_agent.attempt_state import AttemptPhase, AttemptStateStore
-from simple_coding_agent.git_workspace import GitWorkspace, GitWorkspaceError
+from simple_coding_agent.attempt_state import AttemptPhase, AttemptStateError, AttemptStateStore
+from simple_coding_agent.git_workspace import (
+    BranchMovedSinceClaimError,
+    GitWorkspace,
+    GitWorkspaceError,
+)
 from simple_coding_agent.publication import (
     HandoffRecordRef,
     PublicationRequest,
@@ -342,7 +346,15 @@ class FakeGitHub:
 
 
 class PushFailingWorkspace:
-    def push_attempt_branch(self, branch: str, *, max_retries: int, deadline: float | None = None) -> str:
+    def push_attempt_branch(
+        self,
+        branch: str,
+        *,
+        max_retries: int,
+        deadline: float | None = None,
+        expected_revision: str | None = None,
+        lease_known: bool = False,
+    ) -> str:
         raise GitWorkspaceError("remote hung up unexpectedly")
 
 
@@ -852,3 +864,134 @@ def test_result_comment_records_an_automatic_requeue_source_when_requested(
     (comment,) = [body for _, body in github.comments]
     assert "<!-- requeue-source: automatic -->" in comment
     assert "<!-- requeue-source: human -->" not in comment
+
+
+class BranchMovedWorkspace:
+    """A pusher double whose remote moved since the claim-time lease."""
+
+    def __init__(self, revision: str | None = None) -> None:
+        self.revision = revision
+        self.calls: list[tuple[str | None, bool]] = []
+
+    def push_attempt_branch(
+        self,
+        branch: str,
+        *,
+        max_retries: int,
+        deadline: float | None = None,
+        expected_revision: str | None = None,
+        lease_known: bool = False,
+    ) -> str:
+        self.calls.append((expected_revision, lease_known))
+        raise BranchMovedSinceClaimError(
+            f"branch moved since claim: remote {branch} is rival-sha,"
+            " claim-time lease was absent"
+        )
+
+
+class RecordingWorkspace:
+    """A pusher double recording the lease each push used."""
+
+    def __init__(self, sha: str = "new-sha") -> None:
+        self.sha = sha
+        self.calls: list[tuple[str | None, bool]] = []
+
+    def push_attempt_branch(
+        self,
+        branch: str,
+        *,
+        max_retries: int,
+        deadline: float | None = None,
+        expected_revision: str | None = None,
+        lease_known: bool = False,
+    ) -> str:
+        self.calls.append((expected_revision, lease_known))
+        return self.sha
+
+
+def test_claim_lease_rejection_ends_as_infrastructure_error_without_retry(
+    tmp_path: Path,
+) -> None:
+    workspace = BranchMovedWorkspace()
+    github = FakeGitHub()
+    events: list[tuple[str, str, str, int | None]] = []
+    state = publishing_state(tmp_path)
+    state.record_claim_lease(None)
+
+    result = Publisher(
+        workspace,
+        github,
+        "octo/example",
+        attempt_state=state,
+        event_log=lambda event, detail="", level="INFO", issue_number=None: events.append(
+            (event, detail, level, issue_number)
+        ),
+    ).publish(
+        request(CompletionDecision(None, True, PublicationPath.COMPLETE, ("ready",)), "agent/issue-23")
+    )
+
+    assert result.outcome is AttemptOutcome.INFRASTRUCTURE_ERROR
+    # The lease rejection is not retried: exactly one push attempt.
+    assert workspace.calls == [(None, True)]
+    assert "branch moved since claim" in result.details
+    assert "Partial branch push failed" in result.details
+    assert len(github.comments) == 1
+    assert "branch moved since claim" in github.comments[0][1]
+    assert len(events) == 1
+    assert events[0][0] == "publication_failed"
+    assert "branch moved since claim" in events[0][1]
+    assert events[0][2] == "ERROR"
+    assert events[0][3] == 23
+
+
+def test_successful_push_advances_the_recorded_claim_lease(tmp_path: Path) -> None:
+    workspace = RecordingWorkspace(sha="new-sha")
+    github = FakeGitHub()
+    state = publishing_state(tmp_path)
+    state.record_claim_lease("old-sha")
+
+    result = Publisher(workspace, github, "octo/example", attempt_state=state).publish(
+        request(CompletionDecision(None, True, PublicationPath.COMPLETE, ("ready",)), "agent/issue-23")
+    )
+
+    assert result.outcome is AttemptOutcome.COMPLETE
+    assert workspace.calls == [("old-sha", True)]
+    assert state.read() is not None
+    assert state.read().claim_branch_revision == "new-sha"
+    assert state.read().claim_lease_recorded is True
+
+
+def test_claim_lease_advance_failure_is_not_reported_as_a_push_failure(
+    tmp_path: Path,
+) -> None:
+    class AdvanceFailingStore(AttemptStateStore):
+        def advance_claim_lease(self, revision: str | None):  # type: ignore[override]
+            raise AttemptStateError("disk is gone")
+
+    workspace = RecordingWorkspace(sha="new-sha")
+    github = FakeGitHub()
+    events: list[tuple[str, str, str, int | None]] = []
+    inner = publishing_state(tmp_path)
+    inner.record_claim_lease("old-sha")
+    state = AdvanceFailingStore(tmp_path)
+
+    result = Publisher(
+        workspace,
+        github,
+        "octo/example",
+        attempt_state=state,
+        event_log=lambda event, detail="", level="INFO", issue_number=None: events.append(
+            (event, detail, level, issue_number)
+        ),
+    ).publish(
+        request(CompletionDecision(None, True, PublicationPath.COMPLETE, ("ready",)), "agent/issue-23")
+    )
+
+    assert result.outcome is AttemptOutcome.INFRASTRUCTURE_ERROR
+    assert "Claim lease advance failed" in result.details
+    assert "Partial branch push failed" not in result.details
+    assert "Claim lease advance failed" in github.comments[0][1]
+    assert len(events) == 1
+    assert "Claim lease advance failed" in events[0][1]
+    assert inner.read() is not None
+    assert inner.read().claim_branch_revision == "old-sha"
