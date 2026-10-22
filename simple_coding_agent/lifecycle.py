@@ -132,6 +132,7 @@ from simple_coding_agent.github_tracker import (
     MERGE_CONFLICT,
     ROUND_FINISHED,
     Claim,
+    ClaimLostError,
     TrackerIssue,
     ineligibility_reason,
 )
@@ -2727,12 +2728,13 @@ class AgentLifecycle:
     def _recovery_conflict_reason(
         self, claim: Claim, checkpoint: AttemptCheckpoint
     ) -> str | None:
-        """Detect conflicting human changes or ambiguous state before a retry.
+        """Detect conflicting assignment or label changes before a retry.
 
         Returns a hold reason, or ``None`` when no conflict blocks the retry.
         A fetch failure is ambiguous (the hold remains); a confidently
-        observed human change (assignment or labels moved by someone else) is
-        conflicting (the retry must not overwrite it).
+        observed change by someone else (assignment or labels moved by
+        another worker or a human) is conflicting (the retry must not
+        overwrite it).
         """
 
         try:
@@ -2761,12 +2763,14 @@ class AgentLifecycle:
             if holders:
                 return (
                     f"issue #{checkpoint.issue_number} shows conflicting"
-                    f" human changes (assigned to {holders}); the retry"
+                    f" assignment changes (assigned to another assignee:"
+                    f" {holders}); the retry"
                     " must not overwrite them and requires operator repair."
                 )
             return (
-                f"issue #{checkpoint.issue_number} shows conflicting human"
-                " changes (it is no longer assigned to this agent); the"
+                f"issue #{checkpoint.issue_number} shows conflicting"
+                " assignment changes (it is assigned to another assignee,"
+                " no longer this agent); the"
                 " retry must not overwrite them and requires operator repair."
             )
         return None
@@ -4350,10 +4354,10 @@ class AgentLifecycle:
         if reason is not None:
             if fresh is not None and self._is_self_assignment(fresh):
                 # Our own assignment is an ambiguous prior claim (the
-                # target was unassigned at acceptance and only this
-                # process claims through the serialized boundary), never
-                # lost eligibility: hold it for reconciliation instead of
-                # failing the priority and falling back to FIFO.
+                # target was unassigned at acceptance and this worker's
+                # own assignment went through while its reply was lost),
+                # never lost eligibility: hold it for reconciliation
+                # instead of failing the priority and falling back to FIFO.
                 self._event_log(
                     "next_issue_claim_ambiguous",
                     f"issue #{target_number} is assigned to this agent after"
@@ -4378,6 +4382,25 @@ class AgentLifecycle:
         assert fresh is not None  # eligibility implies presence
         try:
             claim = self._tracker.claim_verified(fresh)
+        except ClaimLostError as error:
+            # Another assignee won the priority target during the settle
+            # window (the tracker already removed only our assignment and
+            # emitted ``claim_lost``): the priority ends terminally as not
+            # fulfilled and this same cycle falls back to FIFO.
+            holders = ", ".join(error.other_assignees)
+            suffix = f" ({holders})" if holders else ""
+            reason = (
+                f"issue #{target_number} claimed by another assignee{suffix}"
+            )
+            store.fail_next_issue(reason)
+            self._event_log(
+                "next_issue_not_fulfilled",
+                f"issue #{target_number} not fulfilled: {reason};"
+                " falling back to the runnable queue",
+                level="WARNING",
+                issue_number=target_number,
+            )
+            return None
         except Exception as error:
             self._event_log(
                 "next_issue_claim_ambiguous",

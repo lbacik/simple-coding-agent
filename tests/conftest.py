@@ -55,3 +55,25 @@ def publisher() -> FakePublisher:
     """A fresh shared publisher double with default publication behaviour."""
 
     return FakePublisher()
+
+
+@pytest.fixture(autouse=True)
+def _instant_claim_settle(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    """Keep the claim settle-window verification instant suite-wide.
+
+    Production always waits :data:`CLAIM_SETTLE_DELAY_SECONDS
+    <simple_coding_agent.github_tracker.CLAIM_SETTLE_DELAY_SECONDS>` between
+    assigning and re-reading; the dedicated hardening tests record the call
+    and assert the delay. Every other test replaces only the tracker's own
+    ``time`` binding with an instant sleep so the suite never waits out the
+    window (and unrelated ``time.sleep`` users, e.g. telemetry timing, are
+    untouched).
+    """
+
+    import types
+
+    import simple_coding_agent.github_tracker as tracker_module
+
+    stub = types.SimpleNamespace(sleep=lambda seconds: None)
+    monkeypatch.setattr(tracker_module, "time", stub)
+    yield
