@@ -85,8 +85,9 @@ Use a fine-grained GitHub PAT limited to the configured repository with only
 `contents:write`, `pull-requests:write`, and `issues:write`. Configure provider
 spending controls in Meta: SDK `max_budget_usd=5` is only a circuit breaker.
 The agent uses only `muse-spark-1.3-contributor`; no fallback model is set.
-The pinned runtime is `claude-agent-sdk==0.2.172` together with the Claude
-Code CLI bundled inside it; pinning the SDK pins the CLI.
+The pinned runtime is the `claude-agent-sdk==` release pinned in
+`pyproject.toml` together with the Claude Code CLI bundled inside it;
+pinning the SDK pins the CLI.
 
 The model backend is configured through operator settings that default to
 Meta, so an existing `.env` with only `META_API_KEY` keeps working with no

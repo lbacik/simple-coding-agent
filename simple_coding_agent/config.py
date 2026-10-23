@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from importlib import metadata
 import logging
 import os
 from pathlib import Path
@@ -37,16 +38,31 @@ _MERGE_METHODS = frozenset({"merge", "squash", "rebase"})
 _HANDOFF_COMMENT_MODES = frozenset({"link", "verbose"})
 _DEFAULT_HANDOFF_COMMENT_MODE = "link"
 _DEFAULT_MODEL_STREAM_IDLE_TIMEOUT_MS = 60000
-#: The single approved agent-SDK release that provenance verification checks
-#: the installed SDK against at startup. This is defined in code, not read
-#: from the environment: the Claude Agent SDK exports ``CLAUDE_AGENT_SDK_VERSION``
-#: into every CLI process it starts, so an inherited value must never become
-#: the expectation. Bump this together with the ``claude-agent-sdk==`` pin in
-#: ``pyproject.toml`` after validating an upgrade; the
-#: ``test_expected_sdk_version_matches_dependency_pin`` test guards the drift.
-EXPECTED_CLAUDE_AGENT_SDK_VERSION = "0.2.172"
 _DEFAULT_HANDOFF_RESERVE_TURNS = 6
 _MAX_HANDOFF_RESERVE_TURNS = 20
+
+
+def _pinned_claude_agent_sdk_version() -> str:
+    """The ``claude-agent-sdk==`` pin this package was installed with.
+
+    Read from the installed package metadata, which is generated from the
+    pin in ``pyproject.toml``, so the pin stays the single place an SDK
+    upgrade is made.
+    """
+
+    for requirement in metadata.requires("simple-coding-agent") or ():
+        pin = re.fullmatch(r"claude-agent-sdk==([^\s;]+)", requirement)
+        if pin:
+            return pin.group(1)
+    raise RuntimeError("simple-coding-agent is installed without a claude-agent-sdk pin")
+
+
+#: The single approved agent-SDK release that provenance verification checks
+#: the installed SDK against at startup. It comes from this package's own
+#: metadata, never from the environment: the Claude Agent SDK exports
+#: ``CLAUDE_AGENT_SDK_VERSION`` into every CLI process it starts, so an
+#: inherited value must never become the expectation.
+EXPECTED_CLAUDE_AGENT_SDK_VERSION = _pinned_claude_agent_sdk_version()
 
 
 def effective_soft_threshold_tokens(

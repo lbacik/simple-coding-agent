@@ -589,7 +589,11 @@ class TestDockerSmoke:
             text=True,
         )
         assert result.returncode == 0
-        assert result.stdout.strip() == "0.2.172", (
+        pin = re.search(
+            r'"claude-agent-sdk==([^"]+)"', (ROOT / "pyproject.toml").read_text()
+        )
+        assert pin, "pyproject.toml must pin the SDK"
+        assert result.stdout.strip() == pin.group(1), (
             f"SDK version mismatch: {result.stdout.strip()}"
         )
 
@@ -606,7 +610,11 @@ class TestDockerSmoke:
             text=True,
         )
         assert result.returncode == 0
-        assert result.stdout.strip() == "2.1.308", (
+        # The CLI ships inside the SDK wheel, so the image must carry the same
+        # CLI as the SDK installed here from the same pin.
+        from claude_agent_sdk._cli_version import __cli_version__
+
+        assert result.stdout.strip() == __cli_version__, (
             f"Bundled CLI version mismatch: {result.stdout.strip()}"
         )
 

@@ -45,9 +45,9 @@ def test_loads_required_operator_settings_and_defaults(tmp_path: Path) -> None:
 
 
 def test_expected_sdk_version_matches_dependency_pin(tmp_path: Path) -> None:
-    # The expected SDK version is defined in code, not read from the
-    # environment, so a bump must change the constant together with the pin
-    # that decides what gets installed. This test fails when they drift apart.
+    # The expected SDK version comes from the installed package metadata, not
+    # the environment, so it must equal the pin that decides what gets
+    # installed and an SDK bump touches only pyproject.toml.
     pyproject = (Path(__file__).parent.parent / "pyproject.toml").read_text()
     dependency_pin = re.search(r'"claude-agent-sdk==([^"]+)"', pyproject)
     assert dependency_pin, "pyproject.toml must pin the SDK"
@@ -58,7 +58,7 @@ def test_expected_sdk_version_matches_dependency_pin(tmp_path: Path) -> None:
     assert not re.search(r'^[^#\n]*claude-agent-sdk==', dockerfile, re.MULTILINE)
 
     # The runtime config carries no SDK version: provenance verification at
-    # startup uses the in-code constant, so no operator setting can override it.
+    # startup uses the pinned version, so no operator setting can override it.
     config = load_runtime_config(_operator_env(tmp_path))
     assert not hasattr(config, "claude_agent_sdk_version")
 
