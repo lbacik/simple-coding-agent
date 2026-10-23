@@ -1494,14 +1494,47 @@ class AgentLifecycle:
         the handoff outcome, publication, issue release, and cleanup are
         durably finished; anything short of that marks it ``not fulfilled``
         with the branch, checkpoint, and working tree retained for recovery.
+        While startup reconciliation is running, while a recovery hold
+        retains the attempt, or when the checkpoint cannot be read, the
+        command is rejected up front -- no model could deliver it -- with
+        no control change and nothing stored.
         """
 
         if self._control_store is None:
             raise ControlStoreError("Operator control is not configured")
         with self._control_lock:
-            has_active_attempt = self._attempt_state.read() is not None
+            try:
+                checkpoint = self._attempt_state.read()
+            except AttemptStateError as error:
+                # The checkpoint cannot be read, so no handoff could be
+                # delivered: reject with the startup hold instead of
+                # raising, keeping the control socket usable while held.
+                self._enter_checkpoint_hold_locked(error)
+                # Bound locally: the control path must not depend on an
+                # assert (which vanishes under -O and would crash the
+                # socket it is meant to keep serving if it ever fired).
+                detail = self._startup_hold_detail or _checkpoint_hold_detail(error)
+                return self._control_store.submit_handoff(
+                    request_id,
+                    has_active_attempt=True,
+                    recovery_hold=RecoveryHold(
+                        issue_number=None,
+                        attempt_id=None,
+                        branch=None,
+                        phase=None,
+                        reason=detail,
+                    ),
+                )
+            hold = self._recovery_hold_locked(checkpoint)
+            if checkpoint is None and hold is not None and not self._recovering:
+                # No checkpoint and no reconciliation in flight: the hold
+                # can only be the dirty-tree hold, which stays a "no active
+                # attempt" rejection for handoff.
+                hold = None
             return self._control_store.submit_handoff(
-                request_id, has_active_attempt=has_active_attempt
+                request_id,
+                has_active_attempt=checkpoint is not None,
+                recovery_hold=hold,
             )
 
     def submit_next_issue(self, request_id: str, issue: object) -> CommandRecord:

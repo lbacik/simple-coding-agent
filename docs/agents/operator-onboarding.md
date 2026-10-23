@@ -633,6 +633,20 @@ retry` (replays only unconfirmed safe steps, never the model) or `recovery
 release --saved-at` (after you secured the work) clears it without duplicate
 remote effects.
 
+`handoff now` is rejected up front -- exit 1, no control change, nothing
+stored -- when no model could deliver it:
+
+- without an active attempt there is nothing to hand off;
+- once the model has begun the handoff skill a second request cannot undo it;
+- while startup reconciliation is running;
+- under a recovery hold for the retained attempt (unresolved finalization or
+  a running `recovery` command) -- resolve it with `agentctl recovery` first;
+- when the attempt checkpoint cannot be read, naming the checkpoint hold
+  detail.
+
+Retrying an already-accepted request ID with the identical payload still
+returns the stored record, even if a hold has since appeared.
+
 ## Persisted error-guard recovery
 
 The agent tracks consecutive `infrastructure_error` outcomes in
