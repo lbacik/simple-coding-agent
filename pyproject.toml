@@ -4,11 +4,11 @@ build-backend = "hatchling.build"
 
 [project]
 name = "simple-coding-agent"
-version = "0.6.3"
+version = "0.7.0"
 description = "An unattended coding agent for one GitHub repository."
 requires-python = ">=3.11"
 dependencies = [
-    "claude-agent-sdk==0.2.172",
+    "claude-agent-sdk==0.2.173",
     "python-dotenv==1.2.4",
     "PyYAML>=6.0,<7",
 ]
