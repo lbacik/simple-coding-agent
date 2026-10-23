@@ -13,6 +13,7 @@ from pathlib import Path
 import re
 import shlex
 import subprocess
+import time
 from types import MappingProxyType
 from typing import Any, Protocol
 
@@ -491,6 +492,8 @@ class SDKClient(Protocol):
 
     async def interrupt(self) -> None: ...
 
+    async def stop_task(self, task_id: str) -> None: ...
+
     async def query(self, prompt: str) -> None: ...
 
     def receive_response(self) -> Any: ...
@@ -503,6 +506,11 @@ class EvidenceWriter(Protocol):
 
     def write_text(self, name: str, content: str) -> Path: ...
 
+
+#: Background task types that hold a result back. Mirrors the SDK's
+#: ``DEFERRING_TASK_TYPES``: shells and monitors run indefinitely by design,
+#: so deferring on them would withhold the result forever.
+DEFERRING_TASK_TYPES = frozenset({"local_agent", "local_workflow"})
 
 ClientFactory = Callable[[ClaudeAgentOptions], SDKClient]
 Clock = Callable[[], datetime]
@@ -1645,6 +1653,8 @@ class ModelExecutor:
         deferred_results = 0
         model_turn_after_defer = False
         background_followup_sent = False
+        deferred_result: Any = None
+        grace_started: float | None = None
         # One pending ``__anext__()`` shared across loop iterations: waiting
         # for it with ``asyncio.wait`` (instead of ``asyncio.timeout``) lets
         # operator boundaries pass without cancelling the generator, which
@@ -1674,7 +1684,49 @@ class ModelExecutor:
                         f"{self._operator_step_trail()}",
                     )
                     return None, tuple(observed_models)
+                if (
+                    grace_started is not None
+                    and self._deferring_task_ids(background_pending)
+                    and time.monotonic() - grace_started
+                    >= self._config.background_task_grace_seconds
+                ):
+                    await _cancel_stream_wait(pending)
+                    pending = None
+                    await self._stop_background_tasks(
+                        client,
+                        self._deferring_task_ids(background_pending),
+                        f"grace of {self._config.background_task_grace_seconds}s expired "
+                        "with deferring tasks still pending",
+                        waited=time.monotonic() - grace_started,
+                    )
+                    for task_id in self._deferring_task_ids(background_pending):
+                        background_pending.pop(task_id, None)
+                    resumed = await self._maybe_background_followup(
+                        client,
+                        self._deferring_pending(background_pending),
+                        background_finished,
+                        deferred_results,
+                        model_turn_after_defer,
+                        background_followup_sent,
+                    )
+                    if resumed is not None:
+                        stream = resumed
+                        background_followup_sent = True
+                        continue
+                    await self._stop_background_tasks(
+                        client,
+                        sorted(background_pending),
+                        "result is terminal; background tasks still running",
+                    )
+                    return deferred_result, tuple(observed_models)
                 wait = self._operator_stream_wait()
+                if grace_started is not None and self._deferring_task_ids(background_pending):
+                    remaining = max(
+                        self._config.background_task_grace_seconds
+                        - (time.monotonic() - grace_started),
+                        0.0,
+                    )
+                    wait = remaining if wait is None else min(wait, remaining)
                 if pending is None:
                     pending = asyncio.ensure_future(stream.__anext__())
                 if wait is None:
@@ -1684,7 +1736,7 @@ class ModelExecutor:
                         pending = None
                         resumed = await self._maybe_background_followup(
                             client,
-                            background_pending,
+                            self._deferring_pending(background_pending),
                             background_finished,
                             deferred_results,
                             model_turn_after_defer,
@@ -1707,7 +1759,7 @@ class ModelExecutor:
                     except StopAsyncIteration:
                         resumed = await self._maybe_background_followup(
                             client,
-                            background_pending,
+                            self._deferring_pending(background_pending),
                             background_finished,
                             deferred_results,
                             model_turn_after_defer,
@@ -1740,17 +1792,26 @@ class ModelExecutor:
                             "every background task reached a terminal status",
                         )
                 elif isinstance(message, ResultMessage) or _looks_like_result(message):
-                    if background_pending:
+                    deferring = self._deferring_task_ids(background_pending)
+                    if deferring:
                         self._settle_all_threads_and_log()
                         deferred_results += 1
+                        deferred_result = message
+                        if grace_started is None:
+                            grace_started = time.monotonic()
                         self._log(
                             "background_result_deferred",
-                            f"pending_task_ids={','.join(sorted(background_pending))}; "
+                            f"pending_task_ids={','.join(deferring)}; "
                             f"deferred_results={deferred_results}; the result is not "
                             "terminal while background tasks are still running",
                         )
                         continue
                     self._settle_all_threads_and_log()
+                    await self._stop_background_tasks(
+                        client,
+                        sorted(background_pending),
+                        "result is terminal; background tasks still running",
+                    )
                     return message, tuple(observed_models)
                 elif isinstance(message, AssistantMessage):
                     if deferred_results:
@@ -1777,6 +1838,49 @@ class ModelExecutor:
             # while a ``__anext__()`` is still pending; never leave it dangling.
             await _cancel_stream_wait(pending)
 
+    @classmethod
+    def _deferring_pending(
+        cls, pending: dict[str, dict[str, str | None]]
+    ) -> dict[str, dict[str, str | None]]:
+        return {task_id: pending[task_id] for task_id in cls._deferring_task_ids(pending)}
+
+    @staticmethod
+    def _deferring_task_ids(pending: dict[str, dict[str, str | None]]) -> list[str]:
+        return sorted(
+            task_id
+            for task_id, detail in pending.items()
+            if detail.get("task_type") in DEFERRING_TASK_TYPES
+        )
+
+    async def _stop_background_tasks(
+        self,
+        client: SDKClient,
+        task_ids: list[str],
+        reason: str,
+        *,
+        waited: float | None = None,
+    ) -> None:
+        """Stop the given background tasks; a failing stop never fails the attempt."""
+
+        if not task_ids:
+            return
+        stopped: list[str] = []
+        for task_id in task_ids:
+            try:
+                await client.stop_task(task_id)
+                stopped.append(task_id)
+            except Exception as error:
+                self._log(
+                    "background_task_stop_failed",
+                    f"task_id={task_id}; error={error!r}",
+                    level="WARNING",
+                )
+        waited_detail = f"; waited_seconds={waited:.1f}" if waited is not None else ""
+        self._log(
+            "background_tasks_stopped",
+            f"task_ids={','.join(stopped)}{waited_detail}; reason={reason}",
+        )
+
     def _observe_background_task(
         self,
         message: object,
@@ -1794,7 +1898,7 @@ class ModelExecutor:
 
         if isinstance(message, TaskStartedMessage):
             if message.task_id:
-                pending.setdefault(message.task_id, {})
+                pending.setdefault(message.task_id, {"task_type": message.task_type})
             return True
         if isinstance(message, TaskNotificationMessage):
             if message.status in TERMINAL_TASK_STATUSES:

@@ -336,6 +336,9 @@ class FakeClient:
     async def interrupt(self) -> None:
         self.interrupted = True
 
+    async def stop_task(self, task_id: str) -> None:
+        self.stopped_tasks = [*getattr(self, 'stopped_tasks', []), task_id]
+
     async def query(self, prompt: str) -> None:
         self.queried_prompts.append(prompt)
 

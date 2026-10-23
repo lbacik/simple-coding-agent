@@ -29,6 +29,7 @@ def test_loads_required_operator_settings_and_defaults(tmp_path: Path) -> None:
     assert config.poll_interval == 60
     assert config.log_level == "INFO"
     assert config.model_timeout == 3600
+    assert config.background_task_grace_seconds == 300
     assert config.publish_timeout == 120
     assert config.max_retries == 3
     assert config.max_consecutive_errors == 3
@@ -90,6 +91,7 @@ def test_inherited_claude_agent_sdk_version_is_ignored(
         ("TARGET_REPO", "owner/repo/extra"),
         ("POLL_INTERVAL", "zero"),
         ("MODEL_TIMEOUT", "0"),
+        ("BACKGROUND_TASK_GRACE_SECONDS", "0"),
         ("AGENT_TRUST_PROJECT_SETTINGS", "sometimes"),
         ("REVIEW_BLOCKING_SEVERITIES", " "),
         ("REVIEW_BLOCKING_SEVERITIES", ","),
@@ -142,6 +144,7 @@ def test_applies_operator_overrides_including_the_test_only_review_gate(
             "POLL_INTERVAL": "15",
             "LOG_LEVEL": "debug",
             "MODEL_TIMEOUT": "120",
+            "BACKGROUND_TASK_GRACE_SECONDS": "45",
             "PUBLISH_TIMEOUT": "45",
             "MAX_RETRIES": "4",
             "MAX_CONSECUTIVE_ERRORS": "2",
@@ -164,6 +167,7 @@ def test_applies_operator_overrides_including_the_test_only_review_gate(
     assert config.poll_interval == 15
     assert config.log_level == "DEBUG"
     assert config.model_timeout == 120
+    assert config.background_task_grace_seconds == 45
     assert config.publish_timeout == 45
     assert config.max_retries == 4
     assert config.max_consecutive_errors == 2
