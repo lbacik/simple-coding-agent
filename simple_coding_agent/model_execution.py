@@ -7,6 +7,7 @@ from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
+import functools
 import json
 import os
 from pathlib import Path
@@ -16,6 +17,7 @@ import subprocess
 import time
 from types import MappingProxyType
 from typing import Any, Protocol
+import uuid
 
 from claude_agent_sdk import (
     AssistantMessage,
@@ -33,6 +35,11 @@ from claude_agent_sdk import (
     UserMessage,
 )
 
+from simple_coding_agent.attempt_processes import (
+    ATTEMPT_PROCESS_GRACE_SECONDS,
+    ATTEMPT_PROCESS_MARKER,
+    reap_marked_processes,
+)
 from simple_coding_agent.config import RuntimeConfig
 from simple_coding_agent.telemetry import CONTEXT_WINDOW_BASES
 from simple_coding_agent.telemetry import (
@@ -1222,7 +1229,15 @@ class ModelExecutor:
             f"max_turns={self._config.max_turns}; "
             f"timeout_seconds={self._config.model_timeout}",
         )
-        client = self._client_factory(self._options(working_directory))
+        # Per-session process marker: child processes inherit it through the
+        # CLI environment, so the post-session reap finds them even after
+        # reparenting to PID 1 or ``setsid``. The attempt id is stable for
+        # the attempt; without one (ad-hoc runs) mint a fresh token so two
+        # concurrent sessions never share a marker value.
+        session_marker = attempt_id if attempt_id else uuid.uuid4().hex
+        client = self._client_factory(
+            self._options(working_directory, attempt_marker=session_marker)
+        )
         try:
             try:
                 await client.connect(f"/implement\n\n{issue_body}")
@@ -1278,6 +1293,7 @@ class ModelExecutor:
                         return followup
             finally:
                 await self._disconnect_client(client)
+                await self._reap_attempt_processes(session_marker)
         except Exception as error:
             return self._evidence(
                 ModelExecutionStatus.INFRASTRUCTURE_ERROR,
@@ -1309,6 +1325,43 @@ class ModelExecutor:
                 "client_disconnect_failed",
                 f"Claude SDK client disconnect failed: {type(error).__name__}.",
             )
+
+    async def _reap_attempt_processes(self, marker_value: str) -> None:
+        """Terminate processes this session started, identified by its marker.
+
+        Runs after the client disconnects on every exit path (the ``finally``
+        in :meth:`execute`). A failure here is logged and never changes the
+        attempt's classified outcome, following the ``_disconnect_client``
+        rule. Silence when nothing was left running keeps the event stream
+        free of per-attempt noise.
+        """
+
+        try:
+            reaped = await asyncio.to_thread(
+                functools.partial(
+                    reap_marked_processes,
+                    ATTEMPT_PROCESS_MARKER,
+                    marker_value,
+                    grace_seconds=ATTEMPT_PROCESS_GRACE_SECONDS,
+                )
+            )
+        except Exception as error:
+            self._log(
+                "attempt_process_reap_failed",
+                f"marker_value={marker_value}; error={error!r}",
+                level="WARNING",
+            )
+            return
+        if not reaped:
+            return
+        sigkill_pids = sorted(entry.pid for entry in reaped if entry.sigkill)
+        self._log(
+            "attempt_processes_reaped",
+            f"reaped={len(reaped)}; "
+            f"pids={','.join(str(entry.pid) for entry in reaped)}; "
+            f"sigkill_pids={','.join(str(pid) for pid in sigkill_pids) or 'none'}; "
+            f"commands={' | '.join(entry.cmdline for entry in reaped)}",
+        )
 
     def _is_model_limit(
         self, terminal: ResultMessage, observed_models: tuple[str, ...]
@@ -1619,7 +1672,9 @@ class ModelExecutor:
             all_models,
         )
 
-    def _options(self, working_directory: Path) -> ClaudeAgentOptions:
+    def _options(
+        self, working_directory: Path, *, attempt_marker: str | None = None
+    ) -> ClaudeAgentOptions:
         settings_sources = ["user"]
         if self._config.agent_trust_project_settings:
             settings_sources.append("project")
@@ -1632,7 +1687,7 @@ class ModelExecutor:
             include_partial_messages=True,
             cwd=working_directory,
             cli_path=self._cli_path,
-            env=_model_environment(self._config),
+            env=_model_environment(self._config, attempt_marker),
             setting_sources=settings_sources,
             strict_mcp_config=self._config.agent_trust_project_settings,
             extra_args={"disable-all-hooks": None}
@@ -3303,7 +3358,9 @@ def _deletes_handoff_note(command: str) -> bool:
     return False
 
 
-def _model_environment(config: RuntimeConfig) -> dict[str, str]:
+def _model_environment(
+    config: RuntimeConfig, attempt_marker: str | None = None
+) -> dict[str, str]:
     """Build the model-backend environment for the CLI from operator config.
 
     ``auth_token`` mode sends the credential as ``ANTHROPIC_AUTH_TOKEN``
@@ -3312,6 +3369,10 @@ def _model_environment(config: RuntimeConfig) -> dict[str, str]:
     credential variable is set to an empty string so a value inherited from
     the parent environment cannot leak into the CLI. An empty base URL
     means ``ANTHROPIC_BASE_URL`` is left unset (direct Anthropic API).
+
+    ``attempt_marker`` is this session's ``SCA_ATTEMPT_ID`` value, inherited
+    by every child process so the post-session reap can find processes that
+    outlived the CLI (reparented to PID 1 or in their own session).
     """
 
     api_key = (
@@ -3338,6 +3399,8 @@ def _model_environment(config: RuntimeConfig) -> dict[str, str]:
     environment["ANTHROPIC_DEFAULT_HAIKU_MODEL"] = model
     environment["CLAUDE_CODE_SUBAGENT_MODEL"] = model
     environment["CLAUDE_STREAM_IDLE_TIMEOUT_MS"] = str(config.model_stream_idle_timeout_ms)
+    if attempt_marker is not None:
+        environment[ATTEMPT_PROCESS_MARKER] = attempt_marker
     return environment
 
 

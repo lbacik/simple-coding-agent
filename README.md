@@ -252,6 +252,18 @@ drains the stream before teardown; `MODEL_STREAM_IDLE_TIMEOUT_MS` (default
 `60000`, passed as `CLAUDE_STREAM_IDLE_TIMEOUT_MS`) is a
 separate stalled-stream control.
 
+Every model session runs with a unique `SCA_ATTEMPT_ID` in the CLI
+environment, inherited by everything the model starts. After the SDK client
+disconnects — on every exit path (success, handoff, `MODEL_TIMEOUT`, token
+hard ceiling, or SDK failure) — the agent reaps that session's leftover
+processes: SIGTERM, a short grace period, then SIGKILL for survivors, logged
+as `attempt_processes_reaped` with the PIDs, command lines, and whether
+SIGKILL was needed. Processes from other sessions (or operator shells) carry
+a different value or none and are never signalled. The image ships `procps`
+so the model can also clean up within an attempt (`ps`/`pgrep`/`pkill`), and
+`docker-compose.yml` sets `init: true` so reaped children never linger as
+zombies under PID 1.
+
 The model runs with `bypassPermissions`, but an SDK `PreToolUse` guard denies
 model-side `git push`, `gh pr merge`, and `gh issue close`, including compound
 shell commands and `git -C`. It records `Skill` pre/post events with the skill
