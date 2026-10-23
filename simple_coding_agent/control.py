@@ -1299,14 +1299,23 @@ class ControlStore:
         raise RequestIdError(f"Unsupported command kind: {kind}")
 
     def get_command(self, request_id: str) -> CommandRecord | None:
-        """Return the durable record for one request ID, if any."""
+        """Return the durable record for one request ID, if any.
 
-        with self.lock:
-            try:
-                with self._connect() as connection:
-                    return self._find_locked(connection, request_id)
-            except sqlite3.Error as error:
-                raise ControlStoreError("Control command could not be read") from error
+        Read-only: it opens a fresh SQLite connection without taking the
+        store lock, so a lookup never waits on the control lock held
+        across the intake claim or a mutating submit's GitHub work. It
+        sees the last committed state; a submit that has not committed
+        yet reads back as not found (``None``), which is correct.
+        Callers already holding the lock (mutating submits, status
+        assembly) keep calling this directly: the re-entrant lock was
+        never needed for a single-statement read.
+        """
+
+        try:
+            with self._connect() as connection:
+                return self._find_locked(connection, request_id)
+        except sqlite3.Error as error:
+            raise ControlStoreError("Control command could not be read") from error
 
     def recent_commands(self, limit: int = 10) -> list[CommandRecord]:
         """Return the most recently committed commands, newest last."""

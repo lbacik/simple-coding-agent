@@ -145,7 +145,13 @@ class ControlServer:
         self._thread.start()
 
     def stop(self) -> None:
-        """Stop serving and remove the runtime endpoint."""
+        """Stop serving and remove the runtime endpoint.
+
+        Only the listener thread is joined (bounded at 10 s). In-flight
+        connection threads are daemons owned by this server: they finish
+        their single reply on their own and never hold the listener open
+        or keep the socket path in use after ``stop()`` unlinks it.
+        """
 
         self._stopped.set()
         listener, self._listener = self._listener, None
@@ -195,6 +201,15 @@ class ControlServer:
             pass
 
     def _serve(self) -> None:
+        """Accept connections until :meth:`stop` closes the listener.
+
+        Each connection is served on its own daemon thread so one
+        connection waiting on the control lock (a mutating submit, or the
+        intake claim across GitHub) never holds up ``telemetry`` or
+        ``command <id>`` behind it. A failing connection is contained to
+        its own thread and never takes down the listener.
+        """
+
         listener = self._listener
         if listener is None:
             return
@@ -206,20 +221,31 @@ class ControlServer:
                 continue
             except OSError:
                 return
+            worker = threading.Thread(
+                target=self._serve_connection,
+                args=(connection,),
+                name="agentctl-connection",
+                daemon=True,
+            )
+            worker.start()
+
+    def _serve_connection(self, connection: socket.socket) -> None:
+        """Serve one connection on its own thread, then close it."""
+
+        try:
             try:
-                try:
-                    self._handle(connection)
-                except Exception as error:
-                    # One failing request must never stop the listener: log
-                    # the failure and answer on the same connection when it
-                    # is still writable, then accept the next connection.
-                    self._log_control_error(f"{type(error).__name__}: {error}")
-                    self._send_failure(connection, error)
-            finally:
-                try:
-                    connection.close()
-                except OSError:
-                    pass
+                self._handle(connection)
+            except Exception as error:
+                # One failing request must never stop the listener: log
+                # the failure and answer on the same connection when it
+                # is still writable, then close this connection.
+                self._log_control_error(f"{type(error).__name__}: {error}")
+                self._send_failure(connection, error)
+        finally:
+            try:
+                connection.close()
+            except OSError:
+                pass
 
     def _handle(self, connection: socket.socket) -> None:
         try:
@@ -504,13 +530,19 @@ class ControlServer:
     def _reply_command(self, connection: socket.socket, request: dict) -> None:
         from simple_coding_agent.control import ControlStoreError, command_to_json
 
+        # The repository label here must never take the control lock:
+        # ``control_status()`` serializes on it, which would make the
+        # lookup wait behind the very submit it is meant to observe.
+        repository = getattr(self._control, "repository", None)
+        if not isinstance(repository, str) or not repository:
+            repository = "unknown"
         request_id = request.get("request_id")
         if not isinstance(request_id, str) or not request_id:
             _send(
                 connection,
                 {
                     "ok": False,
-                    "repository": self._repository(),
+                    "repository": repository,
                     "error": "A request ID is required.",
                 },
             )
@@ -522,7 +554,7 @@ class ControlServer:
                 connection,
                 {
                     "ok": False,
-                    "repository": self._repository(),
+                    "repository": repository,
                     "error": f"Lookup is unavailable: {error}",
                 },
             )
@@ -532,7 +564,7 @@ class ControlServer:
             {
                 "ok": True,
                 "request_id": request_id,
-                "repository": self._repository(),
+                "repository": repository,
                 "command": command_to_json(record) if record is not None else None,
             },
         )
