@@ -72,11 +72,8 @@ class BackgroundFakeClient:
         self.queried_prompts: list[str] = []
         self.interrupted = False
 
-    async def __aenter__(self) -> BackgroundFakeClient:
-        return self
-
-    async def __aexit__(self, *unused: object) -> None:
-        return None
+    async def disconnect(self) -> None:
+        self.disconnect_count = getattr(self, "disconnect_count", 0) + 1
 
     async def connect(self, prompt: str) -> None:
         self.prompt = prompt

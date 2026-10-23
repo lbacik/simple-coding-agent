@@ -43,23 +43,24 @@ class FakeClient:
         self.prompt: str | None = None
         self.interrupted = False
         self.queried_prompts: list[str] = []
+        self.calls: list[str] = []
 
-    async def __aenter__(self) -> FakeClient:
-        return self
-
-    async def __aexit__(self, *unused: object) -> None:
-        return None
+    async def disconnect(self) -> None:
+        self.calls.append("disconnect")
 
     async def connect(self, prompt: str) -> None:
+        self.calls.append("connect")
         self.prompt = prompt
 
     async def interrupt(self) -> None:
+        self.calls.append("interrupt")
         self.interrupted = True
 
     async def stop_task(self, task_id: str) -> None:
         self.stopped_tasks = [*getattr(self, 'stopped_tasks', []), task_id]
 
     async def query(self, prompt: str) -> None:
+        self.calls.append("query")
         self.queried_prompts.append(prompt)
         if self._on_query is not None:
             self._on_query()
@@ -3783,3 +3784,132 @@ def test_compaction_during_pending_operator_handoff_reinjects(tmp_path: Path) ->
     assert any(
         name == "operator_handoff_context_reinjected" for name, _ in events
     )
+
+
+class RealSDKClient(FakeClient):
+    """Like the real SDK client: entering the context already connects."""
+
+    async def __aenter__(self) -> RealSDKClient:
+        await self.connect("")
+        return self
+
+    async def __aexit__(self, *unused: object) -> None:
+        await self.disconnect()
+
+
+def _executed_calls(
+    tmp_path: Path, client_class: type[FakeClient], messages: list[object], **kwargs: object
+) -> tuple[object, list[str]]:
+    captured: list[FakeClient] = []
+
+    def client_factory(options: object) -> FakeClient:
+        client = client_class(options, messages, **kwargs)
+        captured.append(client)
+        return client
+
+    execution = asyncio.run(
+        ModelExecutor(runtime_config(tmp_path), client_factory=client_factory).execute(
+            issue_body="Fix it.", working_directory=tmp_path
+        )
+    )
+    return execution, captured[0].calls
+
+
+def test_connects_the_client_once_with_the_implement_prompt_and_disconnects_it(
+    tmp_path: Path,
+) -> None:
+    captured: list[FakeClient] = []
+
+    def client_factory(options: object) -> FakeClient:
+        client = RealSDKClient(options, [result()])
+        captured.append(client)
+        return client
+
+    asyncio.run(
+        ModelExecutor(runtime_config(tmp_path), client_factory=client_factory).execute(
+            issue_body="Fix it.", working_directory=tmp_path
+        )
+    )
+
+    assert captured[0].calls == ["connect", "disconnect"]
+    assert captured[0].prompt == "/implement\n\nFix it."
+
+
+def test_disconnects_after_a_handoff_followup_on_the_same_client(tmp_path: Path) -> None:
+    _, calls = _executed_calls(
+        tmp_path,
+        RealSDKClient,
+        [result(stop_reason="max_turns_exceeded")],
+        followup_messages=[result(stop_reason="end_turn")],
+    )
+
+    assert calls.count("connect") == 1
+    assert calls.count("disconnect") == 1
+    assert calls[0] == "connect" and calls[-1] == "disconnect"
+    assert "query" in calls
+
+
+def test_disconnects_after_the_timeout_interrupt_path(tmp_path: Path) -> None:
+    class StalledClient(RealSDKClient):
+        async def receive_response(self):
+            if not self.interrupted:
+                await asyncio.Event().wait()
+            yield result(stop_reason="aborted_by_timeout")
+
+    captured: list[StalledClient] = []
+
+    def client_factory(options: object) -> StalledClient:
+        client = StalledClient(options, [])
+        captured.append(client)
+        return client
+
+    asyncio.run(
+        ModelExecutor(
+            replace(runtime_config(tmp_path), model_timeout=0), client_factory=client_factory
+        ).execute(issue_body="Fix it.", working_directory=tmp_path)
+    )
+
+    assert captured[0].calls[0] == "connect"
+    assert captured[0].calls.count("connect") == 1
+    assert captured[0].calls.count("disconnect") == 1
+    assert captured[0].calls[-1] == "disconnect"
+
+
+def test_disconnects_when_the_sdk_raises_mid_stream(tmp_path: Path) -> None:
+    class BrokenClient(RealSDKClient):
+        async def receive_response(self):
+            raise RuntimeError("stream broke")
+            yield
+
+    execution, calls = _executed_calls(tmp_path, BrokenClient, [])
+
+    assert execution.status is ModelExecutionStatus.INFRASTRUCTURE_ERROR
+    assert calls == ["connect", "disconnect"]
+
+
+def test_a_failing_disconnect_does_not_hide_the_execution_result(tmp_path: Path) -> None:
+    class FailingDisconnectClient(RealSDKClient):
+        async def disconnect(self) -> None:
+            await super().disconnect()
+            raise RuntimeError("cleanup failed")
+
+    execution, _ = _executed_calls(tmp_path, FailingDisconnectClient, [result()])
+
+    assert execution.status is ModelExecutionStatus.SUCCEEDED
+
+
+def test_a_failing_disconnect_does_not_hide_the_original_sdk_error(tmp_path: Path) -> None:
+    class BrokenClient(RealSDKClient):
+        async def receive_response(self):
+            raise RuntimeError("stream broke")
+            yield
+
+        async def disconnect(self) -> None:
+            await super().disconnect()
+            raise RuntimeError("cleanup failed")
+
+    execution, calls = _executed_calls(tmp_path, BrokenClient, [])
+
+    assert execution.status is ModelExecutionStatus.INFRASTRUCTURE_ERROR
+    assert "RuntimeError" in execution.explanation
+    assert calls == ["connect", "disconnect"]
