@@ -149,7 +149,10 @@ def test_dispatches_the_issue_body_to_the_pinned_sdk_and_returns_execution_evide
     assert options.max_budget_usd == 20
     assert options.setting_sources == ["user"]
     assert options.skills == ["implement", "tdd", "code-review", "codebase-design", "handoff"]
-    assert options.env == {
+    assert options.env["SCA_ATTEMPT_ID"]
+    assert {
+        key: value for key, value in options.env.items() if key != "SCA_ATTEMPT_ID"
+    } == {
         "ANTHROPIC_BASE_URL": "https://api.meta.ai",
         "ANTHROPIC_AUTH_TOKEN": "meta-secret",
         "ANTHROPIC_API_KEY": "",
@@ -278,7 +281,12 @@ def test_api_key_mode_with_empty_base_url_uses_direct_anthropic_api(
     )
 
     assert execution.status is ModelExecutionStatus.SUCCEEDED
-    assert captured[0].options.env == {
+    assert captured[0].options.env["SCA_ATTEMPT_ID"]
+    assert {
+        key: value
+        for key, value in captured[0].options.env.items()
+        if key != "SCA_ATTEMPT_ID"
+    } == {
         "ANTHROPIC_AUTH_TOKEN": "",
         "ANTHROPIC_API_KEY": "sk-ant-secret",
         "ANTHROPIC_MODEL": "claude-sonnet-5-5",
