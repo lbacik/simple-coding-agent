@@ -48,38 +48,83 @@ def generate_request_id() -> str:
     return f"req-{uuid.uuid4().hex[:12]}"
 
 
-def run_stop(socket_path: Path, request_id: str) -> dict:
+def _with_expect_repo(request: dict, expect_repo: str | None) -> dict:
+    """Add the optional ``expect_repo`` guard field to one socket request.
+
+    When the flag is absent the request is exactly what it was before the
+    flag existed; the socket wire format is otherwise unchanged.
+    """
+
+    if expect_repo is not None:
+        request["expect_repo"] = expect_repo
+    return request
+
+
+def run_stop(
+    socket_path: Path, request_id: str, expect_repo: str | None = None
+) -> dict:
     """Submit ``stop`` once; never present a failure as accepted."""
 
-    return send_request(socket_path, {"op": "stop", "request_id": request_id})
+    return send_request(
+        socket_path,
+        _with_expect_repo({"op": "stop", "request_id": request_id}, expect_repo),
+    )
 
 
-def run_stop_after(socket_path: Path, request_id: str, after: int) -> dict:
+def run_stop_after(
+    socket_path: Path,
+    request_id: str,
+    after: int,
+    expect_repo: str | None = None,
+) -> dict:
     """Submit ``stop --after N`` once; never present a failure as accepted."""
 
     return send_request(
-        socket_path, {"op": "stop_after", "request_id": request_id, "after": after}
+        socket_path,
+        _with_expect_repo(
+            {"op": "stop_after", "request_id": request_id, "after": after},
+            expect_repo,
+        ),
     )
 
 
-def run_next_issue(socket_path: Path, request_id: str, issue: int) -> dict:
+def run_next_issue(
+    socket_path: Path,
+    request_id: str,
+    issue: int,
+    expect_repo: str | None = None,
+) -> dict:
     """Submit ``next issue`` once; never present a failure as accepted."""
 
     return send_request(
-        socket_path, {"op": "next_issue", "request_id": request_id, "issue": issue}
+        socket_path,
+        _with_expect_repo(
+            {"op": "next_issue", "request_id": request_id, "issue": issue},
+            expect_repo,
+        ),
     )
 
 
-def run_resume(socket_path: Path, request_id: str) -> dict:
+def run_resume(
+    socket_path: Path, request_id: str, expect_repo: str | None = None
+) -> dict:
     """Submit ``resume`` once; never present a failure as accepted."""
 
-    return send_request(socket_path, {"op": "resume", "request_id": request_id})
+    return send_request(
+        socket_path,
+        _with_expect_repo({"op": "resume", "request_id": request_id}, expect_repo),
+    )
 
 
-def run_handoff(socket_path: Path, request_id: str) -> dict:
+def run_handoff(
+    socket_path: Path, request_id: str, expect_repo: str | None = None
+) -> dict:
     """Submit ``handoff now`` once; never present a failure as accepted."""
 
-    return send_request(socket_path, {"op": "handoff", "request_id": request_id})
+    return send_request(
+        socket_path,
+        _with_expect_repo({"op": "handoff", "request_id": request_id}, expect_repo),
+    )
 
 
 def run_recovery_retry(socket_path: Path, request_id: str, attempt_id: str) -> dict:
@@ -450,6 +495,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Stop intake after N fully finalized attempts, counting the active one first.",
     )
+    stop_parser.add_argument(
+        "--expect-repo",
+        dest="expect_repo",
+        default=None,
+        help="Refuse the command before anything is committed unless this instance targets the given owner/name repository (case-insensitive).",
+    )
 
     resume_parser = subparsers.add_parser(
         "resume", help="Permit issue intake again; replace any pending stop plan."
@@ -459,6 +510,12 @@ def build_parser() -> argparse.ArgumentParser:
         dest="request_id",
         default=None,
         help="Retry a previously generated request ID with the identical payload.",
+    )
+    resume_parser.add_argument(
+        "--expect-repo",
+        dest="expect_repo",
+        default=None,
+        help="Refuse the command before anything is committed unless this instance targets the given owner/name repository (case-insensitive).",
     )
 
     handoff_parser = subparsers.add_parser(
@@ -478,6 +535,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Retry a previously generated request ID with the identical payload.",
     )
+    handoff_now_parser.add_argument(
+        "--expect-repo",
+        dest="expect_repo",
+        default=None,
+        help="Refuse the command before anything is committed unless this instance targets the given owner/name repository (case-insensitive).",
+    )
 
     next_parser = subparsers.add_parser(
         "next", help="Prioritize one eligible issue for the next permitted claim."
@@ -494,6 +557,12 @@ def build_parser() -> argparse.ArgumentParser:
         dest="request_id",
         default=None,
         help="Retry a previously generated request ID with the identical payload.",
+    )
+    next_issue_parser.add_argument(
+        "--expect-repo",
+        dest="expect_repo",
+        default=None,
+        help="Refuse the command before anything is committed unless this instance targets the given owner/name repository (case-insensitive).",
     )
 
     subparsers.add_parser("status", help="Show one consistent live status snapshot.")
@@ -578,6 +647,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.command == "stop":
             request_id = args.request_id or generate_request_id()
+            expect_repo = args.expect_repo
             if args.after is not None:
                 try:
                     after = parse_stop_after(args.after)
@@ -591,15 +661,34 @@ def main(argv: list[str] | None = None) -> int:
                     socket_path,
                     f"stop --after {after}",
                     request_id,
-                    lambda path, rid: run_stop_after(path, rid, after),
+                    lambda path, rid: run_stop_after(
+                        path, rid, after, expect_repo
+                    ),
                 )
-            return submit_mutating(socket_path, "stop", request_id, run_stop)
+            return submit_mutating(
+                socket_path,
+                "stop",
+                request_id,
+                lambda path, rid: run_stop(path, rid, expect_repo),
+            )
         if args.command == "resume":
             request_id = args.request_id or generate_request_id()
-            return submit_mutating(socket_path, "resume", request_id, run_resume)
+            expect_repo = args.expect_repo
+            return submit_mutating(
+                socket_path,
+                "resume",
+                request_id,
+                lambda path, rid: run_resume(path, rid, expect_repo),
+            )
         if args.command == "handoff" and args.handoff_command == "now":
             request_id = args.request_id or generate_request_id()
-            return submit_mutating(socket_path, "handoff now", request_id, run_handoff)
+            expect_repo = args.expect_repo
+            return submit_mutating(
+                socket_path,
+                "handoff now",
+                request_id,
+                lambda path, rid: run_handoff(path, rid, expect_repo),
+            )
         if args.command == "next" and args.next_command == "issue":
             from simple_coding_agent.control import (
                 NextIssueRejectedError,
@@ -607,6 +696,7 @@ def main(argv: list[str] | None = None) -> int:
             )
 
             request_id = args.request_id or generate_request_id()
+            expect_repo = args.expect_repo
             try:
                 issue = parse_next_issue(args.issue_number)
             except NextIssueRejectedError as error:
@@ -619,7 +709,7 @@ def main(argv: list[str] | None = None) -> int:
                 socket_path,
                 f"next issue {issue}",
                 request_id,
-                lambda path, rid: run_next_issue(path, rid, issue),
+                lambda path, rid: run_next_issue(path, rid, issue, expect_repo),
             )
         if args.command == "status":
             print(format_status(run_status(socket_path)))

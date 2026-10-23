@@ -7,5 +7,5 @@
   ],
   "exit_code": 2,
   "stdout": "",
-  "stderr": "usage: agentctl stop [-h] [--request-id REQUEST_ID] [--after AFTER]\nagentctl stop: error: argument --after: expected one argument\n"
+  "stderr": "usage: agentctl stop [-h] [--request-id REQUEST_ID] [--after AFTER]\n                     [--expect-repo EXPECT_REPO]\nagentctl stop: error: argument --after: expected one argument\n"
 }

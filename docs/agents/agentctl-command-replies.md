@@ -60,6 +60,38 @@ req-example-0009 rejected — stop --after N is rejected while intake is stopped
   `<id>: no such command is recorded.` with the same leading
   `repository:` line.
 
+## Expected-repository guard (since v0.8.0)
+
+The five instance-targeting commands — `stop`, `stop --after N`,
+`resume`, `handoff now`, and `next issue <n>` — accept
+`--expect-repo=<owner/name>`. The flag is defence in depth for callers
+that address several instances (for example a fleet dashboard): it lets
+the caller refuse a command meant for another target repository before
+anything is committed, instead of noticing the wrong `repository:` line
+in a successful reply after the command has already been applied.
+
+- The CLI sends the flag as the optional `expect_repo` socket request
+  field. When the flag is absent, the request is exactly what it was
+  before the flag existed.
+- The socket server compares the field against the instance's
+  `TARGET_REPO` **before** the command reaches the control surface, so
+  the check also runs before the request-ID idempotency lookup: a
+  reused request ID with a mismatched repository still rejects instead
+  of replaying the stored record.
+- The comparison is case-insensitive (`Owner/Name` matches
+  `owner/name`); surrounding whitespace is ignored. No other format
+  validation applies: a malformed value just does not match.
+- A mismatch is an ordinary rejection: exit 1, no command row is
+  stored, no control state changes, and the reason is
+  `expected repository <X>, this instance targets <Y>`, with the same
+  leading `repository:` stderr line as every other rejection.
+- The flag is **not** part of the command's canonical payload: retrying
+  a committed request ID with or without a matching `--expect-repo`
+  is an identical retry and returns the stored record.
+
+`recovery retry`, `recovery release`, and `errors reset` do not accept
+the flag; the server ignores `expect_repo` on those operations.
+
 ## Exit codes
 
 - `0`: committed. The reply above is on stdout.
