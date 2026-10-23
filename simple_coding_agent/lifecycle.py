@@ -3456,12 +3456,18 @@ class AgentLifecycle:
         return used >= budget
 
     def get_command(self, request_id: str) -> CommandRecord | None:
-        """Return one command's current durable acknowledgement."""
+        """Return one command's current durable acknowledgement.
+
+        Read-only: it does not take the control lock, so ``agentctl
+        command <id>`` answers while a mutating submit waits on the lock
+        or works against GitHub under it. It sees the last committed
+        state; a submit that has not committed yet reads back as not
+        found (``None``).
+        """
 
         if self._control_store is None:
             raise ControlStoreError("Operator control is not configured")
-        with self._control_lock:
-            return self._control_store.get_command(request_id)
+        return self._control_store.get_command(request_id)
 
     def submit_errors_reset(self, request_id: str) -> CommandRecord:
         """Reset the consecutive-error guard to 0 through the live process.
