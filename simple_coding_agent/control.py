@@ -86,9 +86,11 @@ class NextIssueRejectedError(ValueError):
 class HandoffRejectedError(ValueError):
     """Raised when ``handoff now`` is rejected without a control change.
 
-    Without an active attempt there is nothing to hand off, and once the
-    model has begun the handoff skill a second request cannot undo it;
-    neither case alters the intake state or an existing plan.
+    Without an active attempt there is nothing to hand off, once the
+    model has begun the handoff skill a second request cannot undo it,
+    and under a recovery hold (startup reconciliation, unresolved
+    finalization, or a running recovery command) no model can deliver
+    it; no case alters the intake state or an existing plan.
     """
 
 
@@ -661,7 +663,13 @@ class ControlStore:
             except sqlite3.Error as error:
                 raise ControlStoreError("Control command could not be committed") from error
 
-    def submit_handoff(self, request_id: str, *, has_active_attempt: bool) -> CommandRecord:
+    def submit_handoff(
+        self,
+        request_id: str,
+        *,
+        has_active_attempt: bool,
+        recovery_hold: RecoveryHold | None = None,
+    ) -> CommandRecord:
         """Durably record ``handoff now`` against the active attempt.
 
         Without an active attempt the command is rejected with no control
@@ -672,6 +680,10 @@ class ControlStore:
         handoff outcome, publication, issue release, and cleanup are
         durably finished. A second request while a begun handoff owns the
         model is rejected so the handoff cannot be undone mid-flight.
+        A ``recovery_hold`` rejects the command without changing intake
+        or the command record, and the rejection names the hold and the
+        next step; retrying an already-accepted request ID with the
+        identical payload still returns the stored record.
         """
 
         _check_request_id(request_id)
@@ -686,6 +698,11 @@ class ControlStore:
                         )
                         connection.execute("ROLLBACK")
                         return existing
+                    if recovery_hold is not None:
+                        connection.execute("ROLLBACK")
+                        raise HandoffRejectedError(
+                            _describe_handoff_hold(recovery_hold)
+                        )
                     if not has_active_attempt:
                         connection.execute("ROLLBACK")
                         raise HandoffRejectedError(
@@ -2042,6 +2059,33 @@ def _describe_hold(hold: RecoveryHold) -> str:
         )
     return (
         f"Resume is blocked: {hold.reason}."
+        " No control change was accepted."
+    )
+
+
+def _describe_handoff_hold(hold: RecoveryHold) -> str:
+    """Render a handoff rejection naming the hold and the next step."""
+
+    if "startup reconciliation is still running" in hold.reason:
+        return (
+            "handoff now is rejected while startup reconciliation is running;"
+            " no control change was accepted."
+        )
+    if hold.issue_number is not None:
+        where = f"issue #{hold.issue_number}"
+        if hold.attempt_id:
+            where += f" (attempt {hold.attempt_id})"
+        if hold.branch:
+            where += f" on {hold.branch}"
+        if hold.phase:
+            where += f" (phase {hold.phase})"
+        return (
+            f"handoff now is rejected under a recovery hold for {where}"
+            f" ({hold.reason}); resolve it with agentctl recovery first."
+            " No control change was accepted."
+        )
+    return (
+        f"handoff now is rejected: {hold.reason}"
         " No control change was accepted."
     )
 

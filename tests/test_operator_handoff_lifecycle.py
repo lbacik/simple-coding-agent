@@ -23,6 +23,7 @@ from simple_coding_agent.control import (
     ControlStore,
     HandoffRejectedError,
     IntakeState,
+    RecoveryHold,
     RequestIdError,
 )
 from simple_coding_agent.control_server import ControlServer, send_request
@@ -1010,7 +1011,11 @@ def test_orphan_handoff_with_no_checkpoint_fails_and_stops_intake(
     )
     attempt_state = AttemptStateStore(tmp_path)
     attempt_state.start(issue_number=ISSUE_NUMBER, branch=f"agent/issue-{ISSUE_NUMBER}")
+    # A live attempt owns the checkpoint at acceptance time; it is gone by
+    # the time the loop observes the orphaned handoff.
+    lifecycle._attempt_processing = True  # noqa: SLF001 - test seam
     lifecycle.submit_handoff("req-handoff")
+    lifecycle._attempt_processing = False  # noqa: SLF001 - test seam
     assert store.intake_state() is IntakeState.STOPPING
     attempt_state.delete()
 
@@ -1032,7 +1037,11 @@ def test_resume_after_a_fulfilled_handoff_permits_intake_without_requeueing(
     )
     attempt_state = AttemptStateStore(tmp_path)
     attempt_state.start(issue_number=ISSUE_NUMBER, branch=f"agent/issue-{ISSUE_NUMBER}")
+    # A live attempt owns the checkpoint at acceptance time; it has
+    # finalized by the time resume runs.
+    lifecycle._attempt_processing = True  # noqa: SLF001 - test seam
     lifecycle.submit_handoff("req-handoff")
+    lifecycle._attempt_processing = False  # noqa: SLF001 - test seam
     store.complete_handoff("req-handoff", "operator handoff fulfilled for issue #24")
     attempt_state.delete()
 
@@ -1182,6 +1191,196 @@ def test_store_handoff_retry_with_the_identical_payload_is_idempotent(
 
     assert second.sequence == first.sequence
     assert second.acknowledgement is CommandAcknowledgement.ACCEPTED
+
+
+def _hold_for_issue(reason: str = "attempt finalization is unresolved") -> RecoveryHold:
+    return RecoveryHold(
+        issue_number=ISSUE_NUMBER,
+        attempt_id="2026-09-22T00:00:00Z",
+        branch=f"agent/issue-{ISSUE_NUMBER}",
+        phase="model_running",
+        reason=reason,
+    )
+
+
+def test_store_rejects_handoff_under_a_recovery_hold(tmp_path: Path) -> None:
+    store = ControlStore(tmp_path)
+
+    with pytest.raises(HandoffRejectedError, match="recovery hold"):
+        store.submit_handoff(
+            "req-1", has_active_attempt=True, recovery_hold=_hold_for_issue()
+        )
+
+    with pytest.raises(HandoffRejectedError, match="agentctl recovery"):
+        store.submit_handoff(
+            "req-2", has_active_attempt=True, recovery_hold=_hold_for_issue()
+        )
+
+    assert store.get_command("req-1") is None
+    assert store.get_command("req-2") is None
+    assert store.intake_state() is IntakeState.RUNNING
+    assert store.pending_command_id() is None
+    assert store.handoff_snapshot() is None
+
+
+def test_store_rejects_handoff_while_reconciliation_runs(tmp_path: Path) -> None:
+    store = ControlStore(tmp_path)
+    hold = RecoveryHold(
+        issue_number=None,
+        attempt_id=None,
+        branch=None,
+        phase=None,
+        reason="startup reconciliation is still running",
+    )
+
+    with pytest.raises(HandoffRejectedError, match="reconciliation"):
+        store.submit_handoff(
+            "req-1", has_active_attempt=True, recovery_hold=hold
+        )
+
+    assert store.get_command("req-1") is None
+    assert store.handoff_snapshot() is None
+
+
+def test_store_handoff_retry_with_identical_payload_wins_over_a_later_hold(
+    tmp_path: Path,
+) -> None:
+    store = ControlStore(tmp_path)
+    first = store.submit_handoff("req-1", has_active_attempt=True)
+
+    second = store.submit_handoff(
+        "req-1", has_active_attempt=True, recovery_hold=_hold_for_issue()
+    )
+
+    assert second.sequence == first.sequence
+    assert second.acknowledgement is CommandAcknowledgement.ACCEPTED
+    assert store.pending_command_id() == "req-1"
+
+
+def test_handoff_rejected_while_startup_reconciliation_runs(
+    tmp_path: Path,
+) -> None:
+    workspace = seeded_workspace(tmp_path / "work")
+    lifecycle, _, store = make_lifecycle(
+        tmp_path, next_claim=None, workspace=workspace, attempt_runner=lambda c, p, r: None
+    )
+    AttemptStateStore(tmp_path).start(
+        issue_number=ISSUE_NUMBER, branch=f"agent/issue-{ISSUE_NUMBER}"
+    )
+    lifecycle._recovering = True  # noqa: SLF001 - test seam
+
+    with pytest.raises(HandoffRejectedError, match="reconciliation"):
+        lifecycle.submit_handoff("req-1")
+
+    assert store.get_command("req-1") is None
+    assert store.handoff_snapshot() is None
+    assert store.intake_state() is IntakeState.RUNNING
+    assert store.pending_command_id() is None
+
+
+def test_handoff_rejected_while_retained_finalization_is_unresolved(
+    tmp_path: Path,
+) -> None:
+    workspace = seeded_workspace(tmp_path / "work")
+    lifecycle, _, store = make_lifecycle(
+        tmp_path, next_claim=None, workspace=workspace, attempt_runner=lambda c, p, r: None
+    )
+    AttemptStateStore(tmp_path).start(
+        issue_number=ISSUE_NUMBER, branch=f"agent/issue-{ISSUE_NUMBER}"
+    )
+
+    with pytest.raises(HandoffRejectedError, match="recovery hold"):
+        lifecycle.submit_handoff("req-1")
+
+    with pytest.raises(HandoffRejectedError, match="agentctl recovery"):
+        lifecycle.submit_handoff("req-2")
+
+    assert store.get_command("req-1") is None
+    assert store.get_command("req-2") is None
+    assert store.handoff_snapshot() is None
+    assert store.intake_state() is IntakeState.RUNNING
+    assert store.pending_command_id() is None
+
+
+def test_handoff_rejected_while_a_recovery_command_executes(
+    tmp_path: Path,
+) -> None:
+    workspace = seeded_workspace(tmp_path / "work")
+    lifecycle, _, store = make_lifecycle(
+        tmp_path, next_claim=None, workspace=workspace, attempt_runner=lambda c, p, r: None
+    )
+    AttemptStateStore(tmp_path).start(
+        issue_number=ISSUE_NUMBER, branch=f"agent/issue-{ISSUE_NUMBER}"
+    )
+    lifecycle._attempt_processing = True  # noqa: SLF001 - test seam
+    lifecycle._recovery_executing = True  # noqa: SLF001 - test seam
+
+    with pytest.raises(HandoffRejectedError, match="recovery hold"):
+        lifecycle.submit_handoff("req-1")
+
+    assert store.get_command("req-1") is None
+    assert store.handoff_snapshot() is None
+    assert store.intake_state() is IntakeState.RUNNING
+
+
+def test_handoff_with_an_unreadable_checkpoint_is_rejected_cleanly(
+    tmp_path: Path,
+) -> None:
+    workspace = seeded_workspace(tmp_path / "work")
+    lifecycle, _, store = make_lifecycle(
+        tmp_path, next_claim=None, workspace=workspace, attempt_runner=lambda c, p, r: None
+    )
+    checkpoint_path = tmp_path / "state" / "attempt.json"
+    checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+    checkpoint_path.write_text("{not valid json")
+
+    with pytest.raises(HandoffRejectedError, match="checkpoint"):
+        lifecycle.submit_handoff("req-1")
+
+    assert store.get_command("req-1") is None
+    assert store.handoff_snapshot() is None
+    assert store.intake_state() is IntakeState.RUNNING
+    assert lifecycle._startup_hold_detail is not None  # noqa: SLF001 - test seam
+
+
+def test_handoff_retry_with_identical_payload_survives_a_later_hold(
+    tmp_path: Path,
+) -> None:
+    workspace = seeded_workspace(tmp_path / "work")
+    lifecycle, _, store = make_lifecycle(
+        tmp_path, next_claim=None, workspace=workspace, attempt_runner=lambda c, p, r: None
+    )
+    AttemptStateStore(tmp_path).start(
+        issue_number=ISSUE_NUMBER, branch=f"agent/issue-{ISSUE_NUMBER}"
+    )
+    lifecycle._attempt_processing = True  # noqa: SLF001 - test seam
+    first = lifecycle.submit_handoff("req-handoff")
+    assert first.acknowledgement is CommandAcknowledgement.ACCEPTED
+
+    # Finalization later stalls, holding intake: the identical retry still
+    # returns the stored acceptance instead of the hold rejection.
+    lifecycle._attempt_processing = False  # noqa: SLF001 - test seam
+    second = lifecycle.submit_handoff("req-handoff")
+
+    assert second.sequence == first.sequence
+    assert second.acknowledgement is CommandAcknowledgement.ACCEPTED
+    assert store.pending_command_id() == "req-handoff"
+
+
+def test_handoff_dirty_tree_without_a_checkpoint_stays_no_active_attempt(
+    tmp_path: Path,
+) -> None:
+    workspace = seeded_workspace(tmp_path / "work")
+    lifecycle, _, store = make_lifecycle(
+        tmp_path, next_claim=None, workspace=workspace, attempt_runner=lambda c, p, r: None
+    )
+    workspace.make_dirty("work.txt")
+
+    with pytest.raises(HandoffRejectedError, match="without an active attempt"):
+        lifecycle.submit_handoff("req-1")
+
+    assert store.get_command("req-1") is None
+    assert store.handoff_snapshot() is None
 
 
 # --- CLI + socket -------------------------------------------------------------
