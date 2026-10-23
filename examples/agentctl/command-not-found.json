@@ -1,0 +1,11 @@
+{
+  "argv": [
+    "--socket",
+    "{{SOCKET}}",
+    "command",
+    "req-example-missing"
+  ],
+  "exit_code": 1,
+  "stdout": "",
+  "stderr": "repository: example-owner/example-repo\nreq-example-missing: no such command is recorded.\n"
+}

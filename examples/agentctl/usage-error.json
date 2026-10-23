@@ -1,0 +1,11 @@
+{
+  "argv": [
+    "--socket",
+    "{{SOCKET}}",
+    "stop",
+    "--after"
+  ],
+  "exit_code": 2,
+  "stdout": "",
+  "stderr": "usage: agentctl stop [-h] [--request-id REQUEST_ID] [--after AFTER]\nagentctl stop: error: argument --after: expected one argument\n"
+}

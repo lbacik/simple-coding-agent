@@ -1,0 +1,12 @@
+{
+  "argv": [
+    "--socket",
+    "{{SOCKET}}",
+    "stop",
+    "--request-id",
+    "req-example-completed"
+  ],
+  "exit_code": 0,
+  "stdout": "repository: example-owner/example-repo\nrequest_id: req-example-completed\nsequence: 1\nacknowledgement: completed\neffect: intake stopped\n",
+  "stderr": ""
+}

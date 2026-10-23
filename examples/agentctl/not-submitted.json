@@ -1,0 +1,12 @@
+{
+  "argv": [
+    "--socket",
+    "/tmp/sca-contract-no-agent/control.sock",
+    "stop",
+    "--request-id",
+    "req-example-not-submitted"
+  ],
+  "exit_code": 2,
+  "stdout": "",
+  "stderr": "req-example-not-submitted not submitted \u2014 cannot connect to the agent process: Cannot connect to the agent process at /tmp/sca-contract-no-agent/control.sock: [Errno 2] No such file or directory. The agent may not be running in this instance. Retry with: agentctl stop --request-id req-example-not-submitted\n"
+}
