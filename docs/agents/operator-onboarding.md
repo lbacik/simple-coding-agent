@@ -517,14 +517,17 @@ instance flag, so opening the wrong container controls the wrong instance.
    /usr/local/bin/agentctl status
    ```
 
-   The first line of every response names the `TARGET_REPO` configured for
-   that container (status, command acceptance, and request-ID lookup all
-   display it). If the repository is not the one you intend to control,
-   leave that container and open the correct one.
+   The first line of every reply the agent answered names the `TARGET_REPO`
+   configured for that container: `status`, accepted commands, `command`
+   lookups, rejections, and "no such command" all display it. If the
+   repository is not the one you intend to control, leave that container
+   and open the correct one. Connection errors and local validation
+   failures have no reply, so they print no `repository:` line.
 
 2. Submit a command from the same shell, e.g.
-   `/usr/local/bin/agentctl stop`. The CLI prints a unique request ID
-   before submission; if the connection drops before the reply arrives,
+   `/usr/local/bin/agentctl stop`. The CLI generates a unique request ID
+   for each submission and prints it in the final reply or error; if the
+   connection drops before the reply arrives,
    retry the identical payload with
    `agentctl stop --request-id <id>` and look it up later with
    `agentctl command <id>`.

@@ -1,0 +1,14 @@
+{
+  "argv": [
+    "--socket",
+    "{{SOCKET}}",
+    "stop",
+    "--after",
+    "2",
+    "--request-id",
+    "req-example-rejected"
+  ],
+  "exit_code": 1,
+  "stdout": "",
+  "stderr": "repository: example-owner/example-repo\nreq-example-rejected rejected \u2014 stop --after N is rejected while intake is stopped; resume first. No control change was accepted.\n"
+}

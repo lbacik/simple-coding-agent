@@ -2,11 +2,11 @@
 
 Run inside the selected agent container; container selection determines
 the controlled instance, so the CLI takes no instance selector. Mutating
-commands generate and print a unique request ID before submission and
-accept ``--request-id`` to retry the same payload after an ambiguous
-connection loss. ``status`` and ``command`` are read-only snapshots from
-the live process: when the process cannot be reached they report a
-connection error instead of a saved snapshot.
+commands generate a unique request ID, print it in the final reply or
+error, and accept ``--request-id`` to retry the same payload after an
+ambiguous connection loss. ``status`` and ``command`` are read-only
+snapshots from the live process: when the process cannot be reached they
+report a connection error instead of a saved snapshot.
 """
 
 from __future__ import annotations
@@ -43,7 +43,7 @@ def default_socket_path() -> Path:
 
 
 def generate_request_id() -> str:
-    """Create the unique request ID printed before a mutating submission."""
+    """Create the unique request ID printed in a mutating command's reply."""
 
     return f"req-{uuid.uuid4().hex[:12]}"
 
@@ -193,30 +193,68 @@ def format_telemetry_error(error: TelemetryError) -> str:
     return json.dumps({"ok": False, "error": {"code": error.code, "message": error.message}})
 
 
-def run_command_lookup(socket_path: Path, request_id: str) -> dict | None:
+def run_command_lookup(
+    socket_path: Path, request_id: str
+) -> tuple[dict | None, str | None]:
     """Look up one command's current durable acknowledgement.
 
-    The returned record carries the ``repository`` of the instance that
-    answered, so the operator can verify the selected container.
+    Returns the stored record (``None`` when no such command is recorded)
+    and the ``repository`` of the instance that answered (``None`` when the
+    reply carries none), so the operator can verify the selected container
+    even on the not-found path.
     """
 
     reply = send_request(socket_path, {"op": "command", "request_id": request_id})
     if not reply.get("ok"):
         raise ControlUnavailableError(reply.get("error", "Lookup is unavailable."))
+    repository = reply.get("repository")
+    if not isinstance(repository, str) or not repository:
+        repository = None
     record = reply.get("command")
-    if record is not None and reply.get("repository") is not None:
-        record = {**record, "repository": reply["repository"]}
-    return record
+    if record is not None and repository is not None:
+        record = {**record, "repository": repository}
+    return record, repository
+
+
+def _one_line(value: object) -> str:
+    """Render one reply value on a single line.
+
+    The contract guarantees ``key: value`` lines with the value running to
+    the end of the line, so an embedded line break (today ``effect:``
+    carries free-text ``detail``) is collapsed to a space.
+    """
+
+    return " ".join(str(value).splitlines())
 
 
 def format_command(reply: dict) -> str:
+    """Render one committed command reply as single-line ``key: value`` lines."""
+
     return (
-        f"repository: {reply.get('repository', 'unknown')}\n"
-        f"request_id: {reply.get('request_id')}\n"
-        f"sequence: {reply.get('sequence')}\n"
-        f"acknowledgement: {reply.get('acknowledgement')}\n"
-        f"effect: {reply.get('detail')}"
+        f"repository: {_one_line(reply.get('repository', 'unknown'))}\n"
+        f"request_id: {_one_line(reply.get('request_id'))}\n"
+        f"sequence: {_one_line(reply.get('sequence'))}\n"
+        f"acknowledgement: {_one_line(reply.get('acknowledgement'))}\n"
+        f"effect: {_one_line(reply.get('detail'))}"
     )
+
+
+#: The sentence closing every rejection reason; store texts already carry
+#: it, so the CLI appends it only when it is missing.
+_NO_CHANGE_SUFFIX = "No control change was accepted."
+
+
+def _rejection_reason(error: object) -> str:
+    """Append the no-change sentence exactly once."""
+
+    text = str(error).strip()
+    if text.endswith(_NO_CHANGE_SUFFIX):
+        return text
+    if text.endswith("."):
+        return f"{text} {_NO_CHANGE_SUFFIX}"
+    if text:
+        return f"{text}. {_NO_CHANGE_SUFFIX}"
+    return _NO_CHANGE_SUFFIX
 
 
 def submit_mutating(
@@ -243,9 +281,12 @@ def submit_mutating(
         )
         return 2
     if not reply.get("ok"):
+        repository = reply.get("repository")
+        if isinstance(repository, str) and repository:
+            print(f"repository: {_one_line(repository)}", file=sys.stderr)
         print(
-            f"{request_id} rejected — {reply.get('error', 'unknown error')}. "
-            "No control change was accepted.",
+            f"{request_id} rejected — "
+            f"{_rejection_reason(reply.get('error', 'unknown error'))}",
             file=sys.stderr,
         )
         return 1
@@ -541,7 +582,10 @@ def main(argv: list[str] | None = None) -> int:
                 try:
                     after = parse_stop_after(args.after)
                 except StopAfterRejectedError as error:
-                    print(f"rejected — {error}", file=sys.stderr)
+                    print(
+                        f"{request_id} rejected — {_rejection_reason(error)}",
+                        file=sys.stderr,
+                    )
                     return 1
                 return submit_mutating(
                     socket_path,
@@ -566,7 +610,10 @@ def main(argv: list[str] | None = None) -> int:
             try:
                 issue = parse_next_issue(args.issue_number)
             except NextIssueRejectedError as error:
-                print(f"{request_id} rejected — {error}", file=sys.stderr)
+                print(
+                    f"{request_id} rejected — {_rejection_reason(error)}",
+                    file=sys.stderr,
+                )
                 return 1
             return submit_mutating(
                 socket_path,
@@ -599,8 +646,10 @@ def main(argv: list[str] | None = None) -> int:
                 return 1
             return 0
         if args.command == "command":
-            record = run_command_lookup(socket_path, args.request_id)
+            record, repository = run_command_lookup(socket_path, args.request_id)
             if record is None:
+                if repository is not None:
+                    print(f"repository: {_one_line(repository)}", file=sys.stderr)
                 print(f"{args.request_id}: no such command is recorded.", file=sys.stderr)
                 return 1
             print(format_command(record))
@@ -612,7 +661,10 @@ def main(argv: list[str] | None = None) -> int:
             try:
                 attempt_id = parse_attempt_id(args.attempt_id)
             except RecoveryRejectedError as error:
-                print(f"{request_id} rejected — {error}", file=sys.stderr)
+                print(
+                    f"{request_id} rejected — {_rejection_reason(error)}",
+                    file=sys.stderr,
+                )
                 return 1
             return submit_mutating(
                 socket_path,
@@ -632,7 +684,10 @@ def main(argv: list[str] | None = None) -> int:
                 attempt_id = parse_attempt_id(args.attempt_id)
                 saved_at = parse_saved_at(args.saved_at)
             except RecoveryRejectedError as error:
-                print(f"{request_id} rejected — {error}", file=sys.stderr)
+                print(
+                    f"{request_id} rejected — {_rejection_reason(error)}",
+                    file=sys.stderr,
+                )
                 return 1
             return submit_mutating(
                 socket_path,

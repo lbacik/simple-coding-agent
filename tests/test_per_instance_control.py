@@ -152,7 +152,7 @@ def test_command_lookup_displays_the_configured_repository(tmp_path: Path) -> No
     instance = InstanceControl(tmp_path, tmp_path / "run" / "control.sock").start()
     try:
         agentctl.run_stop(instance.socket_path, "req-lookup-1")
-        record = agentctl.run_command_lookup(instance.socket_path, "req-lookup-1")
+        record, _ = agentctl.run_command_lookup(instance.socket_path, "req-lookup-1")
 
         assert record is not None
         assert record["repository"] == REPOSITORY
@@ -214,8 +214,11 @@ def test_selected_instance_command_leaves_the_other_instance_unchanged(
         assert reply["ok"] is True
         assert reply["repository"] == "owner/first"
 
-        lookup = agentctl.run_command_lookup(second.socket_path, "req-selected-1")
+        lookup, lookup_repository = agentctl.run_command_lookup(
+            second.socket_path, "req-selected-1"
+        )
         assert lookup is None
+        assert lookup_repository == "owner/second"
         other_status = agentctl.run_status(second.socket_path)
         assert other_status["repository"] == "owner/second"
         assert other_status["intake"] == IntakeState.RUNNING.value
@@ -247,7 +250,9 @@ def test_container_replacement_recreates_the_socket_and_preserves_commands(
     replacement.start()
     try:
         assert socket_path.exists()
-        record = agentctl.run_command_lookup(replacement.socket_path, "req-persist-1")
+        record, _ = agentctl.run_command_lookup(
+            replacement.socket_path, "req-persist-1"
+        )
 
         assert record is not None
         assert record["sequence"] == first["sequence"]
