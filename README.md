@@ -61,7 +61,9 @@ prose or filter issue text for prompt injection.
 Copy `.env.example` and set `GITHUB_TOKEN`, `META_API_KEY`, and `TARGET_REPO`
 (`owner/repo`). `DATA_DIR` defaults to `~/.simple-coding-agent/`; its default
 clone location is `$DATA_DIR/repo/`. Other defaults are `POLL_INTERVAL=60`,
-`LOG_LEVEL=INFO`, `MODEL_TIMEOUT=3600`, `PUBLISH_TIMEOUT=120`,
+`LOG_LEVEL=INFO`, `MODEL_TIMEOUT=3600`, `BACKGROUND_TASK_GRACE_SECONDS=300` (how long a
+finished result waits for background agent tasks before they are stopped),
+`PUBLISH_TIMEOUT=120`,
 `MAX_RETRIES=3`, `MAX_CONSECUTIVE_ERRORS=3`, `MAX_AUTO_CONTINUATIONS=0`
 (no automatic continuation of `round-finished` issues without a human
 requeue), and `MAX_CONFLICT_ATTEMPTS=0` (no automatic conflict detection and no

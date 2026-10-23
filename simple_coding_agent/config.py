@@ -130,6 +130,7 @@ class RuntimeConfig:
     max_conflict_attempts: int = 0
     handoff_comment_mode: str = _DEFAULT_HANDOFF_COMMENT_MODE
     worker_id: str = ""
+    background_task_grace_seconds: int = 300
 
     @property
     def soft_threshold_tokens(self) -> int:
@@ -223,6 +224,9 @@ def load_runtime_config(environ: Mapping[str, str] | None = None) -> RuntimeConf
         poll_interval=_positive_integer(values, "POLL_INTERVAL", 60),
         log_level=log_level,
         model_timeout=_positive_integer(values, "MODEL_TIMEOUT", 3600),
+        background_task_grace_seconds=_positive_integer(
+            values, "BACKGROUND_TASK_GRACE_SECONDS", 300
+        ),
         publish_timeout=_positive_integer(values, "PUBLISH_TIMEOUT", 120),
         max_retries=_positive_integer(values, "MAX_RETRIES", 3),
         max_consecutive_errors=_positive_integer(values, "MAX_CONSECUTIVE_ERRORS", 3),

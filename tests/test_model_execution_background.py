@@ -84,6 +84,9 @@ class BackgroundFakeClient:
     async def interrupt(self) -> None:
         self.interrupted = True
 
+    async def stop_task(self, task_id: str) -> None:
+        self.stopped_tasks = [*getattr(self, 'stopped_tasks', []), task_id]
+
     async def query(self, prompt: str) -> None:
         self.queried_prompts.append(prompt)
 
@@ -141,8 +144,9 @@ def runtime_config(tmp_path: Path) -> RuntimeConfig:
     )
 
 
-def started(task_id: str) -> TaskStartedMessage:
+def started(task_id: str, task_type: str = "local_agent") -> TaskStartedMessage:
     return TaskStartedMessage(
+        task_type=task_type,
         subtype="task_started",
         data={},
         task_id=task_id,
@@ -544,3 +548,54 @@ def test_review_findings_join_when_findings_exist() -> None:
     )
     assert _review_findings_text(ReviewEvidence((), 1), 2) == "not collected"
     assert _review_findings_text(ReviewEvidence((), 0), 0) == "not run"
+
+
+class RaisingStopClient(BackgroundFakeClient):
+    async def stop_task(self, task_id: str) -> None:
+        await super().stop_task(task_id)
+        raise RuntimeError("stop failed")
+
+
+class HangingRaisingStopClient(RaisingStopClient, HangingBackgroundClient):
+    pass
+
+
+def test_non_deferring_task_does_not_defer_and_is_stopped_on_exit(tmp_path: Path) -> None:
+    client = BackgroundFakeClient(
+        None, [started("B", "local_bash"), result(input_tokens=12)]
+    )
+    execution, events, client = run_executor(tmp_path, client)
+
+    assert not any(name == "background_result_deferred" for name, _ in events)
+    assert client.stopped_tasks == ["B"]
+    stopped = [detail for name, detail in events if name == "background_tasks_stopped"]
+    assert len(stopped) == 1 and "B" in stopped[0]
+
+
+def test_grace_expiry_stops_deferring_tasks_and_uses_deferred_result(
+    tmp_path: Path,
+) -> None:
+    client = HangingBackgroundClient(
+        None, [started("A"), result(input_tokens=12)]
+    )
+    execution, events, client = run_executor(
+        tmp_path, client, background_task_grace_seconds=1
+    )
+
+    assert client.stopped_tasks == ["A"]
+    stopped = [detail for name, detail in events if name == "background_tasks_stopped"]
+    assert len(stopped) == 1 and "A" in stopped[0] and "waited_seconds=" in stopped[0]
+    assert not client.interrupted
+
+
+def test_failing_stop_task_is_logged_and_does_not_fail_the_attempt(
+    tmp_path: Path,
+) -> None:
+    client = HangingRaisingStopClient(None, [started("A"), result(input_tokens=12)])
+    execution, events, client = run_executor(
+        tmp_path, client, background_task_grace_seconds=1
+    )
+
+    assert client.stopped_tasks == ["A"]
+    assert any(name == "background_task_stop_failed" for name, _ in events)
+    assert execution.status is ModelExecutionStatus.SUCCEEDED
