@@ -153,11 +153,8 @@ class FakeClient:
         self._messages = messages
         self.queried_prompts: list[str] = []
 
-    async def __aenter__(self) -> FakeClient:
-        return self
-
-    async def __aexit__(self, *unused: object) -> None:
-        return None
+    async def disconnect(self) -> None:
+        self.disconnect_count = getattr(self, "disconnect_count", 0) + 1
 
     async def connect(self, prompt: str) -> None:
         pass

@@ -484,11 +484,9 @@ class ModelExecution:
 class SDKClient(Protocol):
     """The subset of streaming client behaviour used by this boundary."""
 
-    async def __aenter__(self) -> SDKClient: ...
-
-    async def __aexit__(self, *arguments: object) -> None: ...
-
     async def connect(self, prompt: str) -> None: ...
+
+    async def disconnect(self) -> None: ...
 
     async def interrupt(self) -> None: ...
 
@@ -1226,7 +1224,7 @@ class ModelExecutor:
         )
         client = self._client_factory(self._options(working_directory))
         try:
-            async with client:
+            try:
                 await client.connect(f"/implement\n\n{issue_body}")
                 await self._refresh_context_usage(client, reason="session_start")
                 try:
@@ -1278,6 +1276,8 @@ class ModelExecutor:
                     )
                     if followup is not None:
                         return followup
+            finally:
+                await self._disconnect_client(client)
         except Exception as error:
             return self._evidence(
                 ModelExecutionStatus.INFRASTRUCTURE_ERROR,
@@ -1298,6 +1298,17 @@ class ModelExecutor:
                 observed_models,
             )
         return self._classify(terminal, observed_models)
+
+    async def _disconnect_client(self, client: SDKClient) -> None:
+        """Disconnect the client without letting a failure mask the attempt's outcome."""
+
+        try:
+            await client.disconnect()
+        except Exception as error:
+            self._log(
+                "client_disconnect_failed",
+                f"Claude SDK client disconnect failed: {type(error).__name__}.",
+            )
 
     def _is_model_limit(
         self, terminal: ResultMessage, observed_models: tuple[str, ...]
