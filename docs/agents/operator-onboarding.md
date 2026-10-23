@@ -537,6 +537,16 @@ the target checkout's virtual environment to `PATH`, so a bare `agentctl`
 could resolve to the target repository's package instead of the running
 agent's installed entry point.
 
+When a caller addresses several instances (for example a fleet
+dashboard), pass `--expect-repo=<owner/name>` (since v0.8.0) to each of
+`stop`, `stop --after N`, `resume`, `handoff now`, and `next issue <n>`:
+the instance compares the value with its own `TARGET_REPO`
+(case-insensitively) before anything is committed and rejects with exit
+1 — `expected repository <X>, this instance targets <Y>` — when they
+differ, even for an already-used request ID. The flag never changes what
+a matching command does, and retrying a committed request ID with or
+without it returns the stored record.
+
 Never start a second agent process or a one-shot Compose container
 (`docker compose run`) to issue a command: commands are accepted only by the
 live agent inside its own running container, and a second process would

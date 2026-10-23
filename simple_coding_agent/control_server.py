@@ -318,6 +318,7 @@ class ControlServer:
             self._control.submit_stop,
             rejected=(RequestIdError, PayloadMismatchError),
             repository=self._repository(),
+            check_expect_repo=True,
         )
 
     def _reply_stop_after(self, connection: socket.socket, request: dict) -> None:
@@ -334,6 +335,7 @@ class ControlServer:
             lambda request_id: self._control.submit_stop_after(request_id, after),
             rejected=(RequestIdError, PayloadMismatchError, StopAfterRejectedError),
             repository=self._repository(),
+            check_expect_repo=True,
         )
 
     def _reply_next_issue(self, connection: socket.socket, request: dict) -> None:
@@ -350,6 +352,7 @@ class ControlServer:
             lambda request_id: self._control.submit_next_issue(request_id, issue),
             rejected=(RequestIdError, PayloadMismatchError, NextIssueRejectedError),
             repository=self._repository(),
+            check_expect_repo=True,
         )
 
     def _reply_resume(self, connection: socket.socket, request: dict) -> None:
@@ -365,6 +368,7 @@ class ControlServer:
             self._control.submit_resume,
             rejected=(RequestIdError, PayloadMismatchError, ResumeBlockedError),
             repository=self._repository(),
+            check_expect_repo=True,
         )
 
     def _reply_handoff(self, connection: socket.socket, request: dict) -> None:
@@ -380,6 +384,7 @@ class ControlServer:
             self._control.submit_handoff,
             rejected=(RequestIdError, PayloadMismatchError, HandoffRejectedError),
             repository=self._repository(),
+            check_expect_repo=True,
         )
 
     def _reply_recovery_retry(self, connection: socket.socket, request: dict) -> None:
@@ -614,6 +619,18 @@ def socket_path_for(data_dir: Path | None = None) -> Path:
     return resolve_socket_path()
 
 
+def _repository_matches(expected: object, repository: str) -> bool:
+    """Whether an ``expect_repo`` value names this instance's repository.
+
+    The comparison is case-insensitive with surrounding whitespace ignored;
+    anything else (including a malformed value) simply does not match.
+    """
+
+    if not isinstance(expected, str):
+        return False
+    return expected.strip().lower() == repository.strip().lower()
+
+
 def _reply_mutating(
     connection: socket.socket,
     request: dict,
@@ -621,16 +638,41 @@ def _reply_mutating(
     *,
     rejected: tuple[type[Exception], ...],
     repository: str,
+    check_expect_repo: bool = False,
 ) -> None:
     """Reply to one mutating command with its durable acknowledgement.
 
     Rejections (bad IDs, reused IDs, recovery holds) report the reason with
     no control change; storage or liveness failures never appear accepted.
+
+    When ``check_expect_repo`` is set, an ``expect_repo`` request field is
+    compared against this instance's repository before the command reaches
+    ``submit`` (so the check also runs before the request-ID idempotency
+    lookup): a mismatch is an ordinary rejection with nothing stored and
+    no control change. The flag is never part of the stored canonical
+    payload. Operations with ``check_expect_repo`` unset ignore the field.
     """
 
     from simple_coding_agent.control import ControlStoreError, command_to_json
 
     request_id = request.get("request_id")
+    if check_expect_repo and request.get("expect_repo") is not None:
+        expected = request.get("expect_repo")
+        if not _repository_matches(expected, repository):
+            shown = expected.strip() if isinstance(expected, str) else expected
+            _send(
+                connection,
+                {
+                    "ok": False,
+                    "repository": repository,
+                    "error": (
+                        f"expected repository {shown},"
+                        f" this instance targets {repository}"
+                    ),
+                    "request_id": request_id,
+                },
+            )
+            return
     try:
         record = submit(request_id)
     except rejected as error:
