@@ -1380,9 +1380,9 @@ def test_cost_instruction_is_withheld_while_subagents_still_running(
     assert subagent_reply == {}
     assert executor._handoff_context_delivered is False
 
-    # Once the running subagents are stopped, the very next boundary --
-    # even a subagent one -- delivers the handoff instruction instead of
-    # waiting for a main-thread boundary.
+    # Once the running subagents are stopped, a subagent boundary still
+    # neither receives the instruction nor marks it delivered: only a
+    # main-thread boundary delivers it.
     executor._stop_running_subagents()
     stopped_reply = asyncio.run(
         post_hook(
@@ -1397,9 +1397,24 @@ def test_cost_instruction_is_withheld_while_subagents_still_running(
         )
     )
 
-    assert "handoff" in stopped_reply["hookSpecificOutput"]["additionalContext"]
-    assert executor._handoff_context_delivered is True
+    assert stopped_reply == {}
+    assert executor._handoff_context_delivered is False
     assert any(name == "token_soft_threshold_subagents_stopped" for name, _ in events)
+
+    main_reply = asyncio.run(
+        post_hook(
+            {
+                "tool_name": "Read",
+                "tool_input": {"file_path": "src/a.py"},
+                "tool_response": "ok",
+            },
+            None,
+            {},
+        )
+    )
+
+    assert "handoff" in main_reply["hookSpecificOutput"]["additionalContext"]
+    assert executor._handoff_context_delivered is True
     assert any(name == "token_soft_threshold_handoff_context_injected" for name, _ in events)
 
 
@@ -1494,13 +1509,30 @@ def test_cost_handoff_instruction_reaches_main_thread_once_subagents_stopped(
     executor._check_limits("sub-1")
     assert executor._running_subagents == set()
 
-    reply = asyncio.run(
+    subagent_reply = asyncio.run(
         post_hook(
             {
                 "tool_name": "Bash",
                 "tool_input": {"command": "pytest"},
                 "tool_response": "ok",
                 "agent_id": "sub-1",
+            },
+            None,
+            {},
+        )
+    )
+
+    # A subagent boundary never delivers the token handoff instruction, even
+    # with no subagent recorded as running.
+    assert subagent_reply == {}
+    assert executor._handoff_context_delivered is False
+
+    reply = asyncio.run(
+        post_hook(
+            {
+                "tool_name": "Bash",
+                "tool_input": {"command": "pytest"},
+                "tool_response": "ok",
             },
             None,
             {},

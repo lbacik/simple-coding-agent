@@ -714,10 +714,11 @@ class ModelExecutor:
     ``token_soft_threshold_subagents_stopped`` event.
     Only the main thread is steered toward the ``handoff`` skill after the
     crossing; new subagent launches from the main thread are denied. The
-    handoff instruction is delivered on the next tool boundary once no
-    subagent is left running, without waiting for a main-thread boundary.
+    handoff instruction is delivered only at a main-thread tool boundary;
+    a subagent boundary neither receives it nor marks it delivered.
     A ``handoff`` skill invocation counts only when observed in the main
-    thread (``agent_id is None``). Partial subagent output already written
+    thread (``agent_id is None``) and actually ran (denied calls are never
+    recorded). Partial subagent output already written
     to the working tree is left as is for the normal dirty-work
     preservation.
 
@@ -2694,9 +2695,7 @@ class ModelExecutor:
         subtype = getattr(terminal, "subtype", None)
         total_cost_usd = getattr(terminal, "total_cost_usd", None)
 
-        if self._operator_context_delivered and any(
-            event.name == "handoff" for event in self._skill_events
-        ):
+        if self._operator_context_delivered and self._main_thread_handoff_invoked():
             return self._evidence(
                 ModelExecutionStatus.HANDOFF_REQUESTED,
                 "Model invoked the handoff skill after an operator handoff request.",
@@ -2938,6 +2937,24 @@ class ModelExecutor:
         self._log("token_budget_reconciled", json.dumps(summary, sort_keys=True))
         return summary
 
+    def _log_pre_tool_denied(self, hook_input: Any) -> None:
+        """Log a denied PreToolUse call as denied, not as a skill run.
+
+        Denied calls are still logged via ``_log_tool_use`` before the guard
+        decides; this distinct event makes the denial visible instead of
+        leaving a plain ``skill_call``/``tool_call`` line that looks like the
+        tool ran.
+        """
+
+        tool_name = _hook_field(hook_input, "tool_name")
+        if not isinstance(tool_name, str):
+            return
+        skill_name = _skill_name(hook_input) if tool_name == "Skill" else None
+        label = f"skill:{skill_name}" if skill_name else tool_name
+        thread = _thread_label(hook_input)
+        event_name = "skill_call_denied" if skill_name else "tool_call_denied"
+        self._log(event_name, f"{label}{thread}: denied")
+
     async def _guard_and_record_pre_tool_use(
         self, hook_input: Any, tool_use_id: str | None, context: Any
     ) -> dict[str, Any]:
@@ -2947,6 +2964,9 @@ class ModelExecutor:
         # crossing here latches exactly like a response-time crossing.
         self._check_limits(_hook_agent_id(hook_input) or "main")
         if self._token_hard_ceiling_reached:
+            self._log_tool_use("tool_call", hook_input)
+            self._record_tool_call(hook_input, tool_use_id)
+            self._log_pre_tool_denied(hook_input)
             return _deny(
                 "Token budget reached the hard ceiling "
                 f"(max_budget_tokens={self._config.max_budget_tokens}); "
@@ -2955,11 +2975,11 @@ class ModelExecutor:
             )
         self._log_tool_use("tool_call", hook_input)
         self._record_tool_call(hook_input, tool_use_id)
-        await self._record_skill_event("PreToolUse", hook_input, tool_use_id, context)
         self._start_launch_thread(hook_input, tool_use_id)
         if _skill_name(hook_input) == "code-review":
             self._review_count += 1
             if self._review_count > 3:
+                self._log_pre_tool_denied(hook_input)
                 return _deny("At most two code-review repair cycles are allowed.")
         if not self._soft_threshold_crossed:
             self._track_subagent_seen(hook_input)
@@ -2967,15 +2987,14 @@ class ModelExecutor:
         # threshold has crossed, including after the handoff note commit is
         # observed: a late subagent boundary must not overwrite the valid
         # note. The main-thread gate below stays closed until the attempt
-        # ends.
+        # ends. Denied subagent calls get their own wording: only the main
+        # thread performs the handoff.
         if self._soft_threshold_crossed and not _is_main_thread(hook_input):
             agent_id = _hook_agent_id(hook_input)
             if agent_id is not None and agent_id not in self._stopped_subagent_ids:
                 self._stopped_subagent_ids.append(agent_id)
-            return _cost_deny(
-                "Subagent work is stopped after the token soft threshold.",
-                self._issue_number,
-            )
+            self._log_pre_tool_denied(hook_input)
+            return _subagent_deny()
         # The gate stays active until the attempt ends, including after the
         # handoff note commit: invoking the skill is the first step of the
         # handoff, not its end, and an auto-compaction inside the remaining
@@ -2988,6 +3007,7 @@ class ModelExecutor:
             elif tool_name == "Agent" or (
                 tool_name == "Task" and _is_subagent_launch(hook_input)
             ):
+                self._log_pre_tool_denied(hook_input)
                 if committed:
                     return _cost_committed_deny(
                         "New subagent launches are disabled.", self._issue_number
@@ -2998,6 +3018,7 @@ class ModelExecutor:
             elif tool_name in ("Edit", "Write"):
                 file_path = str(_hook_field(hook_input, "tool_input", {}).get("file_path", ""))
                 if ".agent/handoff" not in file_path:
+                    self._log_pre_tool_denied(hook_input)
                     if committed:
                         return _cost_committed_deny(
                             "Further implementation work is disabled.",
@@ -3010,10 +3031,12 @@ class ModelExecutor:
             elif tool_name == "Bash":
                 command = str(_hook_field(hook_input, "tool_input", {}).get("command", ""))
                 if _deletes_handoff_note(command):
+                    self._log_pre_tool_denied(hook_input)
                     if committed:
                         return _note_delete_committed_deny(self._issue_number)
                     return _note_delete_deny(self._issue_number)
                 if not _is_handoff_command(command):
+                    self._log_pre_tool_denied(hook_input)
                     if committed:
                         return _cost_committed_deny(
                             "Further implementation work is disabled.",
@@ -3023,11 +3046,27 @@ class ModelExecutor:
                         "Further implementation work is disabled.",
                         self._issue_number,
                     )
+        # Subagents never perform the operator handoff: while a request is
+        # pending (latched and not yet begun) a subagent `handoff` call is
+        # denied with the subagent wording, even before delivery. The
+        # delivered gate below keeps main-thread behaviour unchanged.
+        if (
+            self._operator_handoff is not None
+            and not self._operator_begun
+            and not _is_main_thread(hook_input)
+            and _hook_field(hook_input, "tool_name") == "Skill"
+            and _skill_name(hook_input) == "handoff"
+        ):
+            self._log_pre_tool_denied(hook_input)
+            return _subagent_deny()
         if self._operator_context_delivered:
             committed = self._handoff_note_committed
             tool_name = _hook_field(hook_input, "tool_name")
             if tool_name == "Skill":
                 if _skill_name(hook_input) != "handoff":
+                    self._log_pre_tool_denied(hook_input)
+                    if not _is_main_thread(hook_input):
+                        return _subagent_deny()
                     if committed:
                         return _operator_committed_deny(
                             "Only the `handoff` skill stays allowed.",
@@ -3040,6 +3079,9 @@ class ModelExecutor:
             elif tool_name in ("Edit", "Write"):
                 file_path = str(_hook_field(hook_input, "tool_input", {}).get("file_path", ""))
                 if ".agent/handoff" not in file_path:
+                    self._log_pre_tool_denied(hook_input)
+                    if not _is_main_thread(hook_input):
+                        return _subagent_deny()
                     if committed:
                         return _operator_committed_deny(
                             "Further implementation work is disabled.",
@@ -3052,10 +3094,16 @@ class ModelExecutor:
             elif tool_name == "Bash":
                 command = str(_hook_field(hook_input, "tool_input", {}).get("command", ""))
                 if _deletes_handoff_note(command):
+                    self._log_pre_tool_denied(hook_input)
+                    if not _is_main_thread(hook_input):
+                        return _subagent_deny()
                     if committed:
                         return _operator_note_delete_committed_deny(self._issue_number)
                     return _operator_note_delete_deny(self._issue_number)
                 if not _is_handoff_command(command):
+                    self._log_pre_tool_denied(hook_input)
+                    if not _is_main_thread(hook_input):
+                        return _subagent_deny()
                     if committed:
                         return _operator_committed_deny(
                             "Further implementation work is disabled.",
@@ -3065,7 +3113,16 @@ class ModelExecutor:
                         "Further implementation work is disabled.",
                         self._issue_number,
                     )
-        return await publication_guard(hook_input, tool_use_id, context)
+        publication_decision = await publication_guard(hook_input, tool_use_id, context)
+        if publication_decision:
+            self._log_pre_tool_denied(hook_input)
+            return publication_decision
+        # Only calls that actually run are recorded as skill invocations:
+        # every deny above returns before reaching here, so a denied
+        # `handoff` (or any denied Skill) never enters `skill_events` and
+        # never marks the operator handoff begun.
+        await self._record_skill_event("PreToolUse", hook_input, tool_use_id, context)
+        return publication_decision
 
     async def _gate_review_on_stop(
         self, hook_input: Any, tool_use_id: str | None, context: Any
@@ -3125,12 +3182,12 @@ class ModelExecutor:
         self._observe_handoff_note_commit(hook_input)
         contexts: list[str] = []
         if self._soft_threshold_crossed and not self._handoff_context_delivered:
-            if _is_main_thread(hook_input) or not self._running_subagents:
-                # Once no subagent is left running the handoff instruction is
-                # delivered on the very next tool boundary (whatever thread
-                # it arrives on) instead of waiting for a main-thread
-                # boundary; stopping the subagents at the crossing is what
-                # frees the remaining budget for the handoff.
+            if _is_main_thread(hook_input):
+                # Only the main thread can perform the handoff, so a subagent
+                # boundary neither receives the instruction nor marks it
+                # delivered; the existing single token follow-up covers the
+                # case where the main thread reaches its final result without
+                # another boundary.
                 self._handoff_context_delivered = True
                 self._log("token_soft_threshold_handoff_context_injected")
                 self._token_handoff_snapshot = self._build_token_snapshot()
@@ -3142,10 +3199,9 @@ class ModelExecutor:
                     )
                 )
             else:
-                # Subagents are still recorded as running (for example the
-                # crossing flag was set without going through the stop
-                # path): a subagent cannot perform the handoff, so the
-                # instruction stays withheld until they are stopped.
+                # A subagent boundary (for example a tool already in flight
+                # at the crossing) never receives the handoff instruction and
+                # never marks it delivered.
                 pass
         if self._operator_handoff is not None and not self._operator_context_delivered:
             # Only the main thread can perform the handoff, so a subagent
@@ -3168,7 +3224,7 @@ class ModelExecutor:
             self._handoff_reinject_pending
             and self._soft_threshold_crossed
             and not self._handoff_note_committed
-            and (_is_main_thread(hook_input) or not self._running_subagents)
+            and _is_main_thread(hook_input)
         ):
             self._handoff_reinject_pending = False
             self._log("token_soft_threshold_handoff_context_reinjected")
@@ -3268,6 +3324,18 @@ class ModelExecutor:
         name = _skill_name(hook_input)
         if not isinstance(name, str):
             return {}
+        if name == "handoff":
+            # Only main-thread `handoff` calls that actually run count: a
+            # denied call or one from a subagent never enters `skill_events`
+            # and never marks the operator handoff begun. PreToolUse only
+            # records allowed calls (every deny returns before recording),
+            # and this guard covers direct PostToolUse boundaries for calls
+            # that never ran.
+            agent_id = _hook_field(hook_input, "agent_id")
+            if agent_id is not None:
+                return {}
+            if self._token_hard_ceiling_reached:
+                return {}
         self._skill_events.append(
             SkillEvent(
                 phase=phase,
@@ -3278,6 +3346,7 @@ class ModelExecutor:
         )
         if (
             name == "handoff"
+            and _hook_field(hook_input, "agent_id") is None
             and self._operator_handoff is not None
             and not self._operator_begun
         ):
@@ -3587,6 +3656,21 @@ def _operator_note_delete_committed_deny(issue_number: int | None) -> dict[str, 
         "Operator handoff note committed. The attempt is over: do not delete"
         f" or move the handoff note at `{path}`. End your turn now without"
         " further tool calls."
+    )
+
+
+def _subagent_deny() -> dict[str, Any]:
+    """Deny a stopped subagent without pointing it at the handoff.
+
+    The main thread performs the handoff, so the subagent is told to end
+    with a brief report. The wording carries no handoff skill invocation,
+    no note path, and no handoff command allowlist.
+    """
+
+    return _deny(
+        "Subagent work is stopped. Do not start the handoff or write a"
+        " handoff note; the main thread does that. End now with a brief"
+        " final report of what you found."
     )
 
 
