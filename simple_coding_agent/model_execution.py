@@ -721,18 +721,22 @@ class ModelExecutor:
     to the working tree is left as is for the normal dirty-work
     preservation.
 
-    The main-thread tool gate stays active until the handoff note commit is
-    observed on the branch, not just until the ``handoff`` skill is invoked:
-    invoking the skill is the first step of the handoff, and an
-    auto-compaction inside the remaining window must not reopen
-    implementation work. While the gate is active only handoff work stays
-    allowed (the ``handoff`` skill, ``Write``/``Edit`` under
+    The main-thread tool gate stays active until the attempt ends, including
+    after the handoff note commit is observed on the branch, not just until
+    the ``handoff`` skill is invoked: invoking the skill is the first step of
+    the handoff, and an auto-compaction inside the remaining window must not
+    reopen implementation work. While the gate is active only handoff work
+    stays allowed (the ``handoff`` skill, ``Write``/``Edit`` under
     ``.agent/handoff/``, and ``_is_handoff_command`` Bash). Deleting or
     moving the note while the handoff is pending is denied with a message
-    naming the next step. A compaction during a pending handoff re-arms the
-    handoff instruction so it is re-sent at the next tool boundary. Stopped
-    subagents stay denied after the note commit so a late subagent boundary
-    cannot overwrite the valid note.
+    naming the next step; denials after the note commit say the handoff note
+    is committed and the attempt is over, telling the model to end its turn
+    without further tool calls. A compaction during a pending handoff
+    re-arms the handoff instruction so it is re-sent at the next tool
+    boundary. Stopped subagents stay denied after the note commit so a late
+    subagent boundary cannot overwrite the valid note. Once a handoff note
+    commit (token or operator path) is observed, the next main-thread result
+    ends the session even when background tasks are still pending.
     """
 
     def __init__(
@@ -1452,6 +1456,7 @@ class ModelExecutor:
                             "Model invoked the handoff skill after a token"
                             " soft-threshold instruction."
                         ),
+                        allow_note_commit=True,
                     )
                     if followup is not None:
                         return followup
@@ -1588,13 +1593,29 @@ class ModelExecutor:
             return None
         return f".agent/handoff/{self._issue_number}.md"
 
+    def _token_handoff_done(self) -> bool:
+        """Whether the token path has handed off: skill invoked or note committed.
+
+        On the token path the main thread has handed off when either it called
+        the ``handoff`` skill or a main-thread note commit newer than the
+        handoff baseline has been observed. There is no condition on commits
+        above the note: the gate stays closed after the note commit, so
+        anything above it can only be work that was already uncommitted before
+        the threshold (the same as a seal commit), which the note validator
+        already accepts.
+        """
+
+        if not self._soft_threshold_crossed:
+            return False
+        return self._main_thread_handoff_invoked() or self._handoff_note_committed
+
     def _capture_handoff_baseline(self) -> None:
         """Remember HEAD while a handoff is pending so the note commit is detectable.
 
-        The gate releases only on a note commit newer than this baseline, so a
-        note carried over from an earlier round of a continued branch never
-        releases it. Best-effort: when git cannot report HEAD the baseline
-        stays ``None`` and the gate fails closed until it can.
+        Only a note commit newer than this baseline counts (and closes the
+        session), so a note carried over from an earlier round of a continued
+        branch never counts. Best-effort: when git cannot report HEAD the
+        baseline stays ``None`` and the gate fails closed until it can.
         """
 
         if self._handoff_baseline_sha is not None or self._working_directory is None:
@@ -1664,14 +1685,16 @@ class ModelExecutor:
                 )
 
     def _observe_handoff_note_commit(self, hook_input: Any) -> None:
-        """Release the handoff gate once the note commit lands on the branch.
+        """Record the handoff note commit once it lands on the branch.
 
         Every model commit goes through the observed ``Bash`` tool, so a
         main-thread command mentioning ``commit`` while a handoff is pending
-        is the only moment the gate needs to re-check git. The branch state
+        is the only moment the runner needs to re-check git. The branch state
         (not the command text) decides: only a commit touching the note path
-        newer than the handoff baseline releases the gate. A release also
-        clears any armed re-injection.
+        newer than the handoff baseline counts. The gate stays closed after
+        the commit until the attempt ends, and the next main-thread result
+        ends the session. Recording the commit also clears any armed
+        re-injection.
         """
 
         if self._handoff_note_committed:
@@ -1763,7 +1786,9 @@ class ModelExecutor:
         hard token limit would itself bypass the budget.
         """
 
-        if not self._soft_threshold_crossed or self._main_thread_handoff_invoked():
+        if self._token_handoff_done():
+            return False
+        if not self._soft_threshold_crossed:
             return False
         if self._cost_followup_blocked():
             self._log(
@@ -1805,11 +1830,14 @@ class ModelExecutor:
         success_explanation: str = (
             "Model invoked the handoff skill after reaching a turns/timeout limit."
         ),
+        allow_note_commit: bool = False,
     ) -> ModelExecution | None:
         """Best-effort same-client follow-up after a turns/timeout/token limit.
 
         Returns a HANDOFF_REQUESTED evidence only when the model actually
-        invoked the handoff skill in the main thread during the follow-up;
+        handed off in the main thread during the follow-up (the ``handoff``
+        skill invocation; on the token path a note commit made during the
+        follow-up counts as success too when ``allow_note_commit`` holds);
         otherwise returns None so the caller falls back to its ordinary limit
         classification. This never retries: a follow-up that fails or times
         out is itself evidence that handoff is not achievable right now.
@@ -1826,12 +1854,21 @@ class ModelExecutor:
         if followup_terminal is None:
             return None
         all_models = tuple(dict.fromkeys((*observed_models, *followup_models)))
-        if not self._main_thread_handoff_invoked():
+        skill_invoked = self._main_thread_handoff_invoked()
+        note_committed = allow_note_commit and self._handoff_note_committed
+        if not (skill_invoked or note_committed):
             return None
         self._note_terminal(followup_terminal)
+        if note_committed and not skill_invoked:
+            explanation = (
+                "Model committed the handoff note after a token"
+                " soft-threshold instruction."
+            )
+        else:
+            explanation = success_explanation
         return self._evidence(
             ModelExecutionStatus.HANDOFF_REQUESTED,
-            success_explanation,
+            explanation,
             followup_terminal.stop_reason,
             getattr(followup_terminal, "model_usage", None),
             all_models,
@@ -2024,7 +2061,7 @@ class ModelExecutor:
                         )
                 elif isinstance(message, ResultMessage) or _looks_like_result(message):
                     deferring = self._deferring_task_ids(background_pending)
-                    if deferring:
+                    if deferring and not self._handoff_note_committed:
                         self._settle_all_threads_and_log()
                         deferred_results += 1
                         deferred_result = message
@@ -2668,10 +2705,20 @@ class ModelExecutor:
                 all_models,
                 terminal_reason=terminal_reason,
             )
-        if self._soft_threshold_crossed and self._main_thread_handoff_invoked():
+        if self._token_handoff_done():
+            if self._main_thread_handoff_invoked():
+                explanation = (
+                    "Model invoked the handoff skill after a token"
+                    " soft-threshold instruction."
+                )
+            else:
+                explanation = (
+                    "Model committed the handoff note after a token"
+                    " soft-threshold instruction."
+                )
             return self._evidence(
                 ModelExecutionStatus.HANDOFF_REQUESTED,
-                "Model invoked the handoff skill after a token soft-threshold instruction.",
+                explanation,
                 stop_reason,
                 model_usage,
                 all_models,
@@ -2748,7 +2795,7 @@ class ModelExecutor:
                 all_models,
                 terminal_reason=terminal_reason,
             )
-        if self._soft_threshold_crossed and not self._main_thread_handoff_invoked():
+        if self._soft_threshold_crossed and not self._token_handoff_done():
             # The crossing was never converted into a handoff (the instruction
             # may have gone unseen or the follow-up failed), so this must not
             # read as an ordinary success: the attempt ends incomplete.
@@ -2919,7 +2966,8 @@ class ModelExecutor:
         # Stopped subagents stay denied for the rest of the run once the
         # threshold has crossed, including after the handoff note commit is
         # observed: a late subagent boundary must not overwrite the valid
-        # note. The main-thread gate below releases on the note commit.
+        # note. The main-thread gate below stays closed until the attempt
+        # ends.
         if self._soft_threshold_crossed and not _is_main_thread(hook_input):
             agent_id = _hook_agent_id(hook_input)
             if agent_id is not None and agent_id not in self._stopped_subagent_ids:
@@ -2928,23 +2976,33 @@ class ModelExecutor:
                 "Subagent work is stopped after the token soft threshold.",
                 self._issue_number,
             )
-        # The gate stays active until the handoff note commit is on the branch:
-        # invoking the skill is the first step of the handoff, not its end,
-        # and an auto-compaction inside the remaining window must not reopen
-        # implementation work.
-        if self._soft_threshold_crossed and not self._handoff_note_committed:
+        # The gate stays active until the attempt ends, including after the
+        # handoff note commit: invoking the skill is the first step of the
+        # handoff, not its end, and an auto-compaction inside the remaining
+        # window must not reopen implementation work.
+        if self._soft_threshold_crossed:
+            committed = self._handoff_note_committed
             tool_name = _hook_field(hook_input, "tool_name")
             if tool_name == "Skill" and _skill_name(hook_input) == "handoff":
                 pass
             elif tool_name == "Agent" or (
                 tool_name == "Task" and _is_subagent_launch(hook_input)
             ):
+                if committed:
+                    return _cost_committed_deny(
+                        "New subagent launches are disabled.", self._issue_number
+                    )
                 return _cost_deny(
                     "New subagent launches are disabled.", self._issue_number
                 )
             elif tool_name in ("Edit", "Write"):
                 file_path = str(_hook_field(hook_input, "tool_input", {}).get("file_path", ""))
                 if ".agent/handoff" not in file_path:
+                    if committed:
+                        return _cost_committed_deny(
+                            "Further implementation work is disabled.",
+                            self._issue_number,
+                        )
                     return _cost_deny(
                         "Further implementation work is disabled.",
                         self._issue_number,
@@ -2952,16 +3010,29 @@ class ModelExecutor:
             elif tool_name == "Bash":
                 command = str(_hook_field(hook_input, "tool_input", {}).get("command", ""))
                 if _deletes_handoff_note(command):
+                    if committed:
+                        return _note_delete_committed_deny(self._issue_number)
                     return _note_delete_deny(self._issue_number)
                 if not _is_handoff_command(command):
+                    if committed:
+                        return _cost_committed_deny(
+                            "Further implementation work is disabled.",
+                            self._issue_number,
+                        )
                     return _cost_deny(
                         "Further implementation work is disabled.",
                         self._issue_number,
                     )
         if self._operator_context_delivered:
+            committed = self._handoff_note_committed
             tool_name = _hook_field(hook_input, "tool_name")
             if tool_name == "Skill":
                 if _skill_name(hook_input) != "handoff":
+                    if committed:
+                        return _operator_committed_deny(
+                            "Only the `handoff` skill stays allowed.",
+                            self._issue_number,
+                        )
                     return _operator_deny(
                         "Only the `handoff` skill stays allowed.",
                         self._issue_number,
@@ -2969,6 +3040,11 @@ class ModelExecutor:
             elif tool_name in ("Edit", "Write"):
                 file_path = str(_hook_field(hook_input, "tool_input", {}).get("file_path", ""))
                 if ".agent/handoff" not in file_path:
+                    if committed:
+                        return _operator_committed_deny(
+                            "Further implementation work is disabled.",
+                            self._issue_number,
+                        )
                     return _operator_deny(
                         "Further implementation work is disabled.",
                         self._issue_number,
@@ -2976,8 +3052,15 @@ class ModelExecutor:
             elif tool_name == "Bash":
                 command = str(_hook_field(hook_input, "tool_input", {}).get("command", ""))
                 if _deletes_handoff_note(command):
+                    if committed:
+                        return _operator_note_delete_committed_deny(self._issue_number)
                     return _operator_note_delete_deny(self._issue_number)
                 if not _is_handoff_command(command):
+                    if committed:
+                        return _operator_committed_deny(
+                            "Further implementation work is disabled.",
+                            self._issue_number,
+                        )
                     return _operator_deny(
                         "Further implementation work is disabled.",
                         self._issue_number,
@@ -3454,6 +3537,56 @@ def _operator_deny(
         f"Create or edit the handoff note at `{path}` with the `Write` (or `Edit`)"
         " tool — Bash cannot create or modify files while the handoff is"
         " pending — then commit it with `git add` + `git commit` in Bash."
+    )
+
+
+def _cost_committed_deny(
+    restriction: str, issue_number: int | None = None
+) -> dict[str, Any]:
+    """Deny token-path work after the handoff note commit.
+
+    The gate stays closed until the attempt ends: the note is already
+    committed, so the model must end its turn now without further tool calls.
+    """
+
+    return _deny(
+        "Handoff note committed. The attempt is over: "
+        f"{restriction} "
+        "End your turn now without further tool calls."
+    )
+
+
+def _operator_committed_deny(
+    restriction: str, issue_number: int | None = None
+) -> dict[str, Any]:
+    """Deny operator-path work after the handoff note commit."""
+
+    return _deny(
+        "Operator handoff note committed. The attempt is over: "
+        f"{restriction} "
+        "End your turn now without further tool calls."
+    )
+
+
+def _note_delete_committed_deny(issue_number: int | None) -> dict[str, Any]:
+    """Deny deleting/moving the note after the token handoff note commit."""
+
+    path, _ = _handoff_note_commit_line(issue_number)
+    return _deny(
+        "Handoff note committed. The attempt is over: do not delete or move"
+        f" the handoff note at `{path}`. End your turn now without further"
+        " tool calls."
+    )
+
+
+def _operator_note_delete_committed_deny(issue_number: int | None) -> dict[str, Any]:
+    """Deny deleting/moving the note after the operator handoff note commit."""
+
+    path, _ = _handoff_note_commit_line(issue_number)
+    return _deny(
+        "Operator handoff note committed. The attempt is over: do not delete"
+        f" or move the handoff note at `{path}`. End your turn now without"
+        " further tool calls."
     )
 
 
