@@ -3001,7 +3001,7 @@ def test_token_instruction_and_followup_share_snapshot_and_two_call_steps(
         assert "pre-filled header" in text
         assert "Summary, Remaining work and Evidence" in text
         assert 'git add .agent/handoff/149.md && git commit -m "Handoff note: issue #149"' in text
-    # The follow-up reuses the injection-time snapshot instead of re-reading git.
+    # With no new commits the fresh follow-up snapshot matches the injection one.
     assert executor._token_followup_snapshot() in followup
     assert executor._token_followup_snapshot() in notice
     # Without a snapshot the prompts keep their legacy wording.
@@ -3014,6 +3014,337 @@ def test_token_instruction_and_followup_share_snapshot_and_two_call_steps(
     assert "commit any outstanding work" not in notice
     legacy_followup = _cost_handoff_followup_prompt(149, _ATTEMPT_ID)
     assert "commit any outstanding work" in legacy_followup
+
+
+def _handoff_executor(tmp_path: Path, repo: Path, base: str, *, issue_number: int = 149):
+    """An executed executor wired to a real repo with branch and base set."""
+
+    captured: list[FakeClient] = []
+
+    def client_factory(options: object) -> FakeClient:
+        client = FakeClient(options, [result()])
+        captured.append(client)
+        return client
+
+    executor = ModelExecutor(
+        replace(runtime_config(tmp_path), max_budget_tokens=1_000_000),
+        client_factory=client_factory,
+    )
+    asyncio.run(
+        executor.execute(
+            issue_body="Fix it.",
+            working_directory=repo,
+            issue_number=issue_number,
+            attempt_id=_ATTEMPT_ID,
+            branch=f"agent/issue-{issue_number}",
+            base_revision=base,
+        )
+    )
+    hooks = captured[0].options.hooks
+    return (
+        executor,
+        hooks["PreToolUse"][0].hooks[0],
+        hooks["PostToolUse"][0].hooks[0],
+    )
+
+
+def _cross_threshold(executor: ModelExecutor) -> None:
+    executor._ledger.observe_response("main", "r-big", 0)
+    executor._ledger.observe_usage("main", "r-big", {"input_tokens": 900_000})
+    executor._check_limits("main")
+    assert executor._soft_threshold_crossed is True
+
+
+def _main_bash_post(post_hook, command: str) -> dict:
+    return asyncio.run(
+        post_hook(
+            {"tool_name": "Bash", "tool_input": {"command": command}, "tool_response": "ok"},
+            None,
+            {},
+        )
+    )
+
+
+def _commit_note(repo: Path, *, issue_number: int = 149) -> str:
+    (repo / ".agent" / "handoff").mkdir(parents=True, exist_ok=True)
+    (repo / ".agent" / "handoff" / f"{issue_number}.md").write_text(
+        "# Handoff note: issue #149\n\n- issue: 149\n"
+    )
+    _git(repo, "add", f".agent/handoff/{issue_number}.md")
+    _git(repo, "commit", "-m", f"Handoff note: issue #{issue_number}")
+    return _git(repo, "rev-parse", "HEAD")
+
+
+def _commit_work(repo: Path, name: str, subject: str) -> str:
+    (repo / name).write_text("work\n")
+    _git(repo, "add", name)
+    _git(repo, "commit", "-m", subject)
+    return _git(repo, "rev-parse", "HEAD")
+
+
+def _prefill_last_work_commit(snapshot: str) -> str:
+    for line in snapshot.splitlines():
+        if line.startswith("- last_work_commit:"):
+            return line.split(":", 1)[1].strip()
+    raise AssertionError("no pre-filled last_work_commit in snapshot")
+
+
+def test_token_followup_rebuilds_header_after_post_injection_work_commit(
+    tmp_path: Path,
+) -> None:
+    """W1 -> N1 -> W2: the follow-up header names W2, not the stale W1."""
+
+    repo, base, w1 = _snapshot_repo(tmp_path)
+    executor, _, post_hook = _handoff_executor(tmp_path, repo, base)
+    _cross_threshold(executor)
+
+    notice = _main_bash_post(post_hook, "git status")
+    assert _prefill_last_work_commit(
+        notice["hookSpecificOutput"]["additionalContext"]
+    ) == w1
+
+    n1 = _commit_note(repo)
+    _main_bash_post(post_hook, 'git add .agent/handoff/149.md && git commit -m "note"')
+    assert executor._handoff_note_committed is True
+
+    w2 = _commit_work(repo, "more.txt", "Address review findings")
+
+    followup = executor._token_followup_snapshot()
+    assert _prefill_last_work_commit(followup) == w2
+    assert f"HEAD: {w2}" in followup
+    # Both the work commit and the note commit are visible in the log section.
+    assert w2[:7] in followup
+    assert n1[:7] in followup
+
+
+def test_token_followup_names_work_beneath_note_at_head(tmp_path: Path) -> None:
+    """W1 -> N1: the follow-up header names W1, never the note N1."""
+
+    repo, base, w1 = _snapshot_repo(tmp_path)
+    executor, _, post_hook = _handoff_executor(tmp_path, repo, base)
+    _cross_threshold(executor)
+    _main_bash_post(post_hook, "git status")
+
+    _commit_note(repo)
+    _main_bash_post(post_hook, 'git add .agent/handoff/149.md && git commit -m "note"')
+    assert executor._handoff_note_committed is True
+
+    followup = executor._token_followup_snapshot()
+    assert _prefill_last_work_commit(followup) == w1
+
+
+def test_token_injection_names_commit_that_raced_the_threshold(
+    tmp_path: Path,
+) -> None:
+    """A work commit landing between crossing and injection counts as work."""
+
+    repo, base, _ = _snapshot_repo(tmp_path)
+    executor, _, post_hook = _handoff_executor(tmp_path, repo, base)
+    _cross_threshold(executor)
+
+    raced = _commit_work(repo, "raced.txt", "Work that raced the injection")
+
+    notice = _main_bash_post(post_hook, "git status")
+    assert (
+        _prefill_last_work_commit(notice["hookSpecificOutput"]["additionalContext"])
+        == raced
+    )
+
+
+def test_note_only_followup_recommit_validates(tmp_path: Path) -> None:
+    """W1 -> N1 -> N2(header=W1) validates: the note names the work beneath N1."""
+
+    from simple_coding_agent.git_workspace import AttemptCommit
+    from simple_coding_agent.lifecycle import _validate_handoff_note
+
+    repo, base, w1 = _snapshot_repo(tmp_path)
+    executor, _, post_hook = _handoff_executor(tmp_path, repo, base)
+    _cross_threshold(executor)
+    _main_bash_post(post_hook, "git status")
+
+    n1 = _commit_note(repo)
+    _main_bash_post(post_hook, 'git add .agent/handoff/149.md && git commit -m "note"')
+    assert executor._handoff_note_committed is True
+
+    header = _prefill_last_work_commit(executor._token_followup_snapshot())
+    assert header == w1
+
+    (repo / ".agent" / "handoff" / "149.md").write_text(
+        "# Handoff note: issue #149\n\n"
+        "- issue: 149\n"
+        f"- started_at: {_ATTEMPT_ID}\n"
+        "- reason: token_soft_threshold\n"
+        f"- last_work_commit: {header}\n"
+    )
+    _git(repo, "add", ".agent/handoff/149.md")
+    _git(repo, "commit", "-m", "Handoff note: issue #149")
+    n2 = _git(repo, "rev-parse", "HEAD")
+
+    validation = _validate_handoff_note(
+        AttemptCommit(revision=n2, subject="Handoff note: issue #149"),
+        [
+            AttemptCommit(revision=n2, subject="Handoff note: issue #149"),
+            AttemptCommit(revision=n1, subject="Handoff note: issue #149"),
+            AttemptCommit(revision=w1, subject="Half-finish the work"),
+        ],
+        149,
+        repo,
+        base,
+        note_commit_revisions={n1},
+    )
+    assert validation.valid
+
+
+def test_token_reinject_after_compaction_carries_current_header(
+    tmp_path: Path,
+) -> None:
+    """Post-injection work is reflected in the post-compaction re-injection."""
+
+    from claude_agent_sdk import SystemMessage
+
+    repo, base, _ = _snapshot_repo(tmp_path, issue_number=24)
+    executor, _, post_hook = _handoff_executor(
+        tmp_path, repo, base, issue_number=24
+    )
+    _cross_threshold(executor)
+    _main_bash_post(post_hook, "git status")
+
+    w2 = _commit_work(repo, "more.txt", "More work after injection")
+
+    compact_client = FakeClient(
+        None,
+        [
+            SystemMessage(
+                subtype="compact_boundary",
+                data={"compact_metadata": {"trigger": "auto", "pre_tokens": 170603}},
+            ),
+            result(),
+        ],
+    )
+    asyncio.run(executor._receive_terminal(compact_client))
+    assert executor._handoff_reinject_pending is True
+
+    repeated = _main_bash_post(post_hook, "git status")[
+        "hookSpecificOutput"
+    ]["additionalContext"]
+    assert "compacted" in repeated
+    assert _prefill_last_work_commit(repeated) == w2
+
+
+def test_token_header_names_previous_round_note_on_continued_branch(
+    tmp_path: Path,
+) -> None:
+    """A continued branch topped by the previous round's note names that note."""
+
+    import subprocess as _subprocess
+
+    repo, base, _ = _snapshot_repo(tmp_path)
+    relpath = ".agent/handoff/149.md"
+    (repo / ".agent" / "handoff").mkdir(parents=True, exist_ok=True)
+    (repo / ".agent" / "handoff" / "149.md").write_text(
+        "# Handoff note: issue #149\n\n- issue: 149\n"
+    )
+    env = dict(
+        _os.environ,
+        GIT_AUTHOR_DATE="2026-01-01T00:00:00+00:00",
+        GIT_COMMITTER_DATE="2026-01-01T00:00:00+00:00",
+    )
+    _subprocess.run(
+        ("git", "add", relpath),
+        cwd=repo,
+        env=env,
+        check=True,
+        text=True,
+        capture_output=True,
+    )
+    _subprocess.run(
+        ("git", "commit", "-m", "Handoff note: issue #149"),
+        cwd=repo,
+        env=env,
+        check=True,
+        text=True,
+        capture_output=True,
+    )
+    previous_note = _git(repo, "rev-parse", "HEAD")
+
+    executor, _, post_hook = _handoff_executor(tmp_path, repo, base)
+    _cross_threshold(executor)
+    notice = _main_bash_post(post_hook, "git status")
+    # The previous round's note predates the attempt, so it is work to name,
+    # not a note commit to skip.
+    assert (
+        _prefill_last_work_commit(notice["hookSpecificOutput"]["additionalContext"])
+        == previous_note
+    )
+
+
+def test_followup_note_with_fresh_header_validates(tmp_path: Path) -> None:
+    """W1 -> N1 -> W2 -> N2(header=W2) passes validation; header=W1 does not."""
+
+    from simple_coding_agent.git_workspace import AttemptCommit
+    from simple_coding_agent.lifecycle import _validate_handoff_note
+
+    repo, base, w1 = _snapshot_repo(tmp_path)
+    executor, _, post_hook = _handoff_executor(tmp_path, repo, base)
+    _cross_threshold(executor)
+    _main_bash_post(post_hook, "git status")
+
+    n1 = _commit_note(repo)
+    _main_bash_post(post_hook, 'git add .agent/handoff/149.md && git commit -m "note"')
+    w2 = _commit_work(repo, "more.txt", "Address review findings")
+
+    header = _prefill_last_work_commit(executor._token_followup_snapshot())
+    assert header == w2
+
+    note_path = repo / ".agent" / "handoff" / "149.md"
+    note_path.write_text(
+        "# Handoff note: issue #149\n\n"
+        "- issue: 149\n"
+        f"- started_at: {_ATTEMPT_ID}\n"
+        "- reason: token_soft_threshold\n"
+        f"- last_work_commit: {header}\n"
+    )
+    _git(repo, "add", ".agent/handoff/149.md")
+    _git(repo, "commit", "-m", "Handoff note: issue #149")
+    n2 = _git(repo, "rev-parse", "HEAD")
+
+    commits = [
+        AttemptCommit(revision=n2, subject="Handoff note: issue #149"),
+        AttemptCommit(revision=w2, subject="Address review findings"),
+        AttemptCommit(revision=n1, subject="Handoff note: issue #149"),
+        AttemptCommit(revision=w1, subject="Half-finish the work"),
+    ]
+    note_commit = commits[0]
+    (repo / ".agent" / "handoff").mkdir(parents=True, exist_ok=True)
+
+    fresh = _validate_handoff_note(
+        note_commit,
+        commits,
+        149,
+        repo,
+        base,
+        note_commit_revisions={n1},
+    )
+    assert fresh.valid
+
+    stale_path_text = (
+        "# Handoff note: issue #149\n\n"
+        "- issue: 149\n"
+        f"- started_at: {_ATTEMPT_ID}\n"
+        "- reason: token_soft_threshold\n"
+        f"- last_work_commit: {w1}\n"
+    )
+    note_path.write_text(stale_path_text)
+    stale = _validate_handoff_note(
+        note_commit,
+        commits,
+        149,
+        repo,
+        base,
+        note_commit_revisions={n1},
+    )
+    assert not stale.valid
+    assert "last_work_commit" in stale.reason
 
 
 def test_token_snapshot_degrades_outside_a_git_repo(tmp_path: Path) -> None:
