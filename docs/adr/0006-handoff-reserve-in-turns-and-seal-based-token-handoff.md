@@ -2,6 +2,8 @@
 
 The soft threshold used to sit a fixed share of the token budget below the hard ceiling (`SOFT_THRESHOLD_PERCENTAGE=0.2`, 800K of 4M tokens). Every turn re-counts the whole main context, so the cost of a turn grows with the context: on #155, with a ~148K context, 800K covered about five turns. The model spent them on orientation commands and hit the hard ceiling before writing its note (#159). We decided that the soft threshold is the earlier of two rules: the existing percentage, and a Handoff reserve of `HANDOFF_RESERVE_TURNS` turns (default 6) at the main thread's latest context size, plus the turn already in flight (`soft = min(max·(1−pct), max − (reserve_turns + 1)·main_context)`). We also decided that after a token soft threshold the model commits only the handoff note. It writes the note with `last_work_commit` set to the HEAD the runtime gives it, and leaves any uncommitted work to sealing (ADR 0001), which commits it on top of the note. Together with injecting the git state the model would otherwise look up, this reduces the handoff to one `Write` and one `Bash`.
 
+After the token handoff note commit, the main-thread gate stays closed until the attempt ends, and the next main-thread result ends the session even when background tasks are still pending (a late task notification cannot restart the model; the runtime waits for the model's own result rather than interrupting mid-turn). A main-thread note commit newer than the handoff baseline counts as the handoff on its own, without a `handoff` skill call: when either the skill was invoked or the note was committed, no token follow-up is sent and terminal classification is `HANDOFF_REQUESTED`.
+
 ## Considered Options
 
 - **Replace the percentage with the reserve.** Rejected: the ledger's estimates are hand-tuned and can err (ADR 0002). The percentage stays as a margin against that, and operators can set it to 0.
@@ -9,6 +11,8 @@ The soft threshold used to sit a fixed share of the token budget below the hard 
 - **The model commits its work, then writes and commits the note (three tool calls).** Rejected for the token path: it costs a turn the reserve may not have, and sealing already guarantees uncommitted work is kept. Operator and turn/time-limit handoffs are not short of tokens and keep that flow.
 - **The runtime fills in or relaxes `last_work_commit`.** Rejected: the note validator's check that the note describes the work beneath it is what makes a note trustworthy.
 - **Deny read-only orientation commands after the soft threshold.** Rejected: a denied tool call costs a full turn too, so it saves nothing and invites retries. The instruction tells the model not to run them instead.
+- **Let post-note work through and seal it.** Rejected: it spends budget past the soft threshold on unrequested work and leaves the note describing an older branch.
+- **Require the `handoff` skill call as the handoff signal.** Rejected: models routinely write and commit the note by hand without calling the skill, and the committed, validated note is the stronger evidence.
 
 ## Consequences
 

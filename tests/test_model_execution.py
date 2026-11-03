@@ -3674,7 +3674,7 @@ def test_cost_guard_stays_active_after_handoff_skill_until_note_commit(
     )
 
 
-def test_cost_guard_releases_after_the_handoff_note_commit(tmp_path: Path) -> None:
+def test_cost_guard_stays_closed_after_the_handoff_note_commit(tmp_path: Path) -> None:
     repo, _, _ = _snapshot_repo(tmp_path, issue_number=24)
     executor, events, pre_hook, post_hook = _hooked_executor_204(tmp_path, repo)
     _cross_soft_threshold_204(executor)
@@ -3739,16 +3739,46 @@ def test_cost_guard_releases_after_the_handoff_note_commit(tmp_path: Path) -> No
         name == "token_soft_threshold_handoff_note_committed" for name, _ in events
     )
 
-    # The gate is released: the handoff is done, the turn can settle.
+    # The gate stays closed after the note commit until the attempt ends:
+    # implementation edits, non-allowlisted Bash, and new launches are
+    # denied with the committed wording, while note edits and allowlisted git
+    # stay allowed.
+    denied_edit = asyncio.run(
+        pre_hook({"tool_name": "Edit", "tool_input": {"file_path": "src/a.py"}}, None, {})
+    )
+    assert denied_edit["hookSpecificOutput"]["permissionDecision"] == "deny"
+    reason = denied_edit["hookSpecificOutput"]["permissionDecisionReason"]
+    assert "note committed" in reason.lower()
+    assert "end your turn" in reason.lower()
+    denied_bash = asyncio.run(
+        pre_hook({"tool_name": "Bash", "tool_input": {"command": "pytest -q"}}, None, {})
+    )
+    assert denied_bash["hookSpecificOutput"]["permissionDecision"] == "deny"
+    assert "note committed" in denied_bash["hookSpecificOutput"]["permissionDecisionReason"].lower()
+    assert "end your turn" in denied_bash["hookSpecificOutput"]["permissionDecisionReason"].lower()
+    denied_launch = asyncio.run(
+        pre_hook({"tool_name": "Agent", "tool_input": {"description": "review"}}, None, {})
+    )
+    assert denied_launch["hookSpecificOutput"]["permissionDecision"] == "deny"
     assert (
         asyncio.run(
-            pre_hook({"tool_name": "Edit", "tool_input": {"file_path": "src/a.py"}}, None, {})
+            pre_hook(
+                {"tool_name": "Write", "tool_input": {"file_path": ".agent/handoff/24.md"}},
+                None,
+                {},
+            )
         )
         == {}
     )
     assert (
         asyncio.run(
-            pre_hook({"tool_name": "Agent", "tool_input": {"description": "review"}}, None, {})
+            pre_hook({"tool_name": "Bash", "tool_input": {"command": "git status"}}, None, {})
+        )
+        == {}
+    )
+    assert (
+        asyncio.run(
+            pre_hook({"tool_name": "Skill", "tool_input": {"skill": "handoff"}}, None, {})
         )
         == {}
     )
@@ -3828,13 +3858,12 @@ def test_stopped_subagent_stays_denied_after_the_handoff_note_commit(
         denied = asyncio.run(pre_hook(hook_input, None, {}))
         assert denied["hookSpecificOutput"]["permissionDecision"] == "deny", hook_input
 
-    # The main-thread gate is still released after the note commit.
-    assert (
-        asyncio.run(
-            pre_hook({"tool_name": "Edit", "tool_input": {"file_path": "src/a.py"}}, None, {})
-        )
-        == {}
+    # The main-thread gate stays closed after the note commit.
+    denied = asyncio.run(
+        pre_hook({"tool_name": "Edit", "tool_input": {"file_path": "src/a.py"}}, None, {})
     )
+    assert denied["hookSpecificOutput"]["permissionDecision"] == "deny"
+    assert "note committed" in denied["hookSpecificOutput"]["permissionDecisionReason"].lower()
 
 
 def test_review_nudge_is_skipped_once_the_handoff_note_is_committed(
@@ -4252,3 +4281,168 @@ def test_a_failing_disconnect_does_not_hide_the_original_sdk_error(tmp_path: Pat
     assert execution.status is ModelExecutionStatus.INFRASTRUCTURE_ERROR
     assert "RuntimeError" in execution.explanation
     assert calls == ["connect", "disconnect"]
+
+
+# --- Token handoff note commit ends the session (issue #324) ------------------
+
+
+def _commit_note_through_hooks(
+    repo: Path, executor: ModelExecutor, post_hook, *, issue_number: int = 24
+) -> None:
+    """Write and commit the handoff note through the observed tools."""
+
+    (repo / ".agent" / "handoff").mkdir(parents=True, exist_ok=True)
+    (repo / ".agent" / "handoff" / f"{issue_number}.md").write_text(
+        "# Handoff note: issue #24\n\n- issue: 24\n"
+    )
+    commit_command = (
+        f'git add .agent/handoff/{issue_number}.md'
+        f' && git commit -m "Handoff note: issue #{issue_number}"'
+    )
+    _git(repo, "add", f".agent/handoff/{issue_number}.md")
+    _git(repo, "commit", "-m", f"Handoff note: issue #{issue_number}")
+    asyncio.run(
+        post_hook(
+            {
+                "tool_name": "Bash",
+                "tool_input": {"command": commit_command},
+                "tool_response": "ok",
+            },
+            "c-note",
+            {},
+        )
+    )
+
+
+def test_note_commit_without_skill_counts_as_token_handoff(tmp_path: Path) -> None:
+    repo, _, _ = _snapshot_repo(tmp_path, issue_number=24)
+    executor, events, pre_hook, post_hook = _hooked_executor_204(tmp_path, repo)
+    _cross_soft_threshold_204(executor)
+
+    _commit_note_through_hooks(repo, executor, post_hook)
+
+    assert executor._handoff_note_committed is True
+    assert executor._token_handoff_done() is True
+    terminal = result()
+    assert executor._needs_cost_handoff_followup(terminal, ()) is False
+    execution = executor._classify(terminal, ())
+    assert execution.status is ModelExecutionStatus.HANDOFF_REQUESTED
+    assert "note" in execution.explanation.lower()
+
+
+def test_skill_call_without_note_still_counts_as_token_handoff(tmp_path: Path) -> None:
+    repo, _, _ = _snapshot_repo(tmp_path, issue_number=24)
+    executor, _, pre_hook, _ = _hooked_executor_204(tmp_path, repo)
+    _cross_soft_threshold_204(executor)
+    _invoke_handoff_skill_204(pre_hook)
+
+    assert executor._token_handoff_done() is True
+    terminal = result()
+    assert executor._needs_cost_handoff_followup(terminal, ()) is False
+    execution = executor._classify(terminal, ())
+    assert execution.status is ModelExecutionStatus.HANDOFF_REQUESTED
+    assert "skill" in execution.explanation.lower()
+
+
+def test_token_followup_note_commit_counts_as_success(tmp_path: Path) -> None:
+    repo, _, _ = _snapshot_repo(tmp_path, issue_number=24)
+    captured: list[FakeClient] = []
+    holder: dict[str, ModelExecutor] = {}
+
+    def on_query() -> None:
+        executor = holder["executor"]
+        (repo / ".agent" / "handoff").mkdir(parents=True, exist_ok=True)
+        (repo / ".agent" / "handoff" / "24.md").write_text(
+            "# Handoff note: issue #24\n\n- issue: 24\n"
+        )
+        commit_command = (
+            'git add .agent/handoff/24.md && git commit -m "Handoff note: issue #24"'
+        )
+        _git(repo, "add", ".agent/handoff/24.md")
+        _git(repo, "commit", "-m", "Handoff note: issue #24")
+        executor._observe_handoff_note_commit(
+            {"tool_name": "Bash", "tool_input": {"command": commit_command}}
+        )
+
+    def client_factory(options: object) -> FakeClient:
+        client = FakeClient(
+            options,
+            [*soft_crossing_messages(), result()],
+            followup_messages=[result(stop_reason="end_turn")],
+            on_query=on_query,
+        )
+        captured.append(client)
+        return client
+
+    executor = ModelExecutor(
+        replace(runtime_config(tmp_path), max_budget_tokens=1_000_000),
+        client_factory=client_factory,
+    )
+    holder["executor"] = executor
+
+    execution = asyncio.run(
+        executor.execute(
+            issue_body="Fix it.",
+            working_directory=repo,
+            issue_number=24,
+            attempt_id=_ATTEMPT_ID_204,
+        )
+    )
+
+    assert execution.status is ModelExecutionStatus.HANDOFF_REQUESTED
+    assert len(captured[0].queried_prompts) == 1
+
+
+def test_result_after_note_commit_is_final_with_pending_background(
+    tmp_path: Path,
+) -> None:
+    from tests.test_model_execution_background import (
+        BackgroundFakeClient,
+        notified,
+        result as bg_result,
+        started,
+    )
+
+    repo, _, _ = _snapshot_repo(tmp_path, issue_number=24)
+    executor, events, pre_hook, post_hook = _hooked_executor_204(tmp_path, repo)
+    _cross_soft_threshold_204(executor)
+    _commit_note_through_hooks(repo, executor, post_hook)
+    assert executor._handoff_note_committed is True
+
+    client = BackgroundFakeClient(
+        None,
+        [started("A"), bg_result(input_tokens=12), notified("A")],
+    )
+    terminal, _ = asyncio.run(executor._receive_terminal(client))
+
+    assert terminal is not None
+    assert not [name for name, _ in events if name == "background_result_deferred"]
+    assert getattr(client, "stopped_tasks", []) == ["A"]
+
+
+def test_result_after_operator_note_commit_is_final_with_pending_background(
+    tmp_path: Path,
+) -> None:
+    from tests.test_model_execution_background import (
+        BackgroundFakeClient,
+        notified,
+        result as bg_result,
+        started,
+    )
+
+    repo, _, _ = _snapshot_repo(tmp_path, issue_number=24)
+    executor, events, _, post_hook = _hooked_executor_204(tmp_path, repo)
+    executor._operator_context_delivered = True
+    executor._capture_handoff_baseline()
+    _commit_note_through_hooks(repo, executor, post_hook)
+    assert executor._handoff_note_committed is True
+
+    client = BackgroundFakeClient(
+        None,
+        [started("A"), bg_result(input_tokens=12), notified("A")],
+    )
+    terminal, _ = asyncio.run(executor._receive_terminal(client))
+
+    assert terminal is not None
+    assert not [name for name, _ in events if name == "background_result_deferred"]
+    assert getattr(client, "stopped_tasks", []) == ["A"]
