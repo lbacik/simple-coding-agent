@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -199,6 +199,166 @@ def _snapshot_section(title: str, output: str | None, empty: str) -> str:
     return f"{title}:\n{_cap_snapshot_lines(body)}"
 
 
+def expected_handoff_last_work_commit(
+    commit_revisions_newest_first: Sequence[str],
+    note_revisions: Collection[str],
+    base_revision: str,
+    *,
+    start: int = 0,
+) -> str:
+    """The work commit a handoff note at ``start`` must name.
+
+    Newest-first ``commit_revisions_newest_first`` is walked from ``start``,
+    skipping the unbroken run of this attempt's note-only ``note_revisions``;
+    the first revision outside the run is the expected ``last_work_commit``,
+    or ``base_revision`` when the run reaches the base. The walk is the same
+    rule ``lifecycle._validate_handoff_note`` applies beneath the newest note
+    commit (there ``start`` is the note's index plus one); the snapshot
+    pre-fill calls it with ``start=0`` for a note that would sit on top of
+    HEAD, so the prompt and the validator cannot disagree.
+    """
+
+    notes = set(note_revisions)
+    cursor = start
+    while (
+        cursor < len(commit_revisions_newest_first)
+        and commit_revisions_newest_first[cursor] in notes
+    ):
+        cursor += 1
+    if cursor < len(commit_revisions_newest_first):
+        return commit_revisions_newest_first[cursor]
+    return base_revision
+
+
+def _attempt_start_epoch_seconds(attempt_id: str | None) -> int | None:
+    """The attempt start as whole epoch seconds, or ``None`` when unknown.
+
+    Mirrors ``git_workspace.attempt_start_epoch`` without importing it (that
+    module imports this one for ``ModelExecutionStatus``): author dates
+    survive rebases while revisions do not, so only commits authored at or
+    after the attempt start count as this attempt's note commits. An
+    unparseable or missing id applies no time bound, exactly like the
+    workspace helper.
+    """
+
+    if attempt_id is None:
+        return None
+    try:
+        started = datetime.fromisoformat(attempt_id.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if started.tzinfo is None:
+        return None
+    return int(started.timestamp())
+
+
+def _token_note_relpath(issue_number: int) -> str:
+    """The repository-relative handoff note path (mirrors ``handoff_note_relpath``)."""
+
+    return f".agent/handoff/{issue_number}.md"
+
+
+def _token_this_attempt_note_revisions(
+    working_directory: Path,
+    base_revision: str,
+    issue_number: int,
+    attempt_id: str | None,
+) -> set[str]:
+    """Revisions of this attempt's note-only commits for the snapshot pre-fill.
+
+    The same notion ``lifecycle`` passes to ``_validate_handoff_note`` as
+    ``note_commit_revisions``: note-touching commits of this attempt (authored
+    at or after the attempt start) that do not carry work. A note-touching
+    commit that deletes the note while changing other files is work that
+    dropped a stale note, not a note commit, so it is excluded from the run
+    and the header names it. Anything git cannot report fails closed to work
+    (it is not skipped), matching validation strictness; an unreadable note
+    log degrades to an empty set so the header falls back to HEAD.
+    """
+
+    relpath = _token_note_relpath(issue_number)
+    output = _run_snapshot_git(
+        working_directory,
+        "log",
+        "--format=%H%x00%at",
+        f"{base_revision}..HEAD",
+        "--",
+        relpath,
+    )
+    if output is None:
+        return set()
+    started = _attempt_start_epoch_seconds(attempt_id)
+    revisions: set[str] = set()
+    for line in output.splitlines():
+        revision, separator, authored = line.partition("\x00")
+        if not separator or not revision or not authored.strip().isdigit():
+            continue
+        if started is not None and int(authored.strip()) < started:
+            continue
+        files_raw = _run_snapshot_git(
+            working_directory,
+            "diff-tree",
+            "--no-commit-id",
+            "--name-only",
+            "-r",
+            "--root",
+            revision,
+            "--",
+        )
+        if files_raw is None:
+            continue
+        files = [path.strip() for path in files_raw.splitlines() if path.strip()]
+        touches_other_files = any(path != relpath for path in files)
+        if not touches_other_files:
+            revisions.add(revision)
+            continue
+        present = _run_snapshot_git(working_directory, "cat-file", "-e", f"{revision}:{relpath}")
+        if present is None:
+            # ``cat-file -e`` reports absence via a non-zero exit (``None``
+            # here), which also covers an unreadable object: either way the
+            # commit deleted the note alongside real work, so it is work.
+            continue
+        revisions.add(revision)
+    return revisions
+
+
+def _token_expected_last_work_commit(
+    working_directory: Path | None,
+    *,
+    base_revision: str | None,
+    issue_number: int | None,
+    attempt_id: str | None,
+    head_sha: str | None,
+) -> str | None:
+    """The ``last_work_commit`` the validator will expect, read fresh from git.
+
+    ``None`` when even HEAD is unknown. Otherwise the newest commit on the
+    branch that is not one of this attempt's note-only commits (the unbroken
+    run of this attempt's note commits at the top skipped), or the base
+    revision when no such commit exists. Earlier rounds' note commits are
+    never skipped, matching the validator. Degraded git output falls back to
+    HEAD (or the base revision when the branch holds no attempt commits) so
+    the handoff stays writable.
+    """
+
+    if head_sha is None:
+        return None
+    if working_directory is None or base_revision is None or issue_number is None:
+        return head_sha
+    output = _run_snapshot_git(
+        working_directory, "log", "--format=%H", f"{base_revision}..HEAD"
+    )
+    if output is None:
+        return head_sha
+    revisions = [line.strip() for line in output.splitlines() if line.strip()]
+    if not revisions:
+        return base_revision
+    note_revisions = _token_this_attempt_note_revisions(
+        working_directory, base_revision, issue_number, attempt_id
+    )
+    return expected_handoff_last_work_commit(revisions, note_revisions, base_revision)
+
+
 def _token_handoff_prefill(
     issue_number: int | None, attempt_id: str | None, head_sha: str | None
 ) -> str:
@@ -227,14 +387,18 @@ def _token_handoff_snapshot(
 ) -> str:
     """Collect the branch state the two-call token handoff needs.
 
-    Taken at injection time so the model never spends its remaining turns
-    on orientation commands: the current branch, the base revision, the
+    Collected fresh every time a handoff prompt is handed to the model (the
+    initial injection, the single follow-up, and any post-compaction
+    re-injection) so the model never spends its remaining turns on
+    orientation commands: the current branch, the base revision, the
     current HEAD SHA, ``git status --short``, ``git log --oneline
     <base>..HEAD`` and ``git diff --stat <base>`` (each capped at
     ``_SNAPSHOT_LINE_LIMIT`` lines), the attempt's ``started_at``, and a
-    pre-filled note header whose ``last_work_commit`` is HEAD at injection
-    time. Anything git cannot report degrades to ``(unavailable)`` instead
-    of failing: the handoff must still be writable.
+    pre-filled note header whose ``last_work_commit`` is the last work
+    commit per the validator's rule (the newest commit that is not one of
+    this attempt's note-only commits, or the base revision when there is no
+    such commit). Anything git cannot report degrades to ``(unavailable)``
+    instead of failing: the handoff must still be writable.
     """
 
     if working_directory is None:
@@ -277,7 +441,7 @@ def _token_handoff_snapshot(
         (
             f"Pre-filled note header (copy verbatim, then fill in Summary,"
             f" Remaining work and Evidence):\n"
-            f"{_token_handoff_prefill(issue_number, attempt_id, head_sha)}"
+            f"{_token_handoff_prefill(issue_number, attempt_id, _token_expected_last_work_commit(working_directory, base_revision=base_revision, issue_number=issue_number, attempt_id=attempt_id, head_sha=head_sha))}"
         ),
         f"The handoff note path is exactly `.agent/handoff/{note_label}.md`.",
     ]
@@ -1547,17 +1711,18 @@ class ModelExecutor:
         )
 
     def _token_followup_snapshot(self) -> str:
-        """The injection-time snapshot, or a fresh one when never injected.
+        """The branch state for the single token follow-up, collected fresh.
 
-        The follow-up prompt carries the state taken at injection time, so
-        the model still sees the branch as it was when the threshold
-        crossed even if the injection raced a commit. When no injection
-        happened (the crossing landed on the terminal result itself), the
-        snapshot is collected fresh.
+        Every snapshot handed to the model reflects the branch at the moment
+        it is sent: a commit that landed alongside the injection is already
+        on the branch when the follow-up header is computed, so naming it is
+        right (the note sits on top of it), and work the model committed
+        after the injection is named instead of the stale injection-time
+        HEAD. The stored injection snapshot is refreshed as a side effect so
+        late readers still see the latest state.
         """
 
-        if self._token_handoff_snapshot is None:
-            self._token_handoff_snapshot = self._build_token_snapshot()
+        self._token_handoff_snapshot = self._build_token_snapshot()
         return self._token_handoff_snapshot
 
     def _cost_followup_blocked(self) -> bool:

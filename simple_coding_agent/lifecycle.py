@@ -138,7 +138,7 @@ from simple_coding_agent.github_tracker import (
     claim_marker_labels,
     ineligibility_reason,
 )
-from simple_coding_agent.model_execution import ModelExecutionStatus, ModelExecutor, OperatorHandoff, ToolCallRecord
+from simple_coding_agent.model_execution import ModelExecutionStatus, ModelExecutor, OperatorHandoff, ToolCallRecord, expected_handoff_last_work_commit
 from simple_coding_agent.observability import AttemptArchive, Redactor
 from simple_coding_agent.operating import ConsecutiveErrorStore
 from simple_coding_agent.publication import (
@@ -7845,13 +7845,12 @@ def _validate_handoff_note(
     if note_index is None:
         expected_last_work_commit = base_revision
     else:
-        cursor = note_index + 1
-        while cursor < len(commits) and commits[cursor].revision in note_revisions:
-            cursor += 1
-        if cursor < len(commits):
-            expected_last_work_commit = commits[cursor].revision
-        else:
-            expected_last_work_commit = base_revision
+        expected_last_work_commit = expected_handoff_last_work_commit(
+            [commit.revision for commit in commits],
+            note_revisions,
+            base_revision,
+            start=note_index + 1,
+        )
     if (
         len(last_work_commit) < 7
         or not expected_last_work_commit.startswith(last_work_commit)
