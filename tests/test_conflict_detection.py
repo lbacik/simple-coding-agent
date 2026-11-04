@@ -958,3 +958,39 @@ def test_graphql_parses_the_head_branch_tip() -> None:
     assert "headRef { target { oid } }" in query
     for connection in ("comments", "reviews", "commits", "files"):
         assert connection not in query
+
+
+# ---------------------------------------------------------------------------
+# FakeTracker mirrors the production stale-head skip (one event, one notice)
+# ---------------------------------------------------------------------------
+
+
+def test_fake_tracker_skips_a_stale_head_pr_with_one_notice() -> None:
+    events: list[tuple[str, str, str, int | None]] = []
+    tracker = FakeTracker(
+        {7: issue(7)},
+        fifo=[],
+        open_pull_requests={
+            "agent/issue-7": open_pr(42, "agent/issue-7", sha="abc123", tip="def456")
+        },
+        max_conflict_attempts=1,
+        event_log=lambda event, detail="", level="INFO", issue_number=None: events.append(
+            (event, detail, level, issue_number)
+        ),
+    )
+
+    assert tracker.detect_conflict_requeues() == []
+    assert tracker.added_labels == []
+    skipped = [entry for entry in events if entry[0] == "conflict_requeue_skipped"]
+    assert len(skipped) == 1
+    assert skipped[0][2] == "WARNING"
+    assert "reason=pr_head_stale" in skipped[0][1]
+    assert "abc123" in skipped[0][1] and "def456" in skipped[0][1]
+    notices = tracker.comments.get(7, [])
+    assert len(notices) == 1
+    assert "<!-- pr-head-stale: pr=42 head=abc123 tip=def456 -->" in notices[0][1]
+
+    # A second poll with the same state posts no further notice.
+    assert tracker.detect_conflict_requeues() == []
+    assert len(tracker.comments.get(7, [])) == 1
+    assert len([entry for entry in events if entry[0] == "conflict_requeue_skipped"]) == 2
