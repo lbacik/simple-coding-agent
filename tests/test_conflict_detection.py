@@ -42,7 +42,9 @@ from simple_coding_agent.github_tracker import (
     TrackerIssue,
     conflict_branch_issue_number,
     is_conflict_detection_eligible,
+    is_pr_head_stale,
 )
+from simple_coding_agent.recovery import parse_pr_head_stale
 from simple_coding_agent.lifecycle import AgentLifecycle, AttemptEvidence, LifecycleStatus
 from simple_coding_agent.publication import PullRequest
 from tests.fakes import FakePublisher, FakeTracker, InMemoryWorkspace
@@ -78,6 +80,7 @@ def open_pr(
     draft: bool = False,
     base: str = "main",
     sha: str = "deadbee",
+    tip: str | None = None,
 ) -> OpenPullRequest:
     return OpenPullRequest(
         number=number,
@@ -86,6 +89,7 @@ def open_pr(
         head_sha=sha,
         draft=draft,
         mergeable=mergeable,
+        branch_tip=tip,
     )
 
 
@@ -96,18 +100,22 @@ class DetectorTransport:
         self,
         issue_pages: list[IssuePage],
         pr_pages: list[PullRequestPage] | None = None,
+        *,
+        comments: dict[int, tuple[IssueComment, ...]] | None = None,
     ) -> None:
         self._issue_pages = issue_pages
         self._pr_pages = list(pr_pages) if pr_pages is not None else None
         self.state = {
             found.number: found for page in issue_pages for found in page.issues
         }
+        self.comments: dict[int, tuple[IssueComment, ...]] = dict(comments or {})
         self.issue_cursors: list[str | None] = []
         self.pr_cursors: list[str | None] = []
         self.assignments: list[tuple[str, str]] = []
         self.added_labels: list[tuple[str, str]] = []
         self.removed_labels: list[tuple[str, str]] = []
         self.removed_assignees: list[tuple[str, str]] = []
+        self.posted_comments: list[tuple[int, str]] = []
 
     def list_issues(self, repository: str, cursor: str | None) -> IssuePage:
         assert repository == "octo/example"
@@ -152,7 +160,16 @@ class DetectorTransport:
         self, repository: str, issue_number: int
     ) -> tuple[IssueComment, ...]:
         assert repository == "octo/example"
-        return ()
+        return self.comments.get(issue_number, ())
+
+    def add_comment(self, repository: str, issue_number: int, body: str) -> None:
+        assert repository == "octo/example"
+        self.posted_comments.append((issue_number, body))
+        # Later polls re-read live state (like GitHub), so the notice the
+        # detector just posted deduplicates the next poll in the same test.
+        self.comments[issue_number] = self.comments.get(issue_number, ()) + (
+            IssueComment(author_login="agent", body=body),
+        )
 
 
 def make_tracker(
@@ -772,3 +789,172 @@ def test_detection_predicate_matches_the_labelling_rule() -> None:
         draft=False,
         mergeable="CONFLICTING",
     )
+
+
+# ---------------------------------------------------------------------------
+# stale pull-request heads: skip the label, tell the issue once
+# ---------------------------------------------------------------------------
+
+
+def test_stale_head_pr_is_never_eligible() -> None:
+    eligible = issue(7)
+
+    assert not is_pr_head_stale("", None)
+    assert not is_pr_head_stale("abc123", None)
+    assert not is_pr_head_stale("", "def456")
+    assert not is_pr_head_stale("abc123", "abc123")
+    assert is_pr_head_stale("abc123", "def456")
+
+    assert not is_conflict_detection_eligible(
+        eligible, draft=False, mergeable="CONFLICTING", head_sha="abc123", branch_tip="def456"
+    )
+    assert is_conflict_detection_eligible(
+        eligible, draft=False, mergeable="CONFLICTING", head_sha="abc123", branch_tip="abc123"
+    )
+    # An unknown tip falls back to today's behaviour.
+    assert is_conflict_detection_eligible(
+        eligible, draft=False, mergeable="CONFLICTING", head_sha="abc123", branch_tip=None
+    )
+
+
+def test_detector_skips_a_stale_head_pr_and_posts_one_notice() -> None:
+    transport = single_issue_transport(
+        issue(7),
+        [open_pr(42, "agent/issue-7", sha="abc123", tip="def456")],
+    )
+    events: list[tuple[str, str, str, int | None]] = []
+    tracker = make_tracker(transport, events)
+
+    queue = tracker.runnable_queue()
+
+    assert queue == ()
+    # No extra per-PR calls: the tip rides along in the single paged query.
+    assert transport.pr_cursors == [None]
+    assert events == [
+        (
+            "conflict_requeue_skipped",
+            "issue #7; pull request #42 head abc123 differs from branch tip"
+            " def456 (reason=pr_head_stale); merge-conflict not applied",
+            "WARNING",
+            7,
+        )
+    ]
+    assert tracker.claim_next() is None
+    assert transport.added_labels == []
+    # Each poll still runs exactly one paged query, stale PR or not.
+    assert transport.pr_cursors == [None, None]
+    assert len(transport.posted_comments) == 1
+    number, body = transport.posted_comments[0]
+    assert number == 7
+    assert "abc123" in body and "def456" in body
+    assert "https://github.com/octo/example/pull/42" in body
+    assert "[#42](https://github.com/octo/example/pull/42)" in body
+    assert "Do not close and reopen" in body
+    assert "422" in body
+    assert "replacement pull request" in body
+    assert "`agent/issue-7`" in body
+    assert "<!-- pr-head-stale: pr=42 head=abc123 tip=def456 -->" in body
+    assert parse_pr_head_stale(body) == {"pr": "42", "head": "abc123", "tip": "def456"}
+
+
+def test_stale_notice_posts_once_per_state() -> None:
+    transport = single_issue_transport(
+        issue(7),
+        [open_pr(42, "agent/issue-7", sha="abc123", tip="def456")],
+    )
+    tracker = make_tracker(transport, [])
+
+    assert tracker.runnable_queue() == ()
+    assert tracker.runnable_queue() == ()
+    assert len(transport.posted_comments) == 1
+
+    # A changed branch tip is a new state: one new comment.
+    transport._pr_pages = [
+        PullRequestPage(
+            pull_requests=(open_pr(42, "agent/issue-7", sha="abc123", tip="999aaa"),),
+            next_cursor=None,
+        )
+    ]
+    assert tracker.runnable_queue() == ()
+    assert len(transport.posted_comments) == 2
+    assert "<!-- pr-head-stale: pr=42 head=abc123 tip=999aaa -->" in transport.posted_comments[1][1]
+
+
+def test_stale_notice_ignores_a_marker_from_an_untrusted_author() -> None:
+    marker_body = (
+        "copied text\n\n<!-- pr-head-stale: pr=42 head=abc123 tip=def456 -->"
+    )
+    transport = single_issue_transport(
+        issue(7),
+        [open_pr(42, "agent/issue-7", sha="abc123", tip="def456")],
+    )
+    transport.comments = {7: (IssueComment(author_login="random-passerby", body=marker_body),)}
+    tracker = make_tracker(transport, [])
+
+    assert tracker.runnable_queue() == ()
+
+    assert len(transport.posted_comments) == 1
+
+
+def test_stale_pr_with_matching_tip_is_labelled_as_today() -> None:
+    transport = single_issue_transport(
+        issue(7),
+        [open_pr(42, "agent/issue-7", sha="abc123", tip="abc123")],
+    )
+    events: list[tuple[str, str, str, int | None]] = []
+    tracker = make_tracker(transport, events)
+
+    assert [found.number for found in tracker.runnable_queue()] == [7]
+    assert transport.added_labels == [("issue-7", "merge-conflict")]
+    assert transport.posted_comments == []
+    assert [event[0] for event in events] == ["conflict_requeue_detected"]
+
+
+def test_graphql_parses_the_head_branch_tip() -> None:
+    transport = StubGraphQLTransport(
+        [
+            {
+                "repository": {
+                    "pullRequests": {
+                        "nodes": [
+                            {
+                                "number": 42,
+                                "headRefName": "agent/issue-7",
+                                "baseRefName": "main",
+                                "headRefOid": "abc123",
+                                "isDraft": False,
+                                "mergeable": "CONFLICTING",
+                                "headRef": {"target": {"oid": "def456"}},
+                            },
+                            {
+                                "number": 43,
+                                "headRefName": "agent/issue-9",
+                                "baseRefName": "main",
+                                "headRefOid": "aaa",
+                                "isDraft": False,
+                                "mergeable": "CONFLICTING",
+                                "headRef": None,
+                            },
+                            {
+                                "number": 44,
+                                "headRefName": "agent/issue-11",
+                                "baseRefName": "main",
+                                "headRefOid": "bbb",
+                                "isDraft": False,
+                                "mergeable": "CONFLICTING",
+                            },
+                        ],
+                        "pageInfo": {"hasNextPage": False, "endCursor": None},
+                    }
+                }
+            }
+        ]
+    )
+
+    page = transport.list_open_pull_requests("octo/example", None)
+
+    assert [pr.branch_tip for pr in page.pull_requests] == ["def456", None, None]
+    query = transport.queries[0]
+    assert "headRef { target { oid } }" in query
+    for connection in ("comments", "reviews", "commits", "files"):
+        assert connection not in query

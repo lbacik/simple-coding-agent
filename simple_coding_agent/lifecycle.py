@@ -3217,6 +3217,20 @@ class AgentLifecycle:
             return 0
         return int(counter(issue))
 
+    def _last_conflict_result_sha(self, issue: TrackerIssue) -> str | None:
+        """The sha of the newest conflict-attempt result on ``issue``, if it pushed one.
+
+        Trackers without the seam (older test doubles) read as ``None``,
+        which disables the same-sha backstop: with a zero budget the count
+        is never consulted for escalation.
+        """
+
+        getter = getattr(self._tracker, "last_conflict_result_sha", None)
+        if not callable(getter):
+            return None
+        result = getter(issue)
+        return result if isinstance(result, str) and result else None
+
     def _stamp_conflict_budget(
         self, claim: Claim, request: ConflictPublicationRequest
     ) -> ConflictPublicationRequest:
@@ -3228,11 +3242,14 @@ class AgentLifecycle:
         at escalation time, never at claim time, so lowering it below a
         running streak escalates on the next failure. A ``success``-path
         push that leaves the remote head unchanged is still reported (and
-        escalated) as ``no_change`` by publication, from ``conflict_prior``.
+        escalated) as ``no_change`` by publication, from ``conflict_prior``;
+        the newest earlier result's sha rides along so a repeated identical
+        push reports ``no_change`` too.
         """
 
         budget = self._max_conflict_attempts
         prior = self._conflict_failure_streak(claim.issue)
+        prior_sha = self._last_conflict_result_sha(claim.issue)
         if request.conflict_outcome in (
             CONFLICT_OUTCOME_SUCCESS,
             CONFLICT_OUTCOME_SKIPPED,
@@ -3247,6 +3264,7 @@ class AgentLifecycle:
             conflict_index=index,
             conflict_budget=budget,
             escalate=escalate,
+            prior_conflict_sha=prior_sha,
         )
 
     def _maybe_escalate_conflict_to_human(
@@ -5727,7 +5745,14 @@ class AgentLifecycle:
         issue_number = claim.issue.number
         branch = _conflict_attempt_branch(issue_number)
         pull_request = self._publisher.find_pull_request(branch)
-        skip = _conflict_entry_skip_reason(pull_request, branch=branch)
+        lease_recorded = bool(getattr(checkpoint, "claim_lease_recorded", False))
+        lease_revision = getattr(checkpoint, "claim_branch_revision", None)
+        skip = _conflict_entry_skip_reason(
+            pull_request,
+            branch=branch,
+            claim_branch_revision=lease_revision if lease_recorded else None,
+            claim_lease_recorded=lease_recorded,
+        )
         if skip is not None:
             reason, details = skip
             self._event_log(

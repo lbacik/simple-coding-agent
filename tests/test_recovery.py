@@ -655,3 +655,94 @@ def test_release_comment_records_an_automatic_requeue_source_when_requested() ->
     assert "<!-- agent-attempt: 2026-09-20T13:00:00Z -->" in body
     assert "<!-- requeue-source: automatic -->" in body
     assert "<!-- requeue-source: human -->" not in body
+
+
+# ---------------------------------------------------------------------------
+# stale-head notice marker: one comment per state, transparent to budgets
+# ---------------------------------------------------------------------------
+
+
+def _stale_notice() -> str:
+    from simple_coding_agent.recovery import pr_head_stale_notice_body
+
+    return pr_head_stale_notice_body(
+        repository="octo/example",
+        branch="agent/issue-7",
+        pr_number=42,
+        head_sha="abc123",
+        branch_tip="def456",
+    )
+
+
+def test_stale_marker_round_trip() -> None:
+    from simple_coding_agent.recovery import (
+        is_pr_head_stale_notice,
+        parse_pr_head_stale,
+        pr_head_stale_marker,
+    )
+
+    marker = pr_head_stale_marker(42, "abc123", "def456")
+
+    assert marker == "<!-- pr-head-stale: pr=42 head=abc123 tip=def456 -->"
+    assert parse_pr_head_stale(f"prose\n\n{marker}") == {
+        "pr": "42",
+        "head": "abc123",
+        "tip": "def456",
+    }
+    assert is_pr_head_stale_notice(f"prose\n\n{marker}") is True
+    assert is_pr_head_stale_notice("ordinary comment") is False
+
+
+def test_stale_marker_rejects_invalid_values() -> None:
+    from simple_coding_agent.recovery import pr_head_stale_marker
+
+    with pytest.raises(ValueError):
+        pr_head_stale_marker(42, "abc 123", "def456")
+    with pytest.raises(ValueError):
+        pr_head_stale_marker(42, "abc123", "")
+    with pytest.raises(ValueError):
+        pr_head_stale_marker(0, "abc123", "def456")
+
+
+def test_stale_notice_names_both_shas_links_the_pr_and_gives_guidance() -> None:
+    body = _stale_notice()
+
+    assert "## Pull request head out of sync" in body
+    assert "`abc123`" in body and "`def456`" in body
+    assert "[#42](https://github.com/octo/example/pull/42)" in body
+    assert "`agent/issue-7`" in body
+    assert "Do not close and reopen" in body
+    assert "422" in body
+    assert "replacement pull request" in body
+    assert "same `agent/issue-7` branch" in body
+
+
+def test_stale_notice_is_transparent_to_the_conflict_streak() -> None:
+    from simple_coding_agent.recovery import (
+        conflict_attempt_marker,
+        count_conflict_failures,
+    )
+
+    failure = (
+        "## Conflict Attempt Result: rebase_conflict\n\n"
+        "<!-- agent-attempt: 2026-10-11T10:00:00Z -->\n"
+        f"{conflict_attempt_marker('rebase_conflict')}"
+    )
+
+    assert count_conflict_failures([failure, _stale_notice(), failure]) == 2
+    assert count_conflict_failures([_stale_notice(), failure]) == 1
+
+
+def test_stale_notice_is_transparent_to_the_continuation_count() -> None:
+    from simple_coding_agent.recovery import (
+        count_automatic_continuations,
+        requeue_source_marker,
+    )
+
+    automatic = (
+        "## Agent Attempt Result: handoff\n\nHalf done.\n\n"
+        "<!-- agent-attempt: 2026-10-11T10:00:00Z -->\n"
+        f"{requeue_source_marker('automatic')}"
+    )
+
+    assert count_automatic_continuations([automatic, _stale_notice(), automatic]) == 2

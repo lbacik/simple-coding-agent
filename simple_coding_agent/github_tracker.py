@@ -19,6 +19,9 @@ from simple_coding_agent.recovery import (
     count_conflict_failures,
     filter_prompt_comments,
     is_handoff_record,
+    parse_conflict_attempt,
+    pr_head_stale_marker,
+    pr_head_stale_notice_body,
     resolve_automatic_continuation_count,
 )
 
@@ -135,8 +138,29 @@ def _trusted_agent_logins(viewer_login: str, peer_logins: frozenset[str]) -> fro
     )
 
 
+def is_pr_head_stale(head_sha: str, branch_tip: str | None) -> bool:
+    """Whether a pull request's recorded head differs from its branch tip.
+
+    ``branch_tip`` is the actual tip of the head branch read in the same
+    query as the pull request (``None`` when unknown, for example a deleted
+    branch or a response without the field); an unknown tip never reads as
+    stale. A stale head means GitHub stopped syncing the pull request with
+    its branch, so the detector must not requeue on its ``CONFLICTING``
+    state.
+    """
+
+    if not head_sha or not branch_tip:
+        return False
+    return branch_tip != head_sha
+
+
 def is_conflict_detection_eligible(
-    issue: TrackerIssue, *, draft: bool, mergeable: str
+    issue: TrackerIssue,
+    *,
+    draft: bool,
+    mergeable: str,
+    head_sha: str = "",
+    branch_tip: str | None = None,
 ) -> bool:
     """Whether the detector may requeue ``issue`` for a conflicting pull request.
 
@@ -144,10 +168,16 @@ def is_conflict_detection_eligible(
     (``UNKNOWN`` only means GitHub is still computing mergeability, so this
     poll skips it); the issue must meet the base queue rules while carrying
     none of the queue labels (an already-queued issue is never relabelled).
-    The detector never counts any budget and never removes ``merge-conflict``.
+    A pull request whose recorded head differs from its branch tip is never
+    eligible: GitHub stopped syncing it with its branch, so its
+    ``CONFLICTING`` state cannot be trusted. An unknown branch tip falls
+    back to today's behaviour. The detector never counts any budget and
+    never removes ``merge-conflict``.
     """
 
     if draft or mergeable != "CONFLICTING":
+        return False
+    if is_pr_head_stale(head_sha, branch_tip):
         return False
     if not issue.meets_base_queue_rules:
         return False
@@ -350,7 +380,11 @@ class OpenPullRequest:
     """The detector fields of one open repository pull request.
 
     Only the scalars the conflict detector reads: no per-PR connections are
-    attached, because each one costs a rate-limit point.
+    attached, because each one costs a rate-limit point. ``branch_tip`` is
+    the actual tip of the head branch read in the same paged query (next to
+    ``head_sha``, never an extra call per pull request); ``None`` means the
+    tip is unknown (a deleted branch, or a response without the field) and
+    the poll falls back to today's behaviour for that pull request.
     """
 
     number: int
@@ -359,6 +393,7 @@ class OpenPullRequest:
     head_sha: str
     draft: bool
     mergeable: str
+    branch_tip: str | None = None
 
 
 @dataclass(frozen=True)
@@ -389,6 +424,8 @@ class GitHubTransport(Protocol):
     def add_label(self, issue_id: str, label: str) -> None: ...
 
     def list_issue_comments(self, repository: str, issue_number: int) -> tuple[IssueComment, ...]: ...
+
+    def add_comment(self, repository: str, issue_number: int, body: str) -> None: ...
 
 
 class GitHubTracker:
@@ -545,6 +582,11 @@ class GitHubTracker:
             return []
         detected: list[tuple[int, int, str]] = []
         cursor: str | None = None
+        # The trusted agent logins for the stale-head notice dedup, read
+        # lazily: ``viewer`` is one extra call per poll at most, only when a
+        # stale pull request actually needs it, never one per pull request.
+        trusted: frozenset[str] | None = None
+        trusted_failed = False
         while True:
             page = list_pull_requests(self._target_repo, cursor)
             for pull_request in page.pull_requests:
@@ -555,8 +597,23 @@ class GitHubTracker:
                 if issue is None:
                     continue
                 if not is_conflict_detection_eligible(
-                    issue, draft=pull_request.draft, mergeable=pull_request.mergeable
+                    issue,
+                    draft=pull_request.draft,
+                    mergeable=pull_request.mergeable,
+                    head_sha=pull_request.head_sha,
+                    branch_tip=pull_request.branch_tip,
                 ):
+                    if (
+                        is_pr_head_stale(pull_request.head_sha, pull_request.branch_tip)
+                        and is_conflict_detection_eligible(
+                            issue,
+                            draft=pull_request.draft,
+                            mergeable=pull_request.mergeable,
+                        )
+                    ):
+                        trusted, trusted_failed = self._skip_stale_pr_head(
+                            issue, pull_request, trusted, trusted_failed
+                        )
                     continue
                 self._transport.add_label(issue.id, MERGE_CONFLICT)
                 by_number[number] = replace(
@@ -574,6 +631,81 @@ class GitHubTracker:
                 break
             cursor = page.next_cursor
         return detected
+
+    def _skip_stale_pr_head(
+        self,
+        issue: TrackerIssue,
+        pull_request: OpenPullRequest,
+        trusted: frozenset[str] | None,
+        trusted_failed: bool,
+    ) -> tuple[frozenset[str] | None, bool]:
+        """Skip a pull request whose head is out of sync with its branch.
+
+        Emits the ``conflict_requeue_skipped`` WARNING (with reason
+        ``pr_head_stale`` and both shas) and posts the one-per-state notice
+        comment on the issue, deduplicated by its hidden marker. The notice
+        is best-effort: any failure is a WARNING and the skip still holds.
+        Returns the (possibly newly read) trusted logins and failure flag.
+        """
+
+        branch_tip = pull_request.branch_tip or ""
+        self._event_log(
+            "conflict_requeue_skipped",
+            f"issue #{issue.number}; pull request #{pull_request.number}"
+            f" head {pull_request.head_sha} differs from branch tip"
+            f" {branch_tip} (reason=pr_head_stale);"
+            " merge-conflict not applied",
+            level="WARNING",
+            issue_number=issue.number,
+        )
+        try:
+            if trusted is None and not trusted_failed:
+                try:
+                    viewer_login = self._transport.viewer().login
+                except Exception as error:
+                    self._event_log(
+                        "stale_notice_check_failed",
+                        f"the stale-head notice dedup could not read the viewer: {error};"
+                        " skipping the notice this poll",
+                        level="WARNING",
+                        issue_number=issue.number,
+                    )
+                    return None, True
+                trusted = _trusted_agent_logins(viewer_login, self._peer_logins)
+            if trusted is not None:
+                comments = self._transport.list_issue_comments(
+                    self._target_repo, issue.number
+                )
+                marker = pr_head_stale_marker(
+                    pull_request.number, pull_request.head_sha, branch_tip
+                )
+                if any(
+                    marker in comment.body
+                    for comment in comments
+                    if comment.author_login and comment.author_login in trusted
+                ):
+                    return trusted, trusted_failed
+                add_comment = getattr(self._transport, "add_comment", None)
+                if callable(add_comment):
+                    add_comment(
+                        self._target_repo,
+                        issue.number,
+                        pr_head_stale_notice_body(
+                            repository=self._target_repo,
+                            branch=pull_request.head_ref,
+                            pr_number=pull_request.number,
+                            head_sha=pull_request.head_sha,
+                            branch_tip=branch_tip,
+                        ),
+                    )
+        except Exception as error:
+            self._event_log(
+                "stale_notice_failed",
+                f"the stale-head notice could not be posted: {error}",
+                level="WARNING",
+                issue_number=issue.number,
+            )
+        return trusted, trusted_failed
 
     def runnable_queue(self) -> tuple[TrackerIssue, ...]:
         """Return all eligible issues, conflicts then continuations then ordinary.
@@ -1031,6 +1163,30 @@ class GitHubTracker:
         )
         return count_conflict_failures(own_bodies_newest_first)
 
+    def last_conflict_result_sha(self, issue: TrackerIssue) -> str | None:
+        """The sha in the newest conflict-attempt result comment, if it pushed one.
+
+        Only comments authored by this worker's own GitHub identity (plus
+        any pool-peer login) are examined; any other comment is ignored
+        even if it contains the marker. A newest result that pushed nothing
+        (``sha=none``, or no conflict marker at all) reads as ``None``.
+        """
+
+        viewer = self._transport.viewer()
+        allowed = _trusted_agent_logins(viewer.login, self._peer_logins)
+        comments = self._transport.list_issue_comments(self._target_repo, issue.number)
+        for comment in reversed(comments):
+            if not comment.author_login or comment.author_login not in allowed:
+                continue
+            parsed = parse_conflict_attempt(comment.body)
+            if parsed is None:
+                continue
+            sha = parsed.get("sha", "")
+            if sha and sha != "none":
+                return sha
+            return None
+        return None
+
     def escalate_conflict_to_human(self, issue: TrackerIssue) -> None:
         """Hand a conflict-exhausted issue to a human with ``ready-for-human``.
 
@@ -1128,8 +1284,9 @@ class GitHubGraphQLTransport:
 
         The detector owns the only pull-request listing: one paged query per
         poll reading exactly ``number headRefName baseRefName headRefOid
-        isDraft mergeable``, with no ``baseRefName`` filter (the profile is
-        not loaded in the loop) and no per-PR connections.
+        isDraft mergeable`` plus the head branch tip (``headRef { target {
+        oid } }``), with no ``baseRefName`` filter (the profile is not
+        loaded in the loop) and no per-PR connections.
         """
 
         owner, name = _repository_parts(repository)
@@ -1138,7 +1295,7 @@ class GitHubGraphQLTransport:
             query OpenPullRequests($owner: String!, $name: String!, $cursor: String) {
               repository(owner: $owner, name: $name) {
                 pullRequests(first: 100, after: $cursor, states: OPEN, orderBy: {field: CREATED_AT, direction: ASC}) {
-                  nodes { number headRefName baseRefName headRefOid isDraft mergeable }
+                  nodes { number headRefName baseRefName headRefOid isDraft mergeable headRef { target { oid } } }
                   pageInfo { hasNextPage endCursor }
                 }
               }
@@ -1753,7 +1910,34 @@ def _open_pull_request_from_graphql(value: dict[str, Any]) -> OpenPullRequest:
         raise ValueError("invalid pull request")
     if not isinstance(mergeable, str) or not mergeable:
         raise ValueError("invalid pull request")
-    return OpenPullRequest(number, head_ref, base_ref, head_sha, draft, mergeable.upper())
+    return OpenPullRequest(
+        number,
+        head_ref,
+        base_ref,
+        head_sha,
+        draft,
+        mergeable.upper(),
+        _head_branch_tip_from_graphql(value.get("headRef")),
+    )
+
+
+def _head_branch_tip_from_graphql(head_ref: Any) -> str | None:
+    """The head branch tip oid, or ``None`` when unknown.
+
+    A deleted branch (or a response without the field) carries a null or
+    missing ``headRef``; that never breaks the poll and the pull request is
+    then handled as today.
+    """
+
+    if not isinstance(head_ref, dict):
+        return None
+    target = head_ref.get("target")
+    if not isinstance(target, dict):
+        return None
+    oid = target.get("oid")
+    if not isinstance(oid, str) or not oid:
+        return None
+    return oid
 
 
 def _pull_request_from_graphql(value: dict[str, Any]) -> PullRequest:
