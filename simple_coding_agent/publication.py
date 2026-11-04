@@ -286,6 +286,12 @@ class ConflictPublicationRequest:
     #: neither the visible ``Worker:`` line nor the hidden ``agent-worker``
     #: marker, keeping the comment byte-for-byte identical to today.
     worker_id: str = ""
+    #: The sha in the newest conflict-attempt result comment on the issue
+    #: before this attempt published (``None`` when no earlier result pushed
+    #: a sha). A success-path push of that same sha is a repeated identical
+    #: push, so it reports ``no_change`` like any other push that changed
+    #: nothing, whatever caused the repetition.
+    prior_conflict_sha: str | None = None
 
     def __post_init__(self) -> None:
         if self.requeue_source is not None:
@@ -644,8 +650,13 @@ class Publisher:
         branch_url: str | None = None
         pushed_sha: str | None = None
         details = request.details
+        # The remote branch revision recorded at claim, read before the push
+        # advances it: a push landing on that same revision changed nothing.
+        claim_revision: str | None = None
+        claim_known = False
         if request.push_branch:
             try:
+                claim_revision, claim_known = self._claim_lease(request.issue_number)
                 checkpoint = self._attempt_state.read() if self._attempt_state is not None else None
                 if checkpoint is None or checkpoint.phase is not AttemptPhase.PUBLISHING:
                     self._check_deadline(deadline)
@@ -765,18 +776,38 @@ class Publisher:
                     conflict_outcome,
                     escalate,
                 )
-            if (
-                conflict_outcome == CONFLICT_OUTCOME_SUCCESS
-                and pushed_sha
-                and request.pull_request is not None
-                and request.pull_request.head_sha
-                and pushed_sha == request.pull_request.head_sha
-            ):
-                # The green push changed nothing on the remote branch: report
-                # it as ``no_change`` (a failure toward the budget) while the
-                # verified green outcome stands.
-                conflict_outcome = CONFLICT_OUTCOME_NO_CHANGE
-                conflict_index, escalate = _conflict_failure_standing(request)
+            if conflict_outcome == CONFLICT_OUTCOME_SUCCESS and pushed_sha:
+                pull_head = (
+                    request.pull_request.head_sha
+                    if request.pull_request is not None
+                    else ""
+                )
+                unchanged = bool(pull_head and pushed_sha == pull_head)
+                if (
+                    not unchanged
+                    and claim_known
+                    and claim_revision
+                    and pushed_sha == claim_revision
+                ):
+                    # The pull request head is stale (GitHub stopped syncing
+                    # it with the branch), but the remote branch already held
+                    # this revision when the attempt claimed it: the push
+                    # changed nothing on the remote branch.
+                    unchanged = True
+                if (
+                    not unchanged
+                    and request.prior_conflict_sha
+                    and pushed_sha == request.prior_conflict_sha
+                ):
+                    # A repeated identical push: the newest earlier conflict
+                    # result already published this sha.
+                    unchanged = True
+                if unchanged:
+                    # The green push changed nothing on the remote branch:
+                    # report it as ``no_change`` (a failure toward the
+                    # budget) while the verified green outcome stands.
+                    conflict_outcome = CONFLICT_OUTCOME_NO_CHANGE
+                    conflict_index, escalate = _conflict_failure_standing(request)
 
         merge_result: str | None = None
         if request.push_branch and branch_url is not None and request.pull_request is not None:

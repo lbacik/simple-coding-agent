@@ -905,3 +905,81 @@ def test_failure_comment_lists_conflicted_files_without_pushing() -> None:
     assert "Conflicted files: a.txt" in body
     assert parse_conflict_attempt(body) is not None
     assert parse_conflict_attempt(body)["outcome"] == "rebase_conflict"
+
+
+# ---------------------------------------------------------------------------
+# entry check: a stale pull-request head skips before any git work
+# ---------------------------------------------------------------------------
+
+
+def test_stale_head_entry_check_skips_when_lease_differs_from_pr_head() -> None:
+    from simple_coding_agent.conflict_attempt import entry_skip_reason
+
+    reason, details = entry_skip_reason(  # type: ignore[misc]
+        pull_request(head_sha="pr-sha"),
+        branch="agent/issue-7",
+        claim_branch_revision="tip-sha",
+        claim_lease_recorded=True,
+    )
+
+    assert reason == "stale_head"
+    assert "pr-sha" in details
+
+
+def test_stale_head_entry_check_passes_when_lease_matches_or_is_absent() -> None:
+    from simple_coding_agent.conflict_attempt import entry_skip_reason
+
+    assert (
+        entry_skip_reason(
+            pull_request(head_sha="tip-sha"),
+            branch="agent/issue-7",
+            claim_branch_revision="tip-sha",
+            claim_lease_recorded=True,
+        )
+        is None
+    )
+    assert (
+        entry_skip_reason(
+            pull_request(head_sha="pr-sha"),
+            branch="agent/issue-7",
+            claim_branch_revision=None,
+            claim_lease_recorded=False,
+        )
+        is None
+    )
+
+
+def test_stale_head_claim_skips_before_any_git_work(tmp_path: Path) -> None:
+    from simple_coding_agent.attempt_state import ATTEMPT_KIND_CONFLICT
+    from simple_coding_agent.github_tracker import Assignment, Claim
+
+    harness = make_conflict_lifecycle(
+        tmp_path,
+        {7: issue(7, labels=CONFLICT)},
+        fifo=[7],
+        pull_requests={"agent/issue-7": pull_request(head_sha="pr-sha")},
+    )
+    lifecycle, tracker, publisher, workspace, runner, events = harness
+    lifecycle._attempt_state.start(  # type: ignore[union-attr]
+        issue_number=7,
+        branch="agent/issue-7",
+        requeue_source="human",
+        attempt_kind=ATTEMPT_KIND_CONFLICT,
+    )
+    checkpoint = lifecycle._attempt_state.record_claim_lease("tip-sha")  # type: ignore[union-attr]
+    claim = Claim(
+        issue=tracker.issues[7],
+        assignment=Assignment(issue_id="issue-7", assignee_id="agent-id"),
+    )
+
+    request, prepared, profile = lifecycle._execute_conflict_attempt(claim, checkpoint)  # type: ignore[union-attr]
+
+    assert request.conflict_outcome == CONFLICT_OUTCOME_SKIPPED
+    assert request.reason == "stale_head"
+    assert request.push_branch is False
+    assert prepared is None
+    assert profile is None
+    assert workspace.prepared_bases == []
+    assert workspace.bootstrap_bases == []
+    assert runner.calls == []
+    assert publisher.pr_lookups == ["agent/issue-7"]

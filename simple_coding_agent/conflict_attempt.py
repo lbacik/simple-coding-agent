@@ -38,6 +38,7 @@ from simple_coding_agent.recovery import (
     CONFLICT_REASON_DRAFT,
     CONFLICT_REASON_NOT_CONFLICTING,
     CONFLICT_REASON_NO_OPEN_PR,
+    CONFLICT_REASON_STALE_HEAD,
 )
 
 
@@ -70,12 +71,23 @@ def attempt_branch(issue_number: int) -> str:
     return f"agent/issue-{issue_number}"
 
 
-def entry_skip_reason(pr: PullRequest | None, *, branch: str) -> tuple[str, str] | None:
+def entry_skip_reason(
+    pr: PullRequest | None,
+    *,
+    branch: str,
+    claim_branch_revision: str | None = None,
+    claim_lease_recorded: bool = False,
+) -> tuple[str, str] | None:
     """The ``(reason, detail)`` ending a conflict attempt as skipped, if any.
 
     Runs after the claim and before any git work, from a fresh read of the
     open pull request behind ``branch``. ``UNKNOWN`` mergeability proceeds:
-    the local rebase is the source of truth.
+    the local rebase is the source of truth. When a claim lease is recorded
+    (the remote branch revision observed at claim) and the pull request's
+    recorded head differs from it, the pull request head is out of sync with
+    its branch and the attempt skips: GitHub stopped syncing the pull
+    request, so rebasing and pushing would change nothing on it. Without a
+    recorded lease the check falls back to today's behaviour.
     """
 
     if pr is None:
@@ -93,6 +105,19 @@ def entry_skip_reason(pr: PullRequest | None, *, branch: str) -> tuple[str, str]
             CONFLICT_REASON_NOT_CONFLICTING,
             f"Pull request #{pr.number} reports `{pr.mergeable}`, not `CONFLICTING`; "
             "there is nothing to bring up to date.",
+        )
+    if (
+        claim_lease_recorded
+        and claim_branch_revision
+        and pr.head_sha
+        and claim_branch_revision != pr.head_sha
+    ):
+        return (
+            CONFLICT_REASON_STALE_HEAD,
+            f"Pull request #{pr.number} reports head `{pr.head_sha}`, but the "
+            f"published branch was observed at `{claim_branch_revision}` when "
+            "claimed; the pull request head is out of sync with its branch, "
+            "so there is nothing to bring up to date.",
         )
     return None
 

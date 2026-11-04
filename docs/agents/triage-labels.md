@@ -54,6 +54,21 @@ ordinary work; an issue labelled `ready-for-human` is excluded. If the
 issue also carries `ready-for-agent` or `round-finished`, those take
 precedence and the stale `merge-conflict` signal is removed at the claim.
 
+A pull request whose recorded head differs from its branch tip is never
+labelled: GitHub stopped syncing the pull request with its branch, so its
+`CONFLICTING` state cannot be trusted. The detector reads the branch tip
+in the same paged query (no extra call per pull request) and, on a
+mismatch, skips the label and emits a `conflict_requeue_skipped` WARNING
+naming the issue, the pull request, and both shas. It also posts one
+notice comment on the issue — naming both shas, linking the pull request,
+and advising never to close and reopen it (GitHub refuses the reopen with
+`422 ... branch was force-pushed or recreated`) but to open a replacement
+pull request from the same `agent/issue-N` branch instead. The notice
+carries a hidden `<!-- pr-head-stale: ... -->` marker (pull request,
+recorded head, branch tip); a later poll posts again only when the state
+changes, never every poll. A pull request with an unknown tip (for
+example a deleted branch) is handled as today.
+
 Every conflict attempt removes `merge-conflict` and the assignee, never
 adds `ready-for-agent` or `round-finished`, and posts a result comment
 stamped with a `<!-- conflict-attempt: ... -->` marker carrying the
@@ -64,6 +79,10 @@ commits. Every conflict result carries its `k/N` standing against
 Those comments are transparent to the automatic-continuation count: they
 neither consume nor reset the budget.
 
+A green push also counts as a failure (`no_change`) when it changed
+nothing on the remote branch: the pushed sha equals the pull request's
+recorded head, the remote revision observed at claim time, or the sha the
+previous conflict result already published (a repeated identical push).
 N consecutive failures on one issue (including a push that changes
 nothing) escalate to you: the attempt whose failure reaches the budget
 adds `ready-for-human` — the first label the agent applies itself — and

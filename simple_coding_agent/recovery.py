@@ -311,6 +311,8 @@ def resolve_automatic_continuation_count(
             continue
         if is_conflict_attempt(body):
             continue
+        if is_pr_head_stale_notice(body):
+            continue
         attempt_id = parse_comment_attempt_id(body)
         if attempt_id is None:
             # Unmarked legacy results predate the shared-record era, which
@@ -349,6 +351,8 @@ def count_automatic_continuations(bodies_newest_first: tuple[str, ...] | list[st
         if is_handoff_record(body):
             continue
         if is_conflict_attempt(body):
+            continue
+        if is_pr_head_stale_notice(body):
             continue
         if parse_requeue_source(body) != REQUEUE_SOURCE_AUTOMATIC:
             break
@@ -399,6 +403,10 @@ CONFLICT_REASON_NO_OPEN_PR = "no_open_pr"
 CONFLICT_REASON_DRAFT = "draft"
 CONFLICT_REASON_NOT_CONFLICTING = "not_conflicting"
 CONFLICT_REASON_BASE_MISMATCH = "base_mismatch"
+#: The pull request's recorded head differs from the published branch tip
+#: observed at claim: GitHub stopped syncing the pull request with its
+#: branch, so rebasing and pushing would change nothing on the pull request.
+CONFLICT_REASON_STALE_HEAD = "stale_head"
 
 #: Marker keys reserved for the model resolution follow-up (#271): the
 #: conflicted files, the files the resolution changed outside them, and the
@@ -491,6 +499,89 @@ def is_conflict_escalation(body: str) -> bool:
     return CONFLICT_ESCALATION_MARKER in body
 
 
+#: Hidden marker identifying a pull-request-head-out-of-sync notice. The
+#: detector posts one notice comment per stale state on the issue behind the
+#: branch; the marker names the pull request, its recorded head, and the
+#: branch tip, so a later poll can tell whether the state changed (a new
+#: comment) or is already reported (no comment).
+_PR_HEAD_STALE_MARKER_PREFIX = "<!-- pr-head-stale:"
+
+
+def pr_head_stale_marker(pr_number: int, head_sha: str, branch_tip: str) -> str:
+    """The durable marker recording which stale head state a notice reported."""
+
+    for value in (head_sha, branch_tip):
+        if not value or any(character.isspace() for character in value):
+            raise ValueError(f"Invalid stale-head marker value {value!r}")
+    if isinstance(pr_number, bool) or not isinstance(pr_number, int) or pr_number <= 0:
+        raise ValueError(f"Invalid stale-head pull request number {pr_number!r}")
+    return (
+        f"{_PR_HEAD_STALE_MARKER_PREFIX} pr={pr_number}"
+        f" head={head_sha} tip={branch_tip} -->"
+    )
+
+
+def parse_pr_head_stale(body: str) -> dict[str, str] | None:
+    """Return the stale-head marker fields in a comment body, if any.
+
+    A body without the marker reads as ``None``.
+    """
+
+    start = body.find(_PR_HEAD_STALE_MARKER_PREFIX)
+    if start < 0:
+        return None
+    end = body.find("-->", start)
+    if end < 0:
+        return None
+    fields: dict[str, str] = {}
+    for token in body[start + len(_PR_HEAD_STALE_MARKER_PREFIX) : end].split():
+        key, separator, value = token.partition("=")
+        if separator and key and value:
+            fields[key] = value
+    if not all(key in fields for key in ("pr", "head", "tip")):
+        return None
+    return fields
+
+
+def is_pr_head_stale_notice(body: str) -> bool:
+    """Whether a comment body is a pull-request-head-out-of-sync notice."""
+
+    return parse_pr_head_stale(body) is not None
+
+
+def pr_head_stale_notice_body(
+    *,
+    repository: str,
+    branch: str,
+    pr_number: int,
+    head_sha: str,
+    branch_tip: str,
+) -> str:
+    """Build the one-per-state detector notice for a stale pull request head.
+
+    The body names both shas, links the pull request, and carries the
+    recovery that worked: never close and reopen the pull request (GitHub
+    refuses the reopen after a force-push), and open a replacement pull
+    request from the same branch instead. The hidden marker identifies the
+    exact stale state so later polls deduplicate.
+    """
+
+    pr_link = f"https://github.com/{repository}/pull/{pr_number}"
+    return (
+        "## Pull request head out of sync\n\n"
+        f"The pull request [#{pr_number}]({pr_link}) behind `{branch}` reports"
+        f" merge conflicts, but its recorded head `{head_sha}` differs from"
+        f" the tip of the branch (`{branch_tip}`). The detector skipped the"
+        " `merge-conflict` requeue, so no conflict attempt will run until a"
+        " human resolves the desync.\n\n"
+        "Do not close and reopen the pull request: GitHub refuses the reopen"
+        " with `422 ... branch was force-pushed or recreated`. Open a"
+        f" replacement pull request from the same `{branch}` branch"
+        " instead.\n\n"
+        f"{pr_head_stale_marker(pr_number, head_sha, branch_tip)}"
+    )
+
+
 def is_conflict_failure(body: str) -> bool:
     """Whether a comment body is a conflict-attempt failure counting toward the budget.
 
@@ -537,6 +628,8 @@ def count_conflict_failures(bodies_newest_first: tuple[str, ...] | list[str]) ->
         if is_conflict_escalation(body):
             break
         if is_handoff_record(body):
+            continue
+        if is_pr_head_stale_notice(body):
             continue
         if not is_conflict_attempt(body):
             break

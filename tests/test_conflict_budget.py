@@ -826,3 +826,161 @@ def test_checkpoint_kind_round_trips_and_defaults_ordinary(tmp_path: Path) -> No
     legacy.start(issue_number=7, branch="agent/issue-7", requeue_source="human")
 
     assert legacy.read() is not None and legacy.read().attempt_kind == ATTEMPT_KIND_ORDINARY  # type: ignore[union-attr]
+
+
+# ---------------------------------------------------------------------------
+# stale-head guards: a no-op push reports no_change even with a stale PR head
+# ---------------------------------------------------------------------------
+
+
+def _leased_publisher(
+    tmp_path: Path, lease: str | None, pushed_sha: str
+) -> tuple[Publisher, _ConflictGitHub, _ConflictWorkspace]:
+    """A production publisher whose checkpoint records ``lease`` (or none)."""
+
+    from simple_coding_agent.attempt_state import AttemptPhase
+
+    store = AttemptStateStore(tmp_path / "store-lease")
+    store.start(issue_number=7, branch="agent/issue-7", requeue_source="human")
+    if lease is not None:
+        store.record_claim_lease(lease)
+    store.transition(AttemptPhase.SETUP)
+    store.transition(AttemptPhase.MODEL_RUNNING)
+    store.transition(AttemptPhase.PUSHING)
+    github = _ConflictGitHub()
+    workspace = _ConflictWorkspace()
+    workspace.pushed_sha = pushed_sha
+    publisher = Publisher(workspace, github, "octo/example", attempt_state=store)  # type: ignore[arg-type]
+    return publisher, github, workspace
+
+
+def test_lease_no_change_when_push_matches_claim_lease_but_not_pr_head(
+    tmp_path: Path,
+) -> None:
+    publisher, github, _ = _leased_publisher(tmp_path, "tip-sha", "tip-sha")
+
+    result = publisher.publish_conflict(
+        conflict_request(
+            outcome=AttemptOutcome.COMPLETE,
+            conflict_outcome="success",
+            push_branch=True,
+            pull_request=pull_request(head_sha="stale-pr-sha"),
+            conflict_index=0,
+            conflict_prior=0,
+            conflict_budget=3,
+            details="Rebased cleanly.",
+        )
+    )
+
+    assert result.conflict_outcome == CONFLICT_OUTCOME_NO_CHANGE
+    assert parse_conflict_attempt(github.comments[0])["outcome"] == "no_change"
+    assert "**Conflict attempts**: 1/3" in github.comments[0]
+
+
+def test_third_consecutive_lease_no_change_escalates(tmp_path: Path) -> None:
+    publisher, github, _ = _leased_publisher(tmp_path, "tip-sha", "tip-sha")
+
+    result = publisher.publish_conflict(
+        conflict_request(
+            outcome=AttemptOutcome.COMPLETE,
+            conflict_outcome="success",
+            push_branch=True,
+            pull_request=pull_request(head_sha="stale-pr-sha"),
+            conflict_index=2,
+            conflict_prior=2,
+            conflict_budget=3,
+            details="Rebased cleanly.",
+        )
+    )
+
+    assert result.conflict_outcome == CONFLICT_OUTCOME_NO_CHANGE
+    assert result.escalated is True
+    assert is_conflict_escalation(github.comments[0]) is True
+    assert "**Conflict attempts**: 3/3" in github.comments[0]
+
+
+def test_no_lease_keeps_the_pr_head_comparison(tmp_path: Path) -> None:
+    publisher, github, _ = _leased_publisher(tmp_path, None, "tip-sha")
+
+    result = publisher.publish_conflict(
+        conflict_request(
+            outcome=AttemptOutcome.COMPLETE,
+            conflict_outcome="success",
+            push_branch=True,
+            pull_request=pull_request(head_sha="other-sha"),
+            conflict_index=0,
+            conflict_prior=0,
+            conflict_budget=3,
+            details="Rebased cleanly.",
+        )
+    )
+
+    assert result.conflict_outcome == "success"
+    assert parse_conflict_attempt(github.comments[0])["outcome"] == "success"
+    assert "**Conflict attempts**: 0/3" in github.comments[0]
+
+
+def test_repeated_sha_backstop_reports_no_change(tmp_path: Path) -> None:
+    publisher, github, _ = _leased_publisher(tmp_path, None, "repeat-sha")
+
+    result = publisher.publish_conflict(
+        conflict_request(
+            outcome=AttemptOutcome.COMPLETE,
+            conflict_outcome="success",
+            push_branch=True,
+            pull_request=pull_request(head_sha="other-sha"),
+            conflict_index=0,
+            conflict_prior=1,
+            conflict_budget=3,
+            prior_conflict_sha="repeat-sha",
+            details="Rebased cleanly.",
+        )
+    )
+
+    assert result.conflict_outcome == CONFLICT_OUTCOME_NO_CHANGE
+    assert parse_conflict_attempt(github.comments[0])["outcome"] == "no_change"
+    assert "**Conflict attempts**: 2/3" in github.comments[0]
+
+
+def test_stamp_records_the_prior_conflict_sha(tmp_path: Path) -> None:
+    tracker = FakeTracker(
+        {7: issue()},
+        fifo=[7],
+        comments={7: [("agent", fail_body("success", sha="prior-sha"))]},
+    )
+    lifecycle = AgentLifecycle(
+        tracker=tracker,  # type: ignore[arg-type]
+        attempt_state=AttemptStateStore(tmp_path / "store-stamp"),
+        workspace=InMemoryWorkspace(tmp_path / "repo"),
+        profile_loader=lambda _: profile(),
+        publisher=FakePublisher(pull_requests={"agent/issue-7": pull_request()}),
+        attempt_runner=None,  # type: ignore[arg-type]
+        control_store=None,
+        sleeper=lambda seconds: None,
+        event_log=lambda *args, **kwargs: None,
+        max_conflict_attempts=3,
+        command_runner=FakeCommandRunner([]),
+        conflict_model_executor=FakeConflictExecutor(),
+        conflict_issue_comments=lambda _: (),
+    )
+    claim = lifecycle._tracker.claim_next()  # type: ignore[union-attr]
+    assert claim is not None
+    request = lifecycle._stamp_conflict_budget(
+        claim,
+        conflict_request(
+            outcome=AttemptOutcome.COMPLETE,
+            conflict_outcome="success",
+            push_branch=True,
+        ),
+    )
+
+    assert request.prior_conflict_sha == "prior-sha"
+
+
+def test_last_conflict_sha_ignores_untrusted_authors() -> None:
+    tracker = FakeTracker(
+        {7: issue()},
+        comments={7: [("stranger", fail_body("success", sha="other-sha"))]},
+    )
+
+    assert tracker.last_conflict_result_sha(issue()) is None

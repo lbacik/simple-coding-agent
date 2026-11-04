@@ -43,8 +43,14 @@ from simple_coding_agent.github_tracker import (
     TrackerIssue,
     conflict_branch_issue_number,
     is_conflict_detection_eligible,
+    is_pr_head_stale,
 )
-from simple_coding_agent.recovery import count_conflict_failures
+from simple_coding_agent.recovery import (
+    count_conflict_failures,
+    parse_conflict_attempt,
+    pr_head_stale_marker,
+    pr_head_stale_notice_body,
+)
 from simple_coding_agent.command_runner import (
     CommandExecution,
     CommandResult,
@@ -494,6 +500,7 @@ class FakeTracker:
         comments: dict[int, list[tuple[str, str]]] | None = None,
         peer_logins: list[str] | None = None,
         worker_id: str = "",
+        repository: str = "octo/example",
     ) -> None:
         self.issues = dict(issues or {})
         self.fifo: list[int] = list(fifo or [])
@@ -531,6 +538,7 @@ class FakeTracker:
         self.open_pull_requests = dict(open_pull_requests or {})
         self.has_pull_request_listing = open_pull_requests is not None
         self.max_conflict_attempts = max_conflict_attempts
+        self.repository = repository
         # Optional per-Worker id for shared-login pool tests: mirrors the
         # production tracker's ``claimed-by:<worker-id>`` marker behaviour
         # (marker add on claim, marker-aware self/recover/release). Empty
@@ -568,9 +576,21 @@ class FakeTracker:
             issue = self.issues.get(number)
             if issue is None:
                 continue
+            head_sha = getattr(pull_request, "head_sha", "")
+            branch_tip = getattr(pull_request, "branch_tip", None)
             if not is_conflict_detection_eligible(
-                issue, draft=pull_request.draft, mergeable=pull_request.mergeable
+                issue,
+                draft=pull_request.draft,
+                mergeable=pull_request.mergeable,
+                head_sha=head_sha,
+                branch_tip=branch_tip,
             ):
+                if is_pr_head_stale(head_sha, branch_tip) and is_conflict_detection_eligible(
+                    issue, draft=pull_request.draft, mergeable=pull_request.mergeable
+                ):
+                    self._skip_stale_pr_head(
+                        number, head, pull_request, head_sha, branch_tip or ""
+                    )
                 continue
             self.issues[number] = replace(issue, labels=issue.labels | {MERGE_CONFLICT})
             self.added_labels.append((issue.id, MERGE_CONFLICT))
@@ -588,6 +608,56 @@ class FakeTracker:
         )
         self.fifo = newly + self.fifo
         return detected
+
+    def _skip_stale_pr_head(
+        self, number: int, head: str, pull_request: object, head_sha: str, branch_tip: str
+    ) -> None:
+        """Mirror the production stale-head skip: event plus one notice per state."""
+
+        self._event_log(
+            "conflict_requeue_skipped",
+            f"issue #{number}; pull request #{pull_request.number}"
+            f" head {head_sha} differs from branch tip"
+            f" {branch_tip} (reason=pr_head_stale);"
+            " merge-conflict not applied",
+            level="WARNING",
+            issue_number=number,
+        )
+        allowed = {"agent"} | set(self.peer_logins)
+        marker = pr_head_stale_marker(pull_request.number, head_sha, branch_tip)
+        rows = self.comments.setdefault(number, [])
+        if any(
+            marker in body for author, body in rows if author and author in allowed
+        ):
+            return
+        rows.append(
+            (
+                "agent",
+                pr_head_stale_notice_body(
+                    repository=self.repository,
+                    branch=head,
+                    pr_number=pull_request.number,
+                    head_sha=head_sha,
+                    branch_tip=branch_tip,
+                ),
+            )
+        )
+
+    def last_conflict_result_sha(self, issue: TrackerIssue) -> str | None:
+        """Mirror the production newest-conflict-sha lookup over seeded comments."""
+
+        allowed = {"agent"} | set(self.peer_logins)
+        for author, body in reversed(self.comments.get(issue.number, [])):
+            if not author or author not in allowed:
+                continue
+            parsed = parse_conflict_attempt(body)
+            if parsed is None:
+                continue
+            sha = parsed.get("sha", "")
+            if sha and sha != "none":
+                return sha
+            return None
+        return None
 
     def claim_next(self) -> Claim | None:
         self.detect_conflict_requeues()
