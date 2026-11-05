@@ -76,7 +76,8 @@ path above instead and skip step 1.)
      verbatim. If no attempt id was given, omit this line>
    - reason: <token_soft_threshold | token_hard_ceiling | cost_hard_limit | turn_limit | time_limit | operator_request>
    - last_work_commit: <SHA of the last commit from step 1, or the branch's
-     existing HEAD if step 1 committed nothing>
+     existing HEAD if step 1 committed nothing; a short SHA (7 or more
+     characters) is fine>
 
    ## Summary
 

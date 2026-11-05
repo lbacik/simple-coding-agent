@@ -373,7 +373,9 @@ def _token_handoff_prefill(
     if attempt_id is not None:
         lines.append(f"- started_at: {attempt_id}")
     lines.append("- reason: token_soft_threshold")
-    lines.append(f"- last_work_commit: {head_sha or '(unknown)'}")
+    # A 12-character short SHA: fewer characters to mistranscribe, and the
+    # validator already accepts any prefix of 7 or more characters.
+    lines.append(f"- last_work_commit: {head_sha[:12] if head_sha else '(unknown)'}")
     return "\n".join(lines)
 
 
