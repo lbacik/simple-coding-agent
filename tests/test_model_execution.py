@@ -2932,7 +2932,7 @@ def test_token_snapshot_carries_branch_state_and_prefilled_header(tmp_path: Path
     assert "# Handoff note: issue #149" in snapshot
     assert "- issue: 149" in snapshot
     assert "- reason: token_soft_threshold" in snapshot
-    assert f"- last_work_commit: {head}" in snapshot
+    assert f"- last_work_commit: {head[:12]}" in snapshot
 
 
 def test_token_snapshot_caps_each_git_output_at_forty_lines(tmp_path: Path) -> None:
@@ -3026,7 +3026,7 @@ def test_token_instruction_and_followup_share_snapshot_and_two_call_steps(
         assert "dirty.txt" in text
         assert "Half-finish the work" in text
         assert _ATTEMPT_ID in text
-        assert f"- last_work_commit: {head}" in text
+        assert f"- last_work_commit: {head[:12]}" in text
         assert "Do not run diagnostic commands" in text
         assert "Do not commit work yourself" in text
         assert "Sealing will commit any uncommitted work" in text
@@ -3133,7 +3133,7 @@ def test_token_followup_rebuilds_header_after_post_injection_work_commit(
     notice = _main_bash_post(post_hook, "git status")
     assert _prefill_last_work_commit(
         notice["hookSpecificOutput"]["additionalContext"]
-    ) == w1
+    ) == w1[:12]
 
     n1 = _commit_note(repo)
     _main_bash_post(post_hook, 'git add .agent/handoff/149.md && git commit -m "note"')
@@ -3142,7 +3142,7 @@ def test_token_followup_rebuilds_header_after_post_injection_work_commit(
     w2 = _commit_work(repo, "more.txt", "Address review findings")
 
     followup = executor._token_followup_snapshot()
-    assert _prefill_last_work_commit(followup) == w2
+    assert _prefill_last_work_commit(followup) == w2[:12]
     assert f"HEAD: {w2}" in followup
     # Both the work commit and the note commit are visible in the log section.
     assert w2[:7] in followup
@@ -3162,7 +3162,7 @@ def test_token_followup_names_work_beneath_note_at_head(tmp_path: Path) -> None:
     assert executor._handoff_note_committed is True
 
     followup = executor._token_followup_snapshot()
-    assert _prefill_last_work_commit(followup) == w1
+    assert _prefill_last_work_commit(followup) == w1[:12]
 
 
 def test_token_injection_names_commit_that_raced_the_threshold(
@@ -3179,7 +3179,7 @@ def test_token_injection_names_commit_that_raced_the_threshold(
     notice = _main_bash_post(post_hook, "git status")
     assert (
         _prefill_last_work_commit(notice["hookSpecificOutput"]["additionalContext"])
-        == raced
+        == raced[:12]
     )
 
 
@@ -3199,7 +3199,7 @@ def test_note_only_followup_recommit_validates(tmp_path: Path) -> None:
     assert executor._handoff_note_committed is True
 
     header = _prefill_last_work_commit(executor._token_followup_snapshot())
-    assert header == w1
+    assert header == w1[:12]
 
     (repo / ".agent" / "handoff" / "149.md").write_text(
         "# Handoff note: issue #149\n\n"
@@ -3260,7 +3260,7 @@ def test_token_reinject_after_compaction_carries_current_header(
         "hookSpecificOutput"
     ]["additionalContext"]
     assert "compacted" in repeated
-    assert _prefill_last_work_commit(repeated) == w2
+    assert _prefill_last_work_commit(repeated) == w2[:12]
 
 
 def test_token_header_names_previous_round_note_on_continued_branch(
@@ -3306,7 +3306,7 @@ def test_token_header_names_previous_round_note_on_continued_branch(
     # not a note commit to skip.
     assert (
         _prefill_last_work_commit(notice["hookSpecificOutput"]["additionalContext"])
-        == previous_note
+        == previous_note[:12]
     )
 
 
@@ -3326,7 +3326,7 @@ def test_followup_note_with_fresh_header_validates(tmp_path: Path) -> None:
     w2 = _commit_work(repo, "more.txt", "Address review findings")
 
     header = _prefill_last_work_commit(executor._token_followup_snapshot())
-    assert header == w2
+    assert header == w2[:12]
 
     note_path = repo / ".agent" / "handoff" / "149.md"
     note_path.write_text(

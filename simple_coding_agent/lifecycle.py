@@ -6896,7 +6896,10 @@ def _emit_handoff_note_events(
 
     A bad ``started_at`` never rejects the note: it emits
     ``handoff_note_started_at_invalid`` and the note is otherwise judged as
-    before. Any invalid note additionally emits ``handoff_note_rejected``
+    before. A mistyped ``last_work_commit`` (a near-copy of the expected
+    revision that names no commit) likewise warns via
+    ``handoff_note_last_work_commit_mistyped`` without rejecting. Any
+    invalid note additionally emits ``handoff_note_rejected``
     with the validation reason, so a silent downgrade to ``incomplete`` is
     always visible in the event stream.
     """
@@ -6905,6 +6908,13 @@ def _emit_handoff_note_events(
         event_log(
             "handoff_note_started_at_invalid",
             validation.started_at_warning,
+            level="WARNING",
+            issue_number=issue_number,
+        )
+    if validation.last_work_commit_warning:
+        event_log(
+            "handoff_note_last_work_commit_mistyped",
+            validation.last_work_commit_warning,
             level="WARNING",
             issue_number=issue_number,
         )
@@ -7735,6 +7745,88 @@ class _HandoffNoteValidation:
     valid: bool
     reason: str = ""
     started_at_warning: str | None = None
+    last_work_commit_warning: str | None = None
+
+
+_HEX_DIGITS = frozenset("0123456789abcdefABCDEF")
+
+
+def _is_hex(value: str) -> bool:
+    """Whether ``value`` is a non-empty hexadecimal string."""
+
+    return bool(value) and all(char in _HEX_DIGITS for char in value)
+
+
+def _levenshtein_within(first: str, second: str, limit: int) -> int:
+    """Levenshtein distance between two strings, capped at ``limit + 1``.
+
+    The full matrix is tiny here (both sides are at most 40 characters),
+    so this stays simple: a two-row dynamic program with an early exit
+    when the current row's minimum already exceeds ``limit``.
+    """
+
+    if first == second:
+        return 0
+    if abs(len(first) - len(second)) > limit:
+        return limit + 1
+    previous = list(range(len(second) + 1))
+    for i, first_char in enumerate(first, start=1):
+        current = [i]
+        row_min = i
+        for j, second_char in enumerate(second, start=1):
+            cost = 0 if first_char == second_char else 1
+            best = min(
+                previous[j] + 1,  # deletion
+                current[j - 1] + 1,  # insertion
+                previous[j - 1] + cost,  # substitution
+            )
+            current.append(best)
+            if best < row_min:
+                row_min = best
+        if row_min > limit:
+            return limit + 1
+        previous = current
+    distance = previous[-1]
+    return distance if distance <= limit else limit + 1
+
+
+def _last_work_commit_typo_distance(value: str, expected: str, limit: int) -> int:
+    """Smallest edit distance from ``value`` to any long-enough prefix of ``expected``.
+
+    Only prefixes of ``expected`` that are at least 7 characters long count:
+    a short typed fragment matching an equally short prefix proves nothing.
+    """
+
+    best = limit + 1
+    for end in range(7, len(expected) + 1):
+        distance = _levenshtein_within(value, expected[:end], limit)
+        if distance < best:
+            best = distance
+            if best == 0:
+                break
+    return best
+
+
+def _resolves_to_commit(working_directory: Path, value: str) -> bool:
+    """Whether ``value`` names a commit in the attempt's repository.
+
+    A transcription slip names nothing; a stale ``last_work_commit`` names
+    the real (older) commit the note was actually written against (#323).
+    Anything git cannot report (not a repository, unreadable object store)
+    counts as not resolving, so validation degrades to the typo check.
+    """
+
+    try:
+        completed = subprocess.run(
+            ("git", "rev-parse", "--verify", "--quiet", f"{value}^{{commit}}"),
+            cwd=working_directory,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except Exception:
+        return False
+    return completed.returncode == 0
 
 
 def _this_attempt_note_commit_revisions(
@@ -7876,17 +7968,36 @@ def _validate_handoff_note(
             base_revision,
             start=note_index + 1,
         )
+    if expected_last_work_commit.startswith(last_work_commit) and len(last_work_commit) >= 7:
+        return _HandoffNoteValidation(True, started_at_warning=started_at_warning)
+    # Not an exact prefix: tell a transcription slip apart from a stale note.
+    # A near-copy of the expected revision that names no commit is evidence
+    # the model copied the right value and slipped; a value naming a real
+    # (older) commit is the stale-HEAD case (#323) and stays rejected, as
+    # does anything further than two edits away, non-hex, or missing.
     if (
-        len(last_work_commit) < 7
-        or not expected_last_work_commit.startswith(last_work_commit)
+        len(last_work_commit) >= 7
+        and _is_hex(last_work_commit)
+        and not _resolves_to_commit(working_directory, last_work_commit)
+        and _last_work_commit_typo_distance(last_work_commit, expected_last_work_commit, 2)
+        <= 2
     ):
         return _HandoffNoteValidation(
-            False,
-            "Handoff note's `last_work_commit` does not match the last preserved "
-            "work commit.",
-            started_at_warning,
+            True,
+            started_at_warning=started_at_warning,
+            last_work_commit_warning=(
+                f"issue #{issue_number}: the handoff note's `last_work_commit` value"
+                f" {last_work_commit!r} is not an exact prefix of the expected"
+                f" revision {expected_last_work_commit!r}; accepting as a"
+                " transcription slip."
+            ),
         )
-    return _HandoffNoteValidation(True, started_at_warning=started_at_warning)
+    return _HandoffNoteValidation(
+        False,
+        "Handoff note's `last_work_commit` does not match the last preserved "
+        "work commit.",
+        started_at_warning,
+    )
 
 
 def _parse_handoff_note_fields(text: str) -> dict[str, str]:
