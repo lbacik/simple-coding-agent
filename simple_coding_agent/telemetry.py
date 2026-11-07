@@ -647,6 +647,9 @@ def _normalize_last_finished(summary: object) -> dict:
     finished_at = summary.get("finished_at", summary.get("completed_at"))
     if not isinstance(finished_at, str) or not finished_at:
         raise ValueError("last_finished must carry a finished_at timestamp")
+    lifecycle_state = summary.get("lifecycle_state", "finished")
+    if lifecycle_state not in ("finished", "released"):
+        lifecycle_state = "finished"
     return {
         "attempt_id": attempt_id,
         "issue_number": issue_number,
@@ -656,6 +659,7 @@ def _normalize_last_finished(summary: object) -> dict:
         "budget_used": _measured_figure(summary.get("budget_used")),
         "turns": _measured_figure(summary.get("turns")),
         "pull_request": _normalize_pull_request(summary.get("pull_request")),
+        "lifecycle_state": lifecycle_state,
     }
 
 
@@ -694,6 +698,7 @@ def load_last_finished(data_dir: Path) -> dict | None:
             "budget_used": budget_used,
             "turns": turns,
             "pull_request": record.get("pull_request"),
+            "lifecycle_state": record.get("lifecycle_state", "finished"),
         }
     )
 

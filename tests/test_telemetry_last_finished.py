@@ -176,6 +176,7 @@ def test_finish_attempt_stores_the_shaped_last_finished() -> None:
         "budget_used": {"value": 812345, "basis": "measured"},
         "turns": {"value": 23, "basis": "measured"},
         "pull_request": {"number": 11, "url": "https://example.test/11"},
+        "lifecycle_state": "finished",
     }
 
 
@@ -428,6 +429,7 @@ def test_seed_prefers_the_latest_completed_attempt(tmp_path: Path) -> None:
         "budget_used": {"value": 200, "basis": "measured"},
         "turns": {"value": 2, "basis": "measured"},
         "pull_request": None,
+        "lifecycle_state": "finished",
     }
 
 

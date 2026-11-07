@@ -10,20 +10,30 @@ recorded in its ``attempt.json``, never by string reversal, so directories
 without a recorded ``started_at`` are skipped.
 
 An unsealed archive, including the active Attempt's, is a moving snapshot:
-its summary and manifest are computed at read time. Sealing lands in a
-later ticket, so ``sealed`` is always ``False`` here.
+its summary and manifest are computed at read time. A Sealed archive
+freezes both: the sealing record carries ``sealed_at`` and the frozen
+manifest.
 """
 
 from __future__ import annotations
 
 import base64
-from collections.abc import Container, Mapping
+from collections.abc import Callable, Container, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import hashlib
+import io
 import json
+import os
 from pathlib import Path
-from typing import Any
+import tarfile
+from typing import Any, BinaryIO
+
+from simple_coding_agent.observability import (
+    SEALING_FILENAME,
+    discard_manifest_snapshot,
+    read_manifest_snapshot,
+)
 
 
 #: ``attempts list`` page size when the consumer passes no ``--limit``.
@@ -146,19 +156,20 @@ def show_attempt(
     directories = _archive_directories(data_dir)
     if active is not None and active.attempt_id == attempt_id:
         summary = _live_summary(active, held=held)
+        return {"attempt": summary, "manifest": _manifest(directories, attempt_id)}
+    run_dir = find_run_directory(data_dir, attempt_id)
+    if run_dir is None:
+        raise AttemptHistoryError(
+            "not_found", f"unknown attempt {attempt_id!r}"
+        )
+    record = _read_record(run_dir / "attempt.json")
+    sealing = read_sealing_record(run_dir)
+    summary = _archived_summary(attempt_id, record, held=held, sealing=sealing)
+    if sealing is not None:
+        manifest = [dict(entry) for entry in sealing["manifest"]]
     else:
-        record: Mapping[str, Any] | None = None
-        for run_dir in directories:
-            candidate = _read_record(run_dir / "attempt.json")
-            if candidate.get("started_at") == attempt_id:
-                record = candidate
-                break
-        if record is None:
-            raise AttemptHistoryError(
-                "not_found", f"unknown attempt {attempt_id!r}"
-            )
-        summary = _archived_summary(attempt_id, record, held=held)
-    return {"attempt": summary, "manifest": _manifest(directories, attempt_id)}
+        manifest = _manifest(directories, attempt_id)
+    return {"attempt": summary, "manifest": manifest}
 
 
 def _archive_directories(data_dir: Path) -> list[Path]:
@@ -213,6 +224,14 @@ def _is_public_evidence(path: Path, relative: str) -> bool:
     """Whether an archive file may appear in a manifest (never private state)."""
 
     if path.is_symlink() or not path.is_file():
+        return False
+    return _is_public_relative(relative)
+
+
+def _is_public_relative(relative: str) -> bool:
+    """Whether one archive-relative POSIX path may appear in a manifest."""
+
+    if relative == SEALING_FILENAME:
         return False
     lowered = relative.lower()
     if any(part.startswith(".") for part in relative.split("/")):
@@ -297,7 +316,9 @@ def _read_archived_summaries(
             started_at = record.get("started_at")
             if not isinstance(started_at, str) or not started_at:
                 continue
-            summaries[started_at] = _archived_summary(started_at, record, held=held)
+            summaries[started_at] = _archived_summary(
+                started_at, record, held=held, sealing=read_sealing_record(run_dir)
+            )
     return summaries
 
 
@@ -317,9 +338,20 @@ def _live_summary(active: ActiveAttempt, *, held: Container[str]) -> dict[str, A
 
 
 def _archived_summary(
-    attempt_id: str, record: Mapping[str, Any], *, held: Container[str]
+    attempt_id: str,
+    record: Mapping[str, Any],
+    *,
+    held: Container[str],
+    sealing: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Build the moving-snapshot summary of one archived Attempt."""
+    """Build the summary of one archived Attempt.
+
+    Unsealed archives read as a moving snapshot (``sealed: False``); a
+    present sealing record freezes ``sealed``/``sealed_at`` and the
+    manifest. The lifecycle state comes from the archive record
+    (``released`` for a release without a Terminal Outcome) and defaults
+    to ``finished``.
+    """
 
     issue_number = record.get("issue_number")
     if isinstance(issue_number, bool) or not isinstance(issue_number, int):
@@ -330,15 +362,24 @@ def _archived_summary(
     finished_at = record.get("completed_at")
     if not isinstance(finished_at, str) or not finished_at:
         finished_at = None
+    lifecycle_state = record.get("lifecycle_state")
+    if lifecycle_state not in ("finished", "released"):
+        lifecycle_state = "finished"
+    sealed_at: str | None = None
+    if sealing is not None:
+        candidate = sealing.get("sealed_at")
+        sealed_at = candidate if isinstance(candidate, str) and candidate else None
     return _summary(
         attempt_id=attempt_id,
         issue_number=issue_number,
         issue_title=issue_title,
         started_at=attempt_id,
         finished_at=finished_at,
-        lifecycle_state="finished",
+        lifecycle_state=lifecycle_state,
         record=record,
         held=held,
+        sealed=sealing is not None,
+        sealed_at=sealed_at,
     )
 
 
@@ -352,6 +393,8 @@ def _summary(
     lifecycle_state: str,
     record: Mapping[str, Any],
     held: Container[str],
+    sealed: bool = False,
+    sealed_at: str | None = None,
 ) -> dict[str, Any]:
     """Build one contract AttemptSummary in envelope key order."""
 
@@ -363,8 +406,8 @@ def _summary(
         "issue": {"number": issue_number, "title": issue_title},
         "lifecycle_state": lifecycle_state,
         "outcome": _outcome(record),
-        "sealed": False,
-        "sealed_at": None,
+        "sealed": sealed,
+        "sealed_at": sealed_at,
         "started_at": started_at,
     }
 
@@ -420,6 +463,200 @@ def _read_record(path: Path) -> Mapping[str, Any]:
     except (OSError, ValueError):
         return {}
     return value if isinstance(value, Mapping) else {}
+
+
+def read_sealing_record(run_dir: Path) -> dict[str, Any] | None:
+    """Return the sealing record of one archive directory, or ``None``.
+
+    The record carries the frozen ``sealed_at`` timestamp and the frozen
+    ``manifest`` list. A missing or unreadable record means the archive is
+    not Sealed; a malformed one is treated the same way (never raising),
+    so a half-written seal can never fake finality.
+    """
+
+    try:
+        value = json.loads((run_dir / SEALING_FILENAME).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(value, dict):
+        return None
+    sealed_at = value.get("sealed_at")
+    manifest = value.get("manifest")
+    if not isinstance(sealed_at, str) or not sealed_at:
+        return None
+    if not isinstance(manifest, list) or not all(
+        isinstance(entry, dict) for entry in manifest
+    ):
+        return None
+    return {"sealed_at": sealed_at, "manifest": [dict(entry) for entry in manifest]}
+
+
+def find_run_directory(data_dir: Path, attempt_id: str) -> Path | None:
+    """Return the archive run directory of one Attempt ID, or ``None``.
+
+    Matched through the ``started_at`` recorded in ``attempt.json``, never
+    by string reversal of the directory name.
+    """
+
+    for run_dir in _archive_directories(data_dir):
+        if _read_record(run_dir / "attempt.json").get("started_at") == attempt_id:
+            return run_dir
+    return None
+
+
+def seal_archive(run_dir: Path) -> dict[str, Any] | None:
+    """Seal one archive directory; set-once, and never raising.
+
+    Computes the public manifest over the directory, then writes the
+    sealing record (``sealed_at`` plus the frozen manifest) atomically
+    (temporary file plus fsync plus rename) and forgets the process-local
+    write-through snapshot, so later exports serve the frozen manifest.
+    When the archive is already Sealed the stored record is returned
+    unchanged: ``sealed_at`` is set once. Returns the sealing record, or
+    ``None`` when the directory is missing or the seal cannot be written
+    (the caller logs a warning and carries on unsealed).
+    """
+
+    existing = read_sealing_record(run_dir)
+    if existing is not None:
+        return existing
+    if not run_dir.is_dir():
+        return None
+    try:
+        children = sorted(run_dir.rglob("*"))
+    except OSError:
+        return None
+    entries: list[dict[str, Any]] = []
+    for path in children:
+        relative = path.relative_to(run_dir).as_posix()
+        if not _is_public_evidence(path, relative):
+            continue
+        try:
+            raw = path.read_bytes()
+        except OSError:
+            continue
+        entries.append(
+            {
+                "kind": _manifest_kind(relative),
+                "media_type": _media_type(relative),
+                "path": relative,
+                "sha256": hashlib.sha256(raw).hexdigest(),
+                "size": len(raw),
+            }
+        )
+    entries.sort(key=lambda entry: entry["path"])
+    sealed_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    record = {"sealed_at": sealed_at, "manifest": entries}
+    payload = json.dumps(record, sort_keys=True)
+    target = run_dir / SEALING_FILENAME
+    temporary: Path | None = None
+    try:
+        run_dir.mkdir(parents=True, exist_ok=True)
+        with open(run_dir / f".{SEALING_FILENAME}.tmp", "w", encoding="utf-8") as file:
+            temporary = Path(file.name)
+            file.write(payload)
+            file.flush()
+            os.fsync(file.fileno())
+        os.replace(temporary, target)
+    except OSError:
+        return None
+    finally:
+        if temporary is not None:
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                pass
+    discard_manifest_snapshot(run_dir)
+    return read_sealing_record(run_dir) or record
+
+
+def export_projection(
+    data_dir: Path,
+    attempt_id: str,
+    *,
+    active: ActiveAttempt | None = None,
+    held: Container[str] = frozenset(),
+) -> dict[str, Any]:
+    """Return ``{"attempt": AttemptSummary, "manifest": [ManifestEntry]}`` for export.
+
+    The summary matches :func:`show_attempt`; the manifest is the frozen
+    sealing record for a Sealed archive, and a snapshot-merged manifest
+    for an unsealed one: a fresh scan overlaid with the process-local
+    write-through snapshot's ``(size, sha256)`` values, so a file that
+    grows through a side channel after the snapshot keeps the snapshot's
+    entry while the streamed bytes are read live (a torn read the
+    consumer detects as a ``sha256`` mismatch). Snapshot entries for
+    files that are gone or no longer public are dropped. Raises
+    :class:`AttemptHistoryError` with ``invalid_argument``/``not_found``
+    like :func:`show_attempt`.
+    """
+
+    shown = show_attempt(data_dir, attempt_id, active=active, held=held)
+    if shown["attempt"]["sealed"]:
+        return shown
+    run_dir = find_run_directory(data_dir, attempt_id)
+    if run_dir is None:
+        return shown
+    live = {entry["path"]: entry for entry in shown["manifest"]}
+    snapshot = read_manifest_snapshot(run_dir)
+    if not snapshot:
+        return shown
+    merged: list[dict[str, Any]] = []
+    for path, entry in live.items():
+        overlay = snapshot.get(path)
+        if overlay is not None:
+            size, sha256 = overlay
+            if isinstance(size, int) and isinstance(sha256, str):
+                entry = {**entry, "size": size, "sha256": sha256}
+        merged.append(entry)
+    merged.sort(key=lambda entry: entry["path"])
+    return {"attempt": shown["attempt"], "manifest": merged}
+
+
+def write_export_tar(
+    fileobj: BinaryIO,
+    *,
+    attempt: Mapping[str, Any],
+    entries: list[Mapping[str, Any]],
+    read_bytes: Callable[[str], bytes],
+) -> None:
+    """Stream one uncompressed pax export tar: ``manifest.json`` first.
+
+    The manifest member carries ``{"contract": "1.0", "attempt",
+    "files"}``; every file member that follows is the bytes actually
+    read (its tar header size is the live byte count), so for an unsealed
+    archive a file that grew after the snapshot surfaces as a ``sha256``
+    mismatch on the consumer side. The stream is deterministic for a
+    Sealed archive (pax format, zero mtime, fixed ids/mode, no extra pax
+    headers), hence byte-identical across reads. Raises ``KeyError`` when
+    ``read_bytes`` has no bytes for a listed path.
+    """
+
+    manifest_doc = {
+        "contract": "1.0",
+        "attempt": dict(attempt),
+        "files": [dict(entry) for entry in entries],
+    }
+    payload = (json.dumps(manifest_doc, sort_keys=True) + "\n").encode("utf-8")
+
+    def _tarinfo(name: str, size: int) -> tarfile.TarInfo:
+        info = tarfile.TarInfo(name)
+        info.size = size
+        info.mtime = 0
+        info.uid = 0
+        info.gid = 0
+        info.uname = ""
+        info.gname = ""
+        info.mode = 0o444
+        info.pax_headers = {}
+        return info
+
+    with tarfile.open(fileobj=fileobj, mode="w|", format=tarfile.PAX_FORMAT) as archive:
+        archive.addfile(_tarinfo("manifest.json", len(payload)), io.BytesIO(payload))
+        for entry in entries:
+            path = str(entry["path"])
+            data = read_bytes(path)
+            archive.addfile(_tarinfo(path, len(data)), io.BytesIO(data))
 
 
 def _sort_key(value: str) -> Any:

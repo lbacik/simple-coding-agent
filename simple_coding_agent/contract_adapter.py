@@ -25,9 +25,11 @@ Operand shapes and reply envelopes follow the prose and the
 from __future__ import annotations
 
 import json
+import os
 import re
 import sys
 from dataclasses import dataclass, field
+from pathlib import Path, PurePosixPath
 
 from simple_coding_agent.control_server import (
     ControlUnavailableError,
@@ -1046,6 +1048,165 @@ def _run_attempts_list(parsed: ParsedOperation) -> int:
     return _emit_ok(page)
 
 
+def _fetch_attempts_export(attempt_id: str) -> dict:
+    """Read one ``attempts export`` projection; raise :class:`_Unreachable`/`_EngineFailed`."""
+
+    try:
+        reply = send_request(
+            resolve_socket_path(),
+            {"op": "attempts_export", "attempt_id": attempt_id},
+            timeout=SOCKET_TIMEOUT_SECONDS,
+        )
+    except UnreadableReplyError as error:
+        raise _EngineFailed(
+            f"the agent process answered but the reply could not be used: {error}"
+        ) from error
+    except ControlUnavailableError as error:
+        raise _Unreachable(str(error)) from error
+    if not reply.get("ok"):
+        raise _engine_error_for(reply, "attempts export")
+    result = reply.get("attempts_export")
+    problem = _attempts_show_problem(result)
+    if problem is not None:
+        raise _EngineFailed(
+            f"the agent process answered malformed attempts export: {problem}"
+        )
+    assert isinstance(result, dict)
+    return result
+
+
+def _export_data_dir() -> Path:
+    """The archive volume the export streams bytes from (never the socket)."""
+
+    return Path(os.environ.get("DATA_DIR", "~/.simple-coding-agent/")).expanduser()
+
+
+def _run_attempts_export(parsed: ParsedOperation) -> int:
+    """Stream ``attempts export`` as an uncompressed pax tar to stdout.
+
+    The summary and export manifest come from the engine's history
+    projection; the file bytes are read volume-direct so the tar never
+    crosses the control socket. ``manifest.json`` is the first member.
+    An unknown Attempt or ``--path`` answers ``not_found`` with no tar
+    bytes on stdout; a file that grew after the snapshot keeps the
+    snapshot's manifest entry while streaming the bytes actually read,
+    so the consumer detects the torn read as a ``sha256`` mismatch.
+    """
+
+    from simple_coding_agent import attempt_history as attempt_history_module
+
+    attempt_id = parsed.args.get("attempt_id")
+    assert isinstance(attempt_id, str)
+    try:
+        projection = _fetch_attempts_export(attempt_id)
+    except _Unreachable:
+        return _emit_error(
+            code="agent_unreachable",
+            message="cannot reach the agent process",
+            exit_code=EXIT_AGENT_UNREACHABLE,
+            retryable=True,
+        )
+    except _EngineNotFound as error:
+        return _emit_error(
+            code="not_found",
+            message=str(error),
+            exit_code=EXIT_NOT_FOUND,
+            retryable=False,
+        )
+    except _EngineInvalidArgument as error:
+        return _emit_error(
+            code="invalid_argument",
+            message=str(error),
+            exit_code=EXIT_REJECTED,
+            retryable=False,
+        )
+    except _EngineFailed as error:
+        return _emit_error(
+            code="internal",
+            message=f"the agent process could not serve 'attempts export': {error}",
+            exit_code=EXIT_INTERNAL,
+            retryable=True,
+            details={"stored": False},
+        )
+    manifest = projection.get("manifest")
+    assert isinstance(manifest, list)
+    known = {
+        str(entry.get("path"))
+        for entry in manifest
+        if isinstance(entry, dict) and isinstance(entry.get("path"), str)
+    }
+    requested = parsed.args.get("paths", [])
+    for path in requested:
+        if not _is_export_path(path) or path not in known:
+            return _emit_error(
+                code="not_found",
+                message=f"unknown archive path {path!r} for attempt {attempt_id!r}",
+                exit_code=EXIT_NOT_FOUND,
+                retryable=False,
+            )
+    entries = [
+        entry
+        for entry in manifest
+        if isinstance(entry, dict) and (not requested or entry.get("path") in requested)
+    ]
+    data_dir = _export_data_dir()
+    run_dir = attempt_history_module.find_run_directory(data_dir, attempt_id)
+    if run_dir is None:
+        return _emit_error(
+            code="not_found",
+            message=f"unknown attempt {attempt_id!r}",
+            exit_code=EXIT_NOT_FOUND,
+            retryable=False,
+        )
+    live: dict[str, bytes] = {}
+    for entry in entries:
+        assert isinstance(entry, dict)
+        relative = str(entry.get("path"))
+        full = run_dir / relative
+        try:
+            if full.is_symlink() or not full.is_file():
+                raise OSError(f"archive path {relative!r} is not a regular file")
+            live[relative] = full.read_bytes()
+        except OSError as error:
+            return _emit_error(
+                code="internal",
+                message=f"the agent process could not serve 'attempts export': {error}",
+                exit_code=EXIT_INTERNAL,
+                retryable=True,
+                details={"stored": False},
+            )
+    attempt = projection.get("attempt")
+    assert isinstance(attempt, dict)
+    try:
+        attempt_history_module.write_export_tar(
+            sys.stdout.buffer,
+            attempt=attempt,
+            entries=entries,
+            read_bytes=live.__getitem__,
+        )
+        sys.stdout.buffer.flush()
+    except (OSError, KeyError) as error:
+        return _emit_error(
+            code="internal",
+            message=f"the agent process could not serve 'attempts export': {error}",
+            exit_code=EXIT_INTERNAL,
+            retryable=True,
+            details={"stored": False},
+        )
+    return EXIT_OK
+
+
+def _is_export_path(path: object) -> bool:
+    """Whether one ``--path`` value is shaped like an archive member."""
+
+    if not isinstance(path, str) or not path:
+        return False
+    candidate = PurePosixPath(path)
+    if candidate.is_absolute() or ".." in candidate.parts:
+        return False
+    return True
+
+
 def _run_attempts_show(parsed: ParsedOperation) -> int:
     """Serve ``attempts show`` from the engine's history projection."""
 
@@ -1431,6 +1592,8 @@ def main(argv: list[str]) -> int:
         return _run_attempts_list(parsed)
     if parsed.name == "attempts show":
         return _run_attempts_show(parsed)
+    if parsed.name == "attempts export":
+        return _run_attempts_export(parsed)
     if parsed.name == "stop":
         return _run_contract_mutation(parsed, "stop")
     if parsed.name == "resume":

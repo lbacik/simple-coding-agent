@@ -527,27 +527,10 @@ def test_invalid_argument_echoes_the_request_id(contract_server) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Later tickets own every other operation for now
+# All ``attempts`` read operations are implemented; no unimplemented
+# reachable operation remains (attempts export landed with archive
+# sealing in #344).
 # ---------------------------------------------------------------------------
-
-
-@pytest.mark.parametrize(
-    "argv",
-    [
-        ["--contract", "1", "attempts", "export", "#41/1"],
-    ],
-)
-def test_unimplemented_operations_answer_unsupported_when_reachable(
-    contract_server, argv: list[str]
-) -> None:
-    contract_server()
-    code, envelope, _, err = _run(argv)
-    assert code == 3, argv
-    assert envelope["contract"] == "1.0", argv
-    assert envelope["ok"] is False, argv
-    assert envelope["error"]["code"] == "unsupported", argv
-    assert envelope["error"]["retryable"] is False, argv
-    assert err == "", argv
 
 
 def test_unsupported_mutation_does_not_consume_the_request_id(

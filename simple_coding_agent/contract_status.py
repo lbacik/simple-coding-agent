@@ -427,6 +427,9 @@ def project_last_finished(summary: dict | None) -> dict | None:
     else:
         delivery = None
     finished_at = summary.get("finished_at")
+    lifecycle_state = summary.get("lifecycle_state", "finished")
+    if lifecycle_state not in ("finished", "released"):
+        lifecycle_state = "finished"
     return {
         "attempt_id": attempt_id,
         "issue": {
@@ -435,7 +438,7 @@ def project_last_finished(summary: dict | None) -> dict | None:
         },
         "started_at": attempt_id,
         "finished_at": finished_at if isinstance(finished_at, str) else None,
-        "lifecycle_state": "finished",
+        "lifecycle_state": lifecycle_state,
         "outcome": {
             "native": outcome,
             "reason": None,

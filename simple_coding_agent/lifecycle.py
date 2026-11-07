@@ -2911,7 +2911,12 @@ class AgentLifecycle:
         try:
             archive = self._archive_for(claim.issue.number, attempt_id)
             self._commit_finalization(
-                checkpoint, claim.issue.number, branch, actual_outcome, archive
+                checkpoint,
+                claim.issue.number,
+                branch,
+                actual_outcome,
+                archive,
+                released=True,
             )
             self._resolve_pending_handoff(
                 issue_number=claim.issue.number,
@@ -4089,6 +4094,31 @@ class AgentLifecycle:
             held = self._held_attempt_ids_locked(checkpoint)
             data_dir = self._data_dir
         return attempt_history_module.show_attempt(
+            data_dir, attempt_id, active=active, held=held
+        )
+
+    def control_attempts_export(self, attempt_id: str) -> dict[str, Any]:
+        """Serve one ``attempts export`` read: summary plus export manifest.
+
+        Read-only: the manifest is the frozen sealing record for a Sealed
+        archive and the snapshot-merged manifest otherwise — small enough
+        for the control socket. The consumer reads the archive bytes
+        volume-direct and streams the tar itself. Raises
+        :class:`SnapshotFailedError` without a data directory and
+        :class:`AttemptHistoryError` (``invalid_argument``/``not_found``)
+        for a bad or unknown Attempt ID.
+        """
+
+        from simple_coding_agent import attempt_history as attempt_history_module
+
+        if self._data_dir is None:
+            raise SnapshotFailedError("attempt history is not configured for this process")
+        with self._control_lock:
+            checkpoint = self._read_history_checkpoint_locked()
+            active = self._active_attempt_view_locked(checkpoint)
+            held = self._held_attempt_ids_locked(checkpoint)
+            data_dir = self._data_dir
+        return attempt_history_module.export_projection(
             data_dir, attempt_id, active=active, held=held
         )
 
@@ -5746,6 +5776,7 @@ class AgentLifecycle:
         branch: str,
         outcome: AttemptOutcome,
         archive: AttemptArchive | None,
+        released: bool = False,
     ) -> None:
         """Record the durable completion boundary, then remove the checkpoint.
 
@@ -5797,7 +5828,16 @@ class AgentLifecycle:
             level="INFO",
             issue_number=issue_number,
         )
+        if released and archive is not None:
+            # A release without a Terminal Outcome still finalizes: the
+            # lifecycle state rides the archive record (its last write)
+            # into the telemetry and history projections.
+            try:
+                archive.write_attempt({"lifecycle_state": "released"})
+            except Exception:
+                pass
         self._attempt_state.delete()
+        self._seal_archive_and_emit(archive, attempt_id, issue_number=issue_number)
         self._telemetry_finish(
             self._last_finished_summary(
                 attempt_id,
@@ -5806,8 +5846,90 @@ class AgentLifecycle:
                 outcome,
                 completed_at,
                 archive,
+                lifecycle_state="released" if released else "finished",
             )
         )
+
+    def _seal_archive_and_emit(
+        self,
+        archive: AttemptArchive | None,
+        attempt_id: str,
+        *,
+        issue_number: int | None = None,
+    ) -> None:
+        """Seal one Attempt archive and announce it; never raises.
+
+        The sealing record (frozen manifest plus ``sealed_at``) lands
+        atomically after the checkpoint removal, then the ``sealed``
+        Contract Event follows with the explicit Attempt ID. An already
+        Sealed archive (a readable sealing record) is left untouched and
+        never re-announced, so recovering a Sealed attempt writes nothing.
+        A corrupt ``sealing.json`` reads as unsealed, so recovery re-seals
+        (repairing the record) and announces. A seal failure logs
+        one WARNING and leaves the archive unsealed.
+        """
+
+        if archive is None:
+            return
+        try:
+            from simple_coding_agent import attempt_history as attempt_history_module
+
+            already = (
+                attempt_history_module.read_sealing_record(archive.directory)
+                is not None
+            )
+        except Exception:
+            try:
+                already = archive.is_sealed()
+            except Exception:
+                already = False
+        if already:
+            return
+        try:
+            sealed = attempt_history_module.seal_archive(archive.directory)
+        except Exception:
+            sealed = None
+        if sealed is None:
+            try:
+                self._event_log(
+                    "seal_failed",
+                    f"attempt {attempt_id} could not be sealed; its archive stays unsealed",
+                    level="WARNING",
+                    issue_number=issue_number,
+                )
+            except Exception:
+                pass
+            return
+        self._emit_sealed_event(attempt_id, issue_number=issue_number)
+
+    def _emit_sealed_event(
+        self, attempt_id: str, *, issue_number: int | None = None
+    ) -> None:
+        """Emit the ``sealed`` Contract Event source record; never raises.
+
+        The Attempt ID rides explicitly (the checkpoint is already gone,
+        so the sink cannot resolve it); doubles whose ``event_log``
+        predates the ``attempt_id`` keyword fall back to the bare emit.
+        """
+
+        try:
+            try:
+                self._event_log(
+                    "sealed",
+                    f"sealed {attempt_id}",
+                    level="INFO",
+                    issue_number=issue_number,
+                    attempt_id=attempt_id,
+                )
+            except TypeError:
+                self._event_log(
+                    "sealed",
+                    f"sealed {attempt_id}",
+                    level="INFO",
+                    issue_number=issue_number,
+                )
+        except Exception:
+            pass
 
     def _backfill_archived_pull_request(
         self, archive: AttemptArchive | None, attempt_id: str
@@ -5841,6 +5963,7 @@ class AgentLifecycle:
         outcome: AttemptOutcome,
         completed_at: str,
         archive: AttemptArchive | None,
+        lifecycle_state: str = "finished",
     ) -> dict:
         """Build the telemetry ``last_finished`` summary for a finalized attempt.
 
@@ -5885,6 +6008,7 @@ class AgentLifecycle:
             "budget_used": budget_used,
             "turns": turns,
             "pull_request": pull_request,
+            "lifecycle_state": lifecycle_state,
         }
 
     def _reconcile_startup(self) -> AttemptOutcome | None:
@@ -5980,6 +6104,15 @@ class AgentLifecycle:
                         self._active_issue_number = None
                         return None
             self._attempt_state.delete()
+            # The previous process may have crashed between the checkpoint
+            # removal and the seal: finish the archive boundary now when the
+            # archive is still unsealed. An already Sealed archive is left
+            # untouched, so recovering it writes nothing.
+            self._seal_archive_and_emit(
+                self._archive_for(checkpoint.issue_number, checkpoint.started_at),
+                checkpoint.started_at,
+                issue_number=checkpoint.issue_number,
+            )
             self._telemetry_finish()
             self._active_issue_number = None
             return None
