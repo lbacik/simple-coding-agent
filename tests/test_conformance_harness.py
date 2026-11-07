@@ -390,6 +390,14 @@ def test_harness_smoke_reaches_every_state(tmp_path: Path) -> None:
     assert code == 0
     _wait_for_state(socket, "idle")
 
+    # -- halt from paused: close intake so the stopped volume reads paused --
+    code, _ = _agentctl(
+        socket, "stop", "--request-id", "req-smoke-stop-2",
+        "--expect-repo", "octo/example",
+    )
+    assert code == 0
+    _wait_for_state(socket, "paused")
+
     # -- halted: the engine records its halt and exits by decision ----------
     assert call("halt", {"reason": "harness-smoke"}) == {"reason": "harness-smoke"}
     code, offline = _agentctl_json(

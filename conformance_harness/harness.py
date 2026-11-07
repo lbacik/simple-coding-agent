@@ -176,10 +176,9 @@ def _engine_alive(root: Path) -> bool:
     if not isinstance(pid, int):
         return False
     try:
-        os.kill(pid, 0)
-    except (OSError, OverflowError):
+        return not _pid_gone(pid)
+    except OverflowError:
         return False
-    return True
 
 
 def _read_json_file(path: Path) -> dict | None:
@@ -452,7 +451,7 @@ def _pid_gone(pid: int) -> bool:
     # Reap our own exited engines first: a zombie is still signalable, so
     # ``kill(pid, 0)`` alone reports it alive and every stop/halt wait burns
     # its full timeout. Engines spawned by a different CLI process are not
-    # our children (``waitpid`` raises ``ChildError``); those fall through
+    # our children (``waitpid`` raises ``ChildProcessError``); those fall through
     # to the signal probe and are reaped by init once orphaned.
     handle = _SPAWNED.get(pid)
     if handle is not None:
@@ -462,7 +461,7 @@ def _pid_gone(pid: int) -> bool:
         return True
     try:
         done, _ = os.waitpid(pid, os.WNOHANG)
-    except ChildError:
+    except ChildProcessError:
         pass
     except OSError:
         return True
