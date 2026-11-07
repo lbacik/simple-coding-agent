@@ -443,40 +443,27 @@ class ControlServer:
         mutation holds the control lock.
         """
 
-        snapshotter = getattr(self._control, "control_identity", None)
-        if not callable(snapshotter):
+        def _fail_identity(reason: str) -> None:
             _send(
                 connection,
                 {
                     "ok": False,
                     "repository": self._safe_repository(),
-                    "error": "Identity is unavailable:"
-                    " this agent version does not serve identity.",
+                    "error": f"Identity is unavailable: {reason}",
                 },
             )
+
+        snapshotter = getattr(self._control, "control_identity", None)
+        if not callable(snapshotter):
+            _fail_identity("this agent version does not serve identity.")
             return
         try:
             snapshot = snapshotter()
         except Exception as error:
-            _send(
-                connection,
-                {
-                    "ok": False,
-                    "repository": self._safe_repository(),
-                    "error": f"Identity is unavailable: {error}",
-                },
-            )
+            _fail_identity(str(error))
             return
         if not isinstance(snapshot, dict):
-            _send(
-                connection,
-                {
-                    "ok": False,
-                    "repository": self._safe_repository(),
-                    "error": "Identity is unavailable:"
-                    " the identity snapshot was not a JSON object.",
-                },
-            )
+            _fail_identity("the identity snapshot was not a JSON object.")
             return
         _send(connection, {"ok": True, "identity": snapshot})
 

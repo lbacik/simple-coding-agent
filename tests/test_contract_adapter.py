@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import io
 import json
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 
@@ -19,8 +19,9 @@ import pytest
 
 from simple_coding_agent import agentctl, contract_adapter
 from simple_coding_agent.agent_version import agent_version
+from simple_coding_agent.attempt_state import AttemptStateStore
 from simple_coding_agent.contract_adapter import advertised_capabilities
-from simple_coding_agent.control import ControlStore
+from simple_coding_agent.control import CommandRecord, ControlStore
 from simple_coding_agent.control_server import ControlServer
 
 REPOSITORY = "example-owner/example-repo"
@@ -72,19 +73,21 @@ class _ContractControl:
             "capabilities": capabilities,
         }
 
-    def get_command(self, request_id: str):
+    def get_command(self, request_id: str) -> CommandRecord | None:
         return self._store.get_command(request_id)
 
 
 @pytest.fixture
 def contract_server(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> Iterator[ControlServer]:
+) -> Iterator[Callable[..., tuple[ControlServer, _ContractControl]]]:
     """A fresh control socket; tests set AGENTCTL_SOCKET at the server path."""
 
     servers: list[ControlServer] = []
 
-    def _start(name: str = "contract", **kwargs) -> tuple[ControlServer, _ContractControl]:
+    def _start(
+        name: str = "contract", **kwargs: object
+    ) -> tuple[ControlServer, _ContractControl]:
         data_dir = tmp_path / name
         data_dir.mkdir(parents=True, exist_ok=True)
         socket_path = tmp_path / f"{name}.sock"
@@ -95,7 +98,7 @@ def contract_server(
         monkeypatch.setenv("AGENTCTL_SOCKET", str(socket_path))
         return server, control
 
-    yield _start  # type: ignore[misc]
+    yield _start
 
     for server in servers:
         server.stop()
@@ -308,9 +311,7 @@ def test_identity_matches_lifecycle_control_identity(
     socket_path = tmp_path / "engine.sock"
     lifecycle = AgentLifecycle(
         tracker=FakeTracker(worker_id="worker-9"),
-        attempt_state=__import__(
-            "simple_coding_agent.attempt_state", fromlist=["AttemptStateStore"]
-        ).AttemptStateStore(data_dir),
+        attempt_state=AttemptStateStore(data_dir),
         workspace=None,  # type: ignore[arg-type]
         profile_loader=lambda _directory: None,  # type: ignore[return-value]
         publisher=None,  # type: ignore[arg-type]

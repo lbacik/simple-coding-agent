@@ -28,7 +28,6 @@ import json
 import re
 import sys
 from dataclasses import dataclass, field
-from pathlib import Path
 
 from simple_coding_agent.control_server import (
     ControlUnavailableError,
@@ -597,7 +596,7 @@ def _check_values(parsed: ParsedOperation) -> None:
     elif parsed.name == "next issue":
         raw = parsed.args["issue"]
         number = _check_positive_int(raw, "issue number")
-        if number <= 0:  # pragma: no cover - unreachable via the regex
+        if number <= 0:
             raise _InvalidArgument(
                 f"invalid issue number {raw!r}: must be a positive integer"
             )
@@ -757,7 +756,7 @@ def main(argv: list[str]) -> int:
         request_id = _scan_request_id(rest)
         return _emit_error(
             code="usage",
-            message=f"usage: {error}",
+            message=str(error),
             exit_code=EXIT_USAGE,
             retryable=False,
             request_id=request_id,
@@ -838,7 +837,7 @@ def _scan_request_id(tokens: list[str]) -> str | None:
         if flag == "--request-id":
             if inline is not None:
                 return inline
-            if index + 1 < len(tokens) and not tokens[index + 1].startswith("-"):
+            if index + 1 < len(tokens) and not tokens[index + 1].startswith("--"):
                 return tokens[index + 1]
             return None
     return None
