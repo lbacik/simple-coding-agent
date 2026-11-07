@@ -794,7 +794,7 @@ def main(argv: list[str] | None = None) -> int:
                 return 1
             return submit_mutating(
                 socket_path,
-                f"recovery release {attempt_id}",
+                f"recovery release {attempt_id} --saved-at {saved_at}",
                 request_id,
                 lambda path, rid: run_recovery_release(path, rid, attempt_id, saved_at),
             )

@@ -535,12 +535,6 @@ def test_invalid_argument_echoes_the_request_id(contract_server) -> None:
     "argv",
     [
         ["--contract", "1", "attempts", "export", "#41/1"],
-        _mutation(["stop", "--after", "2"]),
-        _mutation(["next", "issue", "43"]),
-        _mutation(["handoff", "now"]),
-        _mutation(["recovery", "retry", "attempt-1"]),
-        _mutation(["recovery", "release", "attempt-1", "--saved-at", "somewhere"]),
-        _mutation(["errors", "reset"]),
     ],
 )
 def test_unimplemented_operations_answer_unsupported_when_reachable(
@@ -559,7 +553,7 @@ def test_unimplemented_operations_answer_unsupported_when_reachable(
 def test_unsupported_mutation_does_not_consume_the_request_id(
     contract_server,
 ) -> None:
-    _, control = contract_server()
+    _, control = contract_server("reduced-unsupported", capabilities=[])
     code, _, _, _ = _run(_mutation(["handoff", "now"], request_id="req-reusable-1"))
     assert code == 3
     assert control.get_command("req-reusable-1") is None
