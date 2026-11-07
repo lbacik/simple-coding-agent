@@ -1317,6 +1317,10 @@ class AgentLifecycle:
         data_dir: Path | None = None,
         mode: str = "online",
         process_started_at: str | None = None,
+        starting: bool = False,
+        startup_check: str | None = None,
+        last_halt: dict | None = None,
+        halt_store: object | None = None,
     ) -> None:
         self._tracker = tracker
         self._attempt_state = attempt_state
@@ -1357,6 +1361,22 @@ class AgentLifecycle:
         )
         self._startup_reconciled = False
         self._recovering = False
+        # Early serving: while ``_starting`` the control endpoint answers
+        # ``instance.state: starting`` with ``startup_check`` naming
+        # provenance verification. Commands committed during ``starting``
+        # or ``recovering`` apply at the first claim boundary; the claim
+        # itself waits until ``starting`` clears. ``_last_halt`` is the
+        # durable halt from the previous engine-decided exit, if any; a
+        # successful start never erases it (it stays until replaced).
+        self._starting = starting
+        self._startup_check = startup_check if starting else None
+        if self._starting and self._startup_check is None:
+            self._startup_check = "provenance"
+        self._halt_store = halt_store
+        if last_halt is not None:
+            self._last_halt: dict | None = dict(last_halt)
+        else:
+            self._last_halt = self._load_last_halt_locked()
         self._active_issue_number: int | None = None
         # True while this process is working through a claimed attempt (from
         # the serialized claim until its processing finishes, including
@@ -1425,6 +1445,109 @@ class AgentLifecycle:
         """Replace the injected model/review workflow (a test seam)."""
 
         self._attempt_runner = attempt_runner
+
+    def set_telemetry(self, telemetry: TelemetryReporter | None) -> None:
+        """Attach the telemetry reporter built after provenance (startup seam)."""
+
+        with self._control_lock:
+            self._telemetry = telemetry
+
+    def attach_post_provenance(
+        self,
+        *,
+        attempt_runner: Callable[[Claim, RepositoryProfile, object], AttemptEvidence] | None = None,
+        telemetry: TelemetryReporter | None = None,
+        conflict_model_executor: object | None = None,
+        conflict_issue_comments: Callable[[TrackerIssue], tuple[str, ...]] | None = None,
+    ) -> None:
+        """Attach provenance-dependent construction after early serving.
+
+        The control endpoint serves ``starting`` before provenance
+        verification; the model executor, attempt runner and telemetry need
+        the verified CLI path and versions, so they are built after
+        provenance and attached here before ``mark_started``.
+        """
+
+        with self._control_lock:
+            if attempt_runner is not None:
+                self._attempt_runner = attempt_runner
+            if telemetry is not None:
+                self._telemetry = telemetry
+            if conflict_model_executor is not None:
+                self._conflict_model_executor = conflict_model_executor
+            if conflict_issue_comments is not None:
+                self._conflict_issue_comments = conflict_issue_comments
+
+    def mark_starting(self, startup_check: str | None = "provenance") -> None:
+        """Enter the early-serving ``starting`` state (control endpoint is up)."""
+
+        with self._control_lock:
+            self._starting = True
+            self._startup_check = startup_check
+
+    def mark_started(self) -> None:
+        """Leave ``starting`` once construction finishes; the loop may claim."""
+
+        with self._control_lock:
+            self._starting = False
+            self._startup_check = None
+
+    def _load_last_halt_locked(self) -> dict | None:
+        """Read the durable halt without breaking startup when it is missing."""
+
+        store = self._halt_store
+        if store is None:
+            return None
+        try:
+            halt = store.read()
+        except Exception:
+            return None
+        if halt is None:
+            return None
+        if isinstance(halt, dict):
+            payload = halt
+        else:
+            payload = {
+                "reason": getattr(halt, "reason", None),
+                "detail": getattr(halt, "detail", None),
+                "at": getattr(halt, "at", None),
+            }
+        if (
+            not isinstance(payload.get("reason"), str)
+            or not isinstance(payload.get("detail"), str)
+            or not isinstance(payload.get("at"), str)
+        ):
+            return None
+        return {
+            "reason": payload["reason"],
+            "detail": payload["detail"],
+            "at": payload["at"],
+        }
+
+    def _status_recovering_locked(self, checkpoint: object | None) -> bool:
+        """Whether contract ``status`` reports ``recovering`` (caller holds the lock).
+
+        True while startup reconciliation finishes recorded effects of
+        earlier attempts, and while intake is held for recovery (an
+        unusable checkpoint or completion ledger, or retained work
+        awaiting a recovery command). A live checkpoint claimed by this
+        process (or simulated in tests before reconciliation) is not a
+        hold: only a retained checkpoint after reconciliation counts.
+        """
+
+        if self._recovering:
+            return True
+        if self._startup_hold_detail is not None:
+            return True
+        if self._recovery_executing:
+            return True
+        if (
+            checkpoint is not None
+            and not self._attempt_processing
+            and self._startup_reconciled
+        ):
+            return True
+        return False
 
     # -- operator control -------------------------------------------------
 
@@ -4017,7 +4140,7 @@ class AgentLifecycle:
             repository=self._repository,
             identity=self.control_identity(),
             intake=store.intake_state(),
-            recovering=self._recovering,
+            recovering=self._status_recovering_locked(checkpoint),
             attempt=attempt,
             pending_record=pending_record,
             stop_plan=store.stop_plan_snapshot(),
@@ -4028,6 +4151,9 @@ class AgentLifecycle:
             usd_ceiling=usd_ceiling,
             generated_at=stamp,
             observed_at=stamp,
+            starting=self._starting,
+            startup_check=self._startup_check,
+            last_halt=self._last_halt,
         )
 
     def _recovery_hold_network_free(
@@ -4590,6 +4716,11 @@ class AgentLifecycle:
         """
 
         with self._control_lock:
+            if self._starting:
+                # The control endpoint is up but construction has not
+                # finished: commands committed during ``starting`` wait
+                # for the first claim boundary after ``mark_started``.
+                return (None, None)
             if self._startup_hold_detail is not None:
                 # A startup hold (unreadable checkpoint or completion
                 # ledger) is active, with or without operator control:
@@ -6972,8 +7103,36 @@ class AgentLifecycle:
         with self._control_lock:
             count = self._error_store.record(outcome, attempt_id)
         if count >= self._max_consecutive_errors:
-            self._event_log("consecutive_error_limit_reached", level="ERROR", issue_number=issue_number)
+            detail = (
+                f"{count} consecutive infrastructure errors reached the limit"
+                f" of {self._max_consecutive_errors} (attempt {attempt_id})"
+            )
+            self._event_log("consecutive_error_limit_reached", detail, level="ERROR", issue_number=issue_number)
+            self._record_halt(
+                "consecutive_error_limit_reached",
+                detail,
+            )
             raise SystemExit(1)
+
+    def _record_halt(self, reason: str, detail: str) -> None:
+        """Best-effort durable halt before an engine-decided exit (never raises)."""
+
+        store = self._halt_store
+        if store is None:
+            return
+        try:
+            recorded = store.record(reason, detail)
+            self._last_halt = {
+                "reason": recorded.reason,
+                "detail": recorded.detail,
+                "at": recorded.at,
+            }
+        except Exception as error:
+            self._event_log(
+                "halt_record_failed",
+                f"{type(error).__name__}: {error}",
+                level="WARNING",
+            )
 
     def _archive_for(self, issue_number: int, started_at: str) -> AttemptArchive | None:
         return (
