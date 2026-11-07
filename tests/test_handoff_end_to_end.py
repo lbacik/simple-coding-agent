@@ -21,7 +21,6 @@ them.
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
 from pathlib import Path
 import subprocess
 
@@ -33,24 +32,23 @@ from simple_coding_agent.lifecycle import LifecycleStatus
 from simple_coding_agent.github_tracker import (
     GitHubTracker,
     IssueComment,
-    TrackerIssue,
 )
 from simple_coding_agent.handoff_record import parse_handoff_record
 from tests.fakes import (
+    LIFECYCLE_REPOSITORY,
     FakeGitHub,
     FakeModelExecutor,
     build_lifecycle,
     git,
+    lifecycle_issue as issue,
     publish_attempt_branch,
     remote_branch_subjects,
     remote_has_branch,
     repository_with_main,
-    running_control_server,
+    running_lifecycle_server,
     write_and_commit,
     write_handoff_note,
 )
-
-REPO = "octo/example"
 
 
 # --- Scenario 1: cost soft-threshold handoff -> continuation -> PR ---------
@@ -182,7 +180,7 @@ def test_repeated_handoff_keeps_both_comments_in_the_filtered_feed() -> None:
             IssueComment(author_login="agent", body="## Agent Attempt Result: incomplete\n\nSecond handoff"),
         ),
     )
-    tracker = GitHubTracker(github, REPO)
+    tracker = GitHubTracker(github, LIFECYCLE_REPOSITORY)
 
     trusted = tracker.trusted_comments(issue(24, author_login="reporter"))
 
@@ -1188,27 +1186,6 @@ def run_published_handoff_continuation(
     return remote, github
 
 
-def issue(
-    number: int,
-    *,
-    body: str = "Fix the thing.",
-    labels: frozenset[str] = frozenset({"ready-for-agent"}),
-    author_login: str = "reporter",
-) -> TrackerIssue:
-    return TrackerIssue(
-        id=f"issue-{number}",
-        number=number,
-        title=f"Issue {number}",
-        body=body,
-        created_at=datetime(2026, 9, 20, tzinfo=UTC),
-        state="OPEN",
-        labels=labels,
-        assignee_logins=(),
-        blocked_by=0,
-        author_login=author_login,
-    )
-
-
 # --- Scenario 11e: token soft-threshold two-call handoff -----------------------
 #
 # The model follows the injected snapshot: it writes the note with the
@@ -1279,13 +1256,9 @@ def test_shared_lifecycle_serves_status_over_the_control_socket(
 
     from simple_coding_agent.agentctl import main as agentctl_main
 
-    remote, _ = repository_with_main(tmp_path)
     github = FakeGitHub(issue(24, body="Fix the thing."))
-    lifecycle = build_lifecycle(
-        remote, tmp_path / "clone", tmp_path / "data", github, FakeModelExecutor()
-    )
 
-    with running_control_server(tmp_path, lifecycle) as socket_path:
+    with running_lifecycle_server(tmp_path, github, FakeModelExecutor()) as (_, socket_path):
         assert agentctl_main(["--socket", str(socket_path), "status"]) == 0
 
     assert "octo/example" in capsys.readouterr().out

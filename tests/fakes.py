@@ -9,9 +9,10 @@ conformance suite runs the same tests against it and the production
 helpers build a temporary bare remote the way the end-to-end handoff test
 does. ``FakeGitHub`` and ``FakeModelExecutor`` drive the real lifecycle
 through a full attempt (claim, model run, publication) against real git
-remotes; ``build_lifecycle`` wires them together and
+remotes; ``build_lifecycle`` wires them together,
 ``running_control_server`` serves the result over the in-process control
-socket for tests that call ``agentctl.main([...])``.
+socket, and ``running_lifecycle_server`` builds and serves both at once for
+tests that call ``agentctl.main([...])``.
 """
 
 from __future__ import annotations
@@ -24,6 +25,10 @@ from datetime import UTC, datetime
 from pathlib import Path
 import shutil
 import subprocess
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from simple_coding_agent.lifecycle import AgentLifecycle
 
 from simple_coding_agent.attempt_workspace import (
     ConflictState,
@@ -1515,3 +1520,34 @@ def running_control_server(
         yield socket_path
     finally:
         server.stop()
+
+
+@contextmanager
+def running_lifecycle_server(
+    tmp_path: Path,
+    github: FakeGitHub,
+    executor: FakeModelExecutor,
+    *,
+    profile_fn=None,
+    repository: str = LIFECYCLE_REPOSITORY,
+) -> Iterator[tuple[AgentLifecycle, Path]]:
+    """Build the shared lifecycle on ``tmp_path`` and serve it over the control socket.
+
+    Creates the bare remote, wires the real lifecycle with :func:`build_lifecycle`
+    (clone at ``tmp_path / "clone"``, state at ``tmp_path / "data"``), and serves
+    it with :func:`running_control_server`. Yields the ``(lifecycle, socket_path)``
+    pair, ready for tests that drive the real ``agentctl`` CLI against the fakes.
+    """
+
+    remote, _ = repository_with_main(tmp_path)
+    lifecycle = build_lifecycle(
+        remote,
+        tmp_path / "clone",
+        tmp_path / "data",
+        github,
+        executor,
+        profile_fn=profile_fn,
+        repository=repository,
+    )
+    with running_control_server(tmp_path, lifecycle) as socket_path:
+        yield lifecycle, socket_path
