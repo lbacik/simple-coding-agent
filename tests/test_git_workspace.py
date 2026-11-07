@@ -14,6 +14,7 @@ from simple_coding_agent.git_workspace import (
     GitWorkspaceRecoveryError,
 )
 from simple_coding_agent.model_execution import ModelExecutionStatus
+from tests.fakes import git, repository_with_main, run_command, write_and_commit
 
 
 def test_clones_once_fetches_and_prepares_an_attempt_from_the_verified_base(
@@ -721,46 +722,6 @@ def test_profile_bootstrap_never_rebases_an_attempt_branch_onto_the_wrong_base(
     assert (clone / "feature.txt").read_text() == "attempt work"
     assert (clone / "README.md").read_text() == "develop content"
     assert [commit.subject for commit in workspace.commits_added(prepared)] == ["Attempt work"]
-
-
-def repository_with_main(tmp_path: Path) -> tuple[Path, Path]:
-    tmp_path.mkdir(parents=True, exist_ok=True)
-    remote = tmp_path / "remote.git"
-    seed = tmp_path / "seed"
-    git(tmp_path, "init", "--bare", str(remote))
-    git(tmp_path, "init", str(seed))
-    git(seed, "checkout", "-b", "main")
-    git(seed, "config", "user.name", "Test User")
-    git(seed, "config", "user.email", "test@example.com")
-    write_and_commit(seed, "README.md", "seed", "Initial commit")
-    write_and_commit(seed, ".gitignore", ".venv/\n", "Ignore environment")
-    git(seed, "remote", "add", "origin", str(remote))
-    git(seed, "push", "-u", "origin", "main")
-    git(remote, "symbolic-ref", "HEAD", "refs/heads/main")
-    return remote, seed
-
-
-def write_and_commit(repository: Path, name: str, contents: str, message: str) -> None:
-    (repository / name).write_text(contents)
-    git(repository, "add", name)
-    git(repository, "commit", "-m", message)
-
-
-def git(cwd: Path, *arguments: str) -> str:
-    return run_command(("git", *arguments), cwd=cwd)
-
-
-def run_command(
-    command: tuple[str, ...], *, cwd: Path | None = None, env: dict[str, str] | None = None
-) -> str:
-    if env is None:
-        # Never let a git subcommand (e.g. "rebase --continue") fall back to
-        # the caller's real $EDITOR: on a real terminal that spawns an
-        # interactive editor attached to it and hangs the test run.
-        env = {**os.environ, "GIT_EDITOR": "true", "GIT_SEQUENCE_EDITOR": "true"}
-    return subprocess.run(
-        command, cwd=cwd, env=env, check=True, text=True, capture_output=True
-    ).stdout.strip()
 
 
 def test_records_the_remote_branch_observed_while_preparing(tmp_path: Path) -> None:

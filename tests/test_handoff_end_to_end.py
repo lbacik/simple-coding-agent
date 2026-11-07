@@ -21,31 +21,34 @@ them.
 
 from __future__ import annotations
 
-from dataclasses import replace
-from datetime import UTC, datetime
 from pathlib import Path
-import os
 import subprocess
 
 from simple_coding_agent.attempt_state import AttemptPhase, AttemptStateStore
-from simple_coding_agent.command_runner import CommandRunner
-from simple_coding_agent.completion import AttemptOutcome, CompletionEvaluator, VerificationRunner
+from simple_coding_agent.completion import AttemptOutcome
 from simple_coding_agent.config import RepositoryProfile
 from simple_coding_agent.git_workspace import GitWorkspace
+from simple_coding_agent.lifecycle import LifecycleStatus
 from simple_coding_agent.github_tracker import (
-    Assignment,
-    GitHubIdentity,
     GitHubTracker,
     IssueComment,
-    IssuePage,
-    TrackerIssue,
 )
-from simple_coding_agent.lifecycle import AgentLifecycle, LifecycleStatus, ModelAttemptRunner
 from simple_coding_agent.handoff_record import parse_handoff_record
-from simple_coding_agent.model_execution import ModelExecution, ModelExecutionStatus, SkillEvent
-from simple_coding_agent.publication import HandoffRecordRef, Publisher, PullRequest
-
-REPO = "octo/example"
+from tests.fakes import (
+    LIFECYCLE_REPOSITORY,
+    FakeGitHub,
+    FakeModelExecutor,
+    build_lifecycle,
+    git,
+    lifecycle_issue as issue,
+    publish_attempt_branch,
+    remote_branch_subjects,
+    remote_has_branch,
+    repository_with_main,
+    running_lifecycle_server,
+    write_and_commit,
+    write_handoff_note,
+)
 
 
 # --- Scenario 1: cost soft-threshold handoff -> continuation -> PR ---------
@@ -177,7 +180,7 @@ def test_repeated_handoff_keeps_both_comments_in_the_filtered_feed() -> None:
             IssueComment(author_login="agent", body="## Agent Attempt Result: incomplete\n\nSecond handoff"),
         ),
     )
-    tracker = GitHubTracker(github, REPO)
+    tracker = GitHubTracker(github, LIFECYCLE_REPOSITORY)
 
     trusted = tracker.trusted_comments(issue(24, author_login="reporter"))
 
@@ -1183,307 +1186,6 @@ def run_published_handoff_continuation(
     return remote, github
 
 
-def build_lifecycle(
-    remote: Path,
-    clone_dir: Path,
-    data_dir: Path,
-    github: "FakeGitHub",
-    executor: "FakeModelExecutor",
-    *,
-    profile_fn=None,
-) -> AgentLifecycle:
-    attempt_state = AttemptStateStore(data_dir)
-    workspace = GitWorkspace(clone_dir, str(remote), token_provider=lambda: "token")
-    tracker = GitHubTracker(github, REPO)
-    runner = ModelAttemptRunner(
-        attempt_state=attempt_state,
-        workspace=workspace,
-        verifier=VerificationRunner(CommandRunner()),
-        evaluator=CompletionEvaluator(frozenset({"blocking"})),
-        model_executor=executor,
-        issue_comments=tracker.trusted_comments,
-    )
-    # These mechanics tests pin verbose mode: they assert the historical
-    # per-attempt handoff result comments alongside the shared record.
-    # Link-mode suppression is covered in test_handoff_comment_mode.py.
-    publisher = Publisher(
-        workspace,
-        github,
-        REPO,
-        attempt_state=attempt_state,
-        sleeper=lambda _: None,
-        handoff_comment_mode="verbose",
-    )
-    return AgentLifecycle(
-        tracker=tracker,
-        attempt_state=attempt_state,
-        workspace=workspace,
-        profile_loader=profile_fn or (lambda _: profile()),
-        publisher=publisher,
-        attempt_runner=runner,
-        sleeper=lambda _: None,
-    )
-
-
-def profile() -> RepositoryProfile:
-    return RepositoryProfile(setup=(), check=("true",), base_branch="main", timeout=30, setup_timeout=30, env={})
-
-
-class FakeModelExecutor:
-    """Runs a scripted local git action to stand in for one model turn.
-
-    Defaults to succeeding with one completed code-review, the minimum
-    evidence the real evaluator requires to reach ``complete``. Pass
-    ``handoff=True`` for an action that stands in for the model invoking the
-    handoff skill instead (write/commit the note, then stop): the returned
-    evidence carries HANDOFF_REQUESTED and a ``handoff`` skill event instead.
-    """
-
-    def __init__(self, *, actions: list | None = None, handoff: bool = False) -> None:
-        self._actions = list(actions or [])
-        self._handoff = handoff
-        self.calls = 0
-        self.captured_prompts: list[str] = []
-
-    async def execute(
-        self, *, issue_body: str, working_directory: Path, issue_number: int | None = None, archive=None
-    ) -> ModelExecution:
-        self.calls += 1
-        self.captured_prompts.append(issue_body)
-        if self._actions:
-            self._actions.pop(0)(working_directory)
-        if self._handoff:
-            return ModelExecution(
-                status=ModelExecutionStatus.HANDOFF_REQUESTED,
-                explanation="scripted handoff",
-                stop_reason="end_turn",
-                model_usage=None,
-                observed_models=(),
-                skill_events=(
-                    SkillEvent(phase="PreToolUse", name="handoff", agent_id=None, timestamp="2026-09-22T00:00:00Z"),
-                ),
-            )
-        return ModelExecution(
-            status=ModelExecutionStatus.SUCCEEDED,
-            explanation="scripted",
-            stop_reason="end_turn",
-            model_usage=None,
-            observed_models=(),
-            skill_events=(SkillEvent(phase="PreToolUse", name="code-review", agent_id=None, timestamp="2026-09-22T00:00:00Z"),),
-        )
-
-
-class FakeGitHub:
-    """A single-issue GitHub double for both the tracker and publisher seams."""
-
-    def __init__(self, initial: TrackerIssue, *, comments: tuple[IssueComment, ...] = ()) -> None:
-        self._issue = initial
-        self.labels: set[str] = set(initial.labels)
-        self.assignee_logins: list[str] = list(initial.assignee_logins)
-        self.comments: list[IssueComment] = list(comments)
-        self.pull_requests: dict[str, PullRequest] = {}
-        self.removed_labels: list[tuple[str, str]] = []
-        self.added_labels: list[tuple[str, str]] = []
-        self._next_pr = 100
-
-    def _current(self) -> TrackerIssue:
-        return replace(self._issue, labels=frozenset(self.labels), assignee_logins=tuple(self.assignee_logins))
-
-    # GitHubTransport
-    def list_issues(self, repository: str, cursor: str | None) -> IssuePage:
-        return IssuePage(issues=(self._current(),), next_cursor=None)
-
-    def get_issue(self, repository: str, number: int) -> TrackerIssue | None:
-        return self._current() if number == self._issue.number else None
-
-    def viewer(self) -> GitHubIdentity:
-        return GitHubIdentity(id="agent-id", login="agent")
-
-    def assign_issue(self, issue_id: str, assignee_id: str) -> Assignment:
-        if "agent" not in self.assignee_logins:
-            self.assignee_logins.append("agent")
-        return Assignment(issue_id=issue_id, assignee_id=assignee_id)
-
-    def remove_assignee(self, issue_id: str, assignee_id: str) -> None:
-        if "agent" in self.assignee_logins:
-            self.assignee_logins.remove("agent")
-
-    def remove_label(self, issue_id: str, label: str) -> None:
-        self.removed_labels.append((issue_id, label))
-        self.labels.discard(label)
-
-    def add_label(self, issue_id: str, label: str) -> None:
-        self.added_labels.append((issue_id, label))
-        self.labels.add(label)
-
-    def list_issue_comments(self, repository: str, issue_number: int) -> tuple[IssueComment, ...]:
-        return tuple(self.comments)
-
-    # PublicationTransport
-    def find_pull_request(self, repository: str, head: str) -> PullRequest | None:
-        return self.pull_requests.get(head)
-
-    def create_pull_request(self, repository: str, head: str, base: str, title: str, body: str) -> PullRequest:
-        pull_request = PullRequest(number=self._next_pr, url=f"https://github.com/{repository}/pull/{self._next_pr}")
-        self._next_pr += 1
-        self.pull_requests[head] = pull_request
-        return pull_request
-
-    def find_attempt_comment(self, repository: str, issue_number: int, marker: str) -> bool:
-        return any(marker in comment.body for comment in self.comments)
-
-    def add_comment(self, repository: str, issue_number: int, body: str) -> None:
-        self.comments.append(IssueComment(author_login="agent", body=body))
-
-    # Shared handoff-record seam: one discoverable comment per issue,
-    # located through its explicit versioned machine marker and only when
-    # authored by this agent's own login (mirroring production trust).
-    def find_handoff_record(self, repository: str, issue_number: int) -> HandoffRecordRef | None:
-        from simple_coding_agent.recovery import is_handoff_record
-
-        matches = [
-            (index, comment)
-            for index, comment in enumerate(self.comments)
-            if is_handoff_record(comment.body) and comment.author_login == "agent"
-        ]
-        if len(matches) > 1:
-            raise AssertionError("more than one shared handoff comment")
-        if not matches:
-            return None
-        index, comment = matches[0]
-        return HandoffRecordRef(comment_id=f"handoff-{index}", body=comment.body)
-
-    def create_handoff_record(self, repository: str, issue_number: int, body: str) -> str:
-        self.comments.append(IssueComment(author_login="agent", body=body))
-        return f"handoff-{len(self.comments) - 1}"
-
-    def update_handoff_record(self, repository: str, comment_id: str, body: str) -> None:
-        try:
-            index = int(comment_id.removeprefix("handoff-"))
-            assert self.comments[index].author_login == "agent"
-        except (ValueError, AssertionError, IndexError) as error:
-            raise AssertionError(f"unknown handoff comment {comment_id!r}") from error
-        self.comments[index] = IssueComment(author_login="agent", body=body)
-
-
-def issue(
-    number: int,
-    *,
-    body: str = "Fix the thing.",
-    labels: frozenset[str] = frozenset({"ready-for-agent"}),
-    author_login: str = "reporter",
-) -> TrackerIssue:
-    return TrackerIssue(
-        id=f"issue-{number}",
-        number=number,
-        title=f"Issue {number}",
-        body=body,
-        created_at=datetime(2026, 9, 20, tzinfo=UTC),
-        state="OPEN",
-        labels=labels,
-        assignee_logins=(),
-        blocked_by=0,
-        author_login=author_login,
-    )
-
-
-def repository_with_main(tmp_path: Path) -> tuple[Path, Path]:
-    remote = tmp_path / "remote.git"
-    seed = tmp_path / "seed"
-    git(tmp_path, "init", "--bare", str(remote))
-    git(tmp_path, "init", str(seed))
-    git(seed, "checkout", "-b", "main")
-    write_and_commit(seed, "README.md", "seed", "Initial commit")
-    git(seed, "remote", "add", "origin", str(remote))
-    git(seed, "push", "-u", "origin", "main")
-    git(remote, "symbolic-ref", "HEAD", "refs/heads/main")
-    return remote, seed
-
-
-def publish_attempt_branch(
-    tmp_path: Path,
-    remote: Path,
-    issue_number: int,
-    files: dict[str, str],
-    message: str,
-) -> None:
-    """Simulate a prior attempt's push -- a handoff's durable artifact -- via a throwaway clone."""
-
-    published = tmp_path / f"published-{issue_number}"
-    git(tmp_path, "clone", str(remote), str(published))
-    git(published, "config", "user.name", "Test User")
-    git(published, "config", "user.email", "test@example.com")
-    git(published, "checkout", "-b", f"agent/issue-{issue_number}")
-    for filename, contents in files.items():
-        path = published / filename
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(contents)
-        git(published, "add", filename)
-    git(published, "commit", "-m", message)
-    git(published, "push", "-u", "origin", f"agent/issue-{issue_number}")
-
-
-def write_and_commit(repository: Path, name: str, contents: str, message: str) -> None:
-    (repository / name).write_text(contents)
-    git(repository, "add", name)
-    git(repository, "commit", "-m", message)
-
-
-def write_handoff_note(
-    working_directory: Path,
-    issue_number: int,
-    body: str,
-    *,
-    reason: str = "token_soft_threshold",
-    last_work_commit: str | None = None,
-) -> None:
-    """Stand in for the handoff skill's own final, separate note commit.
-
-    Follows the required note format from ``skills/handoff/SKILL.md`` so the
-    resulting commit passes ``lifecycle._validate_handoff_note``: a title
-    referencing the issue, the required metadata fields, and a
-    ``last_work_commit`` pointing at whatever HEAD already was (the last
-    preserved work commit, or the branch's base if there was none) unless a
-    caller passes one explicitly, e.g. to exercise a stale-metadata rejection.
-    """
-
-    last_work_commit = last_work_commit or git(working_directory, "rev-parse", "HEAD")
-    note = (
-        f"# Handoff note: issue #{issue_number}\n\n"
-        f"- issue: {issue_number}\n"
-        "- started_at: 2026-09-22T00:00:00Z\n"
-        f"- reason: {reason}\n"
-        f"- last_work_commit: {last_work_commit}\n\n"
-        f"{body}"
-    )
-    (working_directory / ".agent" / "handoff").mkdir(parents=True, exist_ok=True)
-    write_and_commit(working_directory, f".agent/handoff/{issue_number}.md", note, f"Handoff note: issue #{issue_number}")
-
-
-def remote_branch_subjects(remote: Path, branch: str) -> list[str]:
-    output = subprocess.run(
-        ("git", "-C", str(remote), "log", branch, "--format=%s"),
-        check=True,
-        text=True,
-        capture_output=True,
-    ).stdout
-    return output.strip().splitlines()
-
-
-def remote_has_branch(remote: Path, branch: str) -> bool:
-    result = subprocess.run(
-        ("git", "-C", str(remote), "rev-parse", "--verify", "--quiet", branch),
-        text=True,
-        capture_output=True,
-    )
-    return result.returncode == 0
-
-
-def git(cwd: Path, *arguments: str) -> str:
-    env = dict(os.environ, GIT_EDITOR="true")
-    return subprocess.run(("git", *arguments), cwd=cwd, env=env, check=True, text=True, capture_output=True).stdout.strip()
-
-
 # --- Scenario 11e: token soft-threshold two-call handoff -----------------------
 #
 # The model follows the injected snapshot: it writes the note with the
@@ -1540,3 +1242,23 @@ def test_token_handoff_note_only_commit_with_dirty_work_seals_on_top(tmp_path: P
     [comment] = [c for c in github.comments if "Agent Attempt Result: handoff" in c.body]
     assert "Halfway done." in comment.body
     assert git(clone_dir, "show", "agent/issue-24:parser.py") == "half done, plus uncommitted edits"
+
+
+def test_shared_lifecycle_serves_status_over_the_control_socket(
+    tmp_path: Path, capsys
+) -> None:
+    """The shared fakes are ready for contract tests calling ``agentctl``.
+
+    Builds the real lifecycle over the shared fake GitHub/model executor and
+    serves it with the shared in-process control server, then exercises the
+    real ``agentctl`` CLI against it.
+    """
+
+    from simple_coding_agent.agentctl import main as agentctl_main
+
+    github = FakeGitHub(issue(24, body="Fix the thing."))
+
+    with running_lifecycle_server(tmp_path, github, FakeModelExecutor()) as (_, socket_path):
+        assert agentctl_main(["--socket", str(socket_path), "status"]) == 0
+
+    assert "octo/example" in capsys.readouterr().out

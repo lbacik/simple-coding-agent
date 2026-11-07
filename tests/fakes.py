@@ -7,17 +7,28 @@ their own. ``InMemoryWorkspace`` is the in-memory :class:`AttemptWorkspace
 conformance suite runs the same tests against it and the production
 ``GitWorkspace``. The ``repository_with_main``/``git``/``write_and_commit``
 helpers build a temporary bare remote the way the end-to-end handoff test
-does.
+does. ``FakeGitHub`` and ``FakeModelExecutor`` drive the real lifecycle
+through a full attempt (claim, model run, publication) against real git
+remotes; ``build_lifecycle`` wires them together,
+``running_control_server`` serves the result over the in-process control
+socket, and ``running_lifecycle_server`` builds and serves both at once for
+tests that call ``agentctl.main([...])``.
 """
 
 from __future__ import annotations
 
 import os
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, replace
+from datetime import UTC, datetime
 from pathlib import Path
 import shutil
 import subprocess
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from simple_coding_agent.lifecycle import AgentLifecycle
 
 from simple_coding_agent.attempt_workspace import (
     ConflictState,
@@ -40,6 +51,9 @@ from simple_coding_agent.github_tracker import (
     Assignment,
     Claim,
     ClaimLostError,
+    GitHubIdentity,
+    IssueComment,
+    IssuePage,
     TrackerIssue,
     conflict_branch_issue_number,
     is_conflict_detection_eligible,
@@ -56,8 +70,12 @@ from simple_coding_agent.command_runner import (
     CommandResult,
     CommandStatus,
 )
-from simple_coding_agent.model_execution import ModelExecution, ModelExecutionStatus
-from simple_coding_agent.publication import PullRequest
+from simple_coding_agent.model_execution import (
+    ModelExecution,
+    ModelExecutionStatus,
+    SkillEvent,
+)
+from simple_coding_agent.publication import HandoffRecordRef, PullRequest
 
 
 # ---------------------------------------------------------------------------
@@ -1118,3 +1136,418 @@ class FakeConflictExecutor:
             observed_models=(),
             skill_events=(),
         )
+
+
+# ---------------------------------------------------------------------------
+# Lifecycle fakes (full attempt: claim, model run, publication)
+# ---------------------------------------------------------------------------
+
+LIFECYCLE_REPOSITORY = "octo/example"
+
+
+def lifecycle_issue(
+    number: int,
+    *,
+    body: str = "Fix the thing.",
+    labels: frozenset[str] = frozenset({"ready-for-agent"}),
+    author_login: str = "reporter",
+) -> TrackerIssue:
+    """Build a tracker issue for the shared lifecycle doubles."""
+
+    return TrackerIssue(
+        id=f"issue-{number}",
+        number=number,
+        title=f"Issue {number}",
+        body=body,
+        created_at=datetime(2026, 9, 20, tzinfo=UTC),
+        state="OPEN",
+        labels=labels,
+        assignee_logins=(),
+        blocked_by=0,
+        author_login=author_login,
+    )
+
+
+class FakeGitHub:
+    """A single-issue GitHub double for both the tracker and publisher seams."""
+
+    def __init__(
+        self, initial: TrackerIssue, *, comments: tuple[IssueComment, ...] = ()
+    ) -> None:
+        self._issue = initial
+        self.labels: set[str] = set(initial.labels)
+        self.assignee_logins: list[str] = list(initial.assignee_logins)
+        self.comments: list[IssueComment] = list(comments)
+        self.pull_requests: dict[str, PullRequest] = {}
+        self.removed_labels: list[tuple[str, str]] = []
+        self.added_labels: list[tuple[str, str]] = []
+        self._next_pr = 100
+
+    def _current(self) -> TrackerIssue:
+        return replace(
+            self._issue,
+            labels=frozenset(self.labels),
+            assignee_logins=tuple(self.assignee_logins),
+        )
+
+    # GitHubTransport
+    def list_issues(self, repository: str, cursor: str | None) -> IssuePage:
+        return IssuePage(issues=(self._current(),), next_cursor=None)
+
+    def get_issue(self, repository: str, number: int) -> TrackerIssue | None:
+        return self._current() if number == self._issue.number else None
+
+    def viewer(self) -> GitHubIdentity:
+        return GitHubIdentity(id="agent-id", login="agent")
+
+    def assign_issue(self, issue_id: str, assignee_id: str) -> Assignment:
+        if "agent" not in self.assignee_logins:
+            self.assignee_logins.append("agent")
+        return Assignment(issue_id=issue_id, assignee_id=assignee_id)
+
+    def remove_assignee(self, issue_id: str, assignee_id: str) -> None:
+        if "agent" in self.assignee_logins:
+            self.assignee_logins.remove("agent")
+
+    def remove_label(self, issue_id: str, label: str) -> None:
+        self.removed_labels.append((issue_id, label))
+        self.labels.discard(label)
+
+    def add_label(self, issue_id: str, label: str) -> None:
+        self.added_labels.append((issue_id, label))
+        self.labels.add(label)
+
+    def list_issue_comments(
+        self, repository: str, issue_number: int
+    ) -> tuple[IssueComment, ...]:
+        return tuple(self.comments)
+
+    # PublicationTransport
+    def find_pull_request(
+        self, repository: str, head: str
+    ) -> PullRequest | None:
+        return self.pull_requests.get(head)
+
+    def create_pull_request(
+        self, repository: str, head: str, base: str, title: str, body: str
+    ) -> PullRequest:
+        pull_request = PullRequest(
+            number=self._next_pr,
+            url=f"https://github.com/{repository}/pull/{self._next_pr}",
+        )
+        self._next_pr += 1
+        self.pull_requests[head] = pull_request
+        return pull_request
+
+    def find_attempt_comment(
+        self, repository: str, issue_number: int, marker: str
+    ) -> bool:
+        return any(marker in comment.body for comment in self.comments)
+
+    def add_comment(self, repository: str, issue_number: int, body: str) -> None:
+        self.comments.append(IssueComment(author_login="agent", body=body))
+
+    # Shared handoff-record seam: one discoverable comment per issue,
+    # located through its explicit versioned machine marker and only when
+    # authored by this agent's own login (mirroring production trust).
+    def find_handoff_record(
+        self, repository: str, issue_number: int
+    ) -> HandoffRecordRef | None:
+        from simple_coding_agent.recovery import is_handoff_record
+
+        matches = [
+            (index, comment)
+            for index, comment in enumerate(self.comments)
+            if is_handoff_record(comment.body) and comment.author_login == "agent"
+        ]
+        if len(matches) > 1:
+            raise AssertionError("more than one shared handoff comment")
+        if not matches:
+            return None
+        index, comment = matches[0]
+        return HandoffRecordRef(comment_id=f"handoff-{index}", body=comment.body)
+
+    def create_handoff_record(
+        self, repository: str, issue_number: int, body: str
+    ) -> str:
+        self.comments.append(IssueComment(author_login="agent", body=body))
+        return f"handoff-{len(self.comments) - 1}"
+
+    def update_handoff_record(
+        self, repository: str, comment_id: str, body: str
+    ) -> None:
+        try:
+            index = int(comment_id.removeprefix("handoff-"))
+            assert self.comments[index].author_login == "agent"
+        except (ValueError, AssertionError, IndexError) as error:
+            raise AssertionError(f"unknown handoff comment {comment_id!r}") from error
+        self.comments[index] = IssueComment(author_login="agent", body=body)
+
+
+class FakeModelExecutor:
+    """Runs a scripted local git action to stand in for one model turn.
+
+    Defaults to succeeding with one completed code-review, the minimum
+    evidence the real evaluator requires to reach ``complete``. Pass
+    ``handoff=True`` for an action that stands in for the model invoking the
+    handoff skill instead (write/commit the note, then stop): the returned
+    evidence carries HANDOFF_REQUESTED and a ``handoff`` skill event instead.
+    """
+
+    def __init__(
+        self, *, actions: list | None = None, handoff: bool = False
+    ) -> None:
+        self._actions = list(actions or [])
+        self._handoff = handoff
+        self.calls = 0
+        self.captured_prompts: list[str] = []
+
+    async def execute(
+        self,
+        *,
+        issue_body: str,
+        working_directory: Path,
+        issue_number: int | None = None,
+        archive=None,
+    ) -> ModelExecution:
+        self.calls += 1
+        self.captured_prompts.append(issue_body)
+        if self._actions:
+            self._actions.pop(0)(working_directory)
+        if self._handoff:
+            return ModelExecution(
+                status=ModelExecutionStatus.HANDOFF_REQUESTED,
+                explanation="scripted handoff",
+                stop_reason="end_turn",
+                model_usage=None,
+                observed_models=(),
+                skill_events=(
+                    SkillEvent(
+                        phase="PreToolUse",
+                        name="handoff",
+                        agent_id=None,
+                        timestamp="2026-09-22T00:00:00Z",
+                    ),
+                ),
+            )
+        return ModelExecution(
+            status=ModelExecutionStatus.SUCCEEDED,
+            explanation="scripted",
+            stop_reason="end_turn",
+            model_usage=None,
+            observed_models=(),
+            skill_events=(
+                SkillEvent(
+                    phase="PreToolUse",
+                    name="code-review",
+                    agent_id=None,
+                    timestamp="2026-09-22T00:00:00Z",
+                ),
+            ),
+        )
+
+
+def build_lifecycle(
+    remote: Path,
+    clone_dir: Path,
+    data_dir: Path,
+    github: FakeGitHub,
+    executor: FakeModelExecutor,
+    *,
+    profile_fn=None,
+    repository: str = LIFECYCLE_REPOSITORY,
+):
+    """Wire the real lifecycle against the shared fakes over a real git remote.
+
+    Uses the production ``GitWorkspace``, ``GitHubTracker``, publisher, and
+    ``ModelAttemptRunner`` so one ``run_once()`` drives a full attempt (claim,
+    model run, publication). Callers may pass ``profile_fn`` to pin the
+    repository profile (e.g. a failing check); otherwise a ``true`` check on
+    ``main`` is used.
+    """
+
+    from simple_coding_agent.attempt_state import AttemptStateStore
+    from simple_coding_agent.command_runner import CommandRunner
+    from simple_coding_agent.completion import CompletionEvaluator, VerificationRunner
+    from simple_coding_agent.config import RepositoryProfile
+    from simple_coding_agent.control import ControlStore
+    from simple_coding_agent.git_workspace import GitWorkspace
+    from simple_coding_agent.github_tracker import GitHubTracker
+    from simple_coding_agent.lifecycle import AgentLifecycle, ModelAttemptRunner
+    from simple_coding_agent.publication import Publisher
+
+    def default_profile() -> RepositoryProfile:
+        return RepositoryProfile(
+            setup=(),
+            check=("true",),
+            base_branch="main",
+            timeout=30,
+            setup_timeout=30,
+            env={},
+        )
+
+    attempt_state = AttemptStateStore(data_dir)
+    workspace = GitWorkspace(clone_dir, str(remote), token_provider=lambda: "token")
+    tracker = GitHubTracker(github, repository)
+    runner = ModelAttemptRunner(
+        attempt_state=attempt_state,
+        workspace=workspace,
+        verifier=VerificationRunner(CommandRunner()),
+        evaluator=CompletionEvaluator(frozenset({"blocking"})),
+        model_executor=executor,
+        issue_comments=tracker.trusted_comments,
+    )
+    # These mechanics tests pin verbose mode: they assert the historical
+    # per-attempt handoff result comments alongside the shared record.
+    # Link-mode suppression is covered in test_handoff_comment_mode.py.
+    publisher = Publisher(
+        workspace,
+        github,
+        repository,
+        attempt_state=attempt_state,
+        sleeper=lambda _: None,
+        handoff_comment_mode="verbose",
+    )
+    control_store = ControlStore(data_dir)
+    return AgentLifecycle(
+        tracker=tracker,
+        attempt_state=attempt_state,
+        workspace=workspace,
+        profile_loader=profile_fn or (lambda _: default_profile()),
+        publisher=publisher,
+        attempt_runner=runner,
+        sleeper=lambda _: None,
+        control_store=control_store,
+        repository=repository,
+    )
+
+
+def publish_attempt_branch(
+    tmp_path: Path,
+    remote: Path,
+    issue_number: int,
+    files: dict[str, str],
+    message: str,
+) -> None:
+    """Simulate a prior attempt's push -- a handoff's durable artifact."""
+
+    published = tmp_path / f"published-{issue_number}"
+    git(tmp_path, "clone", str(remote), str(published))
+    git(published, "config", "user.name", "Test User")
+    git(published, "config", "user.email", "test@example.com")
+    git(published, "checkout", "-b", f"agent/issue-{issue_number}")
+    for filename, contents in files.items():
+        path = published / filename
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(contents)
+        git(published, "add", filename)
+    git(published, "commit", "-m", message)
+    git(published, "push", "-u", "origin", f"agent/issue-{issue_number}")
+
+
+def write_handoff_note(
+    working_directory: Path,
+    issue_number: int,
+    body: str,
+    *,
+    reason: str = "token_soft_threshold",
+    last_work_commit: str | None = None,
+) -> None:
+    """Stand in for the handoff skill's own final, separate note commit."""
+
+    last_work_commit = last_work_commit or git(
+        working_directory, "rev-parse", "HEAD"
+    )
+    note = (
+        f"# Handoff note: issue #{issue_number}\n\n"
+        f"- issue: {issue_number}\n"
+        "- started_at: 2026-09-22T00:00:00Z\n"
+        f"- reason: {reason}\n"
+        f"- last_work_commit: {last_work_commit}\n\n"
+        f"{body}"
+    )
+    (working_directory / ".agent" / "handoff").mkdir(parents=True, exist_ok=True)
+    write_and_commit(
+        working_directory,
+        f".agent/handoff/{issue_number}.md",
+        note,
+        f"Handoff note: issue #{issue_number}",
+    )
+
+
+def remote_branch_subjects(remote: Path, branch: str) -> list[str]:
+    """Newest-first commit subjects on ``branch`` of a bare remote."""
+
+    output = subprocess.run(
+        ("git", "-C", str(remote), "log", branch, "--format=%s"),
+        check=True,
+        text=True,
+        capture_output=True,
+    ).stdout
+    return output.strip().splitlines()
+
+
+def remote_has_branch(remote: Path, branch: str) -> bool:
+    """Whether ``branch`` exists on a bare remote."""
+
+    result = subprocess.run(
+        ("git", "-C", str(remote), "rev-parse", "--verify", "--quiet", branch),
+        text=True,
+        capture_output=True,
+    )
+    return result.returncode == 0
+
+
+@contextmanager
+def running_control_server(
+    tmp_path: Path, control
+) -> Iterator[Path]:
+    """Serve ``control`` (usually a lifecycle) on a temp control socket.
+
+    Starts an in-process :class:`ControlServer
+    <simple_coding_agent.control_server.ControlServer>` rooted at
+    ``tmp_path`` and yields its socket path, ready for tests that call
+    ``agentctl.main([...])``. Stops the server and removes the endpoint on
+    exit.
+    """
+
+    from simple_coding_agent.control_server import ControlServer
+
+    socket_path = tmp_path / "state" / "agentctl.sock"
+    server = ControlServer(socket_path, control)
+    server.start()
+    try:
+        yield socket_path
+    finally:
+        server.stop()
+
+
+@contextmanager
+def running_lifecycle_server(
+    tmp_path: Path,
+    github: FakeGitHub,
+    executor: FakeModelExecutor,
+    *,
+    profile_fn=None,
+    repository: str = LIFECYCLE_REPOSITORY,
+) -> Iterator[tuple[AgentLifecycle, Path]]:
+    """Build the shared lifecycle on ``tmp_path`` and serve it over the control socket.
+
+    Creates the bare remote, wires the real lifecycle with :func:`build_lifecycle`
+    (clone at ``tmp_path / "clone"``, state at ``tmp_path / "data"``), and serves
+    it with :func:`running_control_server`. Yields the ``(lifecycle, socket_path)``
+    pair, ready for tests that drive the real ``agentctl`` CLI against the fakes.
+    """
+
+    remote, _ = repository_with_main(tmp_path)
+    lifecycle = build_lifecycle(
+        remote,
+        tmp_path / "clone",
+        tmp_path / "data",
+        github,
+        executor,
+        profile_fn=profile_fn,
+        repository=repository,
+    )
+    with running_control_server(tmp_path, lifecycle) as socket_path:
+        yield lifecycle, socket_path
