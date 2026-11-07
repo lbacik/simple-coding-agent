@@ -15,9 +15,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from pathlib import Path
 
-from simple_coding_agent.agent_version import agent_version
 from simple_coding_agent.attempt_history import AttemptHistoryError
-from simple_coding_agent.control import IntakeState
 from simple_coding_agent.control_offline import (
     OfflineControlSnapshot,
     OfflineReadError,
@@ -54,9 +52,9 @@ def offline_identity(data_dir: Path | None = None) -> dict:
         raise OfflineReadError(str(error)) from error
     repository = recorded["repository"]
     worker_id = recorded.get("worker_id", "")
-    version = recorded.get("agent_version") or agent_version()
+    version = recorded.get("agent_version")
     if not isinstance(version, str) or not version:
-        version = agent_version()
+        raise OfflineReadError("Instance identity is malformed.")
     return {
         "backend": BACKEND,
         "agent_version": version,
@@ -72,8 +70,6 @@ def _offline_command_details(
     snapshot: OfflineControlSnapshot, *, repository: str, limit: int = 20
 ) -> list:
     """Recent commands with payloads, newest last, like the online projection."""
-
-    from simple_coding_agent import contract_status as contract_status_module
 
     tail = snapshot.commands[-limit:] if limit else ()
     return [
@@ -238,6 +234,20 @@ def offline_command(data_dir: Path | None, request_id: str) -> dict:
     raise AttemptHistoryError("not_found", f"no command is recorded for {request_id}")
 
 
+def _require_readable_volume(data_dir: Path | None) -> Path:
+    """Resolve the volume and fail closed unless it reads as a stopped instance.
+
+    A missing or malformed identity is a failed read, never an empty
+    listing; an unreadable control store fails closed the same way other
+    offline reads do, so a torn WAL never yields a partial listing.
+    """
+
+    directory = _data_dir(data_dir)
+    offline_identity(directory)
+    read_offline_control(directory)
+    return directory
+
+
 def offline_attempts_list(
     data_dir: Path | None, limit: int | None, before: str | None
 ) -> dict:
@@ -245,13 +255,7 @@ def offline_attempts_list(
 
     from simple_coding_agent import attempt_history as attempt_history_module
 
-    directory = _data_dir(data_dir)
-    # The volume alone identifies the stopped instance; a missing or
-    # malformed identity is a failed read, never an empty listing.
-    offline_identity(directory)
-    # Fail closed on an unreadable control store the same way other
-    # offline reads do, so a torn WAL never yields a partial listing.
-    read_offline_control(directory)
+    directory = _require_readable_volume(data_dir)
     return attempt_history_module.list_attempts(
         directory, active=None, held=frozenset(), limit=limit, before=before
     )
@@ -262,9 +266,7 @@ def offline_attempts_show(data_dir: Path | None, attempt_id: str) -> dict:
 
     from simple_coding_agent import attempt_history as attempt_history_module
 
-    directory = _data_dir(data_dir)
-    offline_identity(directory)
-    read_offline_control(directory)
+    directory = _require_readable_volume(data_dir)
     return attempt_history_module.show_attempt(
         directory, attempt_id, active=None, held=frozenset()
     )
@@ -275,21 +277,7 @@ def offline_attempts_export(data_dir: Path | None, attempt_id: str) -> dict:
 
     from simple_coding_agent import attempt_history as attempt_history_module
 
-    directory = _data_dir(data_dir)
-    offline_identity(directory)
-    read_offline_control(directory)
+    directory = _require_readable_volume(data_dir)
     return attempt_history_module.export_projection(
         directory, attempt_id, active=None, held=frozenset()
     )
-
-
-def offline_export_data_dir() -> Path:
-    """The archive volume the offline export streams bytes from."""
-
-    return _data_dir(None)
-
-
-def is_stopped_intake(snapshot: OfflineControlSnapshot) -> bool:
-    """Whether an offline snapshot is a stopped instance (for tests)."""
-
-    return snapshot.intake is IntakeState.STOPPED

@@ -37,6 +37,7 @@ from simple_coding_agent.control_server import (
     resolve_socket_path,
     send_request,
 )
+from simple_coding_agent.attempt_history import AttemptHistoryError
 
 #: The one contract major this producer serves.
 CONTRACT_MAJOR = 1
@@ -1622,6 +1623,224 @@ def main(argv: list[str]) -> int:
         message=f"operation '{parsed.name}' is not yet served by this producer",
         details={"operation": parsed.name},
     )
+
+
+# ---------------------------------------------------------------------------
+# Offline reads (``agentctl --contract 1 --offline <read>``)
+# ---------------------------------------------------------------------------
+
+
+def _run_offline(parsed: ParsedOperation) -> int:
+    """Serve one offline read from the stopped volume without the engine.
+
+    The call never takes the volume lock and never writes: the control
+    snapshot comes from the volume-direct reader, identity from
+    ``state/instance.json``, the halt from ``state/halt.json`` and
+    attempts from the ``logs/`` archives. A volume a live engine still
+    holds answers ``rejected`` with ``details.reason: "instance_running"``;
+    an unreadable volume answers ``internal``; mutations never reach here
+    (the entry point answers ``unsupported`` first).
+    """
+
+    from simple_coding_agent import offline as offline_module
+    from simple_coding_agent.control_offline import OfflineReadError
+    from simple_coding_agent.volume_lock import VolumeLockError, is_volume_locked
+
+    try:
+        _check_values(parsed)
+    except _InvalidArgument as error:
+        return _emit_error(
+            code="invalid_argument",
+            message=str(error),
+            exit_code=EXIT_REJECTED,
+            retryable=False,
+            request_id=_request_id_for_error(parsed),
+        )
+    data_dir = _export_data_dir()
+    try:
+        locked = is_volume_locked(data_dir)
+    except VolumeLockError as error:
+        return _emit_error(
+            code="internal",
+            message=f"the volume lock could not be probed: {error}",
+            exit_code=EXIT_INTERNAL,
+            retryable=True,
+            request_id=_request_id_for_error(parsed),
+            details={"stored": False},
+        )
+    if locked:
+        return _emit_error(
+            code="rejected",
+            message="the volume is still held by a live engine",
+            exit_code=EXIT_REJECTED,
+            retryable=False,
+            details={"reason": "instance_running"},
+        )
+    if parsed.name == "attempts export":
+        return _run_offline_attempts_export(parsed, data_dir)
+    try:
+        if parsed.name == "identity":
+            return _emit_ok(offline_module.offline_identity(data_dir))
+        if parsed.name == "status":
+            return _emit_ok(offline_module.offline_status(data_dir))
+        if parsed.name == "command":
+            request_id = parsed.args.get("request_id")
+            assert isinstance(request_id, str)
+            return _emit_ok(
+                {"command": offline_module.offline_command(data_dir, request_id)}
+            )
+        if parsed.name == "attempts list":
+            raw_limit = parsed.args.get("limit")
+            before = parsed.args.get("before")
+            limit = int(raw_limit, 10) if raw_limit is not None else None
+            return _emit_ok(
+                offline_module.offline_attempts_list(data_dir, limit, before)
+            )
+        if parsed.name == "attempts show":
+            attempt_id = parsed.args.get("attempt_id")
+            assert isinstance(attempt_id, str)
+            return _emit_ok(
+                offline_module.offline_attempts_show(data_dir, attempt_id)
+            )
+    except OfflineReadError as error:
+        return _emit_error(
+            code="internal",
+            message=f"the stopped volume could not be read: {error}",
+            exit_code=EXIT_INTERNAL,
+            retryable=True,
+            details={"stored": False},
+        )
+    except AttemptHistoryError as error:
+        return _offline_history_error(error)
+    return _unsupported(
+        parsed.name,
+        capability=parsed.capability,
+        request_id=_request_id_for_error(parsed),
+        message=f"operation '{parsed.name}' is not available offline",
+        details={"offline": True},
+    )
+
+
+def _offline_history_error(error: AttemptHistoryError) -> int:
+    """Map one offline history rejection onto its contract error and exit."""
+
+    if error.code == "not_found":
+        return _emit_error(
+            code="not_found",
+            message=str(error),
+            exit_code=EXIT_NOT_FOUND,
+            retryable=False,
+        )
+    if error.code == "invalid_argument":
+        return _emit_error(
+            code="invalid_argument",
+            message=str(error),
+            exit_code=EXIT_REJECTED,
+            retryable=False,
+        )
+    return _emit_error(
+        code="internal",
+        message=f"the stopped volume could not be read: {error}",
+        exit_code=EXIT_INTERNAL,
+        retryable=True,
+        details={"stored": False},
+    )
+
+
+def _run_offline_attempts_export(
+    parsed: ParsedOperation, data_dir: Path
+) -> int:
+    """Stream one offline ``attempts export`` tar to stdout, volume-direct.
+
+    The summary and export manifest come from the volume-direct
+    projection; the file bytes are read from the archive run directory,
+    so the tar never crosses the control socket. ``manifest.json`` is the
+    first member, like the online export.
+    """
+
+    from simple_coding_agent import attempt_history as attempt_history_module
+    from simple_coding_agent import offline as offline_module
+    from simple_coding_agent.control_offline import OfflineReadError
+
+    attempt_id = parsed.args.get("attempt_id")
+    assert isinstance(attempt_id, str)
+    try:
+        projection = offline_module.offline_attempts_export(data_dir, attempt_id)
+    except AttemptHistoryError as error:
+        return _offline_history_error(error)
+    except OfflineReadError as error:
+        return _emit_error(
+            code="internal",
+            message=f"the stopped volume could not be read: {error}",
+            exit_code=EXIT_INTERNAL,
+            retryable=True,
+            details={"stored": False},
+        )
+    manifest = projection.get("manifest")
+    assert isinstance(manifest, list)
+    known = {
+        str(entry.get("path"))
+        for entry in manifest
+        if isinstance(entry, dict) and isinstance(entry.get("path"), str)
+    }
+    requested = parsed.args.get("paths", [])
+    for path in requested:
+        if not _is_export_path(path) or path not in known:
+            return _emit_error(
+                code="not_found",
+                message=f"unknown archive path {path!r} for attempt {attempt_id!r}",
+                exit_code=EXIT_NOT_FOUND,
+                retryable=False,
+            )
+    entries = [
+        entry
+        for entry in manifest
+        if isinstance(entry, dict) and (not requested or entry.get("path") in requested)
+    ]
+    run_dir = attempt_history_module.find_run_directory(data_dir, attempt_id)
+    if run_dir is None:
+        return _emit_error(
+            code="not_found",
+            message=f"unknown attempt {attempt_id!r}",
+            exit_code=EXIT_NOT_FOUND,
+            retryable=False,
+        )
+    live: dict[str, bytes] = {}
+    for entry in entries:
+        assert isinstance(entry, dict)
+        relative = str(entry.get("path"))
+        full = run_dir / relative
+        try:
+            if full.is_symlink() or not full.is_file():
+                raise OSError(f"archive path {relative!r} is not a regular file")
+            live[relative] = full.read_bytes()
+        except OSError as error:
+            return _emit_error(
+                code="internal",
+                message=f"the stopped volume could not be read: {error}",
+                exit_code=EXIT_INTERNAL,
+                retryable=True,
+                details={"stored": False},
+            )
+    attempt = projection.get("attempt")
+    assert isinstance(attempt, dict)
+    try:
+        attempt_history_module.write_export_tar(
+            sys.stdout.buffer,
+            attempt=attempt,
+            entries=entries,
+            read_bytes=live.__getitem__,
+        )
+        sys.stdout.buffer.flush()
+    except (OSError, KeyError) as error:
+        return _emit_error(
+            code="internal",
+            message=f"the stopped volume could not be read: {error}",
+            exit_code=EXIT_INTERNAL,
+            retryable=True,
+            details={"stored": False},
+        )
+    return EXIT_OK
 
 
 def _scan_request_id(tokens: list[str]) -> str | None:

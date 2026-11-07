@@ -235,7 +235,7 @@ def _read_copy(copy_db: Path) -> OfflineControlSnapshot:
             raise OfflineReadError("The control state could not be read.") from error
         if state_row is None:
             raise OfflineReadError("The control state is missing.")
-        state = dict(zip(available, state_row))
+        state = dict(zip(available, state_row, strict=True))
         try:
             intake = IntakeState(state.get("intake"))
         except ValueError as error:
@@ -288,11 +288,7 @@ def _read_extra_state(state: dict) -> dict:
         if value is None:
             return None
         if isinstance(value, bool) or not isinstance(value, int):
-            try:
-                parsed = int(value)  # type: ignore[arg-type]
-            except (TypeError, ValueError) as error:
-                raise OfflineReadError("The control state is malformed.") from error
-            return parsed
+            raise OfflineReadError("The control state is malformed.")
         return value
 
     def _optional_str(name: str) -> str | None:
@@ -311,12 +307,11 @@ def _read_extra_state(state: dict) -> dict:
     next_number_raw = state.get("next_issue_number")
     next_number: int | None = None
     if next_number_raw is not None:
-        try:
-            next_number = int(next_number_raw)  # type: ignore[arg-type]
-        except (TypeError, ValueError) as error:
-            raise OfflineReadError("The control state is malformed.") from error
-        if isinstance(next_number_raw, bool):
+        if isinstance(next_number_raw, bool) or not isinstance(
+            next_number_raw, int
+        ):
             raise OfflineReadError("The control state is malformed.")
+        next_number = next_number_raw
     next_request = _optional_str("next_issue_request_id")
     if (next_number is None) != (next_request is None):
         raise OfflineReadError("The control state is malformed.")
@@ -325,10 +320,9 @@ def _read_extra_state(state: dict) -> dict:
     begun_raw = state.get("handoff_begun")
     begun = False
     if begun_raw is not None:
-        try:
-            begun = bool(int(begun_raw))  # type: ignore[arg-type]
-        except (TypeError, ValueError) as error:
-            raise OfflineReadError("The control state is malformed.") from error
+        if isinstance(begun_raw, bool) or not isinstance(begun_raw, int):
+            raise OfflineReadError("The control state is malformed.")
+        begun = bool(begun_raw)
     handoff_phase = _optional_str("handoff_phase")
     return {
         "stop_after_requested": requested,
@@ -347,11 +341,16 @@ def _read_extra_state(state: dict) -> dict:
 
 def _record_from_row(row: tuple) -> CommandRecord:
     request_id, sequence, kind, acknowledgement, detail, created_at, updated_at = row[:7]
+    for field in (request_id, kind, detail, created_at, updated_at):
+        if not isinstance(field, str):
+            raise OfflineReadError("A control command is malformed.")
+    if isinstance(sequence, bool) or not isinstance(sequence, int):
+        raise OfflineReadError("A control command is malformed.")
     try:
         ack = CommandAcknowledgement(acknowledgement)
-        ordered = int(sequence)
     except (ValueError, TypeError) as error:
         raise OfflineReadError("A control command is malformed.") from error
+    ordered = sequence
     return CommandRecord(
         request_id=request_id,
         sequence=ordered,
