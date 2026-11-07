@@ -124,6 +124,7 @@ def main() -> None:
         turns_max=config.max_turns,
         timeout_seconds=config.model_timeout,
         continuation_max=config.max_auto_continuations,
+        usd_ceiling=config.max_budget_usd,
         # Single source of truth with the executor's prompt-cache warning:
         # the served hit rate stays unavailable below this many measured
         # main-thread responses.

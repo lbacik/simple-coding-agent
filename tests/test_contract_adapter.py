@@ -534,7 +534,6 @@ def test_invalid_argument_echoes_the_request_id(contract_server) -> None:
 @pytest.mark.parametrize(
     "argv",
     [
-        ["--contract", "1", "status"],
         ["--contract", "1", "command", "req-000000000000"],
         ["--contract", "1", "attempts", "list"],
         ["--contract", "1", "attempts", "show", "#41/1"],

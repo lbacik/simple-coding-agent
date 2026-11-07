@@ -56,6 +56,10 @@ class ControlSurface(Protocol):
         """Build one telemetry snapshot for the ``telemetry`` operation."""
         ...
 
+    def contract_status_snapshot(self) -> dict:
+        """Build one contract status snapshot for the ``contract_status`` op."""
+        ...
+
 
 class ControlUnavailableError(ConnectionError):
     """Raised when the agent process cannot be reached."""
@@ -302,6 +306,8 @@ class ControlServer:
                 self._reply_command(connection, request)
             elif operation == "telemetry":
                 self._reply_telemetry(connection)
+            elif operation == "contract_status":
+                self._reply_contract_status(connection)
             else:
                 _send(
                     connection,
@@ -553,6 +559,67 @@ class ControlServer:
             )
             return
         _send(connection, {"ok": True, "telemetry": snapshot})
+
+    def _reply_contract_status(self, connection: socket.socket) -> None:
+        """Answer one contract ``status`` request without raising out of the listener.
+
+        Controls without a contract projection (older agent versions)
+        answer ``Unknown operation`` so ``agentctl`` can report
+        ``unsupported_operation``. Any other failure answers ``ok: False``
+        so the adapter reports ``internal``.
+        """
+
+        snapshotter = getattr(self._control, "contract_status_snapshot", None)
+        if not callable(snapshotter):
+            _send(
+                connection,
+                {
+                    "ok": False,
+                    "repository": self._safe_repository(),
+                    "error": "Unknown operation: 'contract_status'.",
+                },
+            )
+            return
+        try:
+            snapshot = snapshotter()
+        except Exception as error:
+            self._log_control_error(f"contract_status: {type(error).__name__}: {error}")
+            _send(
+                connection,
+                {
+                    "ok": False,
+                    "repository": self._safe_repository(),
+                    "error": f"Contract status failed: {error}",
+                },
+            )
+            return
+        if not isinstance(snapshot, dict):
+            self._log_control_error("contract_status returned a non-object snapshot")
+            _send(
+                connection,
+                {
+                    "ok": False,
+                    "repository": self._safe_repository(),
+                    "error": "Contract status failed: the snapshot was not a JSON object.",
+                },
+            )
+            return
+        try:
+            json.dumps(snapshot)
+        except (TypeError, ValueError) as error:
+            self._log_control_error(
+                f"contract_status snapshot is not JSON-serialisable: {error}"
+            )
+            _send(
+                connection,
+                {
+                    "ok": False,
+                    "repository": self._safe_repository(),
+                    "error": f"Contract status failed: {error}",
+                },
+            )
+            return
+        _send(connection, {"ok": True, "contract_status": snapshot})
 
     def _log_telemetry_failed(self, detail: str, *, cooldown: float) -> None:
         """Record a failed telemetry build, at most once per cooldown window."""

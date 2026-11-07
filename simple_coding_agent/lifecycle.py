@@ -1392,6 +1392,9 @@ class AgentLifecycle:
         # ``control_observed_at``. Served again while the control lock is
         # busy; ``None`` until the first successful build.
         self._telemetry_control: dict | None = None
+        # The last contract status snapshot, served again while the control
+        # lock is busy; ``None`` until the first successful build.
+        self._contract_status: dict | None = None
         # Last publication progress and workspace-dirty state the lifecycle
         # itself observed, keyed by stable attempt ID. Publication flows
         # (live attempts, startup reconciliation, recovery retry) record the
@@ -3775,6 +3778,118 @@ class AgentLifecycle:
         )
         section["control_observed_at"] = format_timestamp(self._clock())
         return section
+
+    def contract_status_snapshot(self) -> dict:
+        """Serve one operator-contract status snapshot for the socket.
+
+        Read-only: assembly goes through the prepared control store,
+        attempt checkpoint and telemetry reporter without network, git or
+        provider I/O. Like :meth:`telemetry_control_snapshot` this waits at
+        most ``CONTROL_LOCK_TIMEOUT_SECONDS`` for the control lock; while
+        the lock is busy the last built snapshot is served, and when none
+        has been built yet this raises :class:`SnapshotFailedError`.
+        """
+
+        if self._control_store is None:
+            raise SnapshotFailedError("operator control is not configured")
+        if not self._control_lock.acquire(timeout=CONTROL_LOCK_TIMEOUT_SECONDS):
+            cached = self._contract_status
+            if cached is None:
+                raise SnapshotFailedError(
+                    "the control lock is busy and no contract status has been built yet"
+                )
+            # A copy: the served snapshot must never alias the cache, or a
+            # consumer mutating it would corrupt later reuses.
+            return copy.deepcopy(cached)
+        try:
+            snapshot = self._build_contract_status()
+        finally:
+            self._control_lock.release()
+        self._contract_status = snapshot
+        return copy.deepcopy(snapshot)
+
+    def _build_contract_status(self) -> dict:
+        """Build a fresh contract status snapshot (caller holds the lock)."""
+
+        from simple_coding_agent import contract_status as contract_status_module
+        from simple_coding_agent.attempt_state import AttemptStateError
+
+        store = self._control_store
+        assert store is not None  # checked by contract_status_snapshot
+        try:
+            checkpoint = self._attempt_state.read()
+        except AttemptStateError as error:
+            # Read-only, as in control_status: record the startup hold
+            # silently (no event) so the operator still sees the hold
+            # reason instead of an error while the process stays up.
+            if self._startup_hold_detail is None:
+                self._startup_hold_kind = "checkpoint"
+                self._startup_hold_detail = _checkpoint_hold_detail(error)
+            checkpoint = None
+        if checkpoint is None:
+            attempt: dict | None = None
+        else:
+            attempt = {
+                "attempt_id": checkpoint.started_at,
+                "issue_number": checkpoint.issue_number,
+                "issue_title": checkpoint.issue_title,
+                "native_phase": checkpoint.phase.value,
+                "started_at": checkpoint.started_at,
+                "last_activity_at": checkpoint.updated_at,
+            }
+        pending_record = None
+        pending_id = store.pending_command_id()
+        if pending_id is not None:
+            candidate = store.get_command(pending_id)
+            if candidate is not None and candidate.kind in ("stop", "handoff"):
+                pending_record = candidate
+        reporter = self._telemetry
+        if reporter is None:
+            current = None
+            last_finished = None
+            usd_ceiling = None
+        else:
+            current = reporter.contract_current_attempt()
+            source = reporter.contract_source()
+            configured = source.get("configured")
+            configured = configured if isinstance(configured, dict) else {}
+            ceiling = configured.get("usd_ceiling")
+            usd_ceiling = ceiling if isinstance(ceiling, int) else None
+            last_finished = source.get("last_finished")
+        if attempt is not None and isinstance(current, dict):
+            # The telemetry seed owns the claim-time identity (attempt id,
+            # issue and title); the checkpoint owns the live phase and
+            # last-activity time. In production both agree; the seed wins
+            # when they differ.
+            seed_id = current.get("attempt_id")
+            if isinstance(seed_id, str) and seed_id:
+                attempt["attempt_id"] = seed_id
+                attempt["started_at"] = seed_id
+            seed_issue = current.get("issue_number")
+            if (
+                isinstance(seed_issue, int)
+                and not isinstance(seed_issue, bool)
+            ):
+                attempt["issue_number"] = seed_issue
+            seed_title = current.get("issue_title")
+            attempt["issue_title"] = seed_title if isinstance(seed_title, str) else None
+        stamp = format_timestamp(self._clock())
+        return contract_status_module.build_status_snapshot(
+            repository=self._repository,
+            identity=self.control_identity(),
+            intake=store.intake_state(),
+            recovering=self._recovering,
+            attempt=attempt,
+            pending_record=pending_record,
+            stop_plan=store.stop_plan_snapshot(),
+            next_issue=store.next_issue_snapshot(),
+            command_details=store.recent_command_details(),
+            current=current,
+            last_finished=last_finished if isinstance(last_finished, dict) else None,
+            usd_ceiling=usd_ceiling,
+            generated_at=stamp,
+            observed_at=stamp,
+        )
 
     def _recovery_hold_network_free(
         self, checkpoint: AttemptCheckpoint | None
