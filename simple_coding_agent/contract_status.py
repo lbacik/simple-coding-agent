@@ -8,7 +8,9 @@ the contract's Status Snapshot without network, git or provider I/O:
 - ``generated_at`` plus the engine ``identity`` (from
   :meth:`lifecycle.control_identity <...>`, lock-free),
 - ``instance`` (``idle``/``active``/``draining``/``paused``, derived from
-  intake and the active attempt),
+  intake and the active attempt; ``starting`` while construction is
+  unfinished and ``recovering`` while reconciliation or a recovery hold
+  is active, with ``startup_check`` and ``last_halt``),
 - ``intake`` (open/closed with ``pending_stop``, ``stop_plan`` and
   ``priority``),
 - the current attempt (native phase, issue, start time, last activity,

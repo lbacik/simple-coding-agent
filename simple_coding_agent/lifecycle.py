@@ -1446,12 +1446,6 @@ class AgentLifecycle:
 
         self._attempt_runner = attempt_runner
 
-    def set_telemetry(self, telemetry: TelemetryReporter | None) -> None:
-        """Attach the telemetry reporter built after provenance (startup seam)."""
-
-        with self._control_lock:
-            self._telemetry = telemetry
-
     def attach_post_provenance(
         self,
         *,

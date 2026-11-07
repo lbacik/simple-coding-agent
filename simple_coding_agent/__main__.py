@@ -30,7 +30,6 @@ from simple_coding_agent.command_runner import CommandRunner
 from simple_coding_agent.completion import CompletionEvaluator, VerificationRunner
 from simple_coding_agent.config import (
     EXPECTED_CLAUDE_AGENT_SDK_VERSION,
-    ConfigurationError,
     RuntimeConfig,
     load_repository_profile,
     load_runtime_config,
@@ -42,7 +41,6 @@ from simple_coding_agent.git_workspace import GitWorkspace
 from simple_coding_agent.github_tracker import GitHubGraphQLTransport, GitHubTracker
 from simple_coding_agent.handoff_record import HandoffPublicationStore
 from simple_coding_agent.halt import (
-    HALT_CONSECUTIVE_ERROR_LIMIT,
     HALT_CONTROL_ENDPOINT_UNAVAILABLE,
     HALT_PROVENANCE_FAILED,
     HaltStore,
@@ -71,7 +69,7 @@ def _load_config() -> RuntimeConfig:
 
     try:
         return load_runtime_config()
-    except ConfigurationError as error:
+    except Exception as error:
         print(f"configuration error: {error}", file=sys.stderr)
         raise SystemExit(2) from None
 
@@ -326,10 +324,3 @@ def _start_control_endpoint(
 
 if __name__ == "__main__":
     main()
-
-
-__all__ = [
-    "HALT_CONSECUTIVE_ERROR_LIMIT",
-    "HALT_CONTROL_ENDPOINT_UNAVAILABLE",
-    "HALT_PROVENANCE_FAILED",
-]
