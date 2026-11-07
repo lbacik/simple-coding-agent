@@ -10,8 +10,9 @@ recorded in its ``attempt.json``, never by string reversal, so directories
 without a recorded ``started_at`` are skipped.
 
 An unsealed archive, including the active Attempt's, is a moving snapshot:
-its summary and manifest are computed at read time. Sealing lands in a
-later ticket, so ``sealed`` is always ``False`` here.
+its summary and manifest are computed at read time. A Sealed archive
+freezes both: the sealing record carries ``sealed_at`` and the frozen
+manifest.
 """
 
 from __future__ import annotations
