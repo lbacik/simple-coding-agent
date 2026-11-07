@@ -60,6 +60,16 @@ class ControlSurface(Protocol):
         """Build one contract status snapshot for the ``contract_status`` op."""
         ...
 
+    def control_attempts_list(
+        self, limit: int | None = ..., before: str | None = ...
+    ) -> dict:
+        """Build one ``attempts list`` page over archives plus the checkpoint."""
+        ...
+
+    def control_attempts_show(self, attempt_id: str) -> dict:
+        """Build one ``attempts show`` summary plus evidence manifest."""
+        ...
+
 
 class ControlUnavailableError(ConnectionError):
     """Raised when the agent process cannot be reached."""
@@ -308,6 +318,10 @@ class ControlServer:
                 self._reply_telemetry(connection)
             elif operation == "contract_status":
                 self._reply_contract_status(connection)
+            elif operation == "attempts_list":
+                self._reply_attempts_list(connection, request)
+            elif operation == "attempts_show":
+                self._reply_attempts_show(connection, request)
             else:
                 _send(
                     connection,
@@ -620,6 +634,159 @@ class ControlServer:
             )
             return
         _send(connection, {"ok": True, "contract_status": snapshot})
+
+    def _reply_attempts_list(
+        self, connection: socket.socket, request: dict
+    ) -> None:
+        """Answer one contract ``attempts list`` request.
+
+        Controls without the history projection (older agent versions)
+        answer ``Unknown operation`` so the adapter reports ``internal``.
+        A rejected page answers ``ok: False`` with its contract code
+        (``invalid_argument``); any other failure answers ``internal``.
+        """
+
+        from simple_coding_agent.attempt_history import AttemptHistoryError
+
+        snapshotter = getattr(self._control, "control_attempts_list", None)
+        if not callable(snapshotter):
+            _send(
+                connection,
+                {
+                    "ok": False,
+                    "repository": self._safe_repository(),
+                    "error": "Unknown operation: 'attempts_list'.",
+                },
+            )
+            return
+        try:
+            page = snapshotter(request.get("limit"), request.get("before"))
+        except AttemptHistoryError as error:
+            _send(
+                connection,
+                {
+                    "ok": False,
+                    "repository": self._safe_repository(),
+                    "code": error.code,
+                    "error": str(error),
+                },
+            )
+            return
+        except Exception as error:
+            self._log_control_error(f"attempts_list: {type(error).__name__}: {error}")
+            _send(
+                connection,
+                {
+                    "ok": False,
+                    "repository": self._safe_repository(),
+                    "code": "internal",
+                    "error": f"Attempts list failed: {error}",
+                },
+            )
+            return
+        if not isinstance(page, dict):
+            self._log_control_error("attempts_list returned a non-object page")
+            _send(
+                connection,
+                {
+                    "ok": False,
+                    "repository": self._safe_repository(),
+                    "code": "internal",
+                    "error": "Attempts list failed: the page was not a JSON object.",
+                },
+            )
+            return
+        try:
+            json.dumps(page)
+        except (TypeError, ValueError) as error:
+            self._log_control_error(f"attempts_list page is not JSON-serialisable: {error}")
+            _send(
+                connection,
+                {
+                    "ok": False,
+                    "repository": self._safe_repository(),
+                    "code": "internal",
+                    "error": f"Attempts list failed: {error}",
+                },
+            )
+            return
+        _send(connection, {"ok": True, "attempts_list": page})
+
+    def _reply_attempts_show(
+        self, connection: socket.socket, request: dict
+    ) -> None:
+        """Answer one contract ``attempts show`` request.
+
+        A missing Attempt answers ``ok: False`` with ``not_found`` and a
+        bad Attempt ID with ``invalid_argument``; any other failure answers
+        ``internal``.
+        """
+
+        from simple_coding_agent.attempt_history import AttemptHistoryError
+
+        snapshotter = getattr(self._control, "control_attempts_show", None)
+        if not callable(snapshotter):
+            _send(
+                connection,
+                {
+                    "ok": False,
+                    "repository": self._safe_repository(),
+                    "error": "Unknown operation: 'attempts_show'.",
+                },
+            )
+            return
+        try:
+            result = snapshotter(request.get("attempt_id"))
+        except AttemptHistoryError as error:
+            _send(
+                connection,
+                {
+                    "ok": False,
+                    "repository": self._safe_repository(),
+                    "code": error.code,
+                    "error": str(error),
+                },
+            )
+            return
+        except Exception as error:
+            self._log_control_error(f"attempts_show: {type(error).__name__}: {error}")
+            _send(
+                connection,
+                {
+                    "ok": False,
+                    "repository": self._safe_repository(),
+                    "code": "internal",
+                    "error": f"Attempts show failed: {error}",
+                },
+            )
+            return
+        if not isinstance(result, dict):
+            self._log_control_error("attempts_show returned a non-object result")
+            _send(
+                connection,
+                {
+                    "ok": False,
+                    "repository": self._safe_repository(),
+                    "code": "internal",
+                    "error": "Attempts show failed: the result was not a JSON object.",
+                },
+            )
+            return
+        try:
+            json.dumps(result)
+        except (TypeError, ValueError) as error:
+            self._log_control_error(f"attempts_show result is not JSON-serialisable: {error}")
+            _send(
+                connection,
+                {
+                    "ok": False,
+                    "repository": self._safe_repository(),
+                    "code": "internal",
+                    "error": f"Attempts show failed: {error}",
+                },
+            )
+            return
+        _send(connection, {"ok": True, "attempts_show": result})
 
     def _log_telemetry_failed(self, detail: str, *, cooldown: float) -> None:
         """Record a failed telemetry build, at most once per cooldown window."""

@@ -535,8 +535,6 @@ def test_invalid_argument_echoes_the_request_id(contract_server) -> None:
     "argv",
     [
         ["--contract", "1", "command", "req-000000000000"],
-        ["--contract", "1", "attempts", "list"],
-        ["--contract", "1", "attempts", "show", "#41/1"],
         ["--contract", "1", "attempts", "export", "#41/1"],
         _mutation(["stop"]),
         _mutation(["stop", "--after", "2"]),
