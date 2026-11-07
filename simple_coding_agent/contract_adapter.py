@@ -1200,18 +1200,9 @@ def _run_contract_mutation(parsed: ParsedOperation, op: str | None = None) -> in
     if op is None:
         op, extra = _mutation_socket_op(parsed)
     else:
+        # Explicit-op callers ("stop", "resume") carry no extra payload;
+        # every other mutation maps through _mutation_socket_op above.
         extra = {}
-        if parsed.name == "stop --after":
-            extra = {"after": int(parsed.args["after"], 10)}
-        elif parsed.name == "next issue":
-            extra = {"issue": int(parsed.args["issue"], 10)}
-        elif parsed.name == "recovery retry":
-            extra = {"attempt_id": parsed.args["attempt_id"]}
-        elif parsed.name == "recovery release":
-            extra = {
-                "attempt_id": parsed.args["attempt_id"],
-                "saved_at": parsed.args["saved_at"],
-            }
     try:
         reply = _send_contract_mutation(op, parsed.request_id, parsed.expect_repo, extra)
     except _Unreachable:

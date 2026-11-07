@@ -99,7 +99,10 @@ in a successful reply after the command has already been applied.
   is an identical retry and returns the stored record.
 
 `recovery retry`, `recovery release`, and `errors reset` do not accept
-the flag; the server ignores `expect_repo` on those operations.
+the flag in the legacy CLI grammar, but the socket server still enforces
+an `expect_repo` field whenever one is present — the contract path always
+sends it — comparing before the idempotency lookup like every other
+mutation.
 
 ## Exit codes
 
