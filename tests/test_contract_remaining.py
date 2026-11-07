@@ -111,6 +111,7 @@ def make_lifecycle(
     tmp_path: Path,
     tracker: FakeTracker,
     runner=None,
+    publisher=None,
 ):
     from simple_coding_agent.lifecycle import AgentLifecycle
 
@@ -126,7 +127,7 @@ def make_lifecycle(
         attempt_state=AttemptStateStore(tmp_path),
         workspace=workspace,
         profile_loader=lambda _: type("Profile", (), {"base_branch": "main"})(),
-        publisher=FakePublisher(),
+        publisher=publisher if publisher is not None else FakePublisher(),
         attempt_runner=runner,
         control_store=store,
         repository=REPOSITORY,
@@ -141,8 +142,9 @@ def start_server(
     tracker: FakeTracker,
     monkeypatch: pytest.MonkeyPatch,
     runner=None,
+    publisher=None,
 ):
-    lifecycle, store = make_lifecycle(tmp_path, tracker, runner)
+    lifecycle, store = make_lifecycle(tmp_path, tracker, runner, publisher)
     socket_path = tmp_path / "state" / "contract-remaining.sock"
     server = ControlServer(socket_path, lifecycle)  # type: ignore[arg-type]
     server.start()
@@ -501,7 +503,10 @@ def test_handoff_now_not_fulfilled_with_work_retained(
         assert release.wait(timeout=30)
         return complete_evidence()
 
-    server, lifecycle, _ = start_server(tmp_path, tracker, monkeypatch, blocking_workflow)
+    publisher = FakePublisher()
+    server, lifecycle, _ = start_server(
+        tmp_path, tracker, monkeypatch, blocking_workflow, publisher
+    )
     worker = threading.Thread(target=lifecycle.run_once)
     try:
         worker.start()
@@ -521,6 +526,10 @@ def test_handoff_now_not_fulfilled_with_work_retained(
         release.set()
         worker.join(timeout=30)
         server.stop()
+
+    # The failed handoff discards nothing: the attempt published its
+    # COMPLETE outcome and that work stands.
+    assert publisher.outcomes == [AttemptOutcome.COMPLETE]
 
     server2, _, _ = restart_server(
         tmp_path, FakeTracker(issues={24: eligible_issue(24)}), monkeypatch
@@ -635,6 +644,77 @@ def test_recovery_release_rejected_for_unknown_attempt(command_server) -> None:
     assert err == ""
     assert code == 1
     assert _error(envelope)["code"] == "rejected"
+
+
+def test_recovery_release_stores_saved_at_echoes_it_and_survives_restart(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    server, lifecycle, _ = start_server(tmp_path, FakeTracker(), monkeypatch)
+    try:
+        checkpoint = lifecycle._attempt_state.read()  # noqa: SLF001
+        assert checkpoint is None
+        state = AttemptStateStore(tmp_path)
+        state.start(issue_number=24, branch="agent/issue-24")
+        attempt_id = state.read().started_at  # type: ignore[union-attr]
+        assert isinstance(attempt_id, str)
+    finally:
+        server.stop()
+
+    server2, _, _ = restart_server(tmp_path, FakeTracker(), monkeypatch)
+    try:
+        code, envelope, _, err = _run(
+            _mutation(
+                ["recovery", "release", attempt_id, "--saved-at", "s3://bucket/work"],
+                request_id="req-rec-release-held",
+            )
+        )
+        assert err == "", err
+        assert code == 0
+        submitted = _result(envelope)
+        assert submitted["command"]["kind"] == "recovery_release"
+        assert submitted["command"]["repository"] == REPOSITORY
+        # --saved-at is stored and echoed as a location only.
+        assert submitted["command"]["arguments"] == {
+            "attempt_id": attempt_id,
+            "saved_at": "s3://bucket/work",
+        }
+        terminal = submitted["command"]["acknowledgement"]
+        assert terminal in ("completed", "not_fulfilled")
+        assert submitted["replayed"] is False
+
+        replay_code, replay_envelope, _, replay_err = _run(
+            _mutation(
+                ["recovery", "release", attempt_id, "--saved-at", "s3://bucket/work"],
+                request_id="req-rec-release-held",
+            )
+        )
+        assert replay_err == ""
+        assert replay_code == 0
+        replayed = _result(replay_envelope)
+        assert replayed["replayed"] is True
+        assert replayed["command"]["sequence"] == submitted["command"]["sequence"]
+        assert replayed["command"]["arguments"] == {
+            "attempt_id": attempt_id,
+            "saved_at": "s3://bucket/work",
+        }
+    finally:
+        server2.stop()
+
+    server3, _, _ = restart_server(tmp_path, FakeTracker(), monkeypatch)
+    try:
+        lookup_code, lookup_envelope, _, lookup_err = _run(
+            ["--contract", "1", "command", "req-rec-release-held"]
+        )
+        assert lookup_err == ""
+        assert lookup_code == 0
+        looked_up = _result(lookup_envelope)["command"]
+        assert looked_up["acknowledgement"] == terminal
+        assert looked_up["arguments"] == {
+            "attempt_id": attempt_id,
+            "saved_at": "s3://bucket/work",
+        }
+    finally:
+        server3.stop()
 
 
 def test_errors_reset_completes_and_replays(command_server) -> None:
