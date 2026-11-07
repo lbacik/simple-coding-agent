@@ -5,7 +5,7 @@
 # Dedicated agent user: UID 1000, HOME=/home/agent
 # Persistent data root: /data  (mount as a named volume)
 
-FROM python:3.12-slim
+FROM python:3.12-slim AS base
 
 # Contract discovery lives on the managed service (Compose `labels:`), not in
 # this image: the same image is shared with one-off containers, and only the
@@ -113,4 +113,33 @@ USER agent
 ENV HOME=/home/agent
 ENV DATA_DIR=/data
 
+ENTRYPOINT ["python", "-m", "simple_coding_agent"]
+
+# ---------------------------------------------------------------------------
+# Conformance harness image (operator contract §15.1; never production)
+# ---------------------------------------------------------------------------
+# The external producer suite drives this target through the Conformance
+# Harness API: `docker run <harness-image> <verb> '<request-json>'` writes
+# one JSON reply to stdout. It wires the real lifecycle to the shared test
+# fakes (`tests/fakes.py`, reused — never copies) via `conformance_harness/`,
+# whose daemon the host-side CLI supervises itself, so no daemon
+# ENTRYPOINT is needed: the harness CLI is the container entry point and
+# `SCA_HARNESS_STATE_DIR` (default `~/.cache/sca-conformance-harness`)
+# selects the state volume. Build with
+# `docker build --target harness .`.
+FROM base AS harness
+USER root
+COPY conformance_harness/ ./conformance_harness/
+COPY tests/fakes.py ./tests/fakes.py
+USER agent
+ENTRYPOINT ["python", "-m", "conformance_harness"]
+
+# ---------------------------------------------------------------------------
+# Production image (default build target; carries no test fakes)
+# ---------------------------------------------------------------------------
+# `docker build .` with no `--target` builds this last stage, so the default
+# output is exactly the historical single-stage image: only
+# `simple_coding_agent/` is present and neither `conformance_harness/` nor
+# `tests/` exists (the harness stage above is not an ancestor of this one).
+FROM base AS production
 ENTRYPOINT ["python", "-m", "simple_coding_agent"]
