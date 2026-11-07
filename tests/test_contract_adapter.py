@@ -534,11 +534,8 @@ def test_invalid_argument_echoes_the_request_id(contract_server) -> None:
 @pytest.mark.parametrize(
     "argv",
     [
-        ["--contract", "1", "command", "req-000000000000"],
         ["--contract", "1", "attempts", "export", "#41/1"],
-        _mutation(["stop"]),
         _mutation(["stop", "--after", "2"]),
-        _mutation(["resume"]),
         _mutation(["next", "issue", "43"]),
         _mutation(["handoff", "now"]),
         _mutation(["recovery", "retry", "attempt-1"]),
@@ -563,7 +560,7 @@ def test_unsupported_mutation_does_not_consume_the_request_id(
     contract_server,
 ) -> None:
     _, control = contract_server()
-    code, _, _, _ = _run(_mutation(["stop"], request_id="req-reusable-1"))
+    code, _, _, _ = _run(_mutation(["handoff", "now"], request_id="req-reusable-1"))
     assert code == 3
     assert control.get_command("req-reusable-1") is None
 

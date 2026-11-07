@@ -3572,6 +3572,20 @@ class AgentLifecycle:
             raise ControlStoreError("Operator control is not configured")
         return self._control_store.get_command(request_id)
 
+    def get_command_with_payload(
+        self, request_id: str
+    ) -> tuple[CommandRecord, dict] | None:
+        """Return one command with its canonical payload, if recorded.
+
+        Read-only like :meth:`get_command`: it never takes the control
+        lock, so a contract ``command`` lookup answers while a mutating
+        submit holds it.
+        """
+
+        if self._control_store is None:
+            raise ControlStoreError("Operator control is not configured")
+        return self._control_store.get_command_with_payload(request_id)
+
     def submit_errors_reset(self, request_id: str) -> CommandRecord:
         """Reset the consecutive-error guard to 0 through the live process.
 
