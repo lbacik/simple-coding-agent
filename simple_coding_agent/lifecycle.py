@@ -139,6 +139,13 @@ from simple_coding_agent.github_tracker import (
     ineligibility_reason,
 )
 from simple_coding_agent.model_execution import ModelExecutionStatus, ModelExecutor, OperatorHandoff, ToolCallRecord, expected_handoff_last_work_commit
+from simple_coding_agent.contract_events import (
+    ContractEventsBuffer,
+    command_accepted_detail,
+    command_resolved_detail,
+    halted_detail,
+    outcome_recorded_detail,
+)
 from simple_coding_agent.observability import AttemptArchive, Redactor
 from simple_coding_agent.operating import ConsecutiveErrorStore
 from simple_coding_agent.publication import (
@@ -1321,6 +1328,7 @@ class AgentLifecycle:
         startup_check: str | None = None,
         last_halt: dict | None = None,
         halt_store: object | None = None,
+        contract_events: ContractEventsBuffer | None = None,
     ) -> None:
         self._tracker = tracker
         self._attempt_state = attempt_state
@@ -1408,6 +1416,16 @@ class AgentLifecycle:
         # Seed the last-finished view from disk so it survives restarts;
         # a failure only leaves it null, never breaks startup.
         self._seed_telemetry_last_finished()
+        # The process-local Contract Events ring feeding
+        # ``status.recent_events`` (``None`` without one: the snapshot then
+        # serves an empty list). Owned by the caller (``__main__`` shares it
+        # with the event logger); never written here, only read.
+        self._contract_events = contract_events
+        # Request IDs already announced as ``command_accepted`` /
+        # ``command_resolved``: command commits and resolutions replay
+        # through the same wrappers, and each Contract Event fires once.
+        self._command_events_accepted: set[str] = set()
+        self._command_events_resolved: set[str] = set()
         # The last control section built for telemetry, with its
         # ``control_observed_at``. Served again while the control lock is
         # busy; ``None`` until the first successful build.
