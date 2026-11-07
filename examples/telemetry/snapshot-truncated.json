@@ -17,7 +17,7 @@
     "active_attempt": {
       "issue_number": 985,
       "branch": "agent/issue-985",
-      "phase": "model_execution",
+      "phase": "model_running",
       "started_at": "2026-09-30T10:00:00Z",
       "issue_title": "Example: catalogue the synthetic inventory"
     },
@@ -29,14 +29,14 @@
     "consecutive_errors": {
       "count": 1,
       "max_consecutive_errors": 3,
-      "last_attempt_id": "2026-09-30T09-00-00-attempt-0981",
+      "last_attempt_id": "2026-09-30T09:00:00Z",
       "last_success_at": "2026-09-29T15:40:00Z"
     },
     "commands": {},
     "control_observed_at": "2026-09-30T14:00:00Z"
   },
   "current_attempt": {
-    "attempt_id": "2026-09-30T10-00-00-attempt-0985",
+    "attempt_id": "2026-09-30T10:00:00Z",
     "issue_number": 985,
     "issue_title": "Example: catalogue the synthetic inventory",
     "observed_at": "2026-09-30T13:59:40Z",
@@ -171,7 +171,7 @@
     }
   },
   "last_finished": {
-    "attempt_id": "2026-09-29T15-10-00-attempt-0961",
+    "attempt_id": "2026-09-29T15:10:00Z",
     "issue_number": 961,
     "issue_title": "Example: refresh the synthetic status copy",
     "outcome": "complete",

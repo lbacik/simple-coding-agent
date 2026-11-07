@@ -506,6 +506,11 @@ The agent adheres strictly to non-destructive cleanup:
 
 ## Per-instance operator control (`agentctl`)
 
+> The legacy `agentctl` grammar documented here (without `--contract`) is
+> deprecated and will be retired in adoption step 5 of the operator contract.
+> It behaves exactly as documented until then; new consumers should use
+> `agentctl --contract 1`.
+
 Each running agent container accepts operator commands through an installed
 control CLI. Container selection is the instance selector: the CLI has no
 instance flag, so opening the wrong container controls the wrong instance.

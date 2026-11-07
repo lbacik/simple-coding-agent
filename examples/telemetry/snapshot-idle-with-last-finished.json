@@ -23,7 +23,7 @@
     "consecutive_errors": {
       "count": 0,
       "max_consecutive_errors": 3,
-      "last_attempt_id": "2026-09-29T15-10-00-attempt-0961",
+      "last_attempt_id": "2026-09-29T15:10:00Z",
       "last_success_at": "2026-09-29T15:40:00Z"
     },
     "commands": {},
@@ -31,7 +31,7 @@
   },
   "current_attempt": null,
   "last_finished": {
-    "attempt_id": "2026-09-29T15-10-00-attempt-0961",
+    "attempt_id": "2026-09-29T15:10:00Z",
     "issue_number": 961,
     "issue_title": "Example: refresh the synthetic status copy",
     "outcome": "complete",
@@ -56,7 +56,7 @@
       "event": "attempt_finalized",
       "issue_number": 961,
       "phase": "publication",
-      "text": "attempt 2026-09-29T15-10-00-attempt-0961 finalized with outcome complete"
+      "text": "attempt 2026-09-29T15:10:00Z finalized with outcome complete"
     },
     {
       "timestamp": "2026-09-30T08:00:00Z",

@@ -17,7 +17,7 @@
     "active_attempt": {
       "issue_number": 981,
       "branch": "agent/issue-981",
-      "phase": "model_execution",
+      "phase": "model_running",
       "started_at": "2026-09-30T09:00:00Z",
       "issue_title": "Example: migrate the synthetic report layout"
     },
@@ -46,7 +46,7 @@
     "consecutive_errors": {
       "count": 0,
       "max_consecutive_errors": 3,
-      "last_attempt_id": "2026-09-29T15-10-00-attempt-0961",
+      "last_attempt_id": "2026-09-29T15:10:00Z",
       "last_success_at": "2026-09-29T15:40:00Z"
     },
     "commands": {
@@ -63,7 +63,7 @@
     "control_observed_at": "2026-09-30T12:05:00Z"
   },
   "current_attempt": {
-    "attempt_id": "2026-09-30T09-00-00-attempt-0981",
+    "attempt_id": "2026-09-30T09:00:00Z",
     "issue_number": 981,
     "issue_title": "Example: migrate the synthetic report layout",
     "observed_at": "2026-09-30T12:04:10Z",
@@ -207,7 +207,7 @@
     }
   },
   "last_finished": {
-    "attempt_id": "2026-09-29T15-10-00-attempt-0961",
+    "attempt_id": "2026-09-29T15:10:00Z",
     "issue_number": 961,
     "issue_title": "Example: refresh the synthetic status copy",
     "outcome": "complete",

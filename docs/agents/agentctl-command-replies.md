@@ -7,6 +7,11 @@ way [telemetry-snapshot.md](telemetry-snapshot.md) publishes the
 telemetry snapshot. The socket wire format is out of scope and does not
 change.
 
+> The legacy `agentctl` grammar documented here (without `--contract`) is
+> deprecated and will be retired in adoption step 5 of the operator contract.
+> It behaves exactly as documented until then; new consumers should use
+> `agentctl --contract 1`.
+
 Covered commands: `stop`, `stop --after N`, `resume`, `handoff now`,
 `next issue <n>`, `recovery retry <attempt>`,
 `recovery release <attempt> --saved-at <path-or-url>`, `errors reset`
