@@ -199,8 +199,8 @@ def main() -> None:
         max_auto_continuations=config.max_auto_continuations,
         max_conflict_attempts=config.max_conflict_attempts,
         worker_id=config.worker_id,
-        event_log=lambda event, detail="", level="INFO", issue_number=None: logger.emit(
-            event, phase="polling", detail=detail, level=level, issue_number=issue_number
+        event_log=lambda event, detail="", level="INFO", issue_number=None, attempt_id=None: logger.emit(
+            event, phase="polling", detail=detail, level=level, issue_number=issue_number, attempt_id=attempt_id
         ),
     )
     command_runner = CommandRunner(
@@ -218,8 +218,8 @@ def main() -> None:
         attempt_state=attempt_state,
         handoff_store=HandoffPublicationStore(config.data_dir),
         handoff_comment_mode=config.handoff_comment_mode,
-        event_log=lambda event, detail="", level="INFO", issue_number=None: logger.emit(
-            event, phase="publication", detail=detail, level=level, issue_number=issue_number
+        event_log=lambda event, detail="", level="INFO", issue_number=None, attempt_id=None: logger.emit(
+            event, phase="publication", detail=detail, level=level, issue_number=issue_number, attempt_id=attempt_id
         ),
     )
     lifecycle = AgentLifecycle(
@@ -240,8 +240,8 @@ def main() -> None:
         conflict_model_executor=None,
         conflict_issue_comments=None,
         conflict_prompt_redactions=config.credential_redactions,
-        event_log=lambda event, detail="", level="INFO", issue_number=None: logger.emit(
-            event, phase="polling", detail=detail, level=level, issue_number=issue_number
+        event_log=lambda event, detail="", level="INFO", issue_number=None, attempt_id=None: logger.emit(
+            event, phase="polling", detail=detail, level=level, issue_number=issue_number, attempt_id=attempt_id
         ),
         attempt_archive_factory=archive_factory,
         completion_store=AttemptCompletionStore(config.data_dir),
@@ -257,8 +257,8 @@ def main() -> None:
         halt_store=halt_store,
     )
     interruption_handler = AttemptInterruptionHandler(
-        event_log=lambda event, detail="", level="INFO", issue_number=None: logger.emit(
-            event, phase="interruption", detail=detail, level=level, issue_number=issue_number
+        event_log=lambda event, detail="", level="INFO", issue_number=None, attempt_id=None: logger.emit(
+            event, phase="interruption", detail=detail, level=level, issue_number=issue_number, attempt_id=attempt_id
         ),
         issue_number_provider=lambda: lifecycle.active_issue_number,
         checkpoint=lifecycle.shutdown,
@@ -267,8 +267,8 @@ def main() -> None:
     control_server = ControlServer(
         socket_path_for(config.data_dir),
         lifecycle,
-        event_log=lambda event, detail="", level="INFO", issue_number=None: logger.emit(
-            event, phase="control", detail=detail, level=level, issue_number=issue_number
+        event_log=lambda event, detail="", level="INFO", issue_number=None, attempt_id=None: logger.emit(
+            event, phase="control", detail=detail, level=level, issue_number=issue_number, attempt_id=attempt_id
         ),
     )
     # 4. Control server start, serving ``starting``.
@@ -297,8 +297,8 @@ def main() -> None:
         model_executor = ModelExecutor(
             config,
             cli_path=provenance.cli_path,
-            event_log=lambda event, detail="", level="INFO", issue_number=None: logger.emit(
-                event, phase="model_execution", detail=detail, level=level, issue_number=issue_number
+            event_log=lambda event, detail="", level="INFO", issue_number=None, attempt_id=None: logger.emit(
+                event, phase="model_execution", detail=detail, level=level, issue_number=issue_number, attempt_id=attempt_id
             ),
         )
         runner = ModelAttemptRunner(
@@ -311,8 +311,8 @@ def main() -> None:
             prompt_redactions=config.credential_redactions,
             model_executor=model_executor,
             attempt_archive_factory=archive_factory,
-            event_log=lambda event, detail="", level="ERROR", issue_number=None: logger.emit(
-                event, phase="setup", detail=detail, level=level, issue_number=issue_number
+            event_log=lambda event, detail="", level="ERROR", issue_number=None, attempt_id=None: logger.emit(
+                event, phase="setup", detail=detail, level=level, issue_number=issue_number, attempt_id=attempt_id
             ),
         )
         telemetry = TelemetryReporter(

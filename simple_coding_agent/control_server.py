@@ -70,6 +70,10 @@ class ControlSurface(Protocol):
         """Build one ``attempts show`` summary plus evidence manifest."""
         ...
 
+    def control_attempts_export(self, attempt_id: str) -> dict:
+        """Build one ``attempts export`` summary plus export manifest."""
+        ...
+
 
 class ControlUnavailableError(ConnectionError):
     """Raised when the agent process cannot be reached."""
@@ -322,6 +326,8 @@ class ControlServer:
                 self._reply_attempts_list(connection, request)
             elif operation == "attempts_show":
                 self._reply_attempts_show(connection, request)
+            elif operation == "attempts_export":
+                self._reply_attempts_export(connection, request)
             else:
                 _send(
                     connection,
@@ -798,6 +804,85 @@ class ControlServer:
             )
             return
         _send(connection, {"ok": True, "attempts_show": result})
+
+    def _reply_attempts_export(
+        self, connection: socket.socket, request: dict
+    ) -> None:
+        """Answer one contract ``attempts export`` read.
+
+        Serves the same shape as ``attempts show`` (summary plus export
+        manifest over the snapshot) so the consumer can stream the tar
+        from the volume itself; the tar never crosses this socket. A
+        missing Attempt answers ``ok: False`` with ``not_found`` and a
+        bad Attempt ID with ``invalid_argument``; any other failure
+        answers ``internal``.
+        """
+
+        from simple_coding_agent.attempt_history import AttemptHistoryError
+
+        snapshotter = getattr(self._control, "control_attempts_export", None)
+        if not callable(snapshotter):
+            _send(
+                connection,
+                {
+                    "ok": False,
+                    "repository": self._safe_repository(),
+                    "error": "Unknown operation: 'attempts_export'.",
+                },
+            )
+            return
+        try:
+            result = snapshotter(request.get("attempt_id"))
+        except AttemptHistoryError as error:
+            _send(
+                connection,
+                {
+                    "ok": False,
+                    "repository": self._safe_repository(),
+                    "code": error.code,
+                    "error": str(error),
+                },
+            )
+            return
+        except Exception as error:
+            self._log_control_error(f"attempts_export: {type(error).__name__}: {error}")
+            _send(
+                connection,
+                {
+                    "ok": False,
+                    "repository": self._safe_repository(),
+                    "code": "internal",
+                    "error": f"Attempts export failed: {error}",
+                },
+            )
+            return
+        if not isinstance(result, dict):
+            self._log_control_error("attempts_export returned a non-object result")
+            _send(
+                connection,
+                {
+                    "ok": False,
+                    "repository": self._safe_repository(),
+                    "code": "internal",
+                    "error": "Attempts export failed: the result was not a JSON object.",
+                },
+            )
+            return
+        try:
+            json.dumps(result)
+        except (TypeError, ValueError) as error:
+            self._log_control_error(f"attempts_export result is not JSON-serialisable: {error}")
+            _send(
+                connection,
+                {
+                    "ok": False,
+                    "repository": self._safe_repository(),
+                    "code": "internal",
+                    "error": f"Attempts export failed: {error}",
+                },
+            )
+            return
+        _send(connection, {"ok": True, "attempts_export": result})
 
     def _log_telemetry_failed(self, detail: str, *, cooldown: float) -> None:
         """Record a failed telemetry build, at most once per cooldown window."""

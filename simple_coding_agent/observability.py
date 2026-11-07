@@ -328,6 +328,7 @@ class AttemptArchive:
             emit("transcripts_copy_failed", f"session_id={session_id}; reason={reason}", "WARNING")
             return (0, 0)
 
+        self._ensure_unsealed("copy_cli_transcripts")
         if not session_id or Path(session_id).name != session_id:
             return fail("no CLI session id was recorded for this attempt")
         base = projects_dir if projects_dir is not None else Path.home() / ".claude" / "projects"
@@ -371,6 +372,10 @@ class AttemptArchive:
                     return fail(f"failed to write {destination}: {error}")
                 copied += 1
                 total_bytes += len(redacted.encode("utf-8"))
+                _remember_snapshot_file(
+                    self.directory,
+                    (Path("transcripts") / relative).as_posix(),
+                )
         except OSError as error:
             return fail(f"failed to copy transcripts for this session: {error}")
         emit(
