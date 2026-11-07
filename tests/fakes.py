@@ -1292,13 +1292,21 @@ class FakeModelExecutor:
     ``handoff=True`` for an action that stands in for the model invoking the
     handoff skill instead (write/commit the note, then stop): the returned
     evidence carries HANDOFF_REQUESTED and a ``handoff`` skill event instead.
+    Pass ``status`` to script another terminal model status (for example
+    ``MODEL_LIMIT_REACHED`` for an incomplete attempt); the code-review
+    skill event is still reported.
     """
 
     def __init__(
-        self, *, actions: list | None = None, handoff: bool = False
+        self,
+        *,
+        actions: list | None = None,
+        handoff: bool = False,
+        status: ModelExecutionStatus = ModelExecutionStatus.SUCCEEDED,
     ) -> None:
         self._actions = list(actions or [])
         self._handoff = handoff
+        self._status = status
         self.calls = 0
         self.captured_prompts: list[str] = []
 
@@ -1331,7 +1339,7 @@ class FakeModelExecutor:
                 ),
             )
         return ModelExecution(
-            status=ModelExecutionStatus.SUCCEEDED,
+            status=self._status,
             explanation="scripted",
             stop_reason="end_turn",
             model_usage=None,
