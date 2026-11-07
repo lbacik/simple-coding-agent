@@ -897,9 +897,9 @@ def _run_attempts_list(parsed: ParsedOperation) -> int:
     """Serve ``attempts list`` from the engine's history projection."""
 
     raw_limit = parsed.args.get("limit")
-    limit = int(raw_limit, 10) if raw_limit is not None else None
     before = parsed.args.get("before")
     try:
+        limit = int(raw_limit, 10) if raw_limit is not None else None
         page = _fetch_attempts_list(limit, before)
     except _Unreachable:
         return _emit_error(
@@ -908,7 +908,7 @@ def _run_attempts_list(parsed: ParsedOperation) -> int:
             exit_code=EXIT_AGENT_UNREACHABLE,
             retryable=True,
         )
-    except _EngineInvalidArgument as error:
+    except (ValueError, _EngineInvalidArgument) as error:
         return _emit_error(
             code="invalid_argument",
             message=str(error),
