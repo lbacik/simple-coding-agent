@@ -1532,13 +1532,15 @@ def main(argv: list[str]) -> int:
             request_id=request_id,
         )
     if offline:
-        return _unsupported(
-            parsed.name,
-            capability=parsed.capability,
-            request_id=_request_id_for_error(parsed),
-            message=f"operation '{parsed.name}' is not available offline",
-            details={"offline": True},
-        )
+        if parsed.mutation:
+            return _unsupported(
+                parsed.name,
+                capability=parsed.capability,
+                request_id=_request_id_for_error(parsed),
+                message=f"operation '{parsed.name}' is not available offline",
+                details={"offline": True},
+            )
+        return _run_offline(parsed)
     if parsed.name == "identity":
         return _run_identity()
     try:

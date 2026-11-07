@@ -1442,6 +1442,24 @@ class AgentLifecycle:
         self._startup_hold_reported = False
         self._telemetry = telemetry
         self._data_dir = data_dir
+        # Record the volume identity for offline reads (repository, Worker
+        # id, agent version): best-effort, never breaking startup. A later
+        # successful start never erases it except by replacing it, so an
+        # offline reader on a read-only mount reports the stopped instance
+        # without the engine, the lock, or any write.
+        try:
+            if data_dir is not None and isinstance(repository, str) and repository:
+                from simple_coding_agent.agent_version import agent_version as _agent_version
+                from simple_coding_agent.instance import record_instance as _record_instance
+
+                _record_instance(
+                    data_dir,
+                    repository=repository,
+                    worker_id=self._request_worker_id(),
+                    agent_version=_agent_version(),
+                )
+        except Exception:
+            pass
         # Seed the last-finished view from disk so it survives restarts;
         # a failure only leaves it null, never breaks startup.
         self._seed_telemetry_last_finished()
