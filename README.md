@@ -206,6 +206,11 @@ CLI at its absolute path, checking `TARGET_REPO` before any mutating command:
 /usr/local/bin/agentctl stop
 ```
 
+This grammar is the legacy operator protocol, deprecated until adoption
+step 5 retires it; new automation must use
+`/usr/local/bin/agentctl --contract 1 ...`. The legacy path stays
+byte-compatible until then.
+
 Container selection is the instance selector. The control socket is
 container-local (`/run/simple-coding-agent/control.sock`, owner `agent`,
 modes `0700`/`0600`); accepted commands persist on that instance's `/data`

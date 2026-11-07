@@ -1315,6 +1315,8 @@ class AgentLifecycle:
         clock: Callable[[], datetime] | None = None,
         telemetry: TelemetryReporter | None = None,
         data_dir: Path | None = None,
+        mode: str = "online",
+        process_started_at: str | None = None,
     ) -> None:
         self._tracker = tracker
         self._attempt_state = attempt_state
@@ -1337,6 +1339,12 @@ class AgentLifecycle:
         self._completion_store = completion_store
         self._control_store = control_store
         self._repository = repository
+        self._mode = mode
+        self._process_started_at = (
+            process_started_at
+            if process_started_at is not None
+            else format_timestamp(datetime.now(UTC))
+        )
         # Wall clock for operator-handoff deadline checks (acceptance + 240s
         # model work, + 120s publication, 360s absolute). Injected in tests;
         # the control store's own commit clock stamps the acceptance itself.
@@ -3606,6 +3614,34 @@ class AgentLifecycle:
             "last_attempt_id": state.last_attempt_id,
             "last_success_at": state.last_success_at,
             "error": None,
+        }
+
+    def control_identity(self) -> dict:
+        """Return this instance's operator-contract identity.
+
+        Read-only: it reports stored configuration (repository, mode,
+        process start, Worker id) and the installed agent version without
+        taking the control lock and without network, git, or provider
+        I/O, so ``identity`` answers within the contract's read budget
+        even while a mutation holds the lock.
+        """
+
+        from simple_coding_agent.agent_version import agent_version
+        from simple_coding_agent.contract_adapter import (
+            BACKEND,
+            CONTRACT_MAJOR,
+            CONTRACT_MINOR,
+            advertised_capabilities,
+        )
+
+        return {
+            "backend": BACKEND,
+            "agent_version": agent_version(),
+            "contract": {"major": CONTRACT_MAJOR, "minor": CONTRACT_MINOR},
+            "repository": self._repository,
+            "mode": self._mode,
+            "process_started_at": self._process_started_at,
+            "capabilities": advertised_capabilities(self._request_worker_id()),
         }
 
     def control_status(self, repository: str | None = None) -> dict:

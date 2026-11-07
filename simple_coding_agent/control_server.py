@@ -46,6 +46,10 @@ class ControlSurface(Protocol):
 
     def get_command(self, request_id: str) -> object | None: ...
 
+    def control_identity(self) -> dict:
+        """The contract identity of this instance (backend, version, caps)."""
+        ...
+
     def control_status(self, repository: str | None = ...) -> dict: ...
 
     def telemetry_snapshot(self) -> dict:
@@ -290,6 +294,8 @@ class ControlServer:
                 self._reply_recovery_release(connection, request)
             elif operation == "errors_reset":
                 self._reply_errors_reset(connection, request)
+            elif operation == "identity":
+                self._reply_identity(connection)
             elif operation == "status":
                 self._reply_status(connection)
             elif operation == "command":
@@ -428,6 +434,51 @@ class ControlServer:
             rejected=(RequestIdError, PayloadMismatchError),
             repository=self._repository(),
         )
+
+    def _reply_identity(self, connection: socket.socket) -> None:
+        """Answer one read-only contract ``identity`` request.
+
+        Lock-free and without network, git, or provider I/O, so
+        ``identity`` stays within the contract's read budget even while a
+        mutation holds the control lock.
+        """
+
+        snapshotter = getattr(self._control, "control_identity", None)
+        if not callable(snapshotter):
+            _send(
+                connection,
+                {
+                    "ok": False,
+                    "repository": self._safe_repository(),
+                    "error": "Identity is unavailable:"
+                    " this agent version does not serve identity.",
+                },
+            )
+            return
+        try:
+            snapshot = snapshotter()
+        except Exception as error:
+            _send(
+                connection,
+                {
+                    "ok": False,
+                    "repository": self._safe_repository(),
+                    "error": f"Identity is unavailable: {error}",
+                },
+            )
+            return
+        if not isinstance(snapshot, dict):
+            _send(
+                connection,
+                {
+                    "ok": False,
+                    "repository": self._safe_repository(),
+                    "error": "Identity is unavailable:"
+                    " the identity snapshot was not a JSON object.",
+                },
+            )
+            return
+        _send(connection, {"ok": True, "identity": snapshot})
 
     def _reply_status(self, connection: socket.socket) -> None:
         from simple_coding_agent.control import ControlStoreError

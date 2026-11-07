@@ -1,5 +1,9 @@
 # Mutating `agentctl` command-reply contract
 
+> Legacy protocol, deprecated until adoption step 5 retires it; new
+> automation must use `agentctl --contract 1 ...`. The replies below stay
+> byte-compatible until then.
+
 The dashboard issues Control actions through the mutating `agentctl`
 commands and parses their replies; CLI operators script against the same
 text. This document publishes that reply format as a contract, the same

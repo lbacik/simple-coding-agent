@@ -472,7 +472,12 @@ def format_status(status: dict) -> str:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="agentctl", description="Control one running agent instance."
+        prog="agentctl",
+        description=(
+            "Control one running agent instance (legacy protocol,"
+            " deprecated until adoption step 5 retires it; new automation"
+            " must use `agentctl --contract 1 ...`)."
+        ),
     )
     parser.add_argument(
         "--socket",
@@ -640,6 +645,14 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     """CLI entry point; returns a process exit code."""
 
+    if argv is None:
+        argv = sys.argv[1:]
+    else:
+        argv = list(argv)
+    if argv[:1] == ["--contract"]:
+        from simple_coding_agent.contract_adapter import main as contract_main
+
+        return contract_main(argv)
     parser = build_parser()
     args = parser.parse_args(argv)
     socket_path = Path(args.socket) if args.socket else default_socket_path()
