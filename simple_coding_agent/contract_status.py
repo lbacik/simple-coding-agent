@@ -8,7 +8,9 @@ the contract's Status Snapshot without network, git or provider I/O:
 - ``generated_at`` plus the engine ``identity`` (from
   :meth:`lifecycle.control_identity <...>`, lock-free),
 - ``instance`` (``idle``/``active``/``draining``/``paused``, derived from
-  intake and the active attempt),
+  intake and the active attempt; ``starting`` while construction is
+  unfinished and ``recovering`` while reconciliation or a recovery hold
+  is active, with ``startup_check`` and ``last_halt``),
 - ``intake`` (open/closed with ``pending_stop``, ``stop_plan`` and
   ``priority``),
 - the current attempt (native phase, issue, start time, last activity,
@@ -173,17 +175,26 @@ def _one_line(detail: object) -> str:
 
 
 def project_instance_state(
-    intake: IntakeState, *, recovering: bool, attempt_active: bool
+    intake: IntakeState,
+    *,
+    recovering: bool,
+    attempt_active: bool,
+    starting: bool = False,
 ) -> str:
     """Derive the contract instance state from intake and the active attempt.
 
-    Native ``running`` is open (``idle`` without an attempt, ``active``
-    with one); ``stopping`` while an attempt is active is closed
-    (``draining``); ``stopped`` is closed (``paused``). A startup
-    reconciliation in progress reports ``recovering`` until the startup
-    ticket owns the full ``starting``/``recovering``/``last_halt`` model.
+    ``starting`` (the engine has opened its control endpoint but has not
+    finished construction) wins over every other state. ``recovering``
+    covers startup reconciliation while recorded effects of earlier
+    attempts finish, and intake held for recovery (an unusable checkpoint
+    or completion ledger, or retained work awaiting a recovery command).
+    Otherwise native ``running`` is open (``idle`` without an attempt,
+    ``active`` with one); ``stopping`` while an attempt is active is
+    closed (``draining``); ``stopped`` is closed (``paused``).
     """
 
+    if starting:
+        return "starting"
     if recovering:
         return "recovering"
     if intake is IntakeState.RUNNING:
@@ -545,8 +556,18 @@ def build_status_snapshot(
     usd_ceiling: int | None,
     generated_at: str,
     observed_at: str,
+    starting: bool = False,
+    startup_check: str | None = None,
+    last_halt: dict | None = None,
 ) -> dict:
-    """Assemble one contract Status Snapshot from prepared state."""
+    """Assemble one contract Status Snapshot from prepared state.
+
+    ``starting`` serves the early control endpoint before construction
+    finishes (with ``startup_check`` naming provenance verification while
+    held). ``recovering`` covers startup reconciliation and intake held
+    for recovery. ``last_halt`` is the durable halt from the previous
+    engine-decided exit, if any; a successful start never erases it.
+    """
 
     attempt_active = attempt is not None
     snapshot = {
@@ -554,10 +575,13 @@ def build_status_snapshot(
         "identity": dict(identity),
         "instance": {
             "state": project_instance_state(
-                intake, recovering=recovering, attempt_active=attempt_active
+                intake,
+                recovering=recovering,
+                attempt_active=attempt_active,
+                starting=starting,
             ),
-            "startup_check": None,
-            "last_halt": None,
+            "startup_check": startup_check if starting else None,
+            "last_halt": dict(last_halt) if last_halt is not None else None,
             "observed_at": observed_at,
         },
         "intake": project_intake(
