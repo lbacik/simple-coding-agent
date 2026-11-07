@@ -9,15 +9,24 @@ from __future__ import annotations
 
 import io
 import json
+import threading
 import time
 from collections.abc import Iterator
 from contextlib import redirect_stderr, redirect_stdout
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
 
 from simple_coding_agent import agentctl
 from simple_coding_agent.attempt_state import AttemptStateStore
+from simple_coding_agent.completion import (
+    AttemptOutcome,
+    CompletionDecision,
+    PublicationPath,
+)
+from simple_coding_agent.github_tracker import Assignment, Claim, TrackerIssue
+from simple_coding_agent.lifecycle import AttemptEvidence
 from simple_coding_agent.control import ControlStore
 from simple_coding_agent.control_server import ControlServer
 from simple_coding_agent.telemetry import TelemetryReporter
@@ -330,37 +339,79 @@ def test_accepted_stop_survives_a_restart(tmp_path: Path) -> None:
 
 
 def test_resume_supersedes_accepted_stop_and_reopens_intake(command_server) -> None:
-    _, _, _, state = command_server
-    state.start(
-        issue_number=42, branch="agent/issue-42", issue_title="Add CSV export"
+    _, lifecycle, _, _ = command_server
+    # A genuinely running attempt (mirroring the lifecycle-level resume test):
+    # a bare checkpoint with nothing processing is a recovery hold and
+    # resume must stay rejected there.
+    tracker = lifecycle._tracker  # noqa: SLF001 - setup seam
+    tracker.next_claim = Claim(
+        TrackerIssue(
+            id="issue-42",
+            number=42,
+            title="Add CSV export",
+            body="Connect boundaries.",
+            created_at=datetime(2026, 9, 20, tzinfo=UTC),
+            state="OPEN",
+            labels=frozenset({"ready-for-agent"}),
+            assignee_logins=(),
+            blocked_by=0,
+            author_login="reporter",
+        ),
+        Assignment("issue-42", "agent-id"),
     )
+    started = threading.Event()
+    release = threading.Event()
 
-    stop_code, _, _, _ = _run(_mutation(["stop"], request_id="req-stop-sup-1"))
-    assert stop_code == 0
+    def blocking_workflow(received_claim, profile, prepared):
+        started.set()
+        assert release.wait(timeout=30)
+        return AttemptEvidence(
+            decision=CompletionDecision(
+                AttemptOutcome.COMPLETE, True, PublicationPath.COMPLETE, ("ready",)
+            ),
+            check_command="pytest",
+            check_exit_code=0,
+            review_cycles=1,
+            review_findings="all clear",
+            details="Implemented the export.",
+        )
 
-    resume_code, resume_envelope, _, resume_err = _run(
-        _mutation(["resume"], request_id="req-resume-sup-1")
-    )
-    assert resume_err == ""
-    assert resume_code == 0
-    resume = _result(resume_envelope)
-    assert resume["command"]["kind"] == "resume"
-    assert resume["command"]["acknowledgement"] == "completed"
-    assert resume["replayed"] is False
+    lifecycle.set_attempt_runner(blocking_workflow)
+    worker = threading.Thread(target=lifecycle.run_once)
+    worker.start()
+    assert started.wait(timeout=30)
+    try:
+        stop_code, _, _, _ = _run(_mutation(["stop"], request_id="req-stop-sup-1"))
+        assert stop_code == 0
 
-    stop_lookup_code, stop_lookup_envelope, _, _ = _run(
-        ["--contract", "1", "command", "req-stop-sup-1"]
-    )
-    assert stop_lookup_code == 0
-    assert (
-        _result(stop_lookup_envelope)["command"]["acknowledgement"] == "superseded"
-    )
+        resume_code, resume_envelope, _, resume_err = _run(
+            _mutation(["resume"], request_id="req-resume-sup-1")
+        )
+        assert resume_err == ""
+        assert resume_code == 0
+        resume = _result(resume_envelope)
+        assert resume["command"]["kind"] == "resume"
+        assert resume["command"]["acknowledgement"] == "completed"
+        assert resume["replayed"] is False
 
-    status_code, status_envelope, _, _ = _run(["--contract", "1", "status"])
-    assert status_code == 0
-    status = _result(status_envelope)
-    assert status["instance"]["state"] == "active"
-    assert status["intake"]["state"] == "open"
+        stop_lookup_code, stop_lookup_envelope, _, _ = _run(
+            ["--contract", "1", "command", "req-stop-sup-1"]
+        )
+        assert stop_lookup_code == 0
+        assert (
+            _result(stop_lookup_envelope)["command"]["acknowledgement"]
+            == "superseded"
+        )
+
+        status_code, status_envelope, _, _ = _run(["--contract", "1", "status"])
+        assert status_code == 0
+        status = _result(status_envelope)
+        assert status["instance"]["state"] == "active"
+        assert status["intake"]["state"] == "open"
+    finally:
+        release.set()
+        worker.join(timeout=30)
+        assert not worker.is_alive()
 
 
 # ---------------------------------------------------------------------------
