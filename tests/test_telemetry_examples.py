@@ -123,14 +123,19 @@ def test_error_examples_cover_each_code() -> None:
 
 
 def test_dockerfile_sets_the_agent_discovery_label() -> None:
+    import re
+
     content = (ROOT / "Dockerfile").read_text()
-    assert 'io.github.lbacik.simple-coding-agent.role="agent"' in content, (
-        "Dockerfile must set the agent discovery label in the image"
+    assert not re.search(
+        r"(?m)^\s*LABEL\b.*io\.github\.lbacik\.simple-coding-agent\.role", content
+    ), (
+        "Contract images MUST NOT carry the legacy "
+        "io.github.lbacik.simple-coding-agent.role label"
     )
 
 
 def test_onboarding_mentions_the_discovery_label() -> None:
     content = (ROOT / "docs" / "agents" / "operator-onboarding.md").read_text()
-    assert "io.github.lbacik.simple-coding-agent.role" in content, (
-        "Operator onboarding docs must mention the discovery label"
+    assert "io.github.lbacik.agent-operator.contract" in content, (
+        "Operator onboarding docs must mention the contract discovery labels"
     )

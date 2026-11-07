@@ -582,14 +582,16 @@ connection error rather than a saved snapshot.
 
 ### Fleet dashboard discovery
 
-Every container built from the agent image carries the label
-`io.github.lbacik.simple-coding-agent.role="agent"`. The label is set in the
-image (`Dockerfile`), not in compose, so any container built from the image
-is discoverable without operator configuration — visible with `docker
-inspect` on the container. A fleet dashboard lists managed instances with:
+The managed service in `docker-compose.yml` carries the operator
+contract's four discovery labels (contract major, instance name, exec user
+`agent`, backend `simple-coding-agent`). They are set on the deployment,
+never as an image `LABEL`: only the managed service is a Managed Instance,
+and contract images MUST NOT carry the legacy
+`io.github.lbacik.simple-coding-agent.role` label. A fleet dashboard lists
+managed instances with:
 
 ```shell
-docker ps --filter "label=io.github.lbacik.simple-coding-agent.role=agent"
+docker ps --filter "label=io.github.lbacik.agent-operator.contract=1"
 ```
 
 and reads one instance's telemetry snapshot with:

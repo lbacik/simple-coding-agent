@@ -7,12 +7,15 @@
 
 FROM python:3.12-slim
 
-# Fleet-dashboard discovery: every container built from this image carries
-# this label (set in the image, not in compose) so a dashboard can list
-# managed instances without operator configuration:
-#   docker ps --filter "label=io.github.lbacik.simple-coding-agent.role=agent"
-# Visible with `docker inspect` on any container built from the image.
-LABEL io.github.lbacik.simple-coding-agent.role="agent"
+# Contract discovery lives on the managed service (Compose `labels:`), not in
+# this image: the same image is shared with one-off containers, and only the
+# managed service is a Managed Instance. Contract images MUST NOT carry the
+# legacy `io.github.lbacik.simple-coding-agent.role` label, so a consumer
+# without contract support never mistakes a contract instance for a legacy one
+# (operator contract, deployment and discovery). A dashboard lists managed
+# instances by the contract labels, e.g.:
+#   docker ps --filter "label=io.github.lbacik.agent-operator.contract=1"
+# Visible with `docker inspect` on the managed container.
 
 # ---------------------------------------------------------------------------
 # System packages
