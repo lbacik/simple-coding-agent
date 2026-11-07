@@ -330,11 +330,15 @@ def test_compose_service_notes_single_instance_scope() -> None:
     )
 
 
-def _compose_agent_labels() -> dict:
+def _compose_agent_service() -> dict:
     import yaml
 
     overlay = yaml.safe_load((ROOT / "docker-compose.yml").read_text())
-    labels = overlay["services"]["agent"].get("labels", {})
+    return overlay["services"]["agent"]
+
+
+def _compose_agent_labels() -> dict:
+    labels = _compose_agent_service().get("labels", {})
     if isinstance(labels, list):
         parsed: dict = {}
         for entry in labels:
@@ -377,10 +381,7 @@ def test_compose_managed_service_carries_no_legacy_role_label() -> None:
 
 
 def test_compose_publishes_no_port() -> None:
-    import yaml
-
-    overlay = yaml.safe_load((ROOT / "docker-compose.yml").read_text())
-    agent = overlay["services"]["agent"]
+    agent = _compose_agent_service()
     assert "ports" not in agent, (
         "Compose managed service must publish no port: the contract is served "
         "only through the container-local socket directory"
@@ -802,15 +803,34 @@ class TestDockerSmoke:
             f"Built image must expose no port; got: {sorted(exposed)}"
         )
 
+    def test_compose_example_resolves_contract_labels(self) -> None:
+        result = subprocess.run(
+            ["docker", "compose", "-f", "docker-compose.yml", "config"],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0, result.stderr
+        for label in (
+            "io.github.lbacik.agent-operator.contract",
+            "io.github.lbacik.agent-operator.instance",
+            "io.github.lbacik.agent-operator.exec-user",
+            "io.github.lbacik.agent-operator.backend",
+        ):
+            assert label in result.stdout, (
+                f"Resolved Compose config must carry discovery label {label}"
+            )
+
     def test_contract_identity_runs_as_agent_without_a_tty(self) -> None:
         import json
 
         result = subprocess.run(
             [
                 "docker", "run", "--rm",
-                "--user", "agent",
                 "simple-coding-agent:smoke-test",
-                # No -t: the contract CLI must run without a TTY.
+                # No --user and no -t: the image default user must be agent
+                # (mirroring `docker exec --user agent`, which names the same
+                # user) and the contract CLI must run without a TTY.
                 "sh", "-c",
                 "whoami && /usr/local/bin/agentctl --contract 1 identity",
             ],
