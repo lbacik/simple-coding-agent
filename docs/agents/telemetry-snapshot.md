@@ -4,16 +4,22 @@ The agent owns a versioned, read-only **telemetry snapshot**: a point-in-time
 report a managed instance gives about itself — its control state, the current
 (or last finished) implementation attempt's token, budget and context figures,
 and its most recent events. A dashboard only reads it and tolerates versions
-it does not fully know. Terms **telemetry snapshot** and **figure basis** are
-defined in `CONTEXT.md`; the transport decision (serve through `agentctl`
-over the control socket, not HTTP) is
-[ADR 0006](../adr/0006-telemetry-through-agentctl-not-http.md). The shape was
-decided in issue #224 and the command mechanics in issue #225.
+it does not fully know. Term **telemetry snapshot** is the legacy-path name
+defined in `CONTEXT.md` (new consumers use the contract's Status Snapshot);
+**figure basis** is defined normatively in the [operator contract
+glossary](https://github.com/lbacik/agent-operator-contract/blob/06ee46c0204f0fc8a2465827cc397bc235dedc26/CONTEXT.md#observation)
+and linked from `CONTEXT.md`; the transport decision (serve through
+`agentctl` over the control socket, not HTTP) is
+[ADR 0006](../adr/0006-telemetry-through-agentctl-not-http.md), whose serving
+rationale is superseded by
+[ADR 0009](../adr/0009-control-per-connection-contractual-responsiveness.md).
+The shape was decided in issue #224 and the command mechanics in issue #225.
 
-Scope note: this document publishes the contract so a dashboard can build and
-test against it. The live `telemetry` socket operation and `agentctl
-telemetry` subcommand are a separate agent-side change; until they land, the
-synthetic examples under `examples/telemetry/` are the conformance target.
+Scope note: this document publishes the legacy-path contract so a dashboard
+can build and test against it. The live `telemetry` socket operation and
+`agentctl telemetry` subcommand ship in the agent; the synthetic examples
+under `examples/telemetry/` mirror that live output and stay byte-compatible
+with it.
 
 ## Top-level fields (schema version 1)
 
@@ -21,7 +27,7 @@ synthetic examples under `examples/telemetry/` are the conformance target.
 {
   "schema_version": 1,
   "generated_at": "2026-09-30T08:01:00Z",  // when this reply was serialised
-  "sequence": 412,                          // +1 per published telemetry update; resets with the process
+  "sequence": 412,                          // +1 per served snapshot; resets with the process
   "identity": {
     "repository": "owner/name",             // TARGET_REPO
     "agent_version": "0.4.5",
@@ -168,7 +174,7 @@ docker inspect -f '{{ index .Config.Labels "io.github.lbacik.simple-coding-agent
 ## Synthetic examples
 
 `examples/telemetry/` holds synthetic schema-v1 snapshots a dashboard can
-build and test against before any agent serves telemetry:
+build and test against: they mirror the live `telemetry` output the agent serves.
 
 - `snapshot-idle-with-last-finished.json` — idle agent, no active attempt,
   last finished attempt present.

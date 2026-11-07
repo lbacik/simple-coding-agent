@@ -74,6 +74,7 @@ _Avoid_: Repo, checkout, sandbox
 
 **Sealing**:
 Turning every uncommitted change in the attempt workspace into a commit attributed to that attempt (issue, attempt ID, and the reason the model stopped). An attempt is sealed after every model execution, whatever its status, so no work the model wrote is ever lost or leaks onto the base. A workspace mid-way through an unresolved rebase or merge is never sealed: its conflicts are aborted instead.
+Sealing is distinct from the operator contract's **Sealed** (a complete, immutable Attempt Archive, defined in the [contract glossary](https://github.com/lbacik/agent-operator-contract/blob/06ee46c0204f0fc8a2465827cc397bc235dedc26/CONTEXT.md#attempts-and-archives)): sealing commits workspace changes during an attempt, while Sealed marks an archive whose evidence set is final and may be cached.
 _Avoid_: Preserving dirty work, safety-net commit, checkpoint (the attempt checkpoint is a different thing)
 
 **Token budget**:
@@ -101,17 +102,21 @@ A separate operator view over the managed instances on one Docker host. It obser
 _Avoid_: Control panel, monitor, fleet manager
 
 **Managed instance**:
-One agent container that a dashboard discovers and observes, serving exactly one target repository. It is identified by its container name, so recreating the container keeps the same managed instance; a container started for a one-off command is never a managed instance.
+One agent container that a dashboard discovers and observes, serving exactly one target repository. It is identified by its container name, so recreating the container keeps the same managed instance; a container started for a one-off command is never a managed instance. Defined normatively in the [operator contract glossary](https://github.com/lbacik/agent-operator-contract/blob/06ee46c0204f0fc8a2465827cc397bc235dedc26/CONTEXT.md#instances).
 _Avoid_: Agent, worker, node
 
 **Peer identity**:
 Another agent identity working the same Queue whose attempt results the agent treats as its own.
 _Avoid_: Human collaborator, shared account
 
+**Status Snapshot**:
+The operator contract's bounded JSON document describing a managed instance (identity, intake, current and last finished attempt, recent commands and events). Defined in the [operator contract glossary](https://github.com/lbacik/agent-operator-contract/blob/06ee46c0204f0fc8a2465827cc397bc235dedc26/CONTEXT.md#observation). On the legacy path this repository still serves the same report as a **Telemetry snapshot** (below) until adoption step 5.
+_Avoid_: Status, metrics, heartbeat
+
 **Telemetry snapshot**:
-A point-in-time, read-only report a managed instance gives about itself: its control state, the current (or last finished) implementation attempt's token, budget and context figures, and its most recent events. The agent owns and versions it; a dashboard only reads it and tolerates versions it does not fully know.
+A point-in-time, read-only report a managed instance gives about itself: its control state, the current (or last finished) implementation attempt's token, budget and context figures, and its most recent events. The agent owns and versions it; a dashboard only reads it and tolerates versions it does not fully know. Legacy-path term for the local `telemetry` operation until adoption step 5; new consumers use the contract's Status Snapshot.
 _Avoid_: Status, metrics, heartbeat
 
 **Figure basis**:
-How a figure in a telemetry snapshot was obtained: `measured` (reported by the provider), `estimated` (computed by the agent), `configured` (set by the operator), `sdk_assumed` (a default the runtime assumes for an unknown model), or `unavailable` (no trustworthy source). An unavailable figure is never shown as zero.
+How a figure in a telemetry snapshot was obtained: `measured` (reported by the provider), `estimated` (computed by the agent), `configured` (set by the operator), `sdk_assumed` (a default the runtime assumes for an unknown model), or `unavailable` (no trustworthy source). An unavailable figure is never shown as zero. Defined normatively as Figure Basis in the [operator contract glossary](https://github.com/lbacik/agent-operator-contract/blob/06ee46c0204f0fc8a2465827cc397bc235dedc26/CONTEXT.md#observation), where this backend's `sdk_assumed` is reported as `assumed` on the contract path.
 _Avoid_: Provenance (reserved for provenance verification of the pinned runtime), source, confidence

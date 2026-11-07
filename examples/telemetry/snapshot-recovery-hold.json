@@ -19,9 +19,9 @@
     "pending_next_issue": null,
     "stop_plan": null,
     "recovery": {
-      "attempt_id": "2026-09-30T09-00-00-attempt-0981",
+      "attempt_id": "2026-09-30T09:00:00Z",
       "issue_number": 981,
-      "phase": "publication",
+      "phase": "publishing",
       "outcome": "complete",
       "branch": "agent/issue-981",
       "workspace": "/data/repo",
@@ -31,13 +31,13 @@
         "pull_request": null
       },
       "hold_reason": "result comment confirmation is not known yet; retry unconfirmed publication steps",
-      "next_action": "run /usr/local/bin/agentctl recovery retry 2026-09-30T09-00-00-attempt-0981"
+      "next_action": "run /usr/local/bin/agentctl recovery retry 2026-09-30T09:00:00Z"
     },
     "handoff": null,
     "consecutive_errors": {
       "count": 0,
       "max_consecutive_errors": 3,
-      "last_attempt_id": "2026-09-29T15-10-00-attempt-0961",
+      "last_attempt_id": "2026-09-29T15:10:00Z",
       "last_success_at": "2026-09-29T15:40:00Z"
     },
     "commands": {},
@@ -45,7 +45,7 @@
   },
   "current_attempt": null,
   "last_finished": {
-    "attempt_id": "2026-09-29T15-10-00-attempt-0961",
+    "attempt_id": "2026-09-29T15:10:00Z",
     "issue_number": 961,
     "issue_title": "Example: refresh the synthetic status copy",
     "outcome": "complete",
@@ -67,7 +67,7 @@
       "event": "recovery_hold_entered",
       "issue_number": 981,
       "phase": "publication",
-      "text": "retained attempt 2026-09-30T09-00-00-attempt-0981 held: result comment confirmation unknown"
+      "text": "retained attempt 2026-09-30T09:00:00Z held: result comment confirmation unknown"
     },
     {
       "timestamp": "2026-09-30T12:31:00Z",
@@ -75,7 +75,7 @@
       "event": "recovery_next_action",
       "issue_number": 981,
       "phase": "publication",
-      "text": "next action: run recovery retry for 2026-09-30T09-00-00-attempt-0981"
+      "text": "next action: run recovery retry for 2026-09-30T09:00:00Z"
     }
   ],
   "truncated": false

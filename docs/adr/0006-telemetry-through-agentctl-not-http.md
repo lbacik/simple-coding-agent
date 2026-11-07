@@ -1,5 +1,7 @@
 # Serve fleet telemetry through agentctl over the control socket, not an HTTP endpoint
 
+> The serving rationale below ("the control server answers connections one at a time") is superseded by [ADR 0009](0009-control-per-connection-contractual-responsiveness.md): the server already serves each connection on its own thread, and the operator contract now requires that responsiveness. The transport decision (control socket via `agentctl`, no HTTP endpoint) stands.
+
 A dashboard needs each managed instance's telemetry snapshot. We decided the agent serves it only as a read-only `telemetry` operation on the existing container-local control socket, exposed as `agentctl telemetry --json`, and the dashboard reads it by running `docker exec --user agent <container-id> /usr/local/bin/agentctl telemetry --json`. The agent publishes no port and opens no listener beyond the control socket, so "container = instance, no published control port" stays true, and the telemetry needs neither a token nor a setting to turn it on.
 
 ## Considered Options
