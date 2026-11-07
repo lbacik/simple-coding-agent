@@ -1632,6 +1632,29 @@ class ControlStore:
             "latest_counted_outcome": latest_outcome,
         }
 
+    # -- shutdown ---------------------------------------------------------
+
+    def checkpoint(self) -> None:
+        """Checkpoint the WAL into the main database file.
+
+        Every orderly engine shutdown calls this after the control store's
+        last write, so ``control.sqlite3`` alone carries the committed
+        state and an offline reader on a read-only mount never depends on
+        a ``-wal`` file being present. Online behaviour is unchanged: the
+        store stays in WAL mode with full durability; this only merges
+        already-committed frames.
+        """
+
+        with self.lock:
+            try:
+                with self._connect() as connection:
+                    row = connection.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+                    connection.commit()
+            except sqlite3.Error as error:
+                raise ControlStoreError("Control store could not be checkpointed") from error
+        if row is None or int(row[0]) != 0 or int(row[2]) != int(row[1]):
+            raise ControlStoreError("Control store could not be checkpointed")
+
     # -- internals --------------------------------------------------------
 
     def _connect(self) -> sqlite3.Connection:
