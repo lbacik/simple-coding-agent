@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import errno
 import fcntl
+import os
 from pathlib import Path
 
 
@@ -90,3 +91,43 @@ class VolumeLock:
 
     def __exit__(self, *exc_info: object) -> None:
         self.release()
+
+
+def is_volume_locked(data_dir: Path) -> bool:
+    """Whether a live engine still holds the volume lock, without taking it.
+
+    Opens the existing lock file read-only (never creating it) and probes
+    with ``LOCK_EX|LOCK_NB``: a failure with ``EACCES``/``EAGAIN`` means a
+    live engine holds the lock, success means no engine holds it. The probe
+    releases immediately and never writes to the volume, so it is safe on a
+    read-only mount. A missing lock file means no engine holds the lock.
+    Raises :class:`VolumeLockError` when the probe itself cannot run.
+    """
+
+    path = Path(data_dir) / "state" / LOCK_FILENAME
+    try:
+        fd = os.open(str(path), os.O_RDONLY)
+    except FileNotFoundError:
+        return False
+    except OSError as error:
+        raise VolumeLockError(
+            f"Volume lock {path} could not be probed: {error}."
+        ) from error
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as error:
+            if error.errno in (errno.EACCES, errno.EAGAIN):
+                return True
+            raise VolumeLockError(
+                f"Volume lock {path} could not be probed: {error}."
+            ) from error
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        except OSError as error:
+            raise VolumeLockError(
+                f"Volume lock {path} could not be probed: {error}."
+            ) from error
+        return False
+    finally:
+        os.close(fd)

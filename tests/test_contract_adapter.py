@@ -451,13 +451,14 @@ def test_offline_mutation_is_unsupported_without_engine_contact(
     assert err == ""
 
 
-def test_offline_read_is_unsupported_until_offline_read_lands(
+def test_offline_read_is_served_from_the_volume_not_the_engine(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setenv("AGENTCTL_SOCKET", str(tmp_path / "missing.sock"))
+    monkeypatch.setenv("DATA_DIR", str(tmp_path / "volume"))
     code, envelope, _, _ = _run(["--contract", "1", "--offline", "status"])
-    assert code == 3
-    assert envelope["error"]["code"] == "unsupported"
+    assert code == 7
+    assert envelope["error"]["code"] == "internal"
 
 
 def test_offline_unsupported_comes_before_argument_values(
