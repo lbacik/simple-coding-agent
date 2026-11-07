@@ -123,6 +123,24 @@ def test_dockerfile_entrypoint_runs_the_agent() -> None:
     )
 
 
+def test_dockerfile_carries_no_legacy_role_label() -> None:
+    content = _dockerfile()
+    assert not re.search(
+        r"(?m)^\s*LABEL\b.*io\.github\.lbacik\.simple-coding-agent\.role", content
+    ), (
+        "Dockerfile must not carry the legacy io.github.lbacik.simple-coding-agent.role label: "
+        "contract images MUST NOT carry it, so a consumer without contract support "
+        "never mistakes a contract instance for a legacy one"
+    )
+
+
+def test_dockerfile_exposes_no_port() -> None:
+    assert not re.search(r"(?m)^\s*EXPOSE\s+", _dockerfile()), (
+        "Dockerfile must not EXPOSE any port: the contract is served only "
+        "through the container-local socket directory"
+    )
+
+
 def test_dockerfile_preinstalls_the_pinned_agent_installer_as_root() -> None:
     content = _dockerfile()
     version = _installer_version()
@@ -309,6 +327,63 @@ def test_compose_service_notes_single_instance_scope() -> None:
     # Either explicit scale:1 or a comment noting sequential-worker scope
     assert "scale" not in content or "1" in content, (
         "Compose configuration must preserve the single-instance scope"
+    )
+
+
+def _compose_agent_labels() -> dict:
+    import yaml
+
+    overlay = yaml.safe_load((ROOT / "docker-compose.yml").read_text())
+    labels = overlay["services"]["agent"].get("labels", {})
+    if isinstance(labels, list):
+        parsed: dict = {}
+        for entry in labels:
+            key, _, value = str(entry).partition("=")
+            parsed[key] = value
+        return parsed
+    assert isinstance(labels, dict), (
+        "Compose managed service labels must be a mapping"
+    )
+    return {str(key): str(value) for key, value in labels.items()}
+
+
+def test_compose_managed_service_carries_contract_discovery_labels() -> None:
+    labels = _compose_agent_labels()
+    assert labels.get("io.github.lbacik.agent-operator.contract") == "1", (
+        "Compose managed service must label the contract major "
+        "(io.github.lbacik.agent-operator.contract=1)"
+    )
+    assert re.fullmatch(
+        r"[a-z0-9][a-z0-9-]{0,62}", labels.get("io.github.lbacik.agent-operator.instance", "")
+    ), (
+        "Compose managed service must label a valid instance name "
+        "(io.github.lbacik.agent-operator.instance)"
+    )
+    assert labels.get("io.github.lbacik.agent-operator.exec-user") == "agent", (
+        "Compose managed service must label the exec user "
+        "(io.github.lbacik.agent-operator.exec-user=agent)"
+    )
+    assert labels.get("io.github.lbacik.agent-operator.backend") == "simple-coding-agent", (
+        "Compose managed service must label the backend "
+        "(io.github.lbacik.agent-operator.backend=simple-coding-agent)"
+    )
+
+
+def test_compose_managed_service_carries_no_legacy_role_label() -> None:
+    labels = _compose_agent_labels()
+    assert not any(
+        key.startswith("io.github.lbacik.simple-coding-agent.role") for key in labels
+    ), "Compose managed service must not carry the legacy role label"
+
+
+def test_compose_publishes_no_port() -> None:
+    import yaml
+
+    overlay = yaml.safe_load((ROOT / "docker-compose.yml").read_text())
+    agent = overlay["services"]["agent"]
+    assert "ports" not in agent, (
+        "Compose managed service must publish no port: the contract is served "
+        "only through the container-local socket directory"
     )
 
 
@@ -704,4 +779,61 @@ class TestDockerSmoke:
         assert result.returncode == 0, result.stderr
         assert result.stdout.strip() == "agent 700", (
             f"Runtime directory must be owned by agent with mode 0700; got: {result.stdout.strip()}"
+        )
+
+    def test_image_carries_no_legacy_role_label(self) -> None:
+        import json
+
+        result = subprocess.run(
+            ["docker", "inspect", "simple-coding-agent:smoke-test"],
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0, result.stderr
+        inspected = json.loads(result.stdout)
+        assert inspected, "docker inspect returned no image metadata"
+        labels = (inspected[0].get("Config") or {}).get("Labels") or {}
+        assert "io.github.lbacik.simple-coding-agent.role" not in labels, (
+            "Built image must not carry the legacy "
+            "io.github.lbacik.simple-coding-agent.role label"
+        )
+        exposed = (inspected[0].get("Config") or {}).get("ExposedPorts") or {}
+        assert not exposed, (
+            f"Built image must expose no port; got: {sorted(exposed)}"
+        )
+
+    def test_contract_identity_runs_as_agent_without_a_tty(self) -> None:
+        import json
+
+        result = subprocess.run(
+            [
+                "docker", "run", "--rm",
+                "--user", "agent",
+                "simple-coding-agent:smoke-test",
+                # No -t: the contract CLI must run without a TTY.
+                "sh", "-c",
+                "whoami && /usr/local/bin/agentctl --contract 1 identity",
+            ],
+            capture_output=True,
+            text=True,
+        )
+        lines = result.stdout.splitlines()
+        assert lines and lines[0].strip() == "agent", (
+            f"Contract CLI must run as the agent user; got: {result.stdout!r}"
+        )
+        envelope = json.loads(lines[-1])
+        assert envelope.get("contract") == "1.0", (
+            f"Contract envelope must carry contract 1.0; got: {envelope!r}"
+        )
+        # No engine runs in this one-shot container, so identity answers
+        # agent_unreachable through the contract envelope (exit 6) instead
+        # of a legacy connection error on stderr.
+        assert envelope.get("ok") is False, (
+            f"Identity without an engine must be ok:false; got: {envelope!r}"
+        )
+        assert (envelope.get("error") or {}).get("code") == "agent_unreachable", (
+            f"Identity without an engine must report agent_unreachable; got: {envelope!r}"
+        )
+        assert result.returncode == 6, (
+            f"agent_unreachable must exit 6; got: {result.returncode}"
         )

@@ -3,6 +3,14 @@ services:
     build: .
     image: simple-coding-agent:latest
     # Single-instance, sequential-worker scope: do not scale beyond 1.
+    # Contract discovery metadata for the managed service (the Managed
+    # Instance). Set here on the deployment, never as an image LABEL: only
+    # the managed service is a Managed Instance.
+    labels:
+      io.github.lbacik.agent-operator.contract: "1"
+      io.github.lbacik.agent-operator.instance: "agent"
+      io.github.lbacik.agent-operator.exec-user: "agent"
+      io.github.lbacik.agent-operator.backend: "simple-coding-agent"
     env_file:
       - .env
     volumes:

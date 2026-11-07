@@ -159,17 +159,22 @@ instance shows up as argument parsing rejecting the `telemetry` subcommand
 not a JSON object means "telemetry not supported by this agent version"; a
 JSON error object is handled by its `code`.
 
-## Discovery label
+## Discovery labels
 
-Every container built from the agent image carries the label
-`io.github.lbacik.simple-coding-agent.role="agent"`, set in the image (not in
-compose), so a dashboard discovers managed instances without operator
-configuration:
+Managed instances are discovered by the operator contract's deployment
+labels, set on the managed service in `docker-compose.yml` (never as an
+image `LABEL`). Contract images MUST NOT carry the legacy
+`io.github.lbacik.simple-coding-agent.role` label, so a consumer without
+contract support never mistakes a contract instance for a legacy one:
 
 ```shell
-docker ps --filter "label=io.github.lbacik.simple-coding-agent.role=agent"
-docker inspect -f '{{ index .Config.Labels "io.github.lbacik.simple-coding-agent.role" }}' <container-id>
+docker ps --filter "label=io.github.lbacik.agent-operator.contract=1"
+docker inspect -f '{{ index .Config.Labels "io.github.lbacik.agent-operator.contract" }}' <container-id>
 ```
+
+The managed service carries all four discovery labels: the contract major,
+the instance name, the exec user (`agent`), and the backend
+(`simple-coding-agent`).
 
 ## Synthetic examples
 
