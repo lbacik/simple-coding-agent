@@ -1983,13 +1983,44 @@ class AgentLifecycle:
                 issue_number=issue_number,
             )
 
+    def _record_attempt_open(self, issue_number: int, checkpoint: AttemptCheckpoint) -> None:
+        """Record the attempt identity in its archive record; never raises.
+
+        Called at claim time, so ``attempt.json`` carries the checkpoint
+        ``started_at`` (the Attempt ID), the issue number, and the issue
+        title from the moment the Claim opens: the contract ``attempts``
+        projection maps an archive directory back to its Attempt ID
+        through this recorded value, never by string reversal of the
+        directory name. Merges into the existing record without clobbering
+        later fields (the finished payload rewrites the same keys).
+        """
+
+        try:
+            archive = self._archive_for(issue_number, checkpoint.started_at)
+            if archive is None:
+                return
+            identity: dict[str, object] = {
+                "started_at": checkpoint.started_at,
+                "issue_number": issue_number,
+            }
+            if isinstance(checkpoint.issue_title, str) and checkpoint.issue_title:
+                identity["issue_title"] = checkpoint.issue_title
+            archive.write_attempt(identity)
+        except Exception as error:
+            self._event_log(
+                "archive_attempt_open_failed",
+                f"the attempt identity could not be archived: {error}",
+                level="WARNING",
+                issue_number=issue_number,
+            )
+
     def _record_attempt_kind(self, issue_number: int, checkpoint: AttemptCheckpoint) -> None:
         """Record a conflict attempt's kind in its archive record; never raises.
 
         Called at claim time, so ``attempt.json`` carries
         ``attempt_kind: conflict`` for a conflict attempt even if the
-        checkpoint is later lost. Ordinary attempts leave the archive
-        untouched.
+        checkpoint is later lost. Ordinary attempts leave the kind out of
+        the archive (identity keys are recorded separately).
         """
 
         if (
