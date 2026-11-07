@@ -189,10 +189,12 @@ class AttemptInterruptionHandler:
         event_log: Callable[..., None],
         issue_number_provider: Callable[[], int | None],
         resignal: Callable[[int], None] | None = None,
+        checkpoint: Callable[[], None] | None = None,
     ) -> None:
         self._event_log = event_log
         self._issue_number_provider = issue_number_provider
         self._resignal = resignal or _resignal_self
+        self._checkpoint = checkpoint
 
     def install(
         self, signals: Sequence[int] = (signal.SIGTERM, signal.SIGINT)
@@ -225,6 +227,14 @@ class AttemptInterruptionHandler:
             )
         except Exception:
             pass
+        if self._checkpoint is not None:
+            # Best effort: merge the control WAL into the main database
+            # file so the stopped volume stays self-sufficient even though
+            # the process dies by resignal below without running `finally`.
+            try:
+                self._checkpoint()
+            except Exception:
+                pass
         for candidate in (signal.SIGTERM, signal.SIGINT):
             try:
                 signal.signal(candidate, signal.SIG_DFL)
@@ -5718,6 +5728,27 @@ class AgentLifecycle:
 
         while not stop():
             self.run_once()
+
+    def shutdown(self) -> None:
+        """Checkpoint the control WAL after the engine's last write.
+
+        Every orderly shutdown path calls this, so the stopped volume's
+        main database file is self-sufficient even though the offline
+        reader would otherwise depend on the ``-wal`` file. Best effort:
+        a failure is logged and never breaks shutdown.
+        """
+
+        store = self._control_store
+        if store is None:
+            return
+        try:
+            store.checkpoint()
+        except Exception as error:
+            self._event_log(
+                "control_checkpoint_failed",
+                _exception_detail(error),
+                level="WARNING",
+            )
 
     # -- conflict attempts ----------------------------------------------------
 

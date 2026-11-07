@@ -130,6 +130,7 @@ def main() -> None:
         cache_min_measured_responses=PROMPT_CACHE_MIN_MEASURED_RESPONSES,
         recent_events=recent_events,
     )
+    control_store = ControlStore(config.data_dir)
     lifecycle = AgentLifecycle(
         tracker=tracker,
         attempt_state=attempt_state,
@@ -167,7 +168,7 @@ def main() -> None:
         ),
         attempt_archive_factory=archive_factory,
         completion_store=AttemptCompletionStore(config.data_dir),
-        control_store=ControlStore(config.data_dir),
+        control_store=control_store,
         repository=config.target_repo,
         telemetry=telemetry,
         data_dir=config.data_dir,
@@ -177,6 +178,7 @@ def main() -> None:
             event, phase="interruption", detail=detail, level=level, issue_number=issue_number
         ),
         issue_number_provider=lambda: lifecycle.active_issue_number,
+        checkpoint=lifecycle.shutdown,
     )
     restore_interruption_handler = interruption_handler.install()
     control_server = ControlServer(
@@ -186,11 +188,16 @@ def main() -> None:
             event, phase="control", detail=detail, level=level, issue_number=issue_number
         ),
     )
-    _start_control_endpoint(logger, control_server)
     try:
+        _start_control_endpoint(logger, control_server)
         lifecycle.run_forever(stop=lambda: False)
     finally:
         control_server.stop()
+        # After the engine's last control write: merge the WAL into the
+        # main database file so the stopped volume reads without it. The
+        # SIGTERM/SIGINT handler above checkpoints the same way before it
+        # resignals, since `finally` never runs on death by signal.
+        lifecycle.shutdown()
         restore_interruption_handler()
 
 
