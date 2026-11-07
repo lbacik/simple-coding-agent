@@ -4,8 +4,10 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterable
 from datetime import UTC, datetime
+import hashlib
 import json
 from pathlib import Path
+import threading
 from typing import TYPE_CHECKING, TextIO
 
 from simple_coding_agent.agent_version import agent_version
@@ -13,6 +15,76 @@ from simple_coding_agent.agent_version import agent_version
 if TYPE_CHECKING:
     from simple_coding_agent.contract_events import ContractEventsBuffer
     from simple_coding_agent.telemetry import RecentEventsBuffer
+
+
+#: The sealing record written once an Attempt's archive is final (contract
+#: section 11.2). It carries ``sealed_at`` and the frozen manifest, and it
+#: is never listed in a manifest or exported (it would hash itself).
+SEALING_FILENAME = "sealing.json"
+
+
+class AttemptArchiveSealedError(Exception):
+    """A write was refused because the Attempt's archive is already Sealed."""
+
+
+#: Write-through manifest snapshot per archive directory: ``{run_dir:
+#: {relative_path: (size, sha256)}}``. Every :class:`AttemptArchive` mutation
+#: refreshes the entries of the files it wrote, so an export can serve the
+#: engine's snapshot while streaming the live bytes: a file that grows
+#: through a side channel (never through these methods) surfaces as a
+#: sha256 mismatch on the consumer side instead of being silently absorbed.
+#: Process-local by design: a restart falls back to a freshly computed
+#: manifest. Guarded by :data:`_SNAPSHOT_LOCK`.
+_SNAPSHOT_REGISTRY: dict[str, dict[str, tuple[int, str]]] = {}
+_SNAPSHOT_LOCK = threading.Lock()
+
+
+def read_manifest_snapshot(run_dir: Path) -> dict[str, tuple[int, str]] | None:
+    """Return the write-through snapshot for one archive directory, if any.
+
+    A copy keyed by relative POSIX path with ``(size, sha256)`` values, or
+    ``None`` when this process has not written to the directory yet (the
+    caller falls back to a freshly computed manifest).
+    """
+
+    key = str(run_dir)
+    with _SNAPSHOT_LOCK:
+        snapshot = _SNAPSHOT_REGISTRY.get(key)
+        return dict(snapshot) if snapshot is not None else None
+
+
+def discard_manifest_snapshot(run_dir: Path) -> None:
+    """Forget the write-through snapshot for one archive directory, if any.
+
+    Called when the archive seals: the sealing record carries the frozen
+    manifest from then on, so the mutable snapshot is no longer needed.
+    """
+
+    with _SNAPSHOT_LOCK:
+        _SNAPSHOT_REGISTRY.pop(str(run_dir), None)
+
+
+def _remember_snapshot_file(run_dir: Path, relative: str) -> None:
+    """Refresh one snapshot entry from the file just written, if readable.
+
+    Best-effort: an unreadable file drops its entry so the caller falls
+    back to the live bytes.
+    """
+
+    path = run_dir / relative
+    try:
+        raw = path.read_bytes()
+    except OSError:
+        with _SNAPSHOT_LOCK:
+            entries = _SNAPSHOT_REGISTRY.get(str(run_dir))
+            if entries is not None:
+                entries.pop(relative, None)
+        return
+    with _SNAPSHOT_LOCK:
+        _SNAPSHOT_REGISTRY.setdefault(str(run_dir), {})[relative] = (
+            len(raw),
+            hashlib.sha256(raw).hexdigest(),
+        )
 
 
 class Redactor:
@@ -77,6 +149,7 @@ class JsonEventLogger:
         phase: str | None = None,
         detail: str = "",
         level: str = "INFO",
+        attempt_id: str | None = None,
     ) -> None:
         record = self._redactor.redact(
             {
@@ -102,18 +175,19 @@ class JsonEventLogger:
                 archive = self._attempt_sink(issue_number)
             except Exception:
                 archive = None
+        if attempt_id is None and archive is not None:
+            attempt_id = archive.started_at
         if self._contract_events is not None:
             try:
                 from simple_coding_agent.contract_events import to_contract_event
 
-                attempt_id = archive.started_at if archive is not None else None
                 contract_event = to_contract_event(record, attempt_id=attempt_id)
                 self._contract_events.record(contract_event)
-                if archive is not None:
+                if event != "sealed" and archive is not None:
                     archive.append_contract_event(contract_event)
             except Exception:
                 pass
-        if archive is not None:
+        if event != "sealed" and archive is not None:
             archive.append_event(record)
 
 
@@ -130,7 +204,22 @@ class AttemptArchive:
         self.started_at = started_at
         self._redactor = Redactor(redactions)
 
+    def is_sealed(self) -> bool:
+        """Whether this Attempt's archive is Sealed and immutable."""
+
+        return (self.directory / SEALING_FILENAME).is_file()
+
+    def _ensure_unsealed(self, operation: str) -> None:
+        """Refuse a write into a Sealed archive; a later write path is a defect."""
+
+        if self.is_sealed():
+            raise AttemptArchiveSealedError(
+                f"archive for attempt {self.started_at!r} is sealed;"
+                f" refusing {operation}"
+            )
+
     def write_attempt(self, metadata: dict[str, object]) -> None:
+        self._ensure_unsealed("write_attempt")
         path = self.directory / "attempt.json"
         try:
             existing = json.loads(path.read_text())
@@ -142,6 +231,7 @@ class AttemptArchive:
         evidence.update(metadata)
         evidence.setdefault("agent_version", agent_version())
         self._write_json("attempt.json", evidence)
+        _remember_snapshot_file(self.directory, "attempt.json")
 
     def read_attempt(self) -> dict[str, object]:
         """Return the merged attempt.json record, or {} when it is missing."""
@@ -156,11 +246,13 @@ class AttemptArchive:
     def append_event(self, record: dict[str, object]) -> None:
         """Append one emitted log record to this attempt's agent_output.json."""
 
+        self._ensure_unsealed("append_event")
         self.directory.mkdir(parents=True, exist_ok=True)
         path = self.directory / "agent_output.json"
         with path.open("a", encoding="utf-8") as file:
             json.dump(self._redactor.redact(record), file, sort_keys=True)
             file.write("\n")
+        _remember_snapshot_file(self.directory, "agent_output.json")
 
     def append_contract_event(self, contract_event: dict[str, object]) -> None:
         """Append one Contract Event to this attempt's ``events.jsonl``.
@@ -170,18 +262,22 @@ class AttemptArchive:
         Listed in the manifest with kind ``events``.
         """
 
+        self._ensure_unsealed("append_contract_event")
         self.directory.mkdir(parents=True, exist_ok=True)
         path = self.directory / "events.jsonl"
         with path.open("a", encoding="utf-8") as file:
             json.dump(self._redactor.redact(contract_event), file, sort_keys=True)
             file.write("\n")
+        _remember_snapshot_file(self.directory, "events.jsonl")
 
     def write_text(self, name: str, content: str) -> Path:
+        self._ensure_unsealed("write_text")
         if Path(name).name != name:
             raise ValueError("Attempt artifact name must not contain a path")
         self.directory.mkdir(parents=True, exist_ok=True)
         path = self.directory / name
         path.write_text(str(self._redactor.redact(content)))
+        _remember_snapshot_file(self.directory, name)
         return path
 
     def copy_cli_transcripts(
