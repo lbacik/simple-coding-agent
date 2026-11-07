@@ -135,9 +135,14 @@ def show_attempt(
     The manifest is computed at read time, so an unsealed archive (including
     the active Attempt's) reads as a moving snapshot, and it never includes
     private engine state. Raises :class:`AttemptHistoryError` with
-    ``not_found`` for an unknown Attempt ID.
+    ``invalid_argument`` for a missing Attempt ID and ``not_found`` for an
+    unknown one.
     """
 
+    if not isinstance(attempt_id, str) or not attempt_id:
+        raise AttemptHistoryError(
+            "invalid_argument", "invalid attempt ID: must not be empty"
+        )
     directories = _archive_directories(data_dir)
     if active is not None and active.attempt_id == attempt_id:
         summary = _live_summary(active, held=held)

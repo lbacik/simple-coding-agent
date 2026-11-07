@@ -3721,6 +3721,100 @@ class AgentLifecycle:
                 consecutive_errors=self._consecutive_errors_snapshot_locked(),
             )
 
+    def control_attempts_list(
+        self, limit: int | None = None, before: str | None = None
+    ) -> dict[str, Any]:
+        """Serve one ``attempts list`` read over archives plus the live checkpoint.
+
+        Read-only: snapshots the checkpoint under the control lock (for the
+        active Attempt overlay and the recovery hold set) and projects over
+        ``self._data_dir``, so an Attempt is listed as soon as its Claim
+        opens and a held Attempt carries ``attention_required``. Raises
+        :class:`SnapshotFailedError` without a data directory and
+        :class:`AttemptHistoryError` (``invalid_argument``) for a bad limit
+        or cursor.
+        """
+
+        from simple_coding_agent import attempt_history as attempt_history_module
+
+        if self._data_dir is None:
+            raise SnapshotFailedError("attempt history is not configured for this process")
+        with self._control_lock:
+            checkpoint = self._read_history_checkpoint_locked()
+            active = self._active_attempt_view_locked(checkpoint)
+            held = self._held_attempt_ids_locked(checkpoint)
+            data_dir = self._data_dir
+        return attempt_history_module.list_attempts(
+            data_dir, active=active, held=held, limit=limit, before=before
+        )
+
+    def control_attempts_show(self, attempt_id: str) -> dict[str, Any]:
+        """Serve one ``attempts show`` read for a single Attempt's evidence.
+
+        Read-only: the summary comes from the live checkpoint when it names
+        this Attempt and from its archive record otherwise, while the
+        manifest is computed at read time over ``self._data_dir``. Raises
+        :class:`SnapshotFailedError` without a data directory and
+        :class:`AttemptHistoryError` (``invalid_argument``/``not_found``)
+        for a bad or unknown Attempt ID.
+        """
+
+        from simple_coding_agent import attempt_history as attempt_history_module
+
+        if self._data_dir is None:
+            raise SnapshotFailedError("attempt history is not configured for this process")
+        with self._control_lock:
+            checkpoint = self._read_history_checkpoint_locked()
+            active = self._active_attempt_view_locked(checkpoint)
+            held = self._held_attempt_ids_locked(checkpoint)
+            data_dir = self._data_dir
+        return attempt_history_module.show_attempt(
+            data_dir, attempt_id, active=active, held=held
+        )
+
+    def _read_history_checkpoint_locked(self) -> AttemptCheckpoint | None:
+        """Read the live checkpoint for a history projection, if any.
+
+        Read-only, as in control_status: an unreadable checkpoint records
+        the startup hold silently (instead of failing the read) so the
+        history still serves the archives while the process stays up.
+        Caller holds the control lock.
+        """
+
+        try:
+            return self._attempt_state.read()
+        except AttemptStateError as error:
+            if self._startup_hold_detail is None:
+                self._startup_hold_kind = "checkpoint"
+                self._startup_hold_detail = _checkpoint_hold_detail(error)
+            return None
+
+    def _active_attempt_view_locked(
+        self, checkpoint: AttemptCheckpoint | None
+    ) -> Any:
+        """Return the history overlay for the live checkpoint, if any."""
+
+        from simple_coding_agent.attempt_history import ActiveAttempt
+
+        if checkpoint is None:
+            return None
+        return ActiveAttempt(
+            attempt_id=checkpoint.started_at,
+            issue_number=checkpoint.issue_number,
+            issue_title=checkpoint.issue_title,
+            phase=checkpoint.phase.value,
+        )
+
+    def _held_attempt_ids_locked(
+        self, checkpoint: AttemptCheckpoint | None
+    ) -> set[str]:
+        """Return the Attempt IDs currently held for recovery, if any."""
+
+        hold = self._recovery_hold_locked(checkpoint)
+        if hold is None or hold.attempt_id is None:
+            return set()
+        return {hold.attempt_id}
+
     def telemetry_snapshot(self) -> dict:
         """Serve one telemetry snapshot for the ``telemetry`` socket operation.
 
@@ -4592,6 +4686,7 @@ class AgentLifecycle:
                 continuation_index=continuation_index,
                 attempt_kind=attempt_kind,
             )
+            self._record_attempt_open(claim.issue.number, checkpoint)
             self._record_attempt_kind(claim.issue.number, checkpoint)
             self._attempt_processing = True
             self._telemetry_begin_for_checkpoint(checkpoint)
@@ -4775,6 +4870,7 @@ class AgentLifecycle:
             continuation_index=continuation_index,
             attempt_kind=ATTEMPT_KIND_CONFLICT if is_conflict else ATTEMPT_KIND_ORDINARY,
         )
+        self._record_attempt_open(claim.issue.number, checkpoint)
         self._record_attempt_kind(claim.issue.number, checkpoint)
         self._attempt_processing = True
         self._telemetry_begin_for_checkpoint(checkpoint)

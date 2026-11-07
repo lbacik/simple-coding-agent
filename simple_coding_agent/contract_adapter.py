@@ -81,8 +81,7 @@ EXIT_REJECTED = 1
 EXIT_USAGE = 2
 EXIT_UNSUPPORTED = 3
 EXIT_CONTRACT_MISMATCH = 4
-# Exit 5 (`not_found`) belongs to the `command` ticket; it is defined
-# there when the lookup lands.
+EXIT_NOT_FOUND = 5
 EXIT_AGENT_UNREACHABLE = 6
 EXIT_INTERNAL = 7
 
@@ -657,6 +656,14 @@ class _EngineFailed(Exception):
     """The engine answered but could not serve the request."""
 
 
+class _EngineNotFound(Exception):
+    """The engine has no record of the requested Attempt, command or path."""
+
+
+class _EngineInvalidArgument(Exception):
+    """The engine rejected an argument value the CLI grammar accepted."""
+
+
 def _fetch_identity() -> dict:
     """Read the engine's identity; raise :class:`_Unreachable`/`_EngineFailed`."""
 
@@ -784,6 +791,181 @@ def _status_problem(status: object) -> str | None:
 
 
 # ---------------------------------------------------------------------------
+# Contract attempts
+# ---------------------------------------------------------------------------
+
+
+def _engine_error_for(reply: dict, operation: str) -> Exception:
+    """Map a failed engine reply onto the contract error it carries."""
+
+    message = str(reply.get("error", f"{operation} is unavailable"))
+    code = reply.get("code")
+    if code == "not_found":
+        return _EngineNotFound(message)
+    if code == "invalid_argument":
+        return _EngineInvalidArgument(message)
+    return _EngineFailed(message)
+
+
+def _fetch_attempts_list(limit: int | None, before: str | None) -> dict:
+    """Read one ``attempts list`` page; raise :class:`_Unreachable`/`_EngineFailed`."""
+
+    try:
+        reply = send_request(
+            resolve_socket_path(),
+            {"op": "attempts_list", "limit": limit, "before": before},
+            timeout=SOCKET_TIMEOUT_SECONDS,
+        )
+    except UnreadableReplyError as error:
+        raise _EngineFailed(
+            f"the agent process answered but the reply could not be used: {error}"
+        ) from error
+    except ControlUnavailableError as error:
+        raise _Unreachable(str(error)) from error
+    if not reply.get("ok"):
+        raise _engine_error_for(reply, "attempts list")
+    page = reply.get("attempts_list")
+    problem = _attempts_list_problem(page)
+    if problem is not None:
+        raise _EngineFailed(
+            f"the agent process answered malformed attempts list: {problem}"
+        )
+    assert isinstance(page, dict)
+    return page
+
+
+def _attempts_list_problem(page: object) -> str | None:
+    """Name the first malformation of an engine ``attempts list`` page, if any."""
+
+    if not isinstance(page, dict):
+        return "page is not an object"
+    attempts = page.get("attempts")
+    if not isinstance(attempts, list) or not all(
+        isinstance(entry, dict) for entry in attempts
+    ):
+        return "page.attempts is not a list of objects"
+    if page.get("next_cursor") is not None and not isinstance(
+        page.get("next_cursor"), str
+    ):
+        return "page.next_cursor is not a string or null"
+    return None
+
+
+def _fetch_attempts_show(attempt_id: str) -> dict:
+    """Read one ``attempts show`` result; raise :class:`_Unreachable`/`_EngineFailed`."""
+
+    try:
+        reply = send_request(
+            resolve_socket_path(),
+            {"op": "attempts_show", "attempt_id": attempt_id},
+            timeout=SOCKET_TIMEOUT_SECONDS,
+        )
+    except UnreadableReplyError as error:
+        raise _EngineFailed(
+            f"the agent process answered but the reply could not be used: {error}"
+        ) from error
+    except ControlUnavailableError as error:
+        raise _Unreachable(str(error)) from error
+    if not reply.get("ok"):
+        raise _engine_error_for(reply, "attempts show")
+    result = reply.get("attempts_show")
+    problem = _attempts_show_problem(result)
+    if problem is not None:
+        raise _EngineFailed(
+            f"the agent process answered malformed attempts show: {problem}"
+        )
+    assert isinstance(result, dict)
+    return result
+
+
+def _attempts_show_problem(result: object) -> str | None:
+    """Name the first malformation of an engine ``attempts show`` result, if any."""
+
+    if not isinstance(result, dict):
+        return "result is not an object"
+    if not isinstance(result.get("attempt"), dict):
+        return "result.attempt is not an object"
+    manifest = result.get("manifest")
+    if not isinstance(manifest, list) or not all(
+        isinstance(entry, dict) for entry in manifest
+    ):
+        return "result.manifest is not a list of objects"
+    return None
+
+
+def _run_attempts_list(parsed: ParsedOperation) -> int:
+    """Serve ``attempts list`` from the engine's history projection."""
+
+    raw_limit = parsed.args.get("limit")
+    limit = int(raw_limit, 10) if raw_limit is not None else None
+    before = parsed.args.get("before")
+    try:
+        page = _fetch_attempts_list(limit, before)
+    except _Unreachable:
+        return _emit_error(
+            code="agent_unreachable",
+            message="cannot reach the agent process",
+            exit_code=EXIT_AGENT_UNREACHABLE,
+            retryable=True,
+        )
+    except _EngineInvalidArgument as error:
+        return _emit_error(
+            code="invalid_argument",
+            message=str(error),
+            exit_code=EXIT_REJECTED,
+            retryable=False,
+        )
+    except _EngineFailed as error:
+        return _emit_error(
+            code="internal",
+            message=f"the agent process could not serve 'attempts list': {error}",
+            exit_code=EXIT_INTERNAL,
+            retryable=True,
+            details={"stored": False},
+        )
+    return _emit_ok(page)
+
+
+def _run_attempts_show(parsed: ParsedOperation) -> int:
+    """Serve ``attempts show`` from the engine's history projection."""
+
+    attempt_id = parsed.args.get("attempt_id")
+    assert isinstance(attempt_id, str)
+    try:
+        result = _fetch_attempts_show(attempt_id)
+    except _Unreachable:
+        return _emit_error(
+            code="agent_unreachable",
+            message="cannot reach the agent process",
+            exit_code=EXIT_AGENT_UNREACHABLE,
+            retryable=True,
+        )
+    except _EngineNotFound as error:
+        return _emit_error(
+            code="not_found",
+            message=str(error),
+            exit_code=EXIT_NOT_FOUND,
+            retryable=False,
+        )
+    except _EngineInvalidArgument as error:
+        return _emit_error(
+            code="invalid_argument",
+            message=str(error),
+            exit_code=EXIT_REJECTED,
+            retryable=False,
+        )
+    except _EngineFailed as error:
+        return _emit_error(
+            code="internal",
+            message=f"the agent process could not serve 'attempts show': {error}",
+            exit_code=EXIT_INTERNAL,
+            retryable=True,
+            details={"stored": False},
+        )
+    return _emit_ok(result)
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
@@ -893,6 +1075,10 @@ def main(argv: list[str]) -> int:
         )
     if parsed.name == "status":
         return _run_status()
+    if parsed.name == "attempts list":
+        return _run_attempts_list(parsed)
+    if parsed.name == "attempts show":
+        return _run_attempts_show(parsed)
     # Later tickets project each remaining operation onto the contract's
     # shared types (command records, attempt archives). Until then the
     # grammar and checks above are in place and the operation answers

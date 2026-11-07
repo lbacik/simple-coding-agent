@@ -395,7 +395,7 @@ def test_show_live_attempt_merges_checkpoint_summary_with_archive_manifest(
 
 
 def _claim_lifecycle(tmp_path: Path, data_dir: Path, **issue_overrides: object):
-    from datetime import UTC, datetime, timedelta
+    from datetime import UTC, datetime
 
     from simple_coding_agent.attempt_state import AttemptStateStore
     from simple_coding_agent.config import RepositoryProfile
