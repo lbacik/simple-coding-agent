@@ -814,25 +814,102 @@ class ControlServer:
         if not isinstance(repository, str) or not repository:
             repository = "unknown"
         request_id = request.get("request_id")
+        contract_mode = _is_contract_request(request)
         if not isinstance(request_id, str) or not request_id:
+            payload: dict = {
+                "ok": False,
+                "repository": repository,
+                "error": "A request ID is required.",
+            }
+            if contract_mode:
+                payload["error_kind"] = "invalid_argument"
+                payload["request_id"] = request_id
+            _send(connection, payload)
+            return
+        if contract_mode and _CONTRACT_REQUEST_ID_RE.fullmatch(request_id) is None:
             _send(
                 connection,
                 {
                     "ok": False,
                     "repository": repository,
-                    "error": "A request ID is required.",
+                    "error": (
+                        f"invalid request ID {request_id!r}: must match"
+                        " ^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"
+                    ),
+                    "request_id": request_id,
+                    "error_kind": "invalid_argument",
                 },
             )
             return
         try:
-            record = self._control.get_command(request_id)
+            if contract_mode:
+                getter = getattr(
+                    self._control, "get_command_with_payload", None
+                )
+                if callable(getter):
+                    with_payload = getter(request_id)
+                else:
+                    record_only = self._control.get_command(request_id)
+                    with_payload = (
+                        (record_only, {}) if record_only is not None else None
+                    )
+            else:
+                record_only = self._control.get_command(request_id)
+                with_payload = None
+                record = record_only
         except (ControlStoreError, RuntimeError, OSError) as error:
+            payload = {
+                "ok": False,
+                "repository": repository,
+                "error": f"Lookup is unavailable: {error}",
+            }
+            if contract_mode:
+                payload["error_kind"] = "internal"
+                payload["request_id"] = request_id
+            _send(connection, payload)
+            return
+        if not contract_mode:
+            _send(
+                connection,
+                {
+                    "ok": True,
+                    "request_id": request_id,
+                    "repository": repository,
+                    "command": command_to_json(record) if record is not None else None,
+                },
+            )
+            return
+        if with_payload is None:
+            _send(
+                connection,
+                {
+                    "ok": False,
+                    "repository": repository,
+                    "error": f"no command is recorded for {request_id}",
+                    "request_id": request_id,
+                    "error_kind": "not_found",
+                },
+            )
+            return
+        try:
+            from simple_coding_agent import contract_status as contract_status_module
+
+            found_record, found_payload = with_payload
+            found_payload = (
+                found_payload if isinstance(found_payload, dict) else {}
+            )
+            command = contract_status_module.project_command(
+                found_record, found_payload, repository=repository
+            )
+        except Exception as error:
             _send(
                 connection,
                 {
                     "ok": False,
                     "repository": repository,
                     "error": f"Lookup is unavailable: {error}",
+                    "request_id": request_id,
+                    "error_kind": "internal",
                 },
             )
             return
@@ -842,7 +919,7 @@ class ControlServer:
                 "ok": True,
                 "request_id": request_id,
                 "repository": repository,
-                "command": command_to_json(record) if record is not None else None,
+                "command": command,
             },
         )
 
@@ -903,6 +980,30 @@ def _repository_matches(expected: object, repository: str) -> bool:
     return expected.strip().lower() == repository.strip().lower()
 
 
+#: Contract request IDs match the operator-contract pattern (spec 6.2).
+_CONTRACT_REQUEST_ID_RE = __import__("re").compile(
+    r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"
+)
+
+
+def _is_contract_request(request: dict) -> bool:
+    """Whether one socket request runs on the operator-contract path."""
+
+    return bool(request.get("contract"))
+
+
+def _rejection_kind(error: Exception) -> str:
+    """Map one answered rejection to its machine-readable contract kind."""
+
+    from simple_coding_agent.control import PayloadMismatchError, RequestIdError
+
+    if isinstance(error, PayloadMismatchError):
+        return "payload_mismatch"
+    if isinstance(error, RequestIdError):
+        return "invalid_argument"
+    return "rejected"
+
+
 def _reply_mutating(
     connection: socket.socket,
     request: dict,
@@ -923,42 +1024,118 @@ def _reply_mutating(
     lookup): a mismatch is an ordinary rejection with nothing stored and
     no control change. The flag is never part of the stored canonical
     payload. Operations with ``check_expect_repo`` unset ignore the field.
+
+    On the contract path (``request["contract"]`` truthy) ``expect_repo``
+    is mandatory for every kind, the check still runs before the
+    idempotency lookup, rejections carry a machine-readable ``error_kind``
+    next to the human message, successes carry the projected
+    ``command`` plus ``replayed``, and engine exceptions carry
+    ``error_kind`` ``internal`` with ``stored: False`` (the failure
+    happened before the commit). The legacy path is byte-compatible:
+    it never sends the flag and ignores the added fields.
     """
 
     from simple_coding_agent.control import ControlStoreError, command_to_json
 
     request_id = request.get("request_id")
-    if check_expect_repo and request.get("expect_repo") is not None:
+    contract_mode = _is_contract_request(request)
+    needs_expect_repo = check_expect_repo or contract_mode
+    if needs_expect_repo and (
+        contract_mode or request.get("expect_repo") is not None
+    ):
         expected = request.get("expect_repo")
         if not _repository_matches(expected, repository):
             shown = expected.strip() if isinstance(expected, str) else expected
-            _send(
-                connection,
-                {
-                    "ok": False,
-                    "repository": repository,
-                    "error": (
-                        f"expected repository {shown},"
-                        f" this instance targets {repository}"
-                    ),
-                    "request_id": request_id,
-                },
-            )
+            payload: dict = {
+                "ok": False,
+                "repository": repository,
+                "error": (
+                    f"expected repository {shown},"
+                    f" this instance targets {repository}"
+                ),
+                "request_id": request_id,
+            }
+            if contract_mode:
+                payload["error_kind"] = "repository_mismatch"
+                payload["details"] = {"repository": repository}
+            _send(connection, payload)
             return
-    try:
-        record = submit(request_id)
-    except rejected as error:
+    if contract_mode and (
+        not isinstance(request_id, str)
+        or _CONTRACT_REQUEST_ID_RE.fullmatch(request_id) is None
+    ):
         _send(
             connection,
             {
                 "ok": False,
                 "repository": repository,
-                "error": str(error),
+                "error": (
+                    f"invalid request ID {request_id!r}: must match"
+                    " ^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"
+                ),
                 "request_id": request_id,
+                "error_kind": "invalid_argument",
             },
         )
         return
+    if contract_mode:
+        try:
+            existing = submit.__self__.get_command(request_id)  # type: ignore[union-attr]
+        except Exception:
+            existing = None
+        replayed_before = existing is not None
+    else:
+        replayed_before = False
+    try:
+        record = submit(request_id)
+    except rejected as error:
+        payload = {
+            "ok": False,
+            "repository": repository,
+            "error": str(error),
+            "request_id": request_id,
+        }
+        if contract_mode:
+            kind = _rejection_kind(error)
+            payload["error_kind"] = kind
+            if kind == "payload_mismatch":
+                pass
+            elif kind == "repository_mismatch":
+                payload["details"] = {"repository": repository}
+        _send(connection, payload)
+        return
     except (ControlStoreError, RuntimeError, OSError) as error:
+        payload = {
+            "ok": False,
+            "repository": repository,
+            "error": f"Command could not be committed: {error}",
+            "request_id": request_id,
+        }
+        if contract_mode:
+            payload["error_kind"] = "internal"
+            payload["stored"] = False
+        _send(connection, payload)
+        return
+    if not contract_mode:
+        _send(
+            connection,
+            {"ok": True, "repository": repository, **command_to_json(record)},
+        )
+        return
+    try:
+        from simple_coding_agent import contract_status as contract_status_module
+
+        payload_dict: dict = {}
+        try:
+            with_payload = submit.__self__.get_command_with_payload(request_id)  # type: ignore[union-attr]
+        except Exception:
+            with_payload = None
+        if with_payload is not None:
+            payload_dict = with_payload[1] if isinstance(with_payload[1], dict) else {}
+        command = contract_status_module.project_command(
+            record, payload_dict, repository=repository
+        )
+    except Exception as error:
         _send(
             connection,
             {
@@ -966,10 +1143,19 @@ def _reply_mutating(
                 "repository": repository,
                 "error": f"Command could not be committed: {error}",
                 "request_id": request_id,
+                "error_kind": "internal",
             },
         )
         return
-    _send(connection, {"ok": True, "repository": repository, **command_to_json(record)})
+    _send(
+        connection,
+        {
+            "ok": True,
+            "repository": repository,
+            "command": command,
+            "replayed": bool(replayed_before),
+        },
+    )
 
 
 def send_request(socket_path: Path, request: dict, *, timeout: float = 10.0) -> dict:

@@ -628,9 +628,18 @@ def _check_values(parsed: ParsedOperation) -> None:
                     "invalid --path value: must not be empty"
                 )
     elif parsed.name == "command":
-        if not parsed.args.get("request_id"):
+        request_id = parsed.args.get("request_id")
+        if not request_id:
             raise _InvalidArgument(
                 "invalid request ID for 'command': must not be empty"
+            )
+        if (
+            not isinstance(request_id, str)
+            or REQUEST_ID_RE.fullmatch(request_id) is None
+        ):
+            raise _InvalidArgument(
+                f"invalid request ID {request_id!r}: must match"
+                " ^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"
             )
     elif parsed.name in ("recovery retry", "recovery release"):
         if not parsed.args.get("attempt_id"):
@@ -788,6 +797,103 @@ def _status_problem(status: object) -> str | None:
     if not isinstance(status.get("truncated"), bool):
         return "status.truncated is not a boolean"
     return None
+
+
+# ---------------------------------------------------------------------------
+# Contract mutations (stop, resume) and command lookup
+# ---------------------------------------------------------------------------
+
+
+_COMMAND_RESULT_KEYS = frozenset(
+    {
+        "acknowledgement",
+        "arguments",
+        "created_at",
+        "detail",
+        "kind",
+        "repository",
+        "request_id",
+        "sequence",
+        "updated_at",
+    }
+)
+
+
+def _command_problem(command: object) -> str | None:
+    """Name the first malformation of an engine CommandRecord, if any."""
+
+    if not isinstance(command, dict):
+        return "command is not an object"
+    missing = _COMMAND_RESULT_KEYS - set(command)
+    if missing:
+        return f"command is missing keys: {sorted(missing)}"
+    if not isinstance(command.get("request_id"), str):
+        return "command.request_id is not a string"
+    if not isinstance(command.get("sequence"), int):
+        return "command.sequence is not an integer"
+    if not isinstance(command.get("kind"), str):
+        return "command.kind is not a string"
+    if not isinstance(command.get("arguments"), dict):
+        return "command.arguments is not an object"
+    if not isinstance(command.get("repository"), str):
+        return "command.repository is not a string"
+    if command.get("acknowledgement") not in (
+        "accepted",
+        "completed",
+        "superseded",
+        "not_fulfilled",
+    ):
+        return "command.acknowledgement is not a known acknowledgement"
+    if not isinstance(command.get("detail"), str):
+        return "command.detail is not a string"
+    if "\n" in command.get("detail", ""):
+        return "command.detail carries a line break"
+    if not isinstance(command.get("created_at"), str):
+        return "command.created_at is not a string"
+    if not isinstance(command.get("updated_at"), str):
+        return "command.updated_at is not a string"
+    return None
+
+
+def _send_contract_mutation(
+    op: str, request_id: str, expect_repo: str
+) -> dict:
+    """Send one contract mutation; raise :class:`_Unreachable`/`_EngineFailed`."""
+
+    try:
+        return send_request(
+            resolve_socket_path(),
+            {
+                "op": op,
+                "request_id": request_id,
+                "expect_repo": expect_repo,
+                "contract": True,
+            },
+            timeout=SOCKET_TIMEOUT_SECONDS,
+        )
+    except UnreadableReplyError as error:
+        raise _EngineFailed(
+            f"the agent process answered but the reply could not be used: {error}"
+        ) from error
+    except ControlUnavailableError as error:
+        raise _Unreachable(str(error)) from error
+
+
+def _send_contract_command(request_id: str) -> dict:
+    """Send one contract ``command`` lookup; raise on transport failure."""
+
+    try:
+        return send_request(
+            resolve_socket_path(),
+            {"op": "command", "request_id": request_id, "contract": True},
+            timeout=SOCKET_TIMEOUT_SECONDS,
+        )
+    except UnreadableReplyError as error:
+        raise _EngineFailed(
+            f"the agent process answered but the reply could not be used: {error}"
+        ) from error
+    except ControlUnavailableError as error:
+        raise _Unreachable(str(error)) from error
 
 
 # ---------------------------------------------------------------------------
@@ -966,6 +1072,204 @@ def _run_attempts_show(parsed: ParsedOperation) -> int:
 
 
 # ---------------------------------------------------------------------------
+# Contract mutation runners (stop, resume) and command lookup
+# ---------------------------------------------------------------------------
+
+
+def _mutation_error(
+    parsed: ParsedOperation, reply: dict
+) -> int:
+    """Map one answered contract rejection to its error code and exit."""
+
+    kind = reply.get("error_kind")
+    message = str(reply.get("error", "the agent process refused the command"))
+    repository = reply.get("repository")
+    details: dict | None = None
+    raw_details = reply.get("details")
+    if isinstance(raw_details, dict):
+        details = dict(raw_details)
+    if kind == "repository_mismatch":
+        resolved = dict(details) if details is not None else {}
+        resolved.setdefault("repository", repository)
+        return _emit_error(
+            code="repository_mismatch",
+            message=message,
+            exit_code=EXIT_REJECTED,
+            retryable=False,
+            request_id=parsed.request_id,
+            details=resolved,
+        )
+    if kind == "payload_mismatch":
+        return _emit_error(
+            code="payload_mismatch",
+            message=message,
+            exit_code=EXIT_REJECTED,
+            retryable=False,
+            request_id=parsed.request_id,
+            details=details,
+        )
+    if kind == "invalid_argument":
+        return _emit_error(
+            code="invalid_argument",
+            message=message,
+            exit_code=EXIT_REJECTED,
+            retryable=False,
+            request_id=parsed.request_id,
+            details=details,
+        )
+    if kind == "rejected":
+        return _emit_error(
+            code="rejected",
+            message=message,
+            exit_code=EXIT_REJECTED,
+            retryable=False,
+            request_id=parsed.request_id,
+            details=details,
+        )
+    if kind == "internal":
+        stored: dict | None = None
+        if reply.get("stored") is False:
+            stored = {"stored": False}
+        elif isinstance(details, dict) and details.get("stored") is False:
+            stored = {"stored": False}
+        return _emit_error(
+            code="internal",
+            message=message,
+            exit_code=EXIT_INTERNAL,
+            retryable=True,
+            request_id=parsed.request_id,
+            details=stored,
+        )
+    # No machine-readable kind: an engine exception of unknown shape.
+    return _emit_error(
+        code="internal",
+        message=message,
+        exit_code=EXIT_INTERNAL,
+        retryable=True,
+        request_id=parsed.request_id,
+        details={"stored": False} if reply.get("stored") is False else None,
+    )
+
+
+def _run_contract_mutation(parsed: ParsedOperation, op: str) -> int:
+    """Serve one contract ``stop``/``resume`` through the control socket."""
+
+    assert parsed.request_id is not None and parsed.expect_repo is not None
+    try:
+        reply = _send_contract_mutation(op, parsed.request_id, parsed.expect_repo)
+    except _Unreachable:
+        return _emit_error(
+            code="agent_unreachable",
+            message=(
+                "cannot reach the agent process; the outcome is unknown,"
+                " retry with the same request ID"
+            ),
+            exit_code=EXIT_AGENT_UNREACHABLE,
+            retryable=True,
+            request_id=parsed.request_id,
+        )
+    except _EngineFailed as error:
+        return _emit_error(
+            code="internal",
+            message=f"the agent process could not serve '{parsed.name}': {error}",
+            exit_code=EXIT_INTERNAL,
+            retryable=True,
+            request_id=parsed.request_id,
+            details={"stored": False},
+        )
+    if not reply.get("ok"):
+        return _mutation_error(parsed, reply)
+    command = reply.get("command")
+    problem = _command_problem(command)
+    if problem is not None:
+        return _emit_error(
+            code="internal",
+            message=(
+                f"the agent process answered malformed contract command: {problem}"
+            ),
+            exit_code=EXIT_INTERNAL,
+            retryable=True,
+            request_id=parsed.request_id,
+        )
+    assert isinstance(command, dict)
+    replayed = reply.get("replayed")
+    if not isinstance(replayed, bool):
+        return _emit_error(
+            code="internal",
+            message="the agent process answered malformed contract command:"
+            " replayed is not a boolean",
+            exit_code=EXIT_INTERNAL,
+            retryable=True,
+            request_id=parsed.request_id,
+        )
+    return _emit_ok({"command": command, "replayed": replayed})
+
+
+def _run_contract_command(request_id: str) -> int:
+    """Serve one contract ``command`` lookup through the control socket."""
+
+    try:
+        reply = _send_contract_command(request_id)
+    except _Unreachable:
+        return _emit_error(
+            code="agent_unreachable",
+            message="cannot reach the agent process",
+            exit_code=EXIT_AGENT_UNREACHABLE,
+            retryable=True,
+        )
+    except _EngineFailed as error:
+        return _emit_error(
+            code="internal",
+            message=f"the agent process could not serve 'command': {error}",
+            exit_code=EXIT_INTERNAL,
+            retryable=True,
+            details={"stored": False},
+        )
+    if not reply.get("ok"):
+        kind = reply.get("error_kind")
+        message = str(reply.get("error", "command lookup is unavailable"))
+        if kind == "not_found":
+            return _emit_error(
+                code="not_found",
+                message=message,
+                exit_code=EXIT_NOT_FOUND,
+                retryable=False,
+            )
+        if kind == "invalid_argument":
+            return _emit_error(
+                code="invalid_argument",
+                message=message,
+                exit_code=EXIT_REJECTED,
+                retryable=False,
+            )
+        stored: dict | None = None
+        if reply.get("stored") is False:
+            stored = {"stored": False}
+        return _emit_error(
+            code="internal",
+            message=message,
+            exit_code=EXIT_INTERNAL,
+            retryable=True,
+            details=stored,
+        )
+    command = reply.get("command")
+    problem = _command_problem(command)
+    if problem is not None:
+        return _emit_error(
+            code="internal",
+            message=(
+                f"the agent process answered malformed contract command: {problem}"
+            ),
+            exit_code=EXIT_INTERNAL,
+            retryable=True,
+        )
+    assert isinstance(command, dict)
+    return _emit_ok({"command": command})
+
+
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
@@ -1079,6 +1383,12 @@ def main(argv: list[str]) -> int:
         return _run_attempts_list(parsed)
     if parsed.name == "attempts show":
         return _run_attempts_show(parsed)
+    if parsed.name == "stop":
+        return _run_contract_mutation(parsed, "stop")
+    if parsed.name == "resume":
+        return _run_contract_mutation(parsed, "resume")
+    if parsed.name == "command":
+        return _run_contract_command(parsed.args["request_id"])
     # Later tickets project each remaining operation onto the contract's
     # shared types (command records, attempt archives). Until then the
     # grammar and checks above are in place and the operation answers

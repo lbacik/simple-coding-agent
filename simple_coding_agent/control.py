@@ -1334,6 +1334,38 @@ class ControlStore:
         except sqlite3.Error as error:
             raise ControlStoreError("Control command could not be read") from error
 
+    def get_command_with_payload(
+        self, request_id: str
+    ) -> tuple[CommandRecord, dict] | None:
+        """Return one durable record with its canonical payload, if recorded.
+
+        Read-only like :meth:`get_command`: it opens a fresh SQLite
+        connection without taking the store lock, so a contract ``command``
+        lookup answers while a mutating submit holds the control lock. The
+        payload is the stored canonical arguments (``after``, ``issue``,
+        ``attempt_id``, ``saved_at``) the contract CommandRecord projects.
+        """
+
+        try:
+            with self._connect() as connection:
+                row = connection.execute(
+                    "SELECT request_id, sequence, kind, acknowledgement, detail,"
+                    " created_at, updated_at, payload FROM commands"
+                    " WHERE request_id = ?",
+                    (request_id,),
+                ).fetchone()
+        except sqlite3.Error as error:
+            raise ControlStoreError("Control command could not be read") from error
+        if row is None:
+            return None
+        try:
+            payload = json.loads(row[7])
+        except (TypeError, ValueError) as error:
+            raise ControlStoreError("Control command is malformed") from error
+        if not isinstance(payload, dict):
+            raise ControlStoreError("Control command is malformed")
+        return (self._record_from_row(row[:7]), payload)
+
     def recent_commands(self, limit: int = 10) -> list[CommandRecord]:
         """Return the most recently committed commands, newest last."""
 
