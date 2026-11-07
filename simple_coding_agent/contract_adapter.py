@@ -709,6 +709,81 @@ def _identity_problem(identity: object) -> str | None:
 
 
 # ---------------------------------------------------------------------------
+# Contract status
+# ---------------------------------------------------------------------------
+
+
+_STATUS_RESULT_KEYS = frozenset(
+    {
+        "generated_at",
+        "identity",
+        "instance",
+        "intake",
+        "current_attempt",
+        "last_finished",
+        "recent_commands",
+        "recent_events",
+        "truncated",
+    }
+)
+
+
+def _fetch_status() -> dict:
+    """Read the engine's contract status; raise :class:`_Unreachable`/`_EngineFailed`."""
+
+    try:
+        reply = send_request(
+            resolve_socket_path(), {"op": "contract_status"}, timeout=SOCKET_TIMEOUT_SECONDS
+        )
+    except UnreadableReplyError as error:
+        raise _EngineFailed(
+            f"the agent process answered but the reply could not be used: {error}"
+        ) from error
+    except ControlUnavailableError as error:
+        raise _Unreachable(str(error)) from error
+    if not reply.get("ok"):
+        raise _EngineFailed(str(reply.get("error", "contract status is unavailable")))
+    status = reply.get("contract_status")
+    problem = _status_problem(status)
+    if problem is not None:
+        raise _EngineFailed(
+            f"the agent process answered malformed contract status: {problem}"
+        )
+    assert isinstance(status, dict)
+    return status
+
+
+def _status_problem(status: object) -> str | None:
+    """Name the first malformation of an engine contract status, if any."""
+
+    if not isinstance(status, dict):
+        return "status is not an object"
+    missing = _STATUS_RESULT_KEYS - set(status)
+    if missing:
+        return f"status is missing keys: {sorted(missing)}"
+    if not isinstance(status.get("generated_at"), str):
+        return "status.generated_at is not a string"
+    for key in ("identity", "instance", "intake"):
+        if not isinstance(status.get(key), dict):
+            return f"status.{key} is not an object"
+    if status.get("current_attempt") is not None and not isinstance(
+        status.get("current_attempt"), dict
+    ):
+        return "status.current_attempt is not an object or null"
+    if status.get("last_finished") is not None and not isinstance(
+        status.get("last_finished"), dict
+    ):
+        return "status.last_finished is not an object or null"
+    if not isinstance(status.get("recent_commands"), list):
+        return "status.recent_commands is not a list"
+    if not isinstance(status.get("recent_events"), list):
+        return "status.recent_events is not a list"
+    if not isinstance(status.get("truncated"), bool):
+        return "status.truncated is not a boolean"
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
@@ -816,10 +891,12 @@ def main(argv: list[str]) -> int:
             retryable=False,
             request_id=_request_id_for_error(parsed),
         )
-    # Later tickets project each operation onto the contract's shared
-    # types (status snapshot, command records, attempt archives). Until
-    # then the grammar and checks above are in place and the operation
-    # answers ``unsupported`` without storing anything.
+    if parsed.name == "status":
+        return _run_status()
+    # Later tickets project each remaining operation onto the contract's
+    # shared types (command records, attempt archives). Until then the
+    # grammar and checks above are in place and the operation answers
+    # ``unsupported`` without storing anything.
     return _unsupported(
         parsed.name,
         capability=parsed.capability,
@@ -877,6 +954,29 @@ def _run_identity() -> int:
             "repository": identity["repository"],
         }
     )
+
+
+def _run_status() -> int:
+    """Serve ``status`` from the engine's prepared-state projection."""
+
+    try:
+        status = _fetch_status()
+    except _Unreachable:
+        return _emit_error(
+            code="agent_unreachable",
+            message="cannot reach the agent process",
+            exit_code=EXIT_AGENT_UNREACHABLE,
+            retryable=True,
+        )
+    except _EngineFailed as error:
+        return _emit_error(
+            code="internal",
+            message=f"the agent process could not serve 'status': {error}",
+            exit_code=EXIT_INTERNAL,
+            retryable=True,
+            details={"stored": False},
+        )
+    return _emit_ok(status)
 
 
 if __name__ == "__main__":  # pragma: no cover - exercised via agentctl.main

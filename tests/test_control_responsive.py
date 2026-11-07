@@ -19,6 +19,12 @@ class _StubTelemetry:
     def snapshot(self, control):  # type: ignore[no-untyped-def]
         return {"control": control.telemetry_control_snapshot()}
 
+    def contract_source(self):  # type: ignore[no-untyped-def]
+        return {"seed": None, "configured": {}, "view": None, "last_finished": None}
+
+    def contract_current_attempt(self):  # type: ignore[no-untyped-def]
+        return None
+
 
 def _make_lifecycle(tmp_path: Path, **kwargs):  # type: ignore[no-untyped-def]
     from simple_coding_agent.lifecycle import AgentLifecycle
@@ -133,6 +139,40 @@ def test_telemetry_and_command_answer_while_submit_waits_on_control_lock(
         assert committed["ok"] is True
         assert committed["command"] is not None
         assert committed["command"]["request_id"] == "req-waiting"
+    finally:
+        server.stop()
+
+
+def test_identity_and_contract_status_answer_while_lock_is_held(
+    tmp_path: Path,
+) -> None:
+    lifecycle, _ = _make_lifecycle(tmp_path)
+    socket_path = tmp_path / "state" / "agentctl.sock"
+    server = ControlServer(socket_path, lifecycle)  # type: ignore[arg-type]
+    server.start()
+    try:
+        # Prime the cached contract snapshot so the bounded fallback has
+        # something to serve while the lock is held.
+        primed = send_request(socket_path, {"op": "contract_status"}, timeout=10)
+        assert primed["ok"] is True
+
+        lock = lifecycle._control_lock  # noqa: SLF001 - hold it as the intake claim does
+        lock.acquire()
+        try:
+            start = time.monotonic()
+            identity = send_request(socket_path, {"op": "identity"}, timeout=10)
+            identity_elapsed = time.monotonic() - start
+            assert identity["ok"] is True
+            assert identity_elapsed < 3
+
+            start = time.monotonic()
+            status = send_request(socket_path, {"op": "contract_status"}, timeout=10)
+            status_elapsed = time.monotonic() - start
+            assert status["ok"] is True
+            assert status["contract_status"]["instance"]["state"] == "idle"
+            assert status_elapsed < 3
+        finally:
+            lock.release()
     finally:
         server.stop()
 

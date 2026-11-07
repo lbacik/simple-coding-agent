@@ -206,8 +206,8 @@ def project_intake(
         kind = getattr(pending_record, "kind", None)
         if kind in _PENDING_STOP_KINDS:
             pending_stop = {
-                "request_id": getattr(pending_record, "request_id"),
-                "sequence": getattr(pending_record, "sequence"),
+                "request_id": pending_record.request_id,
+                "sequence": pending_record.sequence,
             }
     plan: dict | None = None
     if stop_plan is not None:
@@ -463,15 +463,15 @@ def project_command(record: object, payload: dict, *, repository: str) -> dict:
         key: payload[key] for key in keys if key in payload
     }
     return {
-        "request_id": getattr(record, "request_id"),
-        "sequence": getattr(record, "sequence"),
+        "request_id": record.request_id,
+        "sequence": record.sequence,
         "kind": kind,
         "arguments": arguments,
         "repository": repository,
         "acknowledgement": _ACKNOWLEDGEMENTS.get(acknowledgement, acknowledgement),
         "detail": _one_line(getattr(record, "detail", "")),
-        "created_at": getattr(record, "created_at"),
-        "updated_at": getattr(record, "updated_at"),
+        "created_at": record.created_at,
+        "updated_at": record.updated_at,
     }
 
 
