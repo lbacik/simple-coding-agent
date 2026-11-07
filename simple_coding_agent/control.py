@@ -1350,6 +1350,40 @@ class ControlStore:
                 raise ControlStoreError("Control commands could not be read") from error
         return [self._record_from_row(row) for row in reversed(rows)]
 
+    def recent_command_details(
+        self, limit: int = 20
+    ) -> list[tuple[CommandRecord, dict]]:
+        """Return recent commands with their canonical payloads, newest last.
+
+        The contract ``status`` projects each command with its ``arguments``
+        (the stored canonical payload: ``after``, ``issue``, ``attempt_id``,
+        ``saved_at``), so it needs the payload the :class:`CommandRecord`
+        alone does not carry. Read-only: a single query under the store lock,
+        like :meth:`recent_commands`.
+        """
+
+        with self.lock:
+            try:
+                with self._connect() as connection:
+                    rows = connection.execute(
+                        "SELECT request_id, sequence, kind, acknowledgement, detail,"
+                        " created_at, updated_at, payload FROM commands"
+                        " ORDER BY sequence DESC LIMIT ?",
+                        (limit,),
+                    ).fetchall()
+            except sqlite3.Error as error:
+                raise ControlStoreError("Control commands could not be read") from error
+        details: list[tuple[CommandRecord, dict]] = []
+        for row in reversed(rows):
+            try:
+                payload = json.loads(row[7])
+            except (TypeError, ValueError) as error:
+                raise ControlStoreError("Control command is malformed") from error
+            if not isinstance(payload, dict):
+                raise ControlStoreError("Control command is malformed")
+            details.append((self._record_from_row(row[:7]), payload))
+        return details
+
     # -- intake -----------------------------------------------------------
 
     def intake_state(self) -> IntakeState:

@@ -724,10 +724,12 @@ class TelemetryReporter:
         turns_max: int | None = None,
         timeout_seconds: int | None = None,
         continuation_max: int | None = None,
+        usd_ceiling: int | None = None,
         max_budget_tokens: int | None = None,
         max_turns: int | None = None,
         model_timeout: int | None = None,
         max_auto_continuations: int | None = None,
+        max_budget_usd: int | None = None,
         cache_min_measured_responses: int = CACHE_MIN_MEASURED_RESPONSES,
         recent_events: RecentEventsBuffer | None = None,
     ) -> None:
@@ -752,6 +754,7 @@ class TelemetryReporter:
             "continuation_max": (
                 continuation_max if continuation_max is not None else max_auto_continuations
             ),
+            "usd_ceiling": usd_ceiling if usd_ceiling is not None else max_budget_usd,
         }
         self._current_seed: dict | None = None
         self._last_good_current: dict | None = None
@@ -853,6 +856,67 @@ class TelemetryReporter:
             logger.warning(
                 "telemetry publish_attempt_view failed: %s; keeping previous view", error
             )
+
+    def contract_source(self) -> dict:
+        """Return detached claim-time and live pieces for the contract ``status``.
+
+        The contract projection (budget, figures, last finished) is built from
+        these prepared values without touching the token ledger, the tracker,
+        or the workspace: the normalized claim ``seed`` (or ``None`` before
+        the first claim), the configured ceilings, the latest published live
+        ``view`` (or ``None`` until the executor publishes), and the stored
+        ``last_finished`` summary (or ``None``). Never raises: a failure
+        yields all-``None`` pieces so the projection degrades to
+        ``unavailable`` figures instead of failing the read.
+        """
+
+        try:
+            with self._attempt_lock:
+                seed = copy.deepcopy(self._current_seed) if self._current_seed is not None else None
+                configured = dict(self._configured)
+                last_finished = (
+                    copy.deepcopy(self._last_finished)
+                    if self._last_finished is not None
+                    else None
+                )
+            with self._attempt_view_lock:
+                view = copy.deepcopy(self._attempt_view) if self._attempt_view is not None else None
+        except Exception:
+            return {"seed": None, "configured": {}, "view": None, "last_finished": None}
+        return {
+            "seed": seed,
+            "configured": configured,
+            "view": view,
+            "last_finished": last_finished,
+        }
+
+    def contract_current_attempt(self) -> dict | None:
+        """Return the telemetry-shaped current-attempt section for contract status.
+
+        The contract projection maps this section (claim identity, budget,
+        turns, cache, context and timeout figures) onto the Status
+        Snapshot's ``current_attempt`` without touching the token ledger.
+        A build failure keeps the last good section, like :meth:`snapshot`;
+        with no seed (or no good section yet) this returns ``None`` and the
+        projection degrades to ``unavailable`` figures.
+        """
+
+        try:
+            current = self._build_current_attempt()
+        except Exception as error:
+            with self._attempt_lock:
+                if not self._build_failed_logged:
+                    self._build_failed_logged = True
+                    logger.warning(
+                        "telemetry current_attempt build failed: %s; keeping previous view",
+                        error,
+                    )
+                current = copy.deepcopy(self._last_good_current) if self._last_good_current is not None else None
+        else:
+            with self._attempt_lock:
+                self._build_failed_logged = False
+                self._last_good_current = copy.deepcopy(current) if current is not None else None
+        return current
 
     def snapshot(self, control: TelemetryControl) -> dict:
         """Build one schema-v1 snapshot; raise when the control section is missing.
