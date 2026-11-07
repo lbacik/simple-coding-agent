@@ -5862,22 +5862,30 @@ class AgentLifecycle:
         The sealing record (frozen manifest plus ``sealed_at``) lands
         atomically after the checkpoint removal, then the ``sealed``
         Contract Event follows with the explicit Attempt ID. An already
-        Sealed archive is left untouched and never re-announced, so
-        recovering a Sealed attempt writes nothing. A seal failure logs
+        Sealed archive (a readable sealing record) is left untouched and
+        never re-announced, so recovering a Sealed attempt writes nothing.
+        A corrupt ``sealing.json`` reads as unsealed, so recovery re-seals
+        (repairing the record) and announces. A seal failure logs
         one WARNING and leaves the archive unsealed.
         """
 
         if archive is None:
             return
         try:
-            already = archive.is_sealed()
+            from simple_coding_agent import attempt_history as attempt_history_module
+
+            already = (
+                attempt_history_module.read_sealing_record(archive.directory)
+                is not None
+            )
         except Exception:
-            already = False
+            try:
+                already = archive.is_sealed()
+            except Exception:
+                already = False
         if already:
             return
         try:
-            from simple_coding_agent import attempt_history as attempt_history_module
-
             sealed = attempt_history_module.seal_archive(archive.directory)
         except Exception:
             sealed = None

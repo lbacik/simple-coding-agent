@@ -193,6 +193,30 @@ def test_reseal_writes_nothing_and_announces_nothing(tmp_path: Path) -> None:
     assert [event for event in _events if event[0] == "sealed"] == []
 
 
+def test_corrupt_seal_is_repaired_and_announced_on_recovery(
+    tmp_path: Path,
+) -> None:
+    """A corrupt ``sealing.json`` reads as unsealed, so recovery re-seals."""
+
+    archive = _write_attempt(tmp_path, outcome="complete")
+    assert seal_archive(archive.directory) is not None
+    (archive.directory / SEALING_FILENAME).write_text("{not json", encoding="utf-8")
+    assert read_sealing_record(archive.directory) is None
+
+    lifecycle, _events = _sealing_lifecycle(tmp_path)
+    lifecycle._seal_archive_and_emit(  # noqa: SLF001 - recovery seam
+        archive, ATTEMPT_ID, issue_number=41
+    )
+
+    repaired = read_sealing_record(archive.directory)
+    assert repaired is not None
+    assert isinstance(repaired["sealed_at"], str) and repaired["sealed_at"]
+    assert [event for event in _events if event[0] == "sealed"] == [
+        ("sealed", ATTEMPT_ID)
+    ]
+    assert show_attempt(tmp_path, ATTEMPT_ID)["attempt"]["sealed"] is True
+
+
 def test_private_state_never_appears_in_manifest_or_export(
     tmp_path: Path,
 ) -> None:
