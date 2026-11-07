@@ -383,6 +383,13 @@ def _repo_root() -> Path:
     return Path(__file__).resolve().parent.parent
 
 
+#: Engine processes spawned by this process, by pid. Keeping the handle
+#: lets us reap an exited engine (``Popen.poll``) instead of mistaking its
+#: zombie for a live engine. Separate CLI invocations are different
+#: processes, so their engines are never in this table (init reaps those).
+_SPAWNED: dict[int, subprocess.Popen] = {}
+
+
 def _spawn_daemon(root: Path, repository: str) -> int:
     """Start the fakes-wired engine; return its pid."""
 
@@ -405,6 +412,7 @@ def _spawn_daemon(root: Path, repository: str) -> int:
         )
     finally:
         log_file.close()
+    _SPAWNED[process.pid] = process
     return process.pid
 
 
@@ -441,6 +449,26 @@ def _stop_daemon(root: Path, *, kill: bool = False, timeout: float = 15.0) -> bo
 
 
 def _pid_gone(pid: int) -> bool:
+    # Reap our own exited engines first: a zombie is still signalable, so
+    # ``kill(pid, 0)`` alone reports it alive and every stop/halt wait burns
+    # its full timeout. Engines spawned by a different CLI process are not
+    # our children (``waitpid`` raises ``ChildError``); those fall through
+    # to the signal probe and are reaped by init once orphaned.
+    handle = _SPAWNED.get(pid)
+    if handle is not None:
+        if handle.poll() is None:
+            return False
+        _SPAWNED.pop(pid, None)
+        return True
+    try:
+        done, _ = os.waitpid(pid, os.WNOHANG)
+    except ChildError:
+        pass
+    except OSError:
+        return True
+    else:
+        if done == pid:
+            return True
     try:
         os.kill(pid, 0)
     except OSError:

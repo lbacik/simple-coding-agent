@@ -15,8 +15,6 @@ import os
 import time
 from pathlib import Path
 
-import pytest
-
 from conformance_harness import harness as harness_module
 from conformance_harness.harness import HARNESS_VERSION, run_harness
 
@@ -224,8 +222,17 @@ def _wait_for_state(socket: Path, wanted: str, timeout: float = 60.0) -> dict:
     raise AssertionError(f"status never reached {wanted!r}; last={last!r}")
 
 
-def _agentctl(socket: Path, *tokens: str, data_dir: Path | None = None) -> int:
-    """Run the real contract CLI against the harness engine."""
+def _agentctl(
+    socket: Path, *tokens: str, data_dir: Path | None = None
+) -> tuple[int, str]:
+    """Run the real contract CLI against the harness engine.
+
+    Returns the exit code and the captured stdout (the contract envelope),
+    so offline reads can assert on their content.
+    """
+
+    import io
+    from contextlib import redirect_stdout
 
     from simple_coding_agent import agentctl
 
@@ -235,7 +242,10 @@ def _agentctl(socket: Path, *tokens: str, data_dir: Path | None = None) -> int:
     if data_dir is not None:
         os.environ["DATA_DIR"] = str(data_dir)
     try:
-        return agentctl.main(["--contract", "1", *tokens])
+        buffer = io.StringIO()
+        with redirect_stdout(buffer):
+            code = agentctl.main(["--contract", "1", *tokens])
+        return code, buffer.getvalue()
     finally:
         if old_socket is None:
             os.environ.pop("AGENTCTL_SOCKET", None)
@@ -245,6 +255,15 @@ def _agentctl(socket: Path, *tokens: str, data_dir: Path | None = None) -> int:
             os.environ.pop("DATA_DIR", None)
         else:
             os.environ["DATA_DIR"] = old_data
+
+
+def _agentctl_json(
+    socket: Path, *tokens: str, data_dir: Path | None = None
+) -> tuple[int, dict]:
+    """Run the contract CLI and parse its stdout envelope as JSON."""
+
+    code, output = _agentctl(socket, *tokens, data_dir=data_dir)
+    return code, json.loads(output)
 
 
 def test_harness_smoke_reaches_every_state(tmp_path: Path) -> None:
@@ -283,6 +302,15 @@ def test_harness_smoke_reaches_every_state(tmp_path: Path) -> None:
     assert snapshot["intake"]["state"] == "open"
     assert snapshot["current_attempt"] is None
 
+    # -- offline while live: a held volume rejects the read ----------------
+    code, offline = _agentctl_json(
+        socket, "--offline", "status", data_dir=root / "instance"
+    )
+    assert code != 0
+    assert offline["ok"] is False
+    assert offline["error"]["code"] == "rejected"
+    assert offline["error"]["details"]["reason"] == "instance_running"
+
     # -- active: hold after the claim, then make an issue eligible ---------
     assert call("hold", {"point": "after-claim"})["attempt_id"] is None
     assert call("set-issue", {"issue": 7, "eligible": True}) == {
@@ -298,18 +326,29 @@ def test_harness_smoke_reaches_every_state(tmp_path: Path) -> None:
     assert held["attempt_id"] == attempt_id
 
     # -- draining: close intake while the attempt is held ------------------
-    assert _agentctl(
+    code, _ = _agentctl(
         socket, "stop", "--request-id", "req-smoke-stop-1",
         "--expect-repo", "octo/example",
-    ) == 0
+    )
+    assert code == 0
     snapshot = _wait_for_state(socket, "draining")
     assert snapshot["intake"]["state"] == "closed"
 
-    # -- idle-through-pause: release the hold and finish the attempt --------
-    assert call("release", {}) == {"released": True}
+    # -- finish: the held attempt cannot finish on its own, so finish-attempt
+    #    (which releases the hold itself) is race-free ---------------------
     finished = call("finish-attempt", {"native_outcome": "complete"})
     assert finished["attempt_id"] == attempt_id
     assert finished["native_outcome"] == "complete"
+
+    # The release verb on a before-claim hold (no timing involved).
+    assert call("hold", {"point": "before-claim"})["attempt_id"] is None
+    assert call("release", {}) == {"released": True}
+
+    # Withdraw the issue so the later idle is stable (no re-claim churn).
+    assert call("set-issue", {"issue": 7, "eligible": False}) == {
+        "issue": 7,
+        "eligible": False,
+    }
 
     # -- paused: intake closed, no active attempt ---------------------------
     snapshot = _wait_for_state(socket, "paused")
@@ -318,9 +357,16 @@ def test_harness_smoke_reaches_every_state(tmp_path: Path) -> None:
 
     # -- offline stopped: the stopped volume reads without the engine -------
     assert call("stop-container", {}) == {"running": False}
-    assert _agentctl(
+    code, offline = _agentctl_json(
         socket, "--offline", "status", data_dir=root / "instance"
-    ) == 0
+    )
+    assert code == 0, offline
+    assert offline["ok"] is True
+    stopped = offline["result"]
+    assert stopped["instance"]["state"] == "paused"
+    assert stopped["instance"]["last_halt"] is None
+    assert stopped["intake"]["state"] == "closed"
+    assert stopped["current_attempt"] is None
 
     # -- recovering: an unreadable checkpoint holds intake for recovery ----
     assert call("start-container", {}) == {"running": True}
@@ -337,17 +383,24 @@ def test_harness_smoke_reaches_every_state(tmp_path: Path) -> None:
     snapshot = _wait_for_state(socket, "paused")
 
     # -- idle again after reopening intake ----------------------------------
-    assert _agentctl(
+    code, _ = _agentctl(
         socket, "resume", "--request-id", "req-smoke-resume-1",
         "--expect-repo", "octo/example",
-    ) == 0
+    )
+    assert code == 0
     _wait_for_state(socket, "idle")
 
     # -- halted: the engine records its halt and exits by decision ----------
     assert call("halt", {"reason": "harness-smoke"}) == {"reason": "harness-smoke"}
-    assert _agentctl(
+    code, offline = _agentctl_json(
         socket, "--offline", "status", data_dir=root / "instance"
-    ) == 0
+    )
+    assert code == 0, offline
+    assert offline["ok"] is True
+    halted = offline["result"]
+    assert halted["instance"]["state"] == "paused"
+    assert halted["instance"]["last_halt"]["reason"] == "harness-smoke"
+    assert halted["current_attempt"] is None
 
     # -- teardown removes the instance --------------------------------------
     code, reply = invoke("teardown", request("teardown", {}), state_dir=root)
