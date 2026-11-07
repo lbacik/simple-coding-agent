@@ -25,9 +25,16 @@ import sys
 from datetime import UTC, datetime
 from pathlib import Path
 
+from simple_coding_agent.agent_version import agent_version
 from simple_coding_agent.attempt_state import AttemptStateStore
 from simple_coding_agent.command_runner import CommandRunner
 from simple_coding_agent.completion import CompletionEvaluator, VerificationRunner
+from simple_coding_agent.contract_events import (
+    ContractEventsBuffer,
+    halted_detail,
+    process_started_detail,
+    startup_check_detail,
+)
 from simple_coding_agent.config import (
     EXPECTED_CLAUDE_AGENT_SDK_VERSION,
     RuntimeConfig,
@@ -86,6 +93,48 @@ def _acquire_volume_lock(data_dir: Path) -> VolumeLock:
     return lock
 
 
+def emit_process_started(logger: JsonEventLogger) -> None:
+    """Emit the ``process_started`` native event for the contract projection."""
+
+    try:
+        logger.emit(
+            "process_started",
+            phase="startup",
+            detail=process_started_detail(agent_version()),
+        )
+    except Exception:
+        pass
+
+
+def emit_startup_check(logger: JsonEventLogger, check: str, result: str) -> None:
+    """Emit one ``startup_check`` native event (result started/ok/skipped/failed)."""
+
+    try:
+        level = "ERROR" if result == "failed" else "INFO"
+        logger.emit(
+            "startup_check",
+            phase="startup",
+            detail=startup_check_detail(check, result),
+            level=level,
+        )
+    except Exception:
+        pass
+
+
+def emit_halted(logger: JsonEventLogger, reason: str) -> None:
+    """Emit the ``halted`` native event for an engine-decided exit."""
+
+    try:
+        logger.emit(
+            "halted",
+            phase="startup",
+            detail=halted_detail(reason),
+            level="ERROR",
+        )
+    except Exception:
+        pass
+
+
 def _record_startup_halt(halt_store: HaltStore | None, reason: str, detail: str) -> None:
     """Best-effort durable halt before an engine-decided exit (never raises)."""
 
@@ -126,12 +175,16 @@ def main() -> None:
         return archive_factory(issue_number, checkpoint.started_at)
 
     recent_events = RecentEventsBuffer()
+    contract_events = ContractEventsBuffer()
     logger = JsonEventLogger(
         sys.stdout,
         redactions=config.credential_redactions,
         attempt_sink=_attempt_sink,
         recent_events=recent_events,
+        contract_events=contract_events,
     )
+    emit_process_started(logger)
+    emit_startup_check(logger, "provenance", "started")
     # Early construction that needs no provenance, so the control endpoint
     # can serve ``starting`` while provenance verification runs.
     github = GitHubGraphQLTransport(config.github_token, max_retries=config.max_retries)
@@ -193,6 +246,7 @@ def main() -> None:
         attempt_archive_factory=archive_factory,
         completion_store=AttemptCompletionStore(config.data_dir),
         control_store=control_store,
+        contract_events=contract_events,
         repository=config.target_repo,
         telemetry=None,
         data_dir=config.data_dir,
@@ -229,8 +283,11 @@ def main() -> None:
         except ProvenanceError as error:
             detail = str(error)
             _record_startup_halt(halt_store, HALT_PROVENANCE_FAILED, detail)
+            emit_startup_check(logger, "provenance", "failed")
+            emit_halted(logger, HALT_PROVENANCE_FAILED)
             logger.emit("provenance_verification_failed", phase="startup", detail=detail, level="ERROR")
             raise SystemExit(1) from None
+        emit_startup_check(logger, "provenance", "ok")
         logger.emit(
             "provenance_verified",
             phase="startup",
@@ -313,6 +370,7 @@ def _start_control_endpoint(
         _record_startup_halt(
             halt_store, HALT_CONTROL_ENDPOINT_UNAVAILABLE, detail
         )
+        emit_halted(logger, HALT_CONTROL_ENDPOINT_UNAVAILABLE)
         logger.emit(
             "control_endpoint_unavailable",
             phase="startup",
