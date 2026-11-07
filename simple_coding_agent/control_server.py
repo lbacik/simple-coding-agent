@@ -345,6 +345,7 @@ class ControlServer:
             rejected=(RequestIdError, PayloadMismatchError),
             repository=self._repository(),
             check_expect_repo=True,
+            control=self._control,
         )
 
     def _reply_stop_after(self, connection: socket.socket, request: dict) -> None:
@@ -362,6 +363,7 @@ class ControlServer:
             rejected=(RequestIdError, PayloadMismatchError, StopAfterRejectedError),
             repository=self._repository(),
             check_expect_repo=True,
+            control=self._control,
         )
 
     def _reply_next_issue(self, connection: socket.socket, request: dict) -> None:
@@ -379,6 +381,7 @@ class ControlServer:
             rejected=(RequestIdError, PayloadMismatchError, NextIssueRejectedError),
             repository=self._repository(),
             check_expect_repo=True,
+            control=self._control,
         )
 
     def _reply_resume(self, connection: socket.socket, request: dict) -> None:
@@ -395,6 +398,7 @@ class ControlServer:
             rejected=(RequestIdError, PayloadMismatchError, ResumeBlockedError),
             repository=self._repository(),
             check_expect_repo=True,
+            control=self._control,
         )
 
     def _reply_handoff(self, connection: socket.socket, request: dict) -> None:
@@ -411,6 +415,7 @@ class ControlServer:
             rejected=(RequestIdError, PayloadMismatchError, HandoffRejectedError),
             repository=self._repository(),
             check_expect_repo=True,
+            control=self._control,
         )
 
     def _reply_recovery_retry(self, connection: socket.socket, request: dict) -> None:
@@ -426,6 +431,8 @@ class ControlServer:
             ),
             rejected=(RequestIdError, PayloadMismatchError, RecoveryRejectedError),
             repository=self._repository(),
+            check_expect_repo=True,
+            control=self._control,
         )
 
     def _reply_recovery_release(self, connection: socket.socket, request: dict) -> None:
@@ -442,6 +449,8 @@ class ControlServer:
             ),
             rejected=(RequestIdError, PayloadMismatchError, RecoveryRejectedError),
             repository=self._repository(),
+            check_expect_repo=True,
+            control=self._control,
         )
 
     def _reply_errors_reset(self, connection: socket.socket, request: dict) -> None:
@@ -453,6 +462,8 @@ class ControlServer:
             self._control.submit_errors_reset,
             rejected=(RequestIdError, PayloadMismatchError),
             repository=self._repository(),
+            check_expect_repo=True,
+            control=self._control,
         )
 
     def _reply_identity(self, connection: socket.socket) -> None:
@@ -995,11 +1006,21 @@ def _is_contract_request(request: dict) -> bool:
 def _rejection_kind(error: Exception) -> str:
     """Map one answered rejection to its machine-readable contract kind."""
 
-    from simple_coding_agent.control import PayloadMismatchError, RequestIdError
+    from simple_coding_agent.control import (
+        NextIssueRejectedError,
+        PayloadMismatchError,
+        RequestIdError,
+        StopAfterRejectedError,
+    )
+    from simple_coding_agent.recovery import RecoveryRejectedError
 
     if isinstance(error, PayloadMismatchError):
         return "payload_mismatch"
     if isinstance(error, RequestIdError):
+        return "invalid_argument"
+    if isinstance(
+        error, (StopAfterRejectedError, NextIssueRejectedError, RecoveryRejectedError)
+    ) and str(error).startswith("Invalid"):
         return "invalid_argument"
     return "rejected"
 
@@ -1012,6 +1033,7 @@ def _reply_mutating(
     rejected: tuple[type[Exception], ...],
     repository: str,
     check_expect_repo: bool = False,
+    control: object | None = None,
 ) -> None:
     """Reply to one mutating command with its durable acknowledgement.
 
@@ -1080,7 +1102,9 @@ def _reply_mutating(
         return
     if contract_mode:
         try:
-            existing = submit.__self__.get_command(request_id)  # type: ignore[union-attr]
+            lookup = control if control is not None else getattr(submit, "__self__", None)
+            get_command = getattr(lookup, "get_command", None)
+            existing = get_command(request_id) if callable(get_command) else None
         except Exception:
             existing = None
         replayed_before = existing is not None
@@ -1127,7 +1151,11 @@ def _reply_mutating(
 
         payload_dict: dict = {}
         try:
-            with_payload = submit.__self__.get_command_with_payload(request_id)  # type: ignore[union-attr]
+            lookup = control if control is not None else getattr(submit, "__self__", None)
+            get_with_payload = getattr(lookup, "get_command_with_payload", None)
+            with_payload = (
+                get_with_payload(request_id) if callable(get_with_payload) else None
+            )
         except Exception:
             with_payload = None
         if with_payload is not None:

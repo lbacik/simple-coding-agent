@@ -642,14 +642,25 @@ def _check_values(parsed: ParsedOperation) -> None:
                 " ^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"
             )
     elif parsed.name in ("recovery retry", "recovery release"):
-        if not parsed.args.get("attempt_id"):
+        attempt_id = parsed.args.get("attempt_id")
+        if not attempt_id:
             raise _InvalidArgument(
                 f"invalid attempt ID for '{parsed.name}': must not be empty"
             )
-        if parsed.name == "recovery release" and not parsed.args.get("saved_at"):
+        if len(attempt_id) > 256:
             raise _InvalidArgument(
-                "invalid --saved-at value: must not be empty"
+                f"invalid attempt ID for '{parsed.name}': must be at most 256 characters"
             )
+        if parsed.name == "recovery release":
+            saved_at = parsed.args.get("saved_at")
+            if not saved_at:
+                raise _InvalidArgument(
+                    "invalid --saved-at value: must not be empty"
+                )
+            if len(saved_at) > 1024:
+                raise _InvalidArgument(
+                    "invalid --saved-at value: must be at most 1024 characters"
+                )
 
 
 # ---------------------------------------------------------------------------
@@ -856,19 +867,22 @@ def _command_problem(command: object) -> str | None:
 
 
 def _send_contract_mutation(
-    op: str, request_id: str, expect_repo: str
+    op: str, request_id: str, expect_repo: str, extra: dict | None = None
 ) -> dict:
     """Send one contract mutation; raise :class:`_Unreachable`/`_EngineFailed`."""
 
+    payload = {
+        "op": op,
+        "request_id": request_id,
+        "expect_repo": expect_repo,
+        "contract": True,
+    }
+    if extra:
+        payload.update(extra)
     try:
         return send_request(
             resolve_socket_path(),
-            {
-                "op": op,
-                "request_id": request_id,
-                "expect_repo": expect_repo,
-                "contract": True,
-            },
+            payload,
             timeout=SOCKET_TIMEOUT_SECONDS,
         )
     except UnreadableReplyError as error:
@@ -1151,12 +1165,55 @@ def _mutation_error(
     )
 
 
-def _run_contract_mutation(parsed: ParsedOperation, op: str) -> int:
-    """Serve one contract ``stop``/``resume`` through the control socket."""
+def _mutation_socket_op(parsed: ParsedOperation) -> tuple[str, dict]:
+    """Map one parsed mutation onto its socket operation and payload."""
+
+    if parsed.name == "stop":
+        return "stop", {}
+    if parsed.name == "resume":
+        return "resume", {}
+    if parsed.name == "stop --after":
+        return "stop_after", {"after": int(parsed.args["after"], 10)}
+    if parsed.name == "next issue":
+        return "next_issue", {"issue": int(parsed.args["issue"], 10)}
+    if parsed.name == "handoff now":
+        return "handoff", {}
+    if parsed.name == "recovery retry":
+        return "recovery_retry", {"attempt_id": parsed.args["attempt_id"]}
+    if parsed.name == "recovery release":
+        return (
+            "recovery_release",
+            {
+                "attempt_id": parsed.args["attempt_id"],
+                "saved_at": parsed.args["saved_at"],
+            },
+        )
+    if parsed.name == "errors reset":
+        return "errors_reset", {}
+    raise AssertionError(f"not a contract mutation: {parsed.name}")
+
+
+def _run_contract_mutation(parsed: ParsedOperation, op: str | None = None) -> int:
+    """Serve one contract mutation through the control socket."""
 
     assert parsed.request_id is not None and parsed.expect_repo is not None
+    if op is None:
+        op, extra = _mutation_socket_op(parsed)
+    else:
+        extra = {}
+        if parsed.name == "stop --after":
+            extra = {"after": int(parsed.args["after"], 10)}
+        elif parsed.name == "next issue":
+            extra = {"issue": int(parsed.args["issue"], 10)}
+        elif parsed.name == "recovery retry":
+            extra = {"attempt_id": parsed.args["attempt_id"]}
+        elif parsed.name == "recovery release":
+            extra = {
+                "attempt_id": parsed.args["attempt_id"],
+                "saved_at": parsed.args["saved_at"],
+            }
     try:
-        reply = _send_contract_mutation(op, parsed.request_id, parsed.expect_repo)
+        reply = _send_contract_mutation(op, parsed.request_id, parsed.expect_repo, extra)
     except _Unreachable:
         return _emit_error(
             code="agent_unreachable",
@@ -1387,12 +1444,21 @@ def main(argv: list[str]) -> int:
         return _run_contract_mutation(parsed, "stop")
     if parsed.name == "resume":
         return _run_contract_mutation(parsed, "resume")
+    if parsed.name in (
+        "stop --after",
+        "next issue",
+        "handoff now",
+        "recovery retry",
+        "recovery release",
+        "errors reset",
+    ):
+        return _run_contract_mutation(parsed)
     if parsed.name == "command":
         return _run_contract_command(parsed.args["request_id"])
     # Later tickets project each remaining operation onto the contract's
-    # shared types (command records, attempt archives). Until then the
-    # grammar and checks above are in place and the operation answers
-    # ``unsupported`` without storing anything.
+    # shared types (attempt archives). Until then the grammar and checks
+    # above are in place and the operation answers ``unsupported`` without
+    # storing anything.
     return _unsupported(
         parsed.name,
         capability=parsed.capability,
