@@ -172,6 +172,8 @@ def main() -> None:
         repository=config.target_repo,
         telemetry=telemetry,
         data_dir=config.data_dir,
+        mode="online",
+        process_started_at=process_started_at,
     )
     interruption_handler = AttemptInterruptionHandler(
         event_log=lambda event, detail="", level="INFO", issue_number=None: logger.emit(

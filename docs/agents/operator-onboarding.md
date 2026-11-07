@@ -510,6 +510,11 @@ Each running agent container accepts operator commands through an installed
 control CLI. Container selection is the instance selector: the CLI has no
 instance flag, so opening the wrong container controls the wrong instance.
 
+The bare-`agentctl` grammar below is the legacy operator protocol,
+deprecated until adoption step 5 retires it; new automation must use
+`agentctl --contract 1 ...`. The legacy path stays byte-compatible
+until then.
+
 1. Open a shell in the intended **running** container (for example, through
    OrbStack) and verify its identity before any mutating command:
 
