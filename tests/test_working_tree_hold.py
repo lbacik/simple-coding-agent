@@ -42,7 +42,10 @@ def test_dirty_tree_with_intake_stopped_stays_up_and_logs_nothing(tmp_path: Path
     assert result.status is LifecycleStatus.IDLE
     assert tracker.claimed == []
     assert sleeps == [60]
-    assert [event for event, _, _ in events] == ["intake_stopped"]
+    # The ``submit_stop`` setup commits a stop command (terminal without an
+    # active attempt, so ``command_resolved``); the poll itself only logs the
+    # intake gate while the tree holds the claim.
+    assert [event for event, _, _ in events] == ["command_resolved", "intake_stopped"]
     # The live process survives, so the operator socket keeps working.
     snapshot = lifecycle.control_status("owner/repo")
     assert snapshot["intake"] == "stopped"

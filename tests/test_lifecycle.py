@@ -177,6 +177,7 @@ def test_stops_after_the_persisted_consecutive_infrastructure_error_limit(tmp_pa
         "workspace_prepared_for_profile_read",
         "attempt_exception",
         "consecutive_error_limit_reached",
+        "halted",
     ]
     assert events[3][1] == "OSError: profile is missing"
     assert events[3][2] == 24
@@ -643,6 +644,8 @@ def test_logs_every_stage_from_claiming_the_issue_to_dispatching_the_model(
         "claim_lease_recorded",
         "workspace_prepared",
         "attempt_phase_transitioned",
+        "outcome_recorded",
+        "attempt_finished",
     ]
     assert all(issue_number == 24 for _, issue_number in events[1:])
 

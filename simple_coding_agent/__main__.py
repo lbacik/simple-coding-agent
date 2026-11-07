@@ -358,9 +358,10 @@ def _start_control_endpoint(
 ) -> None:
     """Start the operator control endpoint or log and exit.
 
-    A failure to open the control socket is fatal: record a halt, emit
-    exactly one structured ``control_endpoint_unavailable`` event and exit
-    1 so the operator sees JSON instead of a raw traceback.
+    A failure to open the control socket is fatal: record a halt, emit the
+    ``halted`` contract event plus one structured
+    ``control_endpoint_unavailable`` event and exit 1 so the operator sees
+    JSON instead of a raw traceback.
     """
 
     try:

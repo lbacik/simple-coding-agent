@@ -529,6 +529,7 @@ def test_logs_setup_baseline_and_model_dispatch_stages(tmp_path: Path) -> None:
         "setup_started",
         "setup_succeeded",
         "baseline_check_succeeded",
+        "attempt_phase_transitioned",
         "model_dispatch_starting",
         "completion_decided",
     ]
@@ -556,6 +557,7 @@ def test_baseline_failure_tolerated_on_continuation_and_logs_warning(tmp_path: P
         ("setup_started", "INFO"),
         ("setup_succeeded", "INFO"),
         ("baseline_check_failed", "WARNING"),
+        ("attempt_phase_transitioned", "INFO"),
         ("model_dispatch_starting", "INFO"),
         ("completion_decided", "WARNING"),
     ]
