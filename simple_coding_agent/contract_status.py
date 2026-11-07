@@ -20,7 +20,8 @@ the contract's Status Snapshot without network, git or provider I/O:
 Recent commands reuse the contract ``CommandRecord`` shape the mutation
 tickets serve (acknowledgement ``not fulfilled`` renamed to
 ``not_fulfilled``, ``arguments`` in the contract shapes). Recent events
-stay empty until the Contract Events ticket lands.
+are the process-local Contract Events ring (newest 50, redacted, text
+capped at 300 characters), served oldest-first like the telemetry ring.
 
 Every figure carries a ``unit`` and a contract ``basis``
 (``measured``/``estimated``/``configured``/``assumed``/``unavailable``/``not_applicable``;
@@ -559,6 +560,7 @@ def build_status_snapshot(
     starting: bool = False,
     startup_check: str | None = None,
     last_halt: dict | None = None,
+    recent_events: list | None = None,
 ) -> dict:
     """Assemble one contract Status Snapshot from prepared state.
 
@@ -602,7 +604,7 @@ def build_status_snapshot(
             project_command(record, payload, repository=repository)
             for record, payload in command_details
         ],
-        "recent_events": [],
+        "recent_events": list(recent_events) if recent_events is not None else [],
         "truncated": False,
     }
     return apply_contract_size_cap(snapshot)

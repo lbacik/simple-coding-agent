@@ -48,7 +48,12 @@ def test_control_endpoint_failure_logs_event_and_exits_1() -> None:
 
     assert exc_info.value.code == 1
     assert server.start_called
-    record = _read_single_record(stream)
+    lines = stream.getvalue().splitlines()
+    assert len(lines) == 2, f"expected halted + unavailable, got {lines!r}"
+    halted = json.loads(lines[0])
+    assert halted["event"] == "halted"
+    assert halted["level"] == "ERROR"
+    record = json.loads(lines[1])
     assert record["event"] == "control_endpoint_unavailable"
     assert record["level"] == "ERROR"
     assert record["phase"] == "startup"

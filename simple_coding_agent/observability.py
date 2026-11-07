@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, TextIO
 from simple_coding_agent.agent_version import agent_version
 
 if TYPE_CHECKING:
+    from simple_coding_agent.contract_events import ContractEventsBuffer
     from simple_coding_agent.telemetry import RecentEventsBuffer
 
 
@@ -45,7 +46,12 @@ class JsonEventLogger:
     output an operator sees on stdout is durably readable next to the
     attempt's other evidence files. Each redacted record is also fed to the
     telemetry ``recent_events`` ring buffer (when one is attached), so every
-    buffered entry has passed through the redactor.
+    buffered entry has passed through the redactor. The same redacted
+    record is mapped onto one Contract Event and fed to the contract
+    ``recent_events`` ring buffer (when one is attached); issue-tagged
+    events whose sink resolves an archive are additionally appended to that
+    attempt's ``events.jsonl``. The stdout line itself keeps the native
+    shape: stdout is not part of the contract.
     """
 
     def __init__(
@@ -55,11 +61,13 @@ class JsonEventLogger:
         redactions: Iterable[str] = (),
         attempt_sink: AttemptSink | None = None,
         recent_events: RecentEventsBuffer | None = None,
+        contract_events: ContractEventsBuffer | None = None,
     ) -> None:
         self._stream = stream
         self._redactor = Redactor(redactions)
         self._attempt_sink = attempt_sink
         self._recent_events = recent_events
+        self._contract_events = contract_events
 
     def emit(
         self,
@@ -88,10 +96,25 @@ class JsonEventLogger:
                 self._recent_events.record(record)
             except Exception:
                 pass
+        archive: AttemptArchive | None = None
         if issue_number is not None and self._attempt_sink is not None:
-            archive = self._attempt_sink(issue_number)
-            if archive is not None:
-                archive.append_event(record)
+            try:
+                archive = self._attempt_sink(issue_number)
+            except Exception:
+                archive = None
+        if self._contract_events is not None:
+            try:
+                from simple_coding_agent.contract_events import to_contract_event
+
+                attempt_id = archive.started_at if archive is not None else None
+                contract_event = to_contract_event(record, attempt_id=attempt_id)
+                self._contract_events.record(contract_event)
+                if archive is not None:
+                    archive.append_contract_event(contract_event)
+            except Exception:
+                pass
+        if archive is not None:
+            archive.append_event(record)
 
 
 class AttemptArchive:
@@ -102,6 +125,9 @@ class AttemptArchive:
     ) -> None:
         safe_timestamp = started_at.replace(":", "-")
         self.directory = data_dir / "logs" / str(issue_number) / safe_timestamp
+        # The stable Attempt ID the contract events carry (resolved by the
+        # event logger's attempt sink for the record's issue).
+        self.started_at = started_at
         self._redactor = Redactor(redactions)
 
     def write_attempt(self, metadata: dict[str, object]) -> None:
@@ -134,6 +160,20 @@ class AttemptArchive:
         path = self.directory / "agent_output.json"
         with path.open("a", encoding="utf-8") as file:
             json.dump(self._redactor.redact(record), file, sort_keys=True)
+            file.write("\n")
+
+    def append_contract_event(self, contract_event: dict[str, object]) -> None:
+        """Append one Contract Event to this attempt's ``events.jsonl``.
+
+        The event already passed through the logger's redactor; it is
+        redacted again here so a directly appended event is safe too.
+        Listed in the manifest with kind ``events``.
+        """
+
+        self.directory.mkdir(parents=True, exist_ok=True)
+        path = self.directory / "events.jsonl"
+        with path.open("a", encoding="utf-8") as file:
+            json.dump(self._redactor.redact(contract_event), file, sort_keys=True)
             file.write("\n")
 
     def write_text(self, name: str, content: str) -> Path:

@@ -139,6 +139,14 @@ from simple_coding_agent.github_tracker import (
     ineligibility_reason,
 )
 from simple_coding_agent.model_execution import ModelExecutionStatus, ModelExecutor, OperatorHandoff, ToolCallRecord, expected_handoff_last_work_commit
+from simple_coding_agent.contract_events import (
+    ContractEventsBuffer,
+    command_accepted_detail,
+    command_resolved_detail,
+    halted_detail,
+    outcome_recorded_detail,
+    startup_check_detail,
+)
 from simple_coding_agent.observability import AttemptArchive, Redactor
 from simple_coding_agent.operating import ConsecutiveErrorStore
 from simple_coding_agent.publication import (
@@ -326,9 +334,15 @@ def _parse_operator_accepted_at(value: object) -> datetime | None:
 class _ControlOperatorHandoff:
     """Adapt the durable control store to the runner's operator boundary."""
 
-    def __init__(self, store: ControlStore, event_log: Callable[..., None]) -> None:
+    def __init__(
+        self,
+        store: ControlStore,
+        event_log: Callable[..., None],
+        on_resolved: Callable[[object], None] | None = None,
+    ) -> None:
         self._store = store
         self._event_log = event_log
+        self._on_resolved = on_resolved
 
     def snapshot(self) -> dict | None:
         return self._store.handoff_snapshot()
@@ -347,6 +361,11 @@ class _ControlOperatorHandoff:
                 f"request={request_id}; the handoff command is no longer recorded",
                 level="WARNING",
             )
+        elif self._on_resolved is not None:
+            try:
+                self._on_resolved(record)
+            except Exception:
+                pass
 
     def fail(self, request_id: str, reason: str) -> None:
         record = self._store.fail_handoff(request_id, reason)
@@ -356,6 +375,11 @@ class _ControlOperatorHandoff:
                 f"request={request_id}; the handoff command is no longer recorded",
                 level="WARNING",
             )
+        elif self._on_resolved is not None:
+            try:
+                self._on_resolved(record)
+            except Exception:
+                pass
 
 
 class AttemptTracker(Protocol):
@@ -527,6 +551,12 @@ class ModelAttemptRunner:
             preparation = early
 
         self._attempt_state.transition(AttemptPhase.MODEL_RUNNING)
+        self._event_log(
+            "attempt_phase_transitioned",
+            f"phase={AttemptPhase.MODEL_RUNNING.value}",
+            level="INFO",
+            issue_number=claim.issue.number,
+        )
         # Snapshot before dispatch: any commit already on the branch at this
         # point is carried over from a resumed attempt, not produced by this
         # run. `commits_added` is read again after the model runs to count
@@ -960,6 +990,12 @@ class ModelAttemptRunner:
         _log_completion_decision(self._event_log, claim.issue.number, decision)
         if decision.publication_eligible or decision.publication_path is PublicationPath.PARTIAL:
             self._attempt_state.transition(AttemptPhase.PUSHING)
+            self._event_log(
+                "attempt_phase_transitioned",
+                f"phase={AttemptPhase.PUSHING.value}",
+                level="INFO",
+                issue_number=claim.issue.number,
+            )
         findings = _review_findings_text(review, review_count)
         details = execution.explanation
         note_commit_sha = None
@@ -1321,6 +1357,7 @@ class AgentLifecycle:
         startup_check: str | None = None,
         last_halt: dict | None = None,
         halt_store: object | None = None,
+        contract_events: ContractEventsBuffer | None = None,
     ) -> None:
         self._tracker = tracker
         self._attempt_state = attempt_state
@@ -1408,6 +1445,16 @@ class AgentLifecycle:
         # Seed the last-finished view from disk so it survives restarts;
         # a failure only leaves it null, never breaks startup.
         self._seed_telemetry_last_finished()
+        # The process-local Contract Events ring feeding
+        # ``status.recent_events`` (``None`` without one: the snapshot then
+        # serves an empty list). Owned by the caller (``__main__`` shares it
+        # with the event logger); never written here, only read.
+        self._contract_events = contract_events
+        # Request IDs already announced as ``command_accepted`` /
+        # ``command_resolved``: command commits and resolutions replay
+        # through the same wrappers, and each Contract Event fires once.
+        self._command_events_accepted: set[str] = set()
+        self._command_events_resolved: set[str] = set()
         # The last control section built for telemetry, with its
         # ``control_observed_at``. Served again while the control lock is
         # busy; ``None`` until the first successful build.
@@ -1425,6 +1472,83 @@ class AgentLifecycle:
         # keeps its live lookups and never reads these.
         self._observed_publication: dict[str, dict] = {}
         self._observed_workspace_dirty: dict[str, bool] = {}
+
+    def _emit_command_accepted(self, record: object) -> None:
+        """Announce one committed operator command (at most once per request).
+
+        Emits the native ``command_accepted`` event the contract mapper
+        projects; replays of the same request ID never re-announce. Never
+        raises: contract observability must not break command handling.
+        """
+
+        try:
+            request_id = getattr(record, "request_id", None)
+            kind = getattr(record, "kind", None)
+            acknowledgement = getattr(record, "acknowledgement", None)
+            ack = getattr(acknowledgement, "value", acknowledgement)
+            if (
+                not isinstance(request_id, str)
+                or not request_id
+                or not isinstance(kind, str)
+                or not kind
+                or ack != "accepted"
+            ):
+                return
+            if request_id in self._command_events_accepted:
+                return
+            self._command_events_accepted.add(request_id)
+            self._event_log(
+                "command_accepted",
+                command_accepted_detail(request_id, kind, "accepted"),
+                level="INFO",
+            )
+        except Exception:
+            pass
+
+    def _emit_command_resolved(self, record: object) -> None:
+        """Announce one terminal operator command (at most once per request).
+
+        Emits the native ``command_resolved`` event the contract mapper
+        projects for ``completed`` / ``superseded`` / ``not fulfilled``
+        acknowledgements (contract name ``not_fulfilled``). Never raises.
+        """
+
+        try:
+            request_id = getattr(record, "request_id", None)
+            acknowledgement = getattr(record, "acknowledgement", None)
+            ack = getattr(acknowledgement, "value", acknowledgement)
+            if not isinstance(request_id, str) or not request_id:
+                return
+            if not isinstance(ack, str):
+                return
+            resolved = str(ack).replace(" ", "_")
+            if resolved not in ("completed", "superseded", "not_fulfilled"):
+                return
+            if request_id in self._command_events_resolved:
+                return
+            self._command_events_resolved.add(request_id)
+            self._event_log(
+                "command_resolved",
+                command_resolved_detail(request_id, resolved),
+                level="INFO",
+            )
+        except Exception:
+            pass
+
+    def _record_command_commit(self, record: CommandRecord) -> CommandRecord:
+        """Announce one stored command commit (accepted, plus resolved when terminal).
+
+        Retrying the same request ID returns the stored acknowledgement:
+        the accepted announcement fires only on the first acceptance while a
+        terminal replay resolves at most once. Never raises.
+        """
+
+        try:
+            self._emit_command_accepted(record)
+            self._emit_command_resolved(record)
+        except Exception:
+            pass
+        return record
 
     @property
     def active_issue_number(self) -> int | None:
@@ -1476,15 +1600,25 @@ class AgentLifecycle:
         """Enter the early-serving ``starting`` state (control endpoint is up)."""
 
         with self._control_lock:
+            entering = not self._starting
             self._starting = True
             self._startup_check = startup_check
+        if entering:
+            self._event_log(
+                "startup_check",
+                startup_check_detail(startup_check or "provenance", "started"),
+                level="INFO",
+            )
 
     def mark_started(self) -> None:
         """Leave ``starting`` once construction finishes; the loop may claim."""
 
         with self._control_lock:
+            was_starting = self._starting
             self._starting = False
             self._startup_check = None
+        if was_starting:
+            self._event_log("ready", "", level="INFO")
 
     def _load_last_halt_locked(self) -> dict | None:
         """Read the durable halt without breaking startup when it is missing."""
@@ -1552,8 +1686,10 @@ class AgentLifecycle:
             raise ControlStoreError("Operator control is not configured")
         with self._control_lock:
             has_active_attempt = self._attempt_state.read() is not None
-            return self._control_store.submit_stop(
-                request_id, has_active_attempt=has_active_attempt
+            return self._record_command_commit(
+                self._control_store.submit_stop(
+                    request_id, has_active_attempt=has_active_attempt
+                )
             )
 
     def submit_stop_after(self, request_id: str, after: object) -> CommandRecord:
@@ -1570,11 +1706,13 @@ class AgentLifecycle:
             raise ControlStoreError("Operator control is not configured")
         with self._control_lock:
             checkpoint = self._attempt_state.read()
-            return self._control_store.submit_stop_after(
-                request_id,
-                after,
-                has_active_attempt=checkpoint is not None,
-                active_attempt_id=checkpoint.started_at if checkpoint is not None else None,
+            return self._record_command_commit(
+                self._control_store.submit_stop_after(
+                    request_id,
+                    after,
+                    has_active_attempt=checkpoint is not None,
+                    active_attempt_id=checkpoint.started_at if checkpoint is not None else None,
+                )
             )
 
     def submit_resume(self, request_id: str) -> CommandRecord:
@@ -1604,21 +1742,25 @@ class AgentLifecycle:
                 # assert (which vanishes under -O and would crash the
                 # socket it is meant to keep serving if it ever fired).
                 detail = self._startup_hold_detail or _checkpoint_hold_detail(error)
-                return self._control_store.submit_resume(
-                    request_id,
-                    has_active_attempt=True,
-                    recovery_hold=RecoveryHold(
-                        issue_number=None,
-                        attempt_id=None,
-                        branch=None,
-                        phase=None,
-                        reason=detail,
-                    ),
+                return self._record_command_commit(
+                    self._control_store.submit_resume(
+                        request_id,
+                        has_active_attempt=True,
+                        recovery_hold=RecoveryHold(
+                            issue_number=None,
+                            attempt_id=None,
+                            branch=None,
+                            phase=None,
+                            reason=detail,
+                        ),
+                    )
                 )
-            return self._control_store.submit_resume(
-                request_id,
-                has_active_attempt=checkpoint is not None,
-                recovery_hold=self._recovery_hold_locked(checkpoint),
+            return self._record_command_commit(
+                self._control_store.submit_resume(
+                    request_id,
+                    has_active_attempt=checkpoint is not None,
+                    recovery_hold=self._recovery_hold_locked(checkpoint),
+                )
             )
 
     def submit_handoff(self, request_id: str) -> CommandRecord:
@@ -1652,16 +1794,18 @@ class AgentLifecycle:
                 # assert (which vanishes under -O and would crash the
                 # socket it is meant to keep serving if it ever fired).
                 detail = self._startup_hold_detail or _checkpoint_hold_detail(error)
-                return self._control_store.submit_handoff(
-                    request_id,
-                    has_active_attempt=True,
-                    recovery_hold=RecoveryHold(
-                        issue_number=None,
-                        attempt_id=None,
-                        branch=None,
-                        phase=None,
-                        reason=detail,
-                    ),
+                return self._record_command_commit(
+                    self._control_store.submit_handoff(
+                        request_id,
+                        has_active_attempt=True,
+                        recovery_hold=RecoveryHold(
+                            issue_number=None,
+                            attempt_id=None,
+                            branch=None,
+                            phase=None,
+                            reason=detail,
+                        ),
+                    )
                 )
             hold = self._recovery_hold_locked(checkpoint)
             if checkpoint is None and hold is not None and not self._recovering:
@@ -1669,10 +1813,12 @@ class AgentLifecycle:
                 # can only be the dirty-tree hold, which stays a "no active
                 # attempt" rejection for handoff.
                 hold = None
-            return self._control_store.submit_handoff(
-                request_id,
-                has_active_attempt=checkpoint is not None,
-                recovery_hold=hold,
+            return self._record_command_commit(
+                self._control_store.submit_handoff(
+                    request_id,
+                    has_active_attempt=checkpoint is not None,
+                    recovery_hold=hold,
+                )
             )
 
     def submit_next_issue(self, request_id: str, issue: object) -> CommandRecord:
@@ -1707,7 +1853,9 @@ class AgentLifecycle:
                 # Idempotent retry: let the store enforce the
                 # identical-payload rule without touching GitHub, so an
                 # eligibility change after acceptance cannot alter history.
-                return store.submit_next_issue(request_id, issue)
+                return self._record_command_commit(
+                    store.submit_next_issue(request_id, issue)
+                )
             number = parse_next_issue(issue)
             try:
                 fresh = self._tracker.fetch_issue(number)
@@ -1748,7 +1896,25 @@ class AgentLifecycle:
                 raise NextIssueRejectedError(
                     f"{reason}. No control change was accepted."
                 )
-            return store.submit_next_issue(request_id, number)
+            previous = store.next_issue_snapshot()
+            record = self._record_command_commit(
+                store.submit_next_issue(request_id, number)
+            )
+            # A fresh priority supersedes only the earlier priority: the
+            # replaced command turns terminal, so resolve it exactly once.
+            try:
+                previous_id = previous.get("request_id") if isinstance(previous, dict) else None
+                if (
+                    isinstance(previous_id, str)
+                    and previous_id
+                    and previous_id != record.request_id
+                ):
+                    superseded = store.get_command(previous_id)
+                    if superseded is not None:
+                        self._emit_command_resolved(superseded)
+            except Exception:
+                pass
+            return record
 
     # -- operator recovery --------------------------------------------------
 
@@ -1783,7 +1949,8 @@ class AgentLifecycle:
                 # rule; a terminal record is returned without re-executing.
                 record = store.submit_recovery_retry(request_id, parsed)
                 if record.acknowledgement is not CommandAcknowledgement.ACCEPTED:
-                    return record
+                    return self._record_command_commit(record)
+                self._emit_command_accepted(record)
                 # An accepted record for the same ID means this process already
                 # accepted it but never finished: fall through and finish it
                 # once instead of recording twice.
@@ -1793,6 +1960,7 @@ class AgentLifecycle:
             else:
                 checkpoint = self._validated_recovery_checkpoint_locked(parsed)
                 record = store.submit_recovery_retry(request_id, parsed)
+                self._emit_command_accepted(record)
                 self._attempt_processing = True
                 self._recovery_executing = True
         try:
@@ -1804,9 +1972,15 @@ class AgentLifecycle:
         with self._control_lock:
             if success:
                 completed = store.complete_recovery_command(request_id, detail)
-                return completed if completed is not None else store.get_command(request_id)  # type: ignore[return-value]
+                resolved = completed if completed is not None else store.get_command(request_id)
+                if resolved is not None:
+                    self._emit_command_resolved(resolved)
+                return resolved  # type: ignore[return-value]
             failed = store.fail_recovery_command(request_id, detail)
-            return failed if failed is not None else store.get_command(request_id)  # type: ignore[return-value]
+            resolved = failed if failed is not None else store.get_command(request_id)
+            if resolved is not None:
+                self._emit_command_resolved(resolved)
+            return resolved  # type: ignore[return-value]
 
     def submit_recovery_release(
         self, request_id: str, attempt_id: object, saved_at: object
@@ -1846,7 +2020,8 @@ class AgentLifecycle:
                     request_id, parsed_attempt, parsed_saved
                 )
                 if record.acknowledgement is not CommandAcknowledgement.ACCEPTED:
-                    return record
+                    return self._record_command_commit(record)
+                self._emit_command_accepted(record)
                 checkpoint = self._validated_recovery_checkpoint_locked(parsed_attempt)
                 self._attempt_processing = True
                 self._recovery_executing = True
@@ -1855,6 +2030,7 @@ class AgentLifecycle:
                 record = store.submit_recovery_release(
                     request_id, parsed_attempt, parsed_saved
                 )
+                self._emit_command_accepted(record)
                 self._attempt_processing = True
                 self._recovery_executing = True
         try:
@@ -1866,9 +2042,15 @@ class AgentLifecycle:
         with self._control_lock:
             if success:
                 completed = store.complete_recovery_command(request_id, detail)
-                return completed if completed is not None else store.get_command(request_id)  # type: ignore[return-value]
+                resolved = completed if completed is not None else store.get_command(request_id)
+                if resolved is not None:
+                    self._emit_command_resolved(resolved)
+                return resolved  # type: ignore[return-value]
             failed = store.fail_recovery_command(request_id, detail)
-            return failed if failed is not None else store.get_command(request_id)  # type: ignore[return-value]
+            resolved = failed if failed is not None else store.get_command(request_id)
+            if resolved is not None:
+                self._emit_command_resolved(resolved)
+            return resolved  # type: ignore[return-value]
 
     def _validated_recovery_checkpoint_locked(
         self, attempt_id: str
@@ -2778,6 +2960,12 @@ class AgentLifecycle:
                 else:
                     try:
                         self._attempt_state.transition(AttemptPhase.PUSHING)
+                        self._event_log(
+                            "attempt_phase_transitioned",
+                            f"phase={AttemptPhase.PUSHING.value}",
+                            level="INFO",
+                            issue_number=claim.issue.number,
+                        )
                     except AttemptStateError:
                         pass
                     decision = CompletionDecision(
@@ -3728,12 +3916,13 @@ class AgentLifecycle:
             except Exception as error:
                 raise ControlStoreError("Control command could not be read") from error
             if existing is not None:
-                return store.submit_errors_reset(request_id)
+                return self._record_command_commit(store.submit_errors_reset(request_id))
             previous_count = self._consecutive_error_count_or_none()
             self._reset_consecutive_errors()
             record = store.submit_errors_reset(
                 request_id, previous_count=previous_count
             )
+            self._emit_command_accepted(record)
             self._event_log(
                 "consecutive_errors_reset",
                 f"request={request_id}; previous_count={previous_count}; count=0",
@@ -4148,6 +4337,11 @@ class AgentLifecycle:
             starting=self._starting,
             startup_check=self._startup_check,
             last_halt=self._last_halt,
+            recent_events=(
+                self._contract_events.snapshot()
+                if self._contract_events is not None
+                else []
+            ),
         )
 
     def _recovery_hold_network_free(
@@ -4744,7 +4938,8 @@ class AgentLifecycle:
                             # A pending handoff can never still be observed, so
                             # it is failed rather than waited on forever.
                             self._fail_orphan_handoff_locked()
-                            self._control_store.complete_pending_stop()
+                            for stopped in self._control_store.complete_pending_stop():
+                                self._emit_command_resolved(stopped)
                     self._event_log(
                         "intake_stopped",
                         f"issue intake is {self._control_store.intake_state().value};"
@@ -4924,7 +5119,9 @@ class AgentLifecycle:
                 )
                 if marker_detail:
                     reason = f"{reason}{marker_detail}"
-            store.fail_next_issue(reason)
+            failed_priority = store.fail_next_issue(reason)
+            if failed_priority is not None:
+                self._emit_command_resolved(failed_priority)
             self._event_log(
                 "next_issue_not_fulfilled",
                 f"issue #{target_number} not fulfilled: {reason};"
@@ -4946,7 +5143,9 @@ class AgentLifecycle:
             reason = (
                 f"issue #{target_number} claimed by another assignee{suffix}"
             )
-            store.fail_next_issue(reason)
+            failed_priority = store.fail_next_issue(reason)
+            if failed_priority is not None:
+                self._emit_command_resolved(failed_priority)
             self._event_log(
                 "next_issue_not_fulfilled",
                 f"issue #{target_number} not fulfilled: {reason};"
@@ -4966,6 +5165,8 @@ class AgentLifecycle:
             )
             raise
         completed = store.complete_next_issue(claim.issue.number)
+        if completed is not None:
+            self._emit_command_resolved(completed)
         if completed is None:
             # The claimed issue does not match the pending priority: never
             # report a confused assignment as a completed priority claim.
@@ -5029,7 +5230,13 @@ class AgentLifecycle:
         if self._control_store is None:
             setter(None)
             return
-        setter(_ControlOperatorHandoff(self._control_store, self._event_log))
+        setter(
+            _ControlOperatorHandoff(
+                self._control_store,
+                self._event_log,
+                on_resolved=self._emit_command_resolved,
+            )
+        )
 
     def _wire_attempt_telemetry_publisher(self) -> None:
         """Attach the telemetry reporter to the executor that publishes live figures.
@@ -5238,12 +5445,14 @@ class AgentLifecycle:
         )
         if cause is None:
             return False
-        store.fail_handoff(
+        resolved_hold = store.fail_handoff(
             request_id,
             f"Operator handoff {request_id} is not fulfilled: {cause}; the"
             " branch, checkpoint, and working tree are retained for recovery"
             f" of attempt {attempt_id}.",
         )
+        if resolved_hold is not None:
+            self._emit_command_resolved(resolved_hold)
         self._event_log(
             "operator_handoff_not_fulfilled",
             f"request={request_id}; {cause}",
@@ -5311,12 +5520,14 @@ class AgentLifecycle:
             check_allowance=check_allowance,
         )
         if cause is None:
-            store.complete_handoff(
+            resolved_complete = store.complete_handoff(
                 request_id,
                 f"operator handoff fulfilled for issue #{issue_number}: a valid"
                 " `operator_request` handoff note was published, the issue was"
                 " released, and cleanup is durable",
             )
+            if resolved_complete is not None:
+                self._emit_command_resolved(resolved_complete)
             self._event_log(
                 "operator_handoff_completed",
                 f"request={request_id}; issue #{issue_number} handed off",
@@ -5325,12 +5536,14 @@ class AgentLifecycle:
             )
             return True
         hold_suffix = f" of attempt {attempt_id}" if attempt_id else ""
-        store.fail_handoff(
+        resolved_hold = store.fail_handoff(
             request_id,
             f"Operator handoff {request_id} is not fulfilled: {cause}; the"
             " branch, checkpoint, and working tree are retained for recovery"
             f"{hold_suffix}.",
         )
+        if resolved_hold is not None:
+            self._emit_command_resolved(resolved_hold)
         self._event_log(
             "operator_handoff_not_fulfilled",
             f"request={request_id}; {cause}",
@@ -5405,12 +5618,14 @@ class AgentLifecycle:
         request_id = snapshot.get("request_id")
         if not isinstance(request_id, str) or not request_id:
             return
-        store.fail_handoff(
+        resolved_orphan = store.fail_handoff(
             request_id,
             f"Operator handoff {request_id} is not fulfilled: the active"
             " attempt ended without finalizing through the agent, so no model"
             " execution can still observe the request.",
         )
+        if resolved_orphan is not None:
+            self._emit_command_resolved(resolved_orphan)
         self._event_log(
             "operator_handoff_not_fulfilled",
             f"request={request_id}; the active attempt is gone",
@@ -5443,6 +5658,7 @@ class AgentLifecycle:
                 f"stop plan {record.request_id} completed after the final counted attempt finished",
                 level="INFO",
             )
+            self._emit_command_resolved(record)
 
     def _release(
         self,
@@ -5568,7 +5784,19 @@ class AgentLifecycle:
                 branch=branch,
                 outcome=outcome,
             )
+        self._event_log(
+            "outcome_recorded",
+            outcome_recorded_detail(outcome.value),
+            level="INFO",
+            issue_number=issue_number,
+        )
         self._record_control_finalization(attempt_id, outcome)
+        self._event_log(
+            "attempt_finished",
+            "",
+            level="INFO",
+            issue_number=issue_number,
+        )
         self._attempt_state.delete()
         self._telemetry_finish(
             self._last_finished_summary(
@@ -5817,6 +6045,12 @@ class AgentLifecycle:
                         )
                     else:
                         self._attempt_state.transition(AttemptPhase.PUSHING)
+                        self._event_log(
+                            "attempt_phase_transitioned",
+                            f"phase={AttemptPhase.PUSHING.value}",
+                            level="INFO",
+                            issue_number=claim.issue.number,
+                        )
                         decision = CompletionDecision(
                             AttemptOutcome.INCOMPLETE, False, PublicationPath.PARTIAL,
                             ("Model execution was interrupted; preserved committed work.",),
@@ -7111,6 +7345,14 @@ class AgentLifecycle:
     def _record_halt(self, reason: str, detail: str) -> None:
         """Best-effort durable halt before an engine-decided exit (never raises)."""
 
+        try:
+            self._event_log(
+                "halted",
+                halted_detail(reason),
+                level="ERROR",
+            )
+        except Exception:
+            pass
         store = self._halt_store
         if store is None:
             return

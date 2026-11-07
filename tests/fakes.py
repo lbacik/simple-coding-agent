@@ -1356,6 +1356,9 @@ def build_lifecycle(
     *,
     profile_fn=None,
     repository: str = LIFECYCLE_REPOSITORY,
+    event_log=None,
+    attempt_archive_factory=None,
+    contract_events=None,
 ):
     """Wire the real lifecycle against the shared fakes over a real git remote.
 
@@ -1363,7 +1366,11 @@ def build_lifecycle(
     ``ModelAttemptRunner`` so one ``run_once()`` drives a full attempt (claim,
     model run, publication). Callers may pass ``profile_fn`` to pin the
     repository profile (e.g. a failing check); otherwise a ``true`` check on
-    ``main`` is used.
+    ``main`` is used. ``event_log`` and ``attempt_archive_factory`` are
+    threaded into the tracker, runner, publisher, and lifecycle only when
+    given, so existing callers keep the default silent behavior.
+    ``contract_events`` is threaded into the lifecycle only when given (it
+    feeds ``status.recent_events``).
     """
 
     from simple_coding_agent.attempt_state import AttemptStateStore
@@ -1388,7 +1395,13 @@ def build_lifecycle(
 
     attempt_state = AttemptStateStore(data_dir)
     workspace = GitWorkspace(clone_dir, str(remote), token_provider=lambda: "token")
-    tracker = GitHubTracker(github, repository)
+    tracker_kwargs: dict = {}
+    if event_log is not None:
+        tracker_kwargs["event_log"] = event_log
+    tracker = GitHubTracker(github, repository, **tracker_kwargs)
+    runner_kwargs: dict = {}
+    if event_log is not None:
+        runner_kwargs["event_log"] = event_log
     runner = ModelAttemptRunner(
         attempt_state=attempt_state,
         workspace=workspace,
@@ -1396,10 +1409,14 @@ def build_lifecycle(
         evaluator=CompletionEvaluator(frozenset({"blocking"})),
         model_executor=executor,
         issue_comments=tracker.trusted_comments,
+        **runner_kwargs,
     )
     # These mechanics tests pin verbose mode: they assert the historical
     # per-attempt handoff result comments alongside the shared record.
     # Link-mode suppression is covered in test_handoff_comment_mode.py.
+    publisher_kwargs: dict = {}
+    if event_log is not None:
+        publisher_kwargs["event_log"] = event_log
     publisher = Publisher(
         workspace,
         github,
@@ -1407,8 +1424,16 @@ def build_lifecycle(
         attempt_state=attempt_state,
         sleeper=lambda _: None,
         handoff_comment_mode="verbose",
+        **publisher_kwargs,
     )
     control_store = ControlStore(data_dir)
+    lifecycle_kwargs: dict = {}
+    if event_log is not None:
+        lifecycle_kwargs["event_log"] = event_log
+    if attempt_archive_factory is not None:
+        lifecycle_kwargs["attempt_archive_factory"] = attempt_archive_factory
+    if contract_events is not None:
+        lifecycle_kwargs["contract_events"] = contract_events
     return AgentLifecycle(
         tracker=tracker,
         attempt_state=attempt_state,
@@ -1419,6 +1444,7 @@ def build_lifecycle(
         sleeper=lambda _: None,
         control_store=control_store,
         repository=repository,
+        **lifecycle_kwargs,
     )
 
 

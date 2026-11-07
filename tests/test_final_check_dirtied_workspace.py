@@ -276,7 +276,12 @@ def test_clean_final_check_behaves_as_before(tmp_path: Path) -> None:
     assert _event_details(events, "final_check_dirtied_workspace") == []
     assert evidence.decision.publication_eligible
     assert evidence.decision.outcome is None
-    assert [event for event, _ in events][-1] == "completion_decided"
+    # The publication-eligible decision transitions to pushing after the
+    # completion decision is logged.
+    assert [event for event, _ in events][-2:] == [
+        "completion_decided",
+        "attempt_phase_transitioned",
+    ]
 
 
 def test_failed_final_check_keeps_existing_reason(tmp_path: Path) -> None:
