@@ -15,7 +15,7 @@ import signal
 import subprocess
 import threading
 import time
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol
 
 from simple_coding_agent.attempt_state import (
     ATTEMPT_KIND_CONFLICT,
@@ -400,6 +400,10 @@ class AttemptTracker(Protocol):
     def escalate_conflict_to_human(self, issue: TrackerIssue) -> None: ...
 
     def recover_claim(self, issue_number: int) -> Claim | None: ...
+
+    def release_lost_claim(
+        self, issue_number: int
+    ) -> Literal["unassigned", "claimed_by_another"] | None: ...
 
     def release_attempt(self, issue_number: int, label: str, assignee_id: str) -> None: ...
 
@@ -2613,8 +2617,9 @@ class AgentLifecycle:
         if claim is None:
             return False, (
                 f"recovery retry for attempt {attempt_id} not fulfilled:"
-                f" issue #{issue_number} is unavailable for recovery;"
-                f" the hold remains. {hold_suffix}"
+                f" issue #{issue_number} is unavailable for recovery, or this"
+                " Worker's claim on it is gone; retry cannot publish without"
+                f" the claim; the hold remains. {hold_suffix}"
             )
         conflict = self._recovery_conflict_reason(claim, checkpoint)
         if conflict is not None:
@@ -2846,10 +2851,26 @@ class AgentLifecycle:
                 " was discarded."
             )
         if claim is None:
-            return False, (
-                f"recovery release for attempt {attempt_id} not fulfilled:"
-                f" issue #{issue_number} is unavailable for recovery;"
-                " the hold remains and no work was discarded."
+            try:
+                lost_reason = self._tracker.release_lost_claim(issue_number)
+            except Exception as error:
+                return False, (
+                    f"recovery release for attempt {attempt_id} not fulfilled:"
+                    f" issue #{issue_number} is unavailable for recovery"
+                    f" ({_exception_detail(error)}); the hold remains and no"
+                    " work was discarded."
+                )
+            if lost_reason is None:
+                return False, (
+                    f"recovery release for attempt {attempt_id} not fulfilled:"
+                    f" issue #{issue_number} is unavailable for recovery;"
+                    " the hold remains and no work was discarded."
+                )
+            self._abandon_lost_claim(checkpoint, lost_reason)
+            return True, (
+                f"recovery release for attempt {attempt_id} completed;"
+                f" issue #{issue_number} is no longer claimed by this Worker"
+                f" ({lost_reason}); nothing was published; the hold is cleared"
             )
         try:
             self._workspace.prepare_for_profile_read()
@@ -6029,6 +6050,36 @@ class AgentLifecycle:
             "lifecycle_state": lifecycle_state,
         }
 
+    def _abandon_lost_claim(self, checkpoint: AttemptCheckpoint, reason: str) -> None:
+        """Drop a retained attempt whose claim is no longer this Worker's.
+
+        The tracker already removed only this Worker's own marker. Nothing
+        is published, pushed, or taken over, and no terminal outcome is
+        recorded, so nothing counts against the issue's budgets or the
+        completion ledger. The outcome passed to the control accounting
+        only releases a stop plan waiting on this attempt. The checkpoint
+        is removed and the archive sealed; intake then continues.
+        """
+
+        attempt_id = checkpoint.started_at
+        self._event_log(
+            "claim_lost",
+            f"issue #{checkpoint.issue_number} is no longer claimed by this"
+            f" Worker ({reason}); the interrupted attempt {attempt_id} is"
+            " dropped without publishing",
+            level="WARNING",
+            issue_number=checkpoint.issue_number,
+        )
+        self._record_control_finalization(attempt_id, AttemptOutcome.INFRASTRUCTURE_ERROR)
+        self._attempt_state.delete()
+        self._seal_archive_and_emit(
+            self._archive_for(checkpoint.issue_number, attempt_id),
+            attempt_id,
+            issue_number=checkpoint.issue_number,
+        )
+        self._telemetry_finish()
+        self._active_issue_number = None
+
     def _reconcile_startup(self) -> AttemptOutcome | None:
         """Finish one durable attempt without recreating its SDK execution context."""
 
@@ -6136,6 +6187,13 @@ class AgentLifecycle:
             return None
         claim = self._tracker.recover_claim(checkpoint.issue_number)
         if claim is None:
+            # With ``WORKER_ID`` the issue can exist while this Worker's
+            # claim does not (unassigned meanwhile, or only another
+            # Worker's marker): that is a lost claim, not a missing issue.
+            lost_reason = self._tracker.release_lost_claim(checkpoint.issue_number)
+            if lost_reason is not None:
+                self._abandon_lost_claim(checkpoint, lost_reason)
+                return None
             # Recorded decision for #219: a retained checkpoint whose issue
             # is gone entirely is a genuine fatal error, not a workspace
             # hold — there is no issue to hold intake for and no operator

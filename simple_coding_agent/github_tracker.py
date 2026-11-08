@@ -9,7 +9,7 @@ import json
 import os
 import re
 import time
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
@@ -980,6 +980,36 @@ class GitHubTracker:
             if own not in current.labels and has_claim_marker(current.labels):
                 return None
         return Claim(current, Assignment(issue_id=current.id, assignee_id=identity.id))
+
+    def release_lost_claim(
+        self, issue_number: int
+    ) -> Literal["unassigned", "claimed_by_another"] | None:
+        """Finish cleanup for a retained attempt whose claim is no longer ours.
+
+        Called only after :meth:`recover_claim` returned ``None``. Returns
+        ``None`` when the issue is gone entirely (the fatal #219 case, which
+        the caller keeps fatal). Otherwise the issue exists but this
+        Worker's claim does not: the login is no longer assigned
+        (``"unassigned"``) or only another Worker's marker holds the shared
+        login (``"claimed_by_another"``). The only mutation is removing this
+        Worker's own ``claimed-by:<worker-id>`` label when present, after a
+        fresh re-read; another Worker's marker, the assignment, and every
+        queue label are never touched. Without ``WORKER_ID`` there is no
+        lost-claim state, so the issue is reported as gone only when it is.
+        """
+
+        current = self._transport.get_issue(self._target_repo, issue_number)
+        if current is None:
+            return None
+        own = self._own_marker
+        if own is not None and own in current.labels:
+            self._transport.remove_label(current.id, own)
+        if self._other_markers(current.labels):
+            return "claimed_by_another"
+        identity = self._transport.viewer()
+        if identity.login not in current.assignee_logins:
+            return "unassigned"
+        return "claimed_by_another"
 
     def release_attempt(self, issue_number: int, label: str, assignee_id: str) -> None:
         """Idempotently release only this agent's assignment and queue label.

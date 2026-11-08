@@ -891,6 +891,19 @@ class FakeTracker:
                 return None
         return Claim(issue=found, assignment=Assignment(issue_id=found.id, assignee_id="agent-id"))
 
+    def release_lost_claim(self, issue_number: int) -> str | None:
+        found = self.issues.get(issue_number)
+        if found is None:
+            return None
+        if self.worker_id:
+            self.issues[issue_number] = self._release_own_shared_marker(found)
+        foreign = any(
+            label.startswith(CLAIM_MARKER_PREFIX) for label in found.labels
+        )
+        if foreign or "agent" in found.assignee_logins:
+            return "claimed_by_another"
+        return "unassigned"
+
     def release_attempt(self, issue_number: int, label: str, assignee_id: str) -> None:
         self.cleanup.append((issue_number, label, assignee_id))
         if not self.worker_id:
