@@ -37,7 +37,7 @@ The optional per-Worker identity within a shared-login pool (`WORKER_ID`, `[a-z0
 _Avoid_: Username, assignee
 
 **Claim marker**:
-The `claimed-by:<worker-id>` label a pooled Worker adds right after assigning, which its poolmates treat as its claim on the shared login. The marker decides races (a Worker that sees another Worker's marker yields), blocks eligibility (an issue carrying any marker is never eligible), and gates release (the shared assignment goes only when no marker remains). A marker left behind by a lost `/data` directory or a changed Worker id is removed by hand; there is no startup sweep and no TTL.
+The `claimed-by:<worker-id>` label a pooled Worker adds right after assigning, which its poolmates treat as its claim on the shared login. The marker decides races (a Worker that sees another Worker's marker yields), blocks eligibility (an issue carrying any marker is never eligible), and gates release (the shared assignment goes only when no marker remains). A marker left behind by a lost `/data` directory or a changed Worker id is removed by hand; there is no startup sweep and no TTL. The one exception is a Worker's own marker on an issue where its retained checkpoint finds the claim lost (login unassigned, or only another Worker's marker present): startup recovery and `recovery release` remove that own marker, drop the attempt without publishing, and emit a `claim_lost` WARNING, never touching another Worker's marker or the assignment.
 _Avoid_: Claim label, lock file
 
 **Automatic continuation**:

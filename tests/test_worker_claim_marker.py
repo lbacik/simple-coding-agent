@@ -693,3 +693,151 @@ def test_priority_target_with_only_a_foreign_marker_falls_back_to_fifo(
     assert "claimed by another worker (claimed-by:worker-b)" in failed.detail
     not_fulfilled = [row for row in events if row[0] == "next_issue_not_fulfilled"]
     assert not_fulfilled and not_fulfilled[0][3] == 24
+
+
+# ---------------------------------------------------------------------------
+# startup recovery when the Worker's claim is gone (issue #364)
+# ---------------------------------------------------------------------------
+
+
+def test_release_lost_claim_removes_only_the_own_marker_when_unassigned() -> None:
+    transport = SharedTransport(issue(1))
+    tracker = worker_tracker(transport, "worker-a")
+    transport.current = issue(
+        1, labels=frozenset({"ready-for-agent", "claimed-by:worker-a"})
+    )
+
+    assert tracker.release_lost_claim(1) == "unassigned"
+    assert transport.removed_labels == [("issue-1", "claimed-by:worker-a")]
+    assert transport.removed_assignees == []
+    assert transport.current.labels == frozenset({"ready-for-agent"})
+
+
+def test_release_lost_claim_leaves_another_workers_marker_and_assignment() -> None:
+    transport = SharedTransport(issue(1))
+    tracker = worker_tracker(transport, "worker-a")
+    transport.current = issue(
+        1,
+        labels=frozenset({"ready-for-agent", "claimed-by:worker-b"}),
+        assignee_logins=("agent",),
+    )
+
+    assert tracker.release_lost_claim(1) == "claimed_by_another"
+    assert transport.removed_labels == []
+    assert transport.removed_assignees == []
+
+
+def test_release_lost_claim_reports_a_missing_issue_as_gone() -> None:
+    transport = SharedTransport(issue(1))
+    tracker = worker_tracker(transport, "worker-a")
+
+    assert tracker.release_lost_claim(2) is None
+
+
+def _restart_with_checkpoint(
+    tmp_path: Path, tracker: FakeTracker
+) -> tuple[AgentLifecycle, list[tuple[str, str, str]]]:
+    from simple_coding_agent.attempt_state import AttemptStateStore
+    from simple_coding_agent.lifecycle import AgentLifecycle
+
+    AttemptStateStore(tmp_path).start(issue_number=1, branch="agent/issue-1")
+    events: list[tuple[str, str, str]] = []
+    lifecycle = AgentLifecycle(
+        tracker=tracker,  # type: ignore[arg-type]
+        attempt_state=AttemptStateStore(tmp_path),
+        workspace=InMemoryWorkspace(tmp_path / "repo", issue_number=1),
+        profile_loader=lambda _: type("Profile", (), {"base_branch": "main"})(),
+        publisher=FakePublisher(),
+        attempt_runner=lambda received_claim, profile, prepared: None,  # type: ignore[return-value]
+        event_log=lambda event, detail="", level="INFO", issue_number=None: events.append(
+            (event, level, detail)
+        ),
+        sleeper=lambda seconds: None,
+    )
+    return lifecycle, events
+
+
+def test_restart_with_the_login_unassigned_drops_the_attempt_and_continues(
+    tmp_path: Path,
+) -> None:
+    from simple_coding_agent.attempt_state import AttemptStateStore
+    from simple_coding_agent.github_tracker import Assignment, Claim
+
+    tracker = FakeTracker(
+        issues={
+            1: issue(
+                1, labels=frozenset({"ready-for-agent", "claimed-by:worker-a"})
+            ),
+            2: issue(2),
+        },
+        worker_id="worker-a",
+    )
+    lifecycle, events = _restart_with_checkpoint(tmp_path, tracker)
+    tracker.next_claim = Claim(issue(2), Assignment("issue-2", "agent-id"))
+
+    lifecycle.run_once()
+
+    assert "claimed-by:worker-a" not in tracker.issues[1].labels
+    assert AttemptStateStore(tmp_path).read() is None
+    assert tracker.cleanup == [(2, "ready-for-agent", "agent-id")]
+    assert any(e == "claim_lost" and level == "WARNING" for e, level, _ in events)
+    published = lifecycle._publisher.requests  # type: ignore[attr-defined]
+    assert [r.issue_number for r in published] == [2]
+
+
+def test_restart_with_only_another_workers_marker_leaves_it_untouched(
+    tmp_path: Path,
+) -> None:
+    from simple_coding_agent.attempt_state import AttemptStateStore
+
+    tracker = FakeTracker(
+        issues={
+            1: issue(
+                1,
+                labels=frozenset({"ready-for-agent", "claimed-by:worker-b"}),
+                assignee_logins=("agent",),
+            )
+        },
+        worker_id="worker-a",
+    )
+    lifecycle, events = _restart_with_checkpoint(tmp_path, tracker)
+
+    lifecycle.run_once()
+
+    assert tracker.issues[1].labels == frozenset({"ready-for-agent", "claimed-by:worker-b"})
+    assert tracker.issues[1].assignee_logins == ("agent",)
+    assert tracker.removed_labels == []
+    assert AttemptStateStore(tmp_path).read() is None
+    assert any(e == "claim_lost" and level == "WARNING" for e, level, _ in events)
+
+
+def test_restart_with_the_issue_gone_is_still_fatal(tmp_path: Path) -> None:
+    tracker = FakeTracker(issues={}, worker_id="worker-a")
+    lifecycle, _ = _restart_with_checkpoint(tmp_path, tracker)
+
+    with pytest.raises(RuntimeError, match="unavailable for recovery"):
+        lifecycle.run_once()
+
+
+def test_recovery_release_finishes_cleanup_when_the_claim_is_lost(
+    tmp_path: Path,
+) -> None:
+    from simple_coding_agent.attempt_state import AttemptStateStore
+
+    tracker = FakeTracker(
+        issues={
+            1: issue(1, labels=frozenset({"ready-for-agent", "claimed-by:worker-a"}))
+        },
+        worker_id="worker-a",
+    )
+    lifecycle, events = _restart_with_checkpoint(tmp_path, tracker)
+    checkpoint = AttemptStateStore(tmp_path).read()
+    assert checkpoint is not None
+
+    cleared, detail = lifecycle._release_retained_attempt(checkpoint, "s3://saved")
+
+    assert cleared is True
+    assert "no longer claimed by this Worker" in detail
+    assert "claimed-by:worker-a" not in tracker.issues[1].labels
+    assert AttemptStateStore(tmp_path).read() is None
+    assert any(e == "claim_lost" and level == "WARNING" for e, level, _ in events)
