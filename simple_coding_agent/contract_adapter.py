@@ -3,12 +3,11 @@
 A contract consumer runs ``agentctl --contract 1 <operation>`` through
 ``docker exec`` without a TTY and always gets exactly one JSON envelope
 with a trailing newline on stdout plus the contract's distinct exit
-code. This module owns the contract grammar, the check order, envelope
-rendering and exit codes; it reaches the engine only through the
-existing control socket, plus the read-only ``identity`` socket
-operation. Nothing here is shared with the legacy path: without
-``--contract`` :func:`agentctl.main` keeps today's grammar, replies,
-exit codes and stderr byte-compatible.
+code. This module owns the contract check order, envelope rendering and
+exit codes; it reaches the engine only through the existing control
+socket, plus the read-only ``identity`` socket operation. Nothing here is
+shared with the legacy path: without ``--contract`` :func:`agentctl.main`
+keeps today's grammar, replies, exit codes and stderr byte-compatible.
 
 Check order (spec section 4.1): ``--contract`` major, argv grammar
 (``usage``), capability (``unsupported``), argument values
@@ -18,18 +17,22 @@ tickets implement are parsed and gated here but answer ``unsupported``
 until their projection exists; an unreachable engine answers
 ``agent_unreachable`` and an engine-side failure answers ``internal``.
 
-Operand shapes and reply envelopes follow the prose and the
-``examples/agentctl/`` fixtures of agent-operator-contract ``06ee46c``.
+The normative source is agent-operator-contract ``v1.0.0``. The
+contract-side rendering (DTOs, envelope, exit codes, CLI grammar and
+capability checks) uses the shared part of that library
+(:mod:`agent_operator_contract.shared`), pinned to the same tag; the
+grammar, value bounds, envelope shapes and exit codes here are that
+library's, not local equivalents. Engine-side behaviour (control socket
+wire format, projections, redaction, sealing, export) stays private.
 """
 
 from __future__ import annotations
 
-import json
 import os
-import re
 import sys
-from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
+
+from agent_operator_contract import CONTRACT_MAJOR, shared
 
 from simple_coding_agent.control_server import (
     ControlUnavailableError,
@@ -39,54 +42,41 @@ from simple_coding_agent.control_server import (
 )
 from simple_coding_agent.attempt_history import AttemptHistoryError
 
-#: The one contract major this producer serves.
-CONTRACT_MAJOR = 1
+#: The one contract major this producer serves (spec section 5).
+assert CONTRACT_MAJOR == 1
 #: The contract minor reported in every envelope.
-CONTRACT_MINOR = 0
+CONTRACT_MINOR = shared.CONTRACT_MINOR
 #: The ``contract`` member of every envelope.
-CONTRACT_VERSION = f"{CONTRACT_MAJOR}.{CONTRACT_MINOR}"
+CONTRACT_VERSION = shared.CONTRACT_VERSION
 
 #: Backend name reported by ``identity``.
 BACKEND = "simple-coding-agent"
 
 #: Optional capabilities this backend always advertises, sorted.
 BASE_CAPABILITIES = sorted(
-    [
-        "errors-reset",
-        "next-issue",
-        "operator-handoff",
-        "recovery-release",
-        "recovery-retry",
-        "stop-after",
-    ]
+    capability
+    for capability in shared.OPERATOR_CAPABILITIES
+    if capability != "pool"
 )
 
 #: Declaration-only capability advertised exactly when a Worker id is set.
 POOL_CAPABILITY = "pool"
 
-#: Consumer request IDs must match this (spec section 6.2).
-REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
-
-#: ``stop --after`` countdown bounds (spec section 6.2).
-STOP_AFTER_MIN = 1
-STOP_AFTER_MAX = 999
-
-#: ``attempts list`` page-size bounds (spec section 6.1).
-ATTEMPTS_LIMIT_MIN = 1
-ATTEMPTS_LIMIT_MAX = 100
-
 #: Socket timeout for contract reads (consumer default; the engine's own
 #: budget for ``identity`` is 3 s, served lock-free without I/O).
 SOCKET_TIMEOUT_SECONDS = 10.0
 
+#: Every capability the grammar and the capability gate know about.
+ALL_CAPABILITIES = frozenset(shared.OPERATOR_CAPABILITIES)
+
 EXIT_OK = 0
-EXIT_REJECTED = 1
-EXIT_USAGE = 2
-EXIT_UNSUPPORTED = 3
-EXIT_CONTRACT_MISMATCH = 4
-EXIT_NOT_FOUND = 5
-EXIT_AGENT_UNREACHABLE = 6
-EXIT_INTERNAL = 7
+EXIT_REJECTED = shared.exit_code_for("rejected")
+EXIT_USAGE = shared.exit_code_for("usage")
+EXIT_UNSUPPORTED = shared.exit_code_for("unsupported")
+EXIT_CONTRACT_MISMATCH = shared.exit_code_for("contract_mismatch")
+EXIT_NOT_FOUND = shared.exit_code_for("not_found")
+EXIT_AGENT_UNREACHABLE = shared.exit_code_for("agent_unreachable")
+EXIT_INTERNAL = shared.exit_code_for("internal")
 
 _ONLINE_MODES = ("online", "offline")
 
@@ -108,17 +98,17 @@ def advertised_capabilities(worker_id: str) -> list[str]:
 # ---------------------------------------------------------------------------
 # Envelope rendering (stdout only; stderr stays empty on this path)
 # ---------------------------------------------------------------------------
+#
+# Rendering is the shared library's: :func:`_emit_ok` and
+# :func:`_emit_error` only write what ``shared`` built, so the envelope
+# shape, the ``contract`` member, key order and the exit codes cannot drift
+# from the pinned tag.
 
 
 def _emit_ok(result: dict) -> int:
     """Write one success envelope; always exit 0."""
 
-    print(
-        json.dumps(
-            {"contract": CONTRACT_VERSION, "ok": True, "result": result},
-            separators=(",", ":"),
-        )
-    )
+    sys.stdout.write(shared.render_success(result))
     return EXIT_OK
 
 
@@ -126,27 +116,27 @@ def _emit_error(
     *,
     code: str,
     message: str,
-    exit_code: int,
-    retryable: bool,
     request_id: str | None = None,
     details: dict | None = None,
 ) -> int:
     """Write one error envelope with the contract's exit code."""
 
-    error: dict = {"code": code}
-    if details is not None:
-        error["details"] = details
-    error["message"] = message
-    if request_id is not None:
-        error["request_id"] = request_id
-    error["retryable"] = retryable
-    print(
-        json.dumps(
-            {"contract": CONTRACT_VERSION, "error": error, "ok": False},
-            separators=(",", ":"),
-        )
+    text, exit_code = shared.render_error(
+        code, message, details=details, request_id=request_id
     )
+    sys.stdout.write(text)
     return exit_code
+
+
+def _emit_failure(failure: shared.ArgvFailure) -> int:
+    """Write one grammar/gate failure from the shared parser; return its exit."""
+
+    return _emit_error(
+        code=failure.code,
+        message=failure.message,
+        request_id=failure.request_id,
+        details=failure.details or None,
+    )
 
 
 def _unsupported(
@@ -165,505 +155,35 @@ def _unsupported(
     return _emit_error(
         code="unsupported",
         message=message,
-        exit_code=EXIT_UNSUPPORTED,
-        retryable=False,
         request_id=request_id,
         details=resolved,
     )
 
 
 # ---------------------------------------------------------------------------
-# Grammar
+# Grammar and argument values (the shared library owns both)
 # ---------------------------------------------------------------------------
+#
+# ``shared.parse_argv`` parses the contract argv and returns the first
+# failure in the section 4.1 check order (``contract_mismatch`` ->
+# ``usage`` -> ``unsupported`` -> ``invalid_argument``). This adapter never
+# parses argv itself: :func:`main` runs the shared parser once before
+# touching the engine (so grammar failures need no engine) and once more
+# with the instance's advertised capabilities (so the capability gate runs
+# before value checks). The shared operation names (``"attempts-list"``,
+# ``"next-issue"``, ``"handoff"``, ...) are translated onto the engine's
+# socket operations by :func:`_mutation_socket_op` and the read runners.
+#
+# ``ParsedCall`` is ``shared.ParsedCall``: ``operation`` is the canonical
+# name, ``offline`` marks an Offline Read, ``request_id``/``expect_repo``
+# are present exactly for mutations, ``arguments`` carries the validated
+# raw values, and ``capability`` is the required optional capability.
 
 
-class _Usage(Exception):
-    """Malformed argv (contract ``usage``, exit 2)."""
 
 
-@dataclass(frozen=True)
-class ParsedOperation:
-    """One well-formed contract operation with its raw option values."""
-
-    #: Canonical name, e.g. ``"stop --after"`` or ``"attempts list"``.
-    name: str
-    #: Whether the call carries a request ID (a mutation).
-    mutation: bool
-    #: Optional capability gating this operation, if any.
-    capability: str | None
-    #: Raw ``--request-id`` value, if the flag was present.
-    request_id: str | None = None
-    #: Raw ``--expect-repo`` value, if the flag was present.
-    expect_repo: str | None = None
-    #: Raw operation-specific values (``after``, ``issue``, ...).
-    args: dict = field(default_factory=dict)
 
 
-def _split_flag(token: str) -> tuple[str, str | None]:
-    """Split ``--flag=value``; a bare ``--flag`` yields ``None``."""
-
-    if "=" in token:
-        flag, _, value = token.partition("=")
-        return flag, value
-    return token, None
-
-
-def _take_value(
-    operation: str, flag: str, tokens: list[str], index: int
-) -> tuple[str, int]:
-    """Take the value of one ``--flag value`` (or ``--flag=value``)."""
-
-    _, inline = _split_flag(tokens[index])
-    if inline is not None:
-        return inline, index + 1
-    if index + 1 >= len(tokens):
-        raise _Usage(f"argument {flag}: expected one argument")
-    # A dash-leading next token is taken as the value and validated
-    # later, so `--after -3` is `invalid_argument`, not a missing value.
-    return tokens[index + 1], index + 2
-
-
-def _parse_mutation_options(
-    operation: str,
-    tokens: list[str],
-    extra: dict[str, str | None],
-) -> tuple[str | None, str | None, dict]:
-    """Parse the option tail of a mutation.
-
-    ``extra`` maps each additional accepted flag to its inline-or-taken
-    raw value holder (``None`` means flag absent). Returns
-    ``(request_id, expect_repo, values)``; missing ``--request-id`` or
-    ``--expect-repo`` is malformed argv (``usage``), since every mutation
-    requires both.
-    """
-
-    request_id: str | None = None
-    expect_repo: str | None = None
-    values: dict[str, str | None] = dict(extra)
-    seen: set[str] = set()
-    index = 0
-    while index < len(tokens):
-        token = tokens[index]
-        if not token.startswith("--"):
-            raise _Usage(f"unexpected argument '{token}' for '{operation}'")
-        flag, _ = _split_flag(token)
-        if flag in ("--request-id", "--expect-repo") or flag in values:
-            if flag in seen:
-                raise _Usage(f"duplicate argument '{flag}' for '{operation}'")
-            seen.add(flag)
-            value, index = _take_value(operation, flag, tokens, index)
-            if flag == "--request-id":
-                request_id = value
-            elif flag == "--expect-repo":
-                expect_repo = value
-            else:
-                values[flag] = value
-        else:
-            raise _Usage(f"unexpected argument '{token}' for '{operation}'")
-    if request_id is None:
-        raise _Usage(f"missing --request-id for '{operation}'")
-    if expect_repo is None:
-        raise _Usage(f"missing --expect-repo for '{operation}'")
-    return request_id, expect_repo, values
-
-
-def _parse_operation(operation: str, tokens: list[str]) -> ParsedOperation:
-    """Parse one operation and its tokens; raise :class:`_Usage` if malformed."""
-
-    if operation == "identity":
-        if tokens:
-            raise _Usage(f"unexpected argument '{tokens[0]}' for 'identity'")
-        return ParsedOperation(name="identity", mutation=False, capability=None)
-    if operation == "status":
-        if tokens:
-            raise _Usage(f"unexpected argument '{tokens[0]}' for 'status'")
-        return ParsedOperation(name="status", mutation=False, capability=None)
-    if operation == "command":
-        if not tokens:
-            raise _Usage("missing request ID for 'command'")
-        if len(tokens) > 1:
-            raise _Usage(f"unexpected argument '{tokens[1]}' for 'command'")
-        request_id = tokens[0]
-        if request_id.startswith("--"):
-            raise _Usage(f"unexpected argument '{request_id}' for 'command'")
-        return ParsedOperation(
-            name="command",
-            mutation=False,
-            capability=None,
-            args={"request_id": request_id},
-        )
-    if operation == "attempts":
-        return _parse_attempts(tokens)
-    if operation == "stop":
-        return _parse_stop(tokens)
-    if operation == "resume":
-        request_id, expect_repo, _ = _parse_mutation_options("resume", tokens, {})
-        return ParsedOperation(
-            name="resume",
-            mutation=True,
-            capability=None,
-            request_id=request_id,
-            expect_repo=expect_repo,
-        )
-    if operation == "next":
-        return _parse_next(tokens)
-    if operation == "handoff":
-        return _parse_handoff(tokens)
-    if operation == "recovery":
-        return _parse_recovery(tokens)
-    if operation == "errors":
-        return _parse_errors(tokens)
-    raise _Usage(f"unknown operation '{operation}'")
-
-
-def _parse_attempts(tokens: list[str]) -> ParsedOperation:
-    if not tokens:
-        raise _Usage("missing subcommand for 'attempts'")
-    sub, rest = tokens[0], tokens[1:]
-    if sub == "list":
-        limit: str | None = None
-        before: str | None = None
-        seen: set[str] = set()
-        index = 0
-        while index < len(rest):
-            token = rest[index]
-            if not token.startswith("--"):
-                raise _Usage(
-                    f"unexpected argument '{token}' for 'attempts list'"
-                )
-            flag, _ = _split_flag(token)
-            if flag not in ("--limit", "--before"):
-                raise _Usage(
-                    f"unexpected argument '{token}' for 'attempts list'"
-                )
-            if flag in seen:
-                raise _Usage(
-                    f"duplicate argument '{flag}' for 'attempts list'"
-                )
-            seen.add(flag)
-            value, index = _take_value("attempts list", flag, rest, index)
-            if flag == "--limit":
-                limit = value
-            else:
-                before = value
-        return ParsedOperation(
-            name="attempts list",
-            mutation=False,
-            capability=None,
-            args={"limit": limit, "before": before},
-        )
-    if sub == "show":
-        return _parse_attempts_with_id("attempts show", rest, allow_path=False)
-    if sub == "export":
-        return _parse_attempts_with_id("attempts export", rest, allow_path=True)
-    raise _Usage(f"unknown operation 'attempts {sub}'")
-
-
-def _parse_attempts_with_id(
-    name: str, tokens: list[str], *, allow_path: bool
-) -> ParsedOperation:
-    accepted = {"--path"} if allow_path else set()
-    attempt_id: str | None = None
-    paths: list[str] = []
-    options_seen = False
-    index = 0
-    while index < len(tokens):
-        token = tokens[index]
-        if token.startswith("--"):
-            options_seen = True
-            flag, _ = _split_flag(token)
-            if flag not in accepted:
-                raise _Usage(f"unexpected argument '{token}' for '{name}'")
-            value, index = _take_value(name, flag, tokens, index)
-            paths.append(value)
-        else:
-            if attempt_id is not None or options_seen:
-                raise _Usage(f"unexpected argument '{token}' for '{name}'")
-            attempt_id = token
-            index += 1
-    if attempt_id is None:
-        raise _Usage(f"missing attempt ID for '{name}'")
-    args: dict = {"attempt_id": attempt_id}
-    if allow_path:
-        args["paths"] = paths
-    return ParsedOperation(name=name, mutation=False, capability=None, args=args)
-
-
-def _parse_stop(tokens: list[str]) -> ParsedOperation:
-    after: str | None = None
-    rest: list[str] = []
-    index = 0
-    while index < len(tokens):
-        token = tokens[index]
-        flag, _ = _split_flag(token)
-        if flag == "--after":
-            if after is not None:
-                raise _Usage("duplicate argument '--after' for 'stop'")
-            after, index = _take_value("stop", "--after", tokens, index)
-        else:
-            rest.append(token)
-            index += 1
-    request_id, expect_repo, _ = _parse_mutation_options("stop", rest, {})
-    if after is None:
-        return ParsedOperation(
-            name="stop",
-            mutation=True,
-            capability=None,
-            request_id=request_id,
-            expect_repo=expect_repo,
-        )
-    return ParsedOperation(
-        name="stop --after",
-        mutation=True,
-        capability="stop-after",
-        request_id=request_id,
-        expect_repo=expect_repo,
-        args={"after": after},
-    )
-
-
-def _parse_next(tokens: list[str]) -> ParsedOperation:
-    if not tokens:
-        raise _Usage("missing subcommand for 'next'")
-    if tokens[0] != "issue":
-        raise _Usage(f"unknown operation 'next {tokens[0]}'")
-    rest = tokens[1:]
-    issue: str | None = None
-    tail: list[str] = []
-    for token in rest:
-        if token.startswith("--") or issue is not None:
-            tail.append(token)
-        else:
-            issue = token
-    if issue is None:
-        raise _Usage("missing issue number for 'next issue'")
-    request_id, expect_repo, _ = _parse_mutation_options("next issue", tail, {})
-    return ParsedOperation(
-        name="next issue",
-        mutation=True,
-        capability="next-issue",
-        request_id=request_id,
-        expect_repo=expect_repo,
-        args={"issue": issue},
-    )
-
-
-def _parse_handoff(tokens: list[str]) -> ParsedOperation:
-    if not tokens:
-        raise _Usage("missing subcommand for 'handoff'")
-    if tokens[0] != "now":
-        raise _Usage(f"unknown operation 'handoff {tokens[0]}'")
-    request_id, expect_repo, _ = _parse_mutation_options(
-        "handoff now", tokens[1:], {}
-    )
-    return ParsedOperation(
-        name="handoff now",
-        mutation=True,
-        capability="operator-handoff",
-        request_id=request_id,
-        expect_repo=expect_repo,
-    )
-
-
-def _split_attempt_id(name: str, tokens: list[str]) -> tuple[str, list[str]]:
-    """Split one leading positional attempt ID from the option tail."""
-
-    attempt_id: str | None = None
-    tail: list[str] = []
-    for token in tokens:
-        if token.startswith("--") or attempt_id is not None:
-            tail.append(token)
-        else:
-            attempt_id = token
-    if attempt_id is None:
-        raise _Usage(f"missing attempt ID for '{name}'")
-    return attempt_id, tail
-
-
-def _parse_recovery(tokens: list[str]) -> ParsedOperation:
-    if not tokens:
-        raise _Usage("missing subcommand for 'recovery'")
-    sub, rest = tokens[0], tokens[1:]
-    if sub == "retry":
-        attempt_id, tail = _split_attempt_id("recovery retry", rest)
-        request_id, expect_repo, _ = _parse_mutation_options(
-            "recovery retry", tail, {}
-        )
-        return ParsedOperation(
-            name="recovery retry",
-            mutation=True,
-            capability="recovery-retry",
-            request_id=request_id,
-            expect_repo=expect_repo,
-            args={"attempt_id": attempt_id},
-        )
-    if sub == "release":
-        attempt_id, tail = _split_attempt_id("recovery release", rest)
-        request_id, expect_repo, values = _parse_mutation_options(
-            "recovery release", tail, {"--saved-at": None}
-        )
-        saved_at = values["--saved-at"]
-        if saved_at is None:
-            raise _Usage("missing --saved-at for 'recovery release'")
-        return ParsedOperation(
-            name="recovery release",
-            mutation=True,
-            capability="recovery-release",
-            request_id=request_id,
-            expect_repo=expect_repo,
-            args={"attempt_id": attempt_id, "saved_at": saved_at},
-        )
-    raise _Usage(f"unknown operation 'recovery {sub}'")
-
-
-def _parse_errors(tokens: list[str]) -> ParsedOperation:
-    if not tokens:
-        raise _Usage("missing subcommand for 'errors'")
-    if tokens[0] != "reset":
-        raise _Usage(f"unknown operation 'errors {tokens[0]}'")
-    request_id, expect_repo, _ = _parse_mutation_options(
-        "errors reset", tokens[1:], {}
-    )
-    return ParsedOperation(
-        name="errors reset",
-        mutation=True,
-        capability="errors-reset",
-        request_id=request_id,
-        expect_repo=expect_repo,
-    )
-
-
-# ---------------------------------------------------------------------------
-# Argument values (``invalid_argument``, exit 1)
-# ---------------------------------------------------------------------------
-
-
-class _InvalidArgument(Exception):
-    """Well-formed argv with an invalid value."""
-
-
-def _check_request_id(value: str | None) -> None:
-    if not isinstance(value, str) or REQUEST_ID_RE.fullmatch(value) is None:
-        raise _InvalidArgument(
-            f"invalid request ID {value!r}: must match"
-            " ^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"
-        )
-
-
-def _check_positive_int(raw: str, what: str) -> int:
-    if not re.fullmatch(r"[0-9]+", raw):
-        raise _InvalidArgument(
-            f"invalid {what} {raw!r}: must be a positive integer"
-        )
-    return int(raw, 10)
-
-
-def _check_int_range(raw: str, what: str, low: int, high: int) -> int:
-    """Validate one bounded integer option; the message names the range."""
-
-    try:
-        count = _check_positive_int(raw, what)
-    except _InvalidArgument:
-        raise _InvalidArgument(
-            f"invalid {what} {raw!r}: must be an integer {low}..{high}"
-        ) from None
-    if not low <= count <= high:
-        raise _InvalidArgument(
-            f"invalid {what} {raw!r}: must be an integer {low}..{high}"
-        )
-    return count
-
-
-def _check_values(parsed: ParsedOperation) -> None:
-    """Validate raw option values; engine-side checks stay on the engine."""
-
-    if parsed.mutation:
-        _check_request_id(parsed.request_id)
-        if not isinstance(parsed.expect_repo, str) or not parsed.expect_repo:
-            raise _InvalidArgument("invalid --expect-repo: must not be empty")
-    if parsed.name == "stop --after":
-        raw = parsed.args["after"]
-        try:
-            count = _check_positive_int(raw, "--after value")
-        except _InvalidArgument:
-            raise _InvalidArgument(
-                f"invalid --after value {raw!r}: must be an integer"
-                f" {STOP_AFTER_MIN}..{STOP_AFTER_MAX}"
-            ) from None
-        if not STOP_AFTER_MIN <= count <= STOP_AFTER_MAX:
-            raise _InvalidArgument(
-                f"invalid --after value {raw!r}: must be an integer"
-                f" {STOP_AFTER_MIN}..{STOP_AFTER_MAX}"
-            )
-    elif parsed.name == "next issue":
-        raw = parsed.args["issue"]
-        number = _check_positive_int(raw, "issue number")
-        if number <= 0:
-            raise _InvalidArgument(
-                f"invalid issue number {raw!r}: must be a positive integer"
-            )
-    elif parsed.name == "attempts list":
-        limit = parsed.args.get("limit")
-        if limit is not None:
-            try:
-                count = _check_positive_int(limit, "--limit value")
-            except _InvalidArgument:
-                raise _InvalidArgument(
-                    f"invalid --limit value {limit!r}: must be an integer"
-                    f" {ATTEMPTS_LIMIT_MIN}..{ATTEMPTS_LIMIT_MAX}"
-                ) from None
-            if not ATTEMPTS_LIMIT_MIN <= count <= ATTEMPTS_LIMIT_MAX:
-                raise _InvalidArgument(
-                    f"invalid --limit value {limit!r}: must be an integer"
-                    f" {ATTEMPTS_LIMIT_MIN}..{ATTEMPTS_LIMIT_MAX}"
-                )
-        before = parsed.args.get("before")
-        if before is not None and not before:
-            raise _InvalidArgument("invalid --before value: must not be empty")
-    elif parsed.name in ("attempts show", "attempts export"):
-        if not parsed.args.get("attempt_id"):
-            raise _InvalidArgument(
-                f"invalid attempt ID for '{parsed.name}': must not be empty"
-            )
-        for path in parsed.args.get("paths", []):
-            if not path:
-                raise _InvalidArgument(
-                    "invalid --path value: must not be empty"
-                )
-    elif parsed.name == "command":
-        request_id = parsed.args.get("request_id")
-        if not request_id:
-            raise _InvalidArgument(
-                "invalid request ID for 'command': must not be empty"
-            )
-        if (
-            not isinstance(request_id, str)
-            or REQUEST_ID_RE.fullmatch(request_id) is None
-        ):
-            raise _InvalidArgument(
-                f"invalid request ID {request_id!r}: must match"
-                " ^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"
-            )
-    elif parsed.name in ("recovery retry", "recovery release"):
-        attempt_id = parsed.args.get("attempt_id")
-        if not attempt_id:
-            raise _InvalidArgument(
-                f"invalid attempt ID for '{parsed.name}': must not be empty"
-            )
-        if len(attempt_id) > 256:
-            raise _InvalidArgument(
-                f"invalid attempt ID for '{parsed.name}': must be at most 256 characters"
-            )
-        if parsed.name == "recovery release":
-            saved_at = parsed.args.get("saved_at")
-            if not saved_at:
-                raise _InvalidArgument(
-                    "invalid --saved-at value: must not be empty"
-                )
-            if len(saved_at) > 1024:
-                raise _InvalidArgument(
-                    "invalid --saved-at value: must be at most 1024 characters"
-                )
 
 
 # ---------------------------------------------------------------------------
@@ -1016,11 +536,11 @@ def _attempts_show_problem(result: object) -> str | None:
     return None
 
 
-def _run_attempts_list(parsed: ParsedOperation) -> int:
+def _run_attempts_list(parsed: shared.ParsedCall) -> int:
     """Serve ``attempts list`` from the engine's history projection."""
 
-    raw_limit = parsed.args.get("limit")
-    before = parsed.args.get("before")
+    raw_limit = parsed.arguments.get("limit")
+    before = parsed.arguments.get("before")
     try:
         limit = int(raw_limit, 10) if raw_limit is not None else None
         page = _fetch_attempts_list(limit, before)
@@ -1028,22 +548,22 @@ def _run_attempts_list(parsed: ParsedOperation) -> int:
         return _emit_error(
             code="agent_unreachable",
             message="cannot reach the agent process",
-            exit_code=EXIT_AGENT_UNREACHABLE,
-            retryable=True,
+
+
         )
     except (ValueError, _EngineInvalidArgument) as error:
         return _emit_error(
             code="invalid_argument",
             message=str(error),
-            exit_code=EXIT_REJECTED,
-            retryable=False,
+
+
         )
     except _EngineFailed as error:
         return _emit_error(
             code="internal",
             message=f"the agent process could not serve 'attempts list': {error}",
-            exit_code=EXIT_INTERNAL,
-            retryable=True,
+
+
             details={"stored": False},
         )
     return _emit_ok(page)
@@ -1082,7 +602,7 @@ def _export_data_dir() -> Path:
     return Path(os.environ.get("DATA_DIR", "~/.simple-coding-agent/")).expanduser()
 
 
-def _run_attempts_export(parsed: ParsedOperation) -> int:
+def _run_attempts_export(parsed: shared.ParsedCall) -> int:
     """Stream ``attempts export`` as an uncompressed pax tar to stdout.
 
     The summary and export manifest come from the engine's history
@@ -1096,7 +616,7 @@ def _run_attempts_export(parsed: ParsedOperation) -> int:
 
     from simple_coding_agent import attempt_history as attempt_history_module
 
-    attempt_id = parsed.args.get("attempt_id")
+    attempt_id = parsed.arguments.get("attempt_id")
     assert isinstance(attempt_id, str)
     try:
         projection = _fetch_attempts_export(attempt_id)
@@ -1104,29 +624,29 @@ def _run_attempts_export(parsed: ParsedOperation) -> int:
         return _emit_error(
             code="agent_unreachable",
             message="cannot reach the agent process",
-            exit_code=EXIT_AGENT_UNREACHABLE,
-            retryable=True,
+
+
         )
     except _EngineNotFound as error:
         return _emit_error(
             code="not_found",
             message=str(error),
-            exit_code=EXIT_NOT_FOUND,
-            retryable=False,
+
+
         )
     except _EngineInvalidArgument as error:
         return _emit_error(
             code="invalid_argument",
             message=str(error),
-            exit_code=EXIT_REJECTED,
-            retryable=False,
+
+
         )
     except _EngineFailed as error:
         return _emit_error(
             code="internal",
             message=f"the agent process could not serve 'attempts export': {error}",
-            exit_code=EXIT_INTERNAL,
-            retryable=True,
+
+
             details={"stored": False},
         )
     manifest = projection.get("manifest")
@@ -1136,7 +656,7 @@ def _run_attempts_export(parsed: ParsedOperation) -> int:
         for entry in manifest
         if isinstance(entry, dict) and isinstance(entry.get("path"), str)
     }
-    requested = parsed.args.get("paths", [])
+    requested = parsed.arguments.get("paths", [])
     for path in requested:
         if not _is_export_path(path) or path not in known:
             return _emit_error(
@@ -1156,8 +676,8 @@ def _run_attempts_export(parsed: ParsedOperation) -> int:
         return _emit_error(
             code="not_found",
             message=f"unknown attempt {attempt_id!r}",
-            exit_code=EXIT_NOT_FOUND,
-            retryable=False,
+
+
         )
     live: dict[str, bytes] = {}
     for entry in entries:
@@ -1190,8 +710,8 @@ def _run_attempts_export(parsed: ParsedOperation) -> int:
         return _emit_error(
             code="internal",
             message=f"the agent process could not serve 'attempts export': {error}",
-            exit_code=EXIT_INTERNAL,
-            retryable=True,
+
+
             details={"stored": False},
         )
     return EXIT_OK
@@ -1208,10 +728,10 @@ def _is_export_path(path: object) -> bool:
     return True
 
 
-def _run_attempts_show(parsed: ParsedOperation) -> int:
+def _run_attempts_show(parsed: shared.ParsedCall) -> int:
     """Serve ``attempts show`` from the engine's history projection."""
 
-    attempt_id = parsed.args.get("attempt_id")
+    attempt_id = parsed.arguments.get("attempt_id")
     assert isinstance(attempt_id, str)
     try:
         result = _fetch_attempts_show(attempt_id)
@@ -1219,29 +739,29 @@ def _run_attempts_show(parsed: ParsedOperation) -> int:
         return _emit_error(
             code="agent_unreachable",
             message="cannot reach the agent process",
-            exit_code=EXIT_AGENT_UNREACHABLE,
-            retryable=True,
+
+
         )
     except _EngineNotFound as error:
         return _emit_error(
             code="not_found",
             message=str(error),
-            exit_code=EXIT_NOT_FOUND,
-            retryable=False,
+
+
         )
     except _EngineInvalidArgument as error:
         return _emit_error(
             code="invalid_argument",
             message=str(error),
-            exit_code=EXIT_REJECTED,
-            retryable=False,
+
+
         )
     except _EngineFailed as error:
         return _emit_error(
             code="internal",
             message=f"the agent process could not serve 'attempts show': {error}",
-            exit_code=EXIT_INTERNAL,
-            retryable=True,
+
+
             details={"stored": False},
         )
     return _emit_ok(result)
@@ -1253,7 +773,7 @@ def _run_attempts_show(parsed: ParsedOperation) -> int:
 
 
 def _mutation_error(
-    parsed: ParsedOperation, reply: dict
+    parsed: shared.ParsedCall, reply: dict
 ) -> int:
     """Map one answered contract rejection to its error code and exit."""
 
@@ -1270,8 +790,8 @@ def _mutation_error(
         return _emit_error(
             code="repository_mismatch",
             message=message,
-            exit_code=EXIT_REJECTED,
-            retryable=False,
+
+
             request_id=parsed.request_id,
             details=resolved,
         )
@@ -1279,8 +799,8 @@ def _mutation_error(
         return _emit_error(
             code="payload_mismatch",
             message=message,
-            exit_code=EXIT_REJECTED,
-            retryable=False,
+
+
             request_id=parsed.request_id,
             details=details,
         )
@@ -1288,8 +808,8 @@ def _mutation_error(
         return _emit_error(
             code="invalid_argument",
             message=message,
-            exit_code=EXIT_REJECTED,
-            retryable=False,
+
+
             request_id=parsed.request_id,
             details=details,
         )
@@ -1297,8 +817,8 @@ def _mutation_error(
         return _emit_error(
             code="rejected",
             message=message,
-            exit_code=EXIT_REJECTED,
-            retryable=False,
+
+
             request_id=parsed.request_id,
             details=details,
         )
@@ -1311,8 +831,8 @@ def _mutation_error(
         return _emit_error(
             code="internal",
             message=message,
-            exit_code=EXIT_INTERNAL,
-            retryable=True,
+
+
             request_id=parsed.request_id,
             details=stored,
         )
@@ -1327,7 +847,7 @@ def _mutation_error(
     )
 
 
-def _mutation_socket_op(parsed: ParsedOperation) -> tuple[str, dict]:
+def _mutation_socket_op(parsed: shared.ParsedCall) -> tuple[str, dict]:
     """Map one parsed mutation onto its socket operation and payload."""
 
     if parsed.name == "stop":
@@ -1335,19 +855,19 @@ def _mutation_socket_op(parsed: ParsedOperation) -> tuple[str, dict]:
     if parsed.name == "resume":
         return "resume", {}
     if parsed.name == "stop --after":
-        return "stop_after", {"after": int(parsed.args["after"], 10)}
+        return "stop_after", {"after": int(parsed.arguments["after"], 10)}
     if parsed.name == "next issue":
-        return "next_issue", {"issue": int(parsed.args["issue"], 10)}
+        return "next_issue", {"issue": int(parsed.arguments["issue"], 10)}
     if parsed.name == "handoff now":
         return "handoff", {}
     if parsed.name == "recovery retry":
-        return "recovery_retry", {"attempt_id": parsed.args["attempt_id"]}
+        return "recovery_retry", {"attempt_id": parsed.arguments["attempt_id"]}
     if parsed.name == "recovery release":
         return (
             "recovery_release",
             {
-                "attempt_id": parsed.args["attempt_id"],
-                "saved_at": parsed.args["saved_at"],
+                "attempt_id": parsed.arguments["attempt_id"],
+                "saved_at": parsed.arguments["saved_at"],
             },
         )
     if parsed.name == "errors reset":
@@ -1355,7 +875,7 @@ def _mutation_socket_op(parsed: ParsedOperation) -> tuple[str, dict]:
     raise AssertionError(f"not a contract mutation: {parsed.name}")
 
 
-def _run_contract_mutation(parsed: ParsedOperation, op: str | None = None) -> int:
+def _run_contract_mutation(parsed: shared.ParsedCall, op: str | None = None) -> int:
     """Serve one contract mutation through the control socket."""
 
     assert parsed.request_id is not None and parsed.expect_repo is not None
@@ -1374,16 +894,16 @@ def _run_contract_mutation(parsed: ParsedOperation, op: str | None = None) -> in
                 "cannot reach the agent process; the outcome is unknown,"
                 " retry with the same request ID"
             ),
-            exit_code=EXIT_AGENT_UNREACHABLE,
-            retryable=True,
+
+
             request_id=parsed.request_id,
         )
     except _EngineFailed as error:
         return _emit_error(
             code="internal",
             message=f"the agent process could not serve '{parsed.name}': {error}",
-            exit_code=EXIT_INTERNAL,
-            retryable=True,
+
+
             request_id=parsed.request_id,
             details={"stored": False},
         )
@@ -1397,8 +917,8 @@ def _run_contract_mutation(parsed: ParsedOperation, op: str | None = None) -> in
             message=(
                 f"the agent process answered malformed contract command: {problem}"
             ),
-            exit_code=EXIT_INTERNAL,
-            retryable=True,
+
+
             request_id=parsed.request_id,
         )
     assert isinstance(command, dict)
@@ -1408,8 +928,8 @@ def _run_contract_mutation(parsed: ParsedOperation, op: str | None = None) -> in
             code="internal",
             message="the agent process answered malformed contract command:"
             " replayed is not a boolean",
-            exit_code=EXIT_INTERNAL,
-            retryable=True,
+
+
             request_id=parsed.request_id,
         )
     return _emit_ok({"command": command, "replayed": replayed})
@@ -1424,15 +944,15 @@ def _run_contract_command(request_id: str) -> int:
         return _emit_error(
             code="agent_unreachable",
             message="cannot reach the agent process",
-            exit_code=EXIT_AGENT_UNREACHABLE,
-            retryable=True,
+
+
         )
     except _EngineFailed as error:
         return _emit_error(
             code="internal",
             message=f"the agent process could not serve 'command': {error}",
-            exit_code=EXIT_INTERNAL,
-            retryable=True,
+
+
             details={"stored": False},
         )
     if not reply.get("ok"):
@@ -1458,8 +978,8 @@ def _run_contract_command(request_id: str) -> int:
         return _emit_error(
             code="internal",
             message=message,
-            exit_code=EXIT_INTERNAL,
-            retryable=True,
+
+
             details=stored,
         )
     command = reply.get("command")
@@ -1470,8 +990,8 @@ def _run_contract_command(request_id: str) -> int:
             message=(
                 f"the agent process answered malformed contract command: {problem}"
             ),
-            exit_code=EXIT_INTERNAL,
-            retryable=True,
+
+
         )
     assert isinstance(command, dict)
     return _emit_ok({"command": command})
@@ -1484,7 +1004,7 @@ def _run_contract_command(request_id: str) -> int:
 # ---------------------------------------------------------------------------
 
 
-def _request_id_for_error(parsed: ParsedOperation | None) -> str | None:
+def _request_id_for_error(parsed: shared.ParsedCall | None) -> str | None:
     if parsed is not None and parsed.mutation:
         return parsed.request_id
     return None
@@ -1555,16 +1075,16 @@ def main(argv: list[str]) -> int:
                 if parsed.mutation
                 else "cannot reach the agent process"
             ),
-            exit_code=EXIT_AGENT_UNREACHABLE,
-            retryable=True,
+
+
             request_id=_request_id_for_error(parsed),
         )
     except _EngineFailed as error:
         return _emit_error(
             code="internal",
             message=f"the agent process could not serve '{parsed.name}': {error}",
-            exit_code=EXIT_INTERNAL,
-            retryable=True,
+
+
             request_id=_request_id_for_error(parsed),
             details={"stored": False},
         )
@@ -1585,8 +1105,8 @@ def main(argv: list[str]) -> int:
         return _emit_error(
             code="invalid_argument",
             message=str(error),
-            exit_code=EXIT_REJECTED,
-            retryable=False,
+
+
             request_id=_request_id_for_error(parsed),
         )
     if parsed.name == "status":
@@ -1611,7 +1131,7 @@ def main(argv: list[str]) -> int:
     ):
         return _run_contract_mutation(parsed)
     if parsed.name == "command":
-        return _run_contract_command(parsed.args["request_id"])
+        return _run_contract_command(parsed.arguments["request_id"])
     # Later tickets project each remaining operation onto the contract's
     # shared types (attempt archives). Until then the grammar and checks
     # above are in place and the operation answers ``unsupported`` without
@@ -1630,7 +1150,7 @@ def main(argv: list[str]) -> int:
 # ---------------------------------------------------------------------------
 
 
-def _run_offline(parsed: ParsedOperation) -> int:
+def _run_offline(parsed: shared.ParsedCall) -> int:
     """Serve one offline read from the stopped volume without the engine.
 
     The call never takes the volume lock and never writes: the control
@@ -1652,8 +1172,8 @@ def _run_offline(parsed: ParsedOperation) -> int:
         return _emit_error(
             code="invalid_argument",
             message=str(error),
-            exit_code=EXIT_REJECTED,
-            retryable=False,
+
+
             request_id=_request_id_for_error(parsed),
         )
     data_dir = _export_data_dir()
@@ -1663,8 +1183,8 @@ def _run_offline(parsed: ParsedOperation) -> int:
         return _emit_error(
             code="internal",
             message=f"the volume lock could not be probed: {error}",
-            exit_code=EXIT_INTERNAL,
-            retryable=True,
+
+
             request_id=_request_id_for_error(parsed),
             details={"stored": False},
         )
@@ -1672,8 +1192,8 @@ def _run_offline(parsed: ParsedOperation) -> int:
         return _emit_error(
             code="rejected",
             message="the volume is still held by a live engine",
-            exit_code=EXIT_REJECTED,
-            retryable=False,
+
+
             details={"reason": "instance_running"},
         )
     if parsed.name == "attempts export":
@@ -1684,20 +1204,20 @@ def _run_offline(parsed: ParsedOperation) -> int:
         if parsed.name == "status":
             return _emit_ok(offline_module.offline_status(data_dir))
         if parsed.name == "command":
-            request_id = parsed.args.get("request_id")
+            request_id = parsed.arguments.get("request_id")
             assert isinstance(request_id, str)
             return _emit_ok(
                 {"command": offline_module.offline_command(data_dir, request_id)}
             )
         if parsed.name == "attempts list":
-            raw_limit = parsed.args.get("limit")
-            before = parsed.args.get("before")
+            raw_limit = parsed.arguments.get("limit")
+            before = parsed.arguments.get("before")
             limit = int(raw_limit, 10) if raw_limit is not None else None
             return _emit_ok(
                 offline_module.offline_attempts_list(data_dir, limit, before)
             )
         if parsed.name == "attempts show":
-            attempt_id = parsed.args.get("attempt_id")
+            attempt_id = parsed.arguments.get("attempt_id")
             assert isinstance(attempt_id, str)
             return _emit_ok(
                 offline_module.offline_attempts_show(data_dir, attempt_id)
@@ -1706,8 +1226,8 @@ def _run_offline(parsed: ParsedOperation) -> int:
         return _emit_error(
             code="internal",
             message=f"the stopped volume could not be read: {error}",
-            exit_code=EXIT_INTERNAL,
-            retryable=True,
+
+
             details={"stored": False},
         )
     except AttemptHistoryError as error:
@@ -1728,15 +1248,15 @@ def _offline_history_error(error: AttemptHistoryError) -> int:
         return _emit_error(
             code="not_found",
             message=str(error),
-            exit_code=EXIT_NOT_FOUND,
-            retryable=False,
+
+
         )
     if error.code == "invalid_argument":
         return _emit_error(
             code="invalid_argument",
             message=str(error),
-            exit_code=EXIT_REJECTED,
-            retryable=False,
+
+
         )
     return _emit_error(
         code="internal",
@@ -1748,7 +1268,7 @@ def _offline_history_error(error: AttemptHistoryError) -> int:
 
 
 def _run_offline_attempts_export(
-    parsed: ParsedOperation, data_dir: Path
+    parsed: shared.ParsedCall, data_dir: Path
 ) -> int:
     """Stream one offline ``attempts export`` tar to stdout, volume-direct.
 
@@ -1762,7 +1282,7 @@ def _run_offline_attempts_export(
     from simple_coding_agent import offline as offline_module
     from simple_coding_agent.control_offline import OfflineReadError
 
-    attempt_id = parsed.args.get("attempt_id")
+    attempt_id = parsed.arguments.get("attempt_id")
     assert isinstance(attempt_id, str)
     try:
         projection = offline_module.offline_attempts_export(data_dir, attempt_id)
@@ -1772,8 +1292,8 @@ def _run_offline_attempts_export(
         return _emit_error(
             code="internal",
             message=f"the stopped volume could not be read: {error}",
-            exit_code=EXIT_INTERNAL,
-            retryable=True,
+
+
             details={"stored": False},
         )
     manifest = projection.get("manifest")
@@ -1783,7 +1303,7 @@ def _run_offline_attempts_export(
         for entry in manifest
         if isinstance(entry, dict) and isinstance(entry.get("path"), str)
     }
-    requested = parsed.args.get("paths", [])
+    requested = parsed.arguments.get("paths", [])
     for path in requested:
         if not _is_export_path(path) or path not in known:
             return _emit_error(
@@ -1802,8 +1322,8 @@ def _run_offline_attempts_export(
         return _emit_error(
             code="not_found",
             message=f"unknown attempt {attempt_id!r}",
-            exit_code=EXIT_NOT_FOUND,
-            retryable=False,
+
+
         )
     live: dict[str, bytes] = {}
     for entry in entries:
@@ -1836,8 +1356,8 @@ def _run_offline_attempts_export(
         return _emit_error(
             code="internal",
             message=f"the stopped volume could not be read: {error}",
-            exit_code=EXIT_INTERNAL,
-            retryable=True,
+
+
             details={"stored": False},
         )
     return EXIT_OK
@@ -1866,15 +1386,15 @@ def _run_identity() -> int:
         return _emit_error(
             code="agent_unreachable",
             message="cannot reach the agent process",
-            exit_code=EXIT_AGENT_UNREACHABLE,
-            retryable=True,
+
+
         )
     except _EngineFailed as error:
         return _emit_error(
             code="internal",
             message=f"the agent process could not serve 'identity': {error}",
-            exit_code=EXIT_INTERNAL,
-            retryable=True,
+
+
             details={"stored": False},
         )
     return _emit_ok(
@@ -1902,15 +1422,15 @@ def _run_status() -> int:
         return _emit_error(
             code="agent_unreachable",
             message="cannot reach the agent process",
-            exit_code=EXIT_AGENT_UNREACHABLE,
-            retryable=True,
+
+
         )
     except _EngineFailed as error:
         return _emit_error(
             code="internal",
             message=f"the agent process could not serve 'status': {error}",
-            exit_code=EXIT_INTERNAL,
-            retryable=True,
+
+
             details={"stored": False},
         )
     return _emit_ok(status)
