@@ -331,12 +331,15 @@ class GitWorkspace:
             commits.append(AttemptCommit(revision=revision, subject=subject))
         return tuple(commits)
 
-    def conflict_state(self) -> ConflictState:
+    def conflict_state(self, prepared: PreparedAttempt | None = None) -> ConflictState:
         """Return one snapshot of the rebase/merge conflict state.
 
         Fails safe: a tree whose state cannot be read is reported as
         conflicted with a verification problem, so setup never runs
-        against a tree that could not be verified.
+        against a tree that could not be verified. When ``prepared`` is
+        given, marker verification is scoped to files the rebase or the
+        model could have touched (see :meth:`conflict_marker_files`); a
+        missing scope scans everything, as before.
         """
 
         try:
@@ -354,7 +357,7 @@ class GitWorkspace:
         except Exception:
             files = ()
         try:
-            problems = self.rebase_resolution_problems()
+            problems = self.rebase_resolution_problems(prepared)
         except Exception:
             problems = (
                 "Conflict-resolution verification failed; treating the tree as conflicted.",
@@ -836,21 +839,43 @@ class GitWorkspace:
             return ()
         return tuple(line for line in output.splitlines() if line.strip())
 
-    def conflict_marker_files(self) -> tuple[str, ...]:
+    def conflict_marker_files(
+        self,
+        *,
+        base_revision: str | None = None,
+        original_conflicted: tuple[str, ...] = (),
+    ) -> tuple[str, ...]:
         """Return worktree files that still contain conflict markers.
 
-        Covers tracked files plus untracked, non-ignored files, since the
-        model may leave markers in either. Conservative by design: a file
-        that merely mentions markers is reported too, and the attempt then
-        falls back to the pre-rebase state instead of running setup.
+        Without a ``base_revision`` this covers every tracked file plus
+        every untracked, non-ignored file, since the model may leave
+        markers in either. With a ``base_revision`` the scan is scoped to
+        files the rebase or the model could have touched: the originally
+        conflicted files, every path that differs between the base
+        revision and the current work tree (committed, staged, and
+        unstaged), and every untracked, non-ignored file. A file identical
+        to its version at the base revision is never scanned. Conservative
+        by design: a file that merely mentions markers is reported too,
+        and the attempt then falls back to the pre-rebase state instead of
+        running setup. Fail-safe: when the scoped file list cannot be
+        computed, every file is scanned rather than reporting clean.
         """
 
-        try:
-            tracked = self._git("ls-files", "-z")
-            untracked = self._git("ls-files", "--others", "--exclude-standard", "-z")
-        except GitWorkspaceError:
-            return ()
-        names = [name for name in tracked.split("\0") + untracked.split("\0") if name.strip()]
+        # ``None`` means unscoped (scan everything); an empty list is a
+        # real scope (nothing in scope) and scans nothing.
+        names: list[str] | None = None
+        if base_revision is not None and str(base_revision).strip():
+            names = self._scoped_marker_candidates(
+                str(base_revision).strip(),
+                original_conflicted,
+            )
+        if names is None:
+            try:
+                tracked = self._git("ls-files", "-z")
+                untracked = self._git("ls-files", "--others", "--exclude-standard", "-z")
+            except GitWorkspaceError:
+                return ()
+            names = [name for name in tracked.split("\0") + untracked.split("\0") if name.strip()]
         marked: list[str] = []
         for name in names:
             path = self._clone_dir / name
@@ -873,6 +898,40 @@ class GitWorkspace:
                     break
         return tuple(marked)
 
+    def _scoped_marker_candidates(
+        self,
+        base_revision: str,
+        original_conflicted: tuple[str, ...],
+    ) -> list[str] | None:
+        """Paths the resolution could have touched, or ``None`` when unreadable.
+
+        The union of the originally conflicted files, every path differing
+        between ``base_revision`` and the current work tree (committed via
+        ``HEAD``, staged via the index, and unstaged via the work tree),
+        and every untracked, non-ignored file. Any git failure returns
+        ``None`` so the caller falls back to scanning everything.
+        """
+
+        try:
+            candidates: set[str] = {
+                path.strip()
+                for path in (original_conflicted or ())
+                if path and path.strip()
+            }
+            worktree = self._git("diff", "--name-only", base_revision, "--")
+            candidates.update(line.strip() for line in worktree.splitlines() if line.strip())
+            committed = self._git("diff", "--name-only", base_revision, "HEAD", "--")
+            candidates.update(line.strip() for line in committed.splitlines() if line.strip())
+            staged = self._git("diff", "--name-only", "--cached", base_revision, "--")
+            candidates.update(line.strip() for line in staged.splitlines() if line.strip())
+            untracked = self._git("ls-files", "--others", "--exclude-standard", "-z")
+            candidates.update(
+                name.strip() for name in untracked.split("\0") if name.strip()
+            )
+        except GitWorkspaceError:
+            return None
+        return sorted(candidates)
+
     def diff_check_clean(self) -> bool:
         """Return True when ``git diff --check`` reports no whitespace errors.
 
@@ -888,7 +947,9 @@ class GitWorkspace:
             return False
         return True
 
-    def rebase_resolution_problems(self) -> tuple[str, ...]:
+    def rebase_resolution_problems(
+        self, prepared: PreparedAttempt | None = None
+    ) -> tuple[str, ...]:
         """Deterministic post-model verification of a left-in-place rebase.
 
         Returns an empty tuple when the working tree is safe for setup:
@@ -896,6 +957,9 @@ class GitWorkspace:
         markers left in any file, and ``git diff --check`` clean. Any
         remaining problem is described, so the caller can abort the rebase,
         restore the branch, and report the conflict instead of proceeding.
+        When ``prepared`` is given, the marker scan is scoped to files the
+        rebase or the model could have touched; without it every file is
+        scanned, as before.
         """
 
         problems: list[str] = []
@@ -903,7 +967,13 @@ class GitWorkspace:
             conflicted = self.conflicted_files()
             files = f" Conflicting files: {', '.join(conflicted)}." if conflicted else ""
             problems.append(f"A rebase or merge is still in progress.{files}")
-        marked = self.conflict_marker_files()
+        if prepared is None:
+            marked = self.conflict_marker_files()
+        else:
+            marked = self.conflict_marker_files(
+                base_revision=prepared.base_revision,
+                original_conflicted=tuple(prepared.rebase_conflicts or ()),
+            )
         if marked:
             problems.append(f"Conflict markers remain in: {', '.join(marked)}.")
         if not self.diff_check_clean():

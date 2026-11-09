@@ -520,7 +520,7 @@ class ModelAttemptRunner:
         # markers for the model to resolve. Setup commands parse every source
         # file, so they must never run against that half-rebased tree; they
         # are deferred until after the model resolves the conflicts.
-        pre_state = self._workspace.conflict_state()
+        pre_state = self._workspace.conflict_state(prepared)
         setup_deferred = pre_state.in_progress
         preparation: PreparationEvidence | None = None
         if setup_deferred:
@@ -651,7 +651,7 @@ class ModelAttemptRunner:
             # back to the pre-rebase branch state and the attempt reports
             # a rebase_conflict infrastructure error, exactly as if the
             # rebase had been aborted up front.
-            post_state = self._workspace.conflict_state()
+            post_state = self._workspace.conflict_state(prepared)
             if post_state.resolution_problems:
                 remaining = _remaining_conflicts(post_state, prepared)
                 branch = prepared.branch
@@ -674,10 +674,11 @@ class ModelAttemptRunner:
                     issue_number=claim.issue.number,
                 )
                 files = f" Conflicting files: {', '.join(remaining)}." if remaining else ""
+                problems_text = " ".join(post_state.resolution_problems)
                 raise RebaseConflictError(
                     f"Rebase of {branch} onto {profile.base_branch} hit conflicts"
-                    f" (rebase_conflict).{files} The model left conflicts"
-                    " unresolved, so the rebase was aborted and setup was not started.",
+                    f" (rebase_conflict).{files} {problems_text}"
+                    " The rebase was aborted and setup was not started.",
                     branch=branch,
                     base_branch=profile.base_branch,
                     conflicted_files=remaining,
@@ -6722,7 +6723,7 @@ class AgentLifecycle:
             level="INFO",
             issue_number=issue_number,
         )
-        state = self._workspace.conflict_state()
+        state = self._workspace.conflict_state(prepared)
         conflicted = tuple(state.conflicted_files) or tuple(prepared.rebase_conflicts or ())
         if state.in_progress or prepared.rebase_conflicts:
             # A real rebase conflict: leave the rebase in place for the
@@ -7025,7 +7026,7 @@ class AgentLifecycle:
                 push_branch=False,
                 conflicted_files=tuple(conflicted),
             )
-        post_state = self._workspace.conflict_state()
+        post_state = self._workspace.conflict_state(prepared)
         if post_state.resolution_problems:
             remaining = tuple(post_state.conflicted_files) or tuple(conflicted)
             self._event_log(
@@ -7213,7 +7214,7 @@ class AgentLifecycle:
         """Abort an in-progress rebase without changing the attempt's outcome."""
 
         try:
-            if not self._workspace.conflict_state().in_progress:
+            if not self._workspace.conflict_state(prepared).in_progress:
                 return
         except Exception as error:
             self._event_log(

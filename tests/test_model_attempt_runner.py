@@ -355,6 +355,55 @@ def test_unresolved_conflicts_after_the_model_abort_restore_and_raise(
     assert caught.value.conflicted_files == ("SubscriptionController.php",)
 
 
+def test_failed_resolution_reports_the_detected_problem_not_unresolved_claim(
+    tmp_path: Path,
+) -> None:
+    """A marker-only failure names the problem instead of blaming the model.
+
+    When no rebase is in progress and no paths are unmerged, the
+    ``RebaseConflictError`` message (and so the posted infrastructure-error
+    comment) names each detected problem and its files rather than claiming
+    the model left conflicts unresolved.
+    """
+
+    from simple_coding_agent.git_workspace import ConflictState
+
+    executor = FakeModelExecutor(status=ModelExecutionStatus.SUCCEEDED)
+    workspace = InMemoryWorkspace(tmp_path / "repo", resolve_after_model=False)
+    workspace.model_commit("Retained work", files=("Retained work",))
+    workspace.leave_conflict(files=("SubscriptionController.php",))
+
+    def leave_marker_only() -> None:
+        workspace._conflict = ConflictState(
+            in_progress=False,
+            conflicted_files=(),
+            resolution_problems=("Conflict markers remain in: notes.txt.",),
+        )
+
+    executor.after_execute = leave_marker_only
+    events: list[tuple[str, str, str]] = []
+    runner = build_runner(
+        tmp_path,
+        model_executor=executor,
+        workspace=workspace,
+        event_log=lambda event, detail="", level="INFO", issue_number=None: events.append(
+            (event, detail, level)
+        ),
+    )
+    prepared = FakePrepared(rebase_conflicts=("SubscriptionController.php",))
+
+    with pytest.raises(RebaseConflictError) as caught:
+        runner(claim(issue_number=24, issue_body="Fix the parser."), profile(), prepared)
+
+    assert "Conflict markers remain in: notes.txt." in str(caught.value)
+    assert "left conflicts unresolved" not in str(caught.value)
+    assert "rebase_conflict" in str(caught.value)
+    assert "setup was not started" in str(caught.value).lower()
+    failed = [detail for event, detail, _ in events if event == "rebase_resolution_failed"]
+    assert len(failed) == 1
+    assert "Conflict markers remain in: notes.txt." in failed[0]
+
+
 def test_fallback_falls_back_to_the_prepare_snapshot_for_the_file_list(
     tmp_path: Path,
 ) -> None:

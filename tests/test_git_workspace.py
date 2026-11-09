@@ -847,3 +847,188 @@ def test_claim_time_push_overwrites_a_branch_observed_at_attempt_start(
     )
 
     assert pushed == git(tmp_path / "clone", "rev-parse", "HEAD")
+
+
+def _resolve_conflicted_rebase(clone: Path) -> None:
+    """Resolve the README conflict in place and continue the rebase."""
+
+    (clone / "README.md").write_text("resolved content")
+    git(clone, "add", "README.md")
+    git(
+        clone,
+        "-c",
+        "user.name=Test User",
+        "-c",
+        "user.email=test@example.com",
+        "rebase",
+        "--continue",
+    )
+
+
+def test_scoped_marker_scan_ignores_an_untouched_equals_underline(
+    tmp_path: Path,
+) -> None:
+    """An untouched tracked file with ``====`` must not fail a clean resolution."""
+
+    remote, seed = repository_with_main(tmp_path)
+    underline = "=" * 28
+    write_and_commit(
+        seed, "sse.js", f"/*\nServer Sent Events Extension\n{underline}\n*/\n", "Vendor SSE"
+    )
+    git(seed, "push", "origin", "main")
+    clone = tmp_path / "clone"
+    workspace = GitWorkspace(clone, str(remote), token_provider=lambda: "secret-token")
+    workspace.prepare_attempt(base_branch="main", issue_number=19)
+    write_and_commit(clone, "README.md", "branch change", "Conflicting branch commit")
+
+    write_and_commit(seed, "README.md", "upstream fix", "Conflicting upstream commit")
+    git(seed, "push", "origin", "main")
+
+    prepared = workspace.prepare_attempt(base_branch="main", issue_number=19)
+    assert prepared.rebase_conflicts != ()
+
+    _resolve_conflicted_rebase(clone)
+
+    assert workspace.has_unresolved_conflicts() is False
+    # Unscoped, the underline reads as a marker (the old false positive).
+    assert workspace.conflict_marker_files() == ("sse.js",)
+    # Scoped to the rebase, the untouched file is never scanned.
+    assert (
+        workspace.conflict_marker_files(
+            base_revision=prepared.base_revision,
+            original_conflicted=tuple(prepared.rebase_conflicts),
+        )
+        == ()
+    )
+    assert workspace.rebase_resolution_problems(prepared) == ()
+    assert workspace.conflict_state(prepared).resolution_problems == ()
+
+
+def test_scoped_marker_scan_still_flags_the_conflicted_file(tmp_path: Path) -> None:
+    """Real markers left in an originally conflicted file still fail verification."""
+
+    remote, seed = repository_with_main(tmp_path)
+    clone = tmp_path / "clone"
+    workspace = GitWorkspace(clone, str(remote), token_provider=lambda: "secret-token")
+    workspace.prepare_attempt(base_branch="main", issue_number=19)
+    write_and_commit(clone, "README.md", "branch change", "Conflicting branch commit")
+
+    write_and_commit(seed, "README.md", "upstream fix", "Conflicting upstream commit")
+    git(seed, "push", "origin", "main")
+
+    prepared = workspace.prepare_attempt(base_branch="main", issue_number=19)
+
+    (clone / "README.md").write_text("<<<<<<< HEAD\nresolved\n=======\nother\n>>>>>>> branch\n")
+    git(clone, "add", "README.md")
+    git(
+        clone,
+        "-c",
+        "user.name=Test User",
+        "-c",
+        "user.email=test@example.com",
+        "rebase",
+        "--continue",
+    )
+
+    marked = workspace.conflict_marker_files(
+        base_revision=prepared.base_revision,
+        original_conflicted=tuple(prepared.rebase_conflicts),
+    )
+    assert marked == ("README.md",)
+    problems = workspace.rebase_resolution_problems(prepared)
+    assert any("README.md" in problem for problem in problems)
+
+    workspace.abort_unresolved_rebase(prepared)
+    assert (clone / "README.md").read_text() == "branch change"
+    assert workspace.has_unresolved_conflicts() is False
+
+
+def test_scoped_marker_scan_flags_model_changed_files(tmp_path: Path) -> None:
+    """Markers in files the model changed after the rebase still fail (all states)."""
+
+    for state in ("committed", "staged", "unstaged"):
+        remote, seed = repository_with_main(tmp_path / f"repo-{state}")
+        clone = tmp_path / f"repo-{state}" / "clone"
+        workspace = GitWorkspace(clone, str(remote), token_provider=lambda: "secret-token")
+        workspace.prepare_attempt(base_branch="main", issue_number=19)
+        write_and_commit(clone, "README.md", "branch change", "Conflicting branch commit")
+
+        write_and_commit(seed, "README.md", "upstream fix", "Conflicting upstream commit")
+        git(seed, "push", "origin", "main")
+
+        prepared = workspace.prepare_attempt(base_branch="main", issue_number=19)
+        _resolve_conflicted_rebase(clone)
+        assert workspace.rebase_resolution_problems(prepared) == ()
+
+        marker = "<<<<<<< HEAD\nstale\n=======\nother\n>>>>>>> branch\n"
+        if state == "committed":
+            write_and_commit(clone, "notes.txt", marker, "Model fix with markers")
+        elif state == "staged":
+            (clone / "notes.txt").write_text(marker)
+            git(clone, "add", "notes.txt")
+        else:
+            (clone / "notes.txt").write_text(marker)
+
+        marked = workspace.conflict_marker_files(
+            base_revision=prepared.base_revision,
+            original_conflicted=tuple(prepared.rebase_conflicts),
+        )
+        assert marked == ("notes.txt",), state
+        problems = workspace.rebase_resolution_problems(prepared)
+        assert any("notes.txt" in problem for problem in problems), state
+
+
+def test_scoped_marker_scan_still_covers_untracked_files(tmp_path: Path) -> None:
+    """Untracked files stay in scope, including a bare ``====`` line."""
+
+    remote, seed = repository_with_main(tmp_path)
+    clone = tmp_path / "clone"
+    workspace = GitWorkspace(clone, str(remote), token_provider=lambda: "secret-token")
+    workspace.prepare_attempt(base_branch="main", issue_number=19)
+    write_and_commit(clone, "README.md", "branch change", "Conflicting branch commit")
+
+    write_and_commit(seed, "README.md", "upstream fix", "Conflicting upstream commit")
+    git(seed, "push", "origin", "main")
+
+    prepared = workspace.prepare_attempt(base_branch="main", issue_number=19)
+    _resolve_conflicted_rebase(clone)
+    assert workspace.rebase_resolution_problems(prepared) == ()
+
+    (clone / "untracked-notes.txt").write_text("stale center marker\n==========\n")
+    marked = workspace.conflict_marker_files(
+        base_revision=prepared.base_revision,
+        original_conflicted=tuple(prepared.rebase_conflicts),
+    )
+    assert marked == ("untracked-notes.txt",)
+    assert any(
+        "untracked-notes.txt" in problem
+        for problem in workspace.rebase_resolution_problems(prepared)
+    )
+
+
+def test_scoped_marker_scan_falls_back_to_all_files_when_unreadable(
+    tmp_path: Path,
+) -> None:
+    """An uncomputable scope scans everything rather than reporting clean."""
+
+    from dataclasses import replace
+
+    remote, seed = repository_with_main(tmp_path)
+    underline = "=" * 28
+    write_and_commit(
+        seed, "sse.js", f"/*\nServer Sent Events Extension\n{underline}\n*/\n", "Vendor SSE"
+    )
+    git(seed, "push", "origin", "main")
+    clone = tmp_path / "clone"
+    workspace = GitWorkspace(clone, str(remote), token_provider=lambda: "secret-token")
+    prepared = workspace.prepare_attempt(base_branch="main", issue_number=19)
+
+    broken = replace(prepared, base_revision="missing-revision-deadbeef")
+    assert workspace.conflict_marker_files(
+        base_revision=broken.base_revision,
+        original_conflicted=tuple(broken.rebase_conflicts),
+    ) == ("sse.js",)
+    assert any(
+        "sse.js" in problem
+        for problem in workspace.rebase_resolution_problems(broken)
+    )
