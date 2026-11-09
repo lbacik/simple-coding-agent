@@ -23,18 +23,6 @@ from agent_operator_contract import documents, shared
 
 _DRAFT = jsonschema.Draft202012Validator
 
-_MUTATION_OPERATIONS = frozenset(
-    {
-        "stop",
-        "resume",
-        "next-issue",
-        "handoff",
-        "recovery-retry",
-        "recovery-release",
-        "errors-reset",
-    }
-)
-
 #: Canonical operation -> (result schema name, result validator).
 _RESULT_CHECKS = {
     "identity": ("identity", documents.validate_identity),

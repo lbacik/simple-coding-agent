@@ -66,9 +66,6 @@ POOL_CAPABILITY = "pool"
 #: budget for ``identity`` is 3 s, served lock-free without I/O).
 SOCKET_TIMEOUT_SECONDS = 10.0
 
-#: Every capability the grammar and the capability gate know about.
-ALL_CAPABILITIES = frozenset(shared.OPERATOR_CAPABILITIES)
-
 EXIT_OK = 0
 EXIT_REJECTED = shared.exit_code_for("rejected")
 EXIT_USAGE = shared.exit_code_for("usage")

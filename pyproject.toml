@@ -8,7 +8,7 @@ version = "0.9.0"
 description = "An unattended coding agent for one GitHub repository."
 requires-python = ">=3.11"
 dependencies = [
-    "agent-operator-contract",
+    "agent-operator-contract==1.0.0",
     "claude-agent-sdk==0.2.179",
     "python-dotenv==1.2.4",
     "PyYAML>=6.0,<7",
