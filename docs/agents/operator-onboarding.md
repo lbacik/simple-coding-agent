@@ -188,7 +188,13 @@ re-reads after the settle delay and yields when it sees another assignee or
 another worker's marker. Yielding removes only the loser's own marker and
 leaves the shared assignment while the winner's marker exists; when both
 racers yield, the last one out also removes the now-unmarked assignment, so
-the issue returns to the runnable queue for a later poll. An issue carrying
+the issue returns to the runnable queue for a later poll. Every loser then
+sleeps a random back-off, uniform within twice the claim settle delay,
+before its next assign attempt, and each process sleeps a random spread
+delay, uniform within half of `POLL_INTERVAL`, before its first claim while
+every idle poll sleeps a jittered interval (±20% of `POLL_INTERVAL`) — so
+workers that start together retry out of phase and converge on different
+issues within a cycle or two instead of yielding in lockstep. An issue carrying
 any `claimed-by:*` label is never eligible on any claim path. Release is
 ordered per remote re-read: queue labels first, then the worker's own marker,
 then the login's assignment only when no `claimed-by:*` marker remains.
@@ -496,7 +502,8 @@ The agent adheres strictly to non-destructive cleanup:
   1. Emits a warning log (`working_tree_dirty`) once per dirty episode,
      naming the first offending paths (a follow-up `working_tree_clean`
      is logged when the tree reads clean again).
-  2. Sleeps the normal poll interval and keeps serving `agentctl status`,
+  2. Sleeps a jittered poll interval (uniform within ±20% of
+     `POLL_INTERVAL`) and keeps serving `agentctl status`,
      whose `recovery` block reports the hold with the offending paths and
      the repair instruction — no exit, no restart loop, no label changes.
   A stopped instance never inspects the tree and stays quiet.

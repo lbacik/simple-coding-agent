@@ -292,7 +292,7 @@ def test_dirty_tree_without_checkpoint_holds_intake(
 ) -> None:
     """A dirty tree with no checkpoint holds the claim without exiting.
 
-    The process stays up (no ``SystemExit``), sleeps the poll interval,
+    The process stays up (no ``SystemExit``), sleeps a jittered poll interval,
     and keeps serving the control socket, so the operator retains a live
     view while the tree awaits manual repair.
     """
