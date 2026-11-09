@@ -19,6 +19,8 @@ from pathlib import Path
 
 import pytest
 
+from tests.contract_schema import validate_producer_envelope
+
 from simple_coding_agent import agentctl
 from simple_coding_agent.attempt_state import AttemptStateStore
 from simple_coding_agent.control import ControlStore
@@ -140,7 +142,9 @@ def _run(argv: list[str]) -> tuple[int, dict, str, str]:
     stdout = out.getvalue()
     assert stdout.endswith("\n"), "stdout must end with exactly one newline"
     assert stdout.count("\n") == 1, "stdout must hold exactly one envelope"
-    return code, json.loads(stdout), stdout, err.getvalue()
+    envelope = json.loads(stdout)
+    validate_producer_envelope(envelope, argv, code)
+    return code, envelope, stdout, err.getvalue()
 
 
 def _result(envelope: dict) -> dict:
@@ -158,6 +162,20 @@ def _write_record(
     record = {"started_at": started_at, "issue_number": issue_number}
     record.update(fields)
     archive.write_attempt(record)
+    # Production appends a contract event on every log line (claim_opened
+    # always fires), so a synthetic archive without events.jsonl never
+    # occurs in reality; the pinned attempts-show schema requires the
+    # events entry in the manifest.
+    archive.append_contract_event(
+        {
+            "at": started_at,
+            "level": "info",
+            "event": "claim_opened",
+            "attempt_id": started_at,
+            "issue": issue_number,
+            "text": "",
+        }
+    )
     return archive
 
 
@@ -458,9 +476,20 @@ def test_show_live_attempt_merges_checkpoint_summary_with_archive_manifest(
 
     _, checkpoint = lifecycle._gated_claim()
     assert checkpoint is not None
-    AttemptArchive(
+    live_archive = AttemptArchive(
         _data_dir(claim_server), issue_number=7, started_at=checkpoint.started_at
-    ).write_text("0001_tool_call.json", "{}")
+    )
+    live_archive.write_text("0001_tool_call.json", "{}")
+    live_archive.append_contract_event(
+        {
+            "at": checkpoint.started_at,
+            "level": "info",
+            "event": "claim_opened",
+            "attempt_id": checkpoint.started_at,
+            "issue": 7,
+            "text": "",
+        }
+    )
 
     code, envelope, _, err = _run(
         ["--contract", "1", "attempts", "show", checkpoint.started_at]

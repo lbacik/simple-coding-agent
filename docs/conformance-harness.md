@@ -62,3 +62,28 @@ protocol state is reached — `starting`, `recovering`, `idle`, `active`,
 UV_PROJECT_ENVIRONMENT=/home/agent/venv-py311 \
   uv run --python 3.11 --extra dev pytest tests/test_conformance_harness.py
 ```
+
+## Docker mode (external producer suite)
+
+The pinned producer suite speaks to the producer only through real
+`docker exec`/`docker run`, so CI runs the harness in Docker mode: every
+verb is proxied into a container built from the `harness` image target,
+which bakes the volume paths in as its `DATA_DIR`/`AGENTCTL_SOCKET`
+defaults so the suite's offline `docker run` (no environment) reads the
+same volume the daemon writes.
+
+```shell
+docker build --target harness -t simple-coding-agent:harness .
+SCA_HARNESS_DOCKER=1 SCA_HARNESS_IMAGE=simple-coding-agent:harness \
+  python -m agent_operator_contract.producer_suite --harness scripts/harness.sh \
+    --capabilities stop-after,next-issue,operator-handoff,recovery-retry,recovery-release,errors-reset \
+    --require-all --timeout 180
+```
+
+`SCA_HARNESS_DOCKER=1` makes `setup` create a named volume and a
+`sleep infinity` container from `SCA_HARNESS_IMAGE` (overriding the image
+entrypoint), then run `setup` through `docker exec` so the engine starts
+inside the container on the volume; every later verb is the same
+`docker exec` proxy, and `teardown` removes the container and the volume.
+`DOCKER` selects the docker executable. Without the flag the harness stays
+process-local (unit tests, local smoke runs).

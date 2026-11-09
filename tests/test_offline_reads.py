@@ -22,6 +22,8 @@ from pathlib import Path
 
 import pytest
 
+from tests.contract_schema import validate_export_stream, validate_producer_envelope
+
 from simple_coding_agent import agentctl
 from simple_coding_agent.agent_version import agent_version
 from simple_coding_agent.attempt_state import AttemptStateStore
@@ -90,6 +92,52 @@ def _reporter() -> TelemetryReporter:
     )
 
 
+def _claim_event_log(data_dir: Path):
+    """Mirror production: the claim opens the attempt's ``events.jsonl``.
+
+    Production appends a contract event on every log line (claim_opened
+    always fires) before the archive seals; a no-op event log would leave
+    a synthetic archive without ``events.jsonl``, which the pinned
+    attempts-show schema requires in the manifest.
+    """
+
+    def _log(event, detail="", level="INFO", issue_number=None, **kwargs) -> None:
+        try:
+            if event not in ("issue_claimed", "next_issue_claimed"):
+                return
+            if issue_number is None:
+                return
+            issue_dir = data_dir / "logs" / str(issue_number)
+            if not issue_dir.is_dir():
+                return
+            run_dirs = sorted(
+                path for path in issue_dir.iterdir() if path.is_dir()
+            )
+            if not run_dirs:
+                return
+            record_path = run_dirs[-1] / "attempt.json"
+            record = json.loads(record_path.read_text(encoding="utf-8"))
+            started_at = record.get("started_at") if isinstance(record, dict) else None
+            if not isinstance(started_at, str) or not started_at:
+                return
+            AttemptArchive(
+                data_dir, issue_number=issue_number, started_at=started_at
+            ).append_contract_event(
+                {
+                    "at": started_at,
+                    "level": "info",
+                    "event": "claim_opened",
+                    "attempt_id": started_at,
+                    "issue": issue_number,
+                    "text": "",
+                }
+            )
+        except Exception:
+            pass
+
+    return _log
+
+
 def _build_stopped_volume(data_dir: Path, *, record_halt: bool = True) -> dict:
     """Run the faked engine once, stop it cleanly, and checkpoint the WAL."""
 
@@ -118,7 +166,7 @@ def _build_stopped_volume(data_dir: Path, *, record_halt: bool = True) -> dict:
         data_dir=data_dir,
         halt_store=HaltStore(data_dir),
         sleeper=lambda seconds: None,
-        event_log=lambda *args, **kwargs: None,
+        event_log=_claim_event_log(data_dir),
         attempt_archive_factory=lambda issue_number, started_at: AttemptArchive(
             data_dir, issue_number=issue_number, started_at=started_at
         ),
@@ -204,7 +252,9 @@ def _run(argv: list[str]) -> tuple[int, dict, str, str]:
     stdout = out.getvalue()
     assert stdout.endswith("\n"), "stdout must end with exactly one newline"
     assert stdout.count("\n") == 1, "stdout must hold exactly one envelope"
-    return code, json.loads(stdout), stdout, err.getvalue()
+    envelope = json.loads(stdout)
+    validate_producer_envelope(envelope, argv, code)
+    return code, envelope, stdout, err.getvalue()
 
 
 def _run_export_raw(argv: list[str]) -> tuple[int, bytes, str]:
@@ -222,7 +272,10 @@ def _run_export_raw(argv: list[str]) -> tuple[int, bytes, str]:
         wrapper.flush()
         sys.stdout = previous
     assert isinstance(code, int)
-    return code, raw.getvalue(), err.getvalue()
+    payload = raw.getvalue()
+    if code == 0:
+        validate_export_stream(payload)
+    return code, payload, err.getvalue()
 
 
 def _tar_members(payload: bytes) -> tuple[list[str], dict]:
@@ -271,7 +324,7 @@ def test_offline_reads_from_read_only_stopped_volume(
         code, envelope, _, err = _run(["--contract", "1", "--offline", "status"])
         assert code == 0, envelope
         status = envelope["result"]
-        assert status["instance"]["state"] == "paused"
+        assert status["instance"]["state"] == "stopped"
         assert status["intake"]["state"] == "closed"
         assert status["instance"]["last_halt"] == {
             "reason": HALT_REASON,
@@ -338,7 +391,7 @@ def test_offline_status_reports_stopped_and_last_halt(
     code, envelope, _, _ = _run(["--contract", "1", "--offline", "status"])
     assert code == 0, envelope
     status = envelope["result"]
-    assert status["instance"]["state"] == "paused"
+    assert status["instance"]["state"] == "stopped"
     assert status["current_attempt"] is None
     assert status["instance"]["last_halt"]["reason"] == HALT_REASON
     assert status["instance"]["last_halt"]["at"] == info["halt"].at
@@ -353,7 +406,7 @@ def test_offline_status_without_halt_reports_none(
     code, envelope, _, _ = _run(["--contract", "1", "--offline", "status"])
     assert code == 0, envelope
     status = envelope["result"]
-    assert status["instance"]["state"] == "paused"
+    assert status["instance"]["state"] == "stopped"
     assert status["instance"]["last_halt"] is None
 
 
@@ -429,7 +482,7 @@ def test_offline_reads_after_unclean_stop_are_correct_or_internal(
             # The committed WAL row is current data, never stale: a
             # successful read surfaces it instead of the older snapshot.
             status = envelope["result"]
-            assert status["instance"]["state"] == "paused"
+            assert status["instance"]["state"] == "stopped"
             assert "req-killed" in [
                 entry["request_id"] for entry in status["recent_commands"]
             ]

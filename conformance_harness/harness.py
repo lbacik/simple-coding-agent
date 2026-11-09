@@ -18,6 +18,18 @@ cannot do: ``capability`` (a requested Operator Capability the fixed engine
 set does not advertise) and ``native-outcome`` (a ``finish-attempt``
 outcome the engine has no notion of). Every hold point, crash point, verb
 and the ``defer-publication`` one-shot are supported.
+
+Docker mode (``SCA_HARNESS_DOCKER=1``) runs the same verbs inside a
+container for the external producer suite, which speaks to the producer
+only through real ``docker exec``/``docker run`` (spec section 3): ``setup``
+creates a named volume and a container from ``SCA_HARNESS_IMAGE`` (default
+``simple-coding-agent:harness``) whose entrypoint is overridden to
+``sleep infinity``, then proxies every verb through ``docker exec`` into
+the in-container harness CLI, which manages the engine on the volume
+exactly as in process-local mode. The suite's ``docker exec`` and offline
+``docker run`` reach the same volume because the harness image bakes the
+volume paths in as its ``DATA_DIR``/``AGENTCTL_SOCKET`` defaults.
+``teardown`` removes the container and the volume.
 """
 
 from __future__ import annotations
@@ -30,6 +42,7 @@ import signal
 import subprocess
 import sys
 import time
+import uuid
 from pathlib import Path
 
 
@@ -885,6 +898,200 @@ _VERB_HANDLERS = {
 
 
 # ---------------------------------------------------------------------------
+# Docker mode (operator contract §3 + §15.1)
+# ---------------------------------------------------------------------------
+
+
+def _docker_mode() -> bool:
+    """Whether this invocation proxies verbs into a harness container."""
+
+    return os.environ.get("SCA_HARNESS_DOCKER", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+
+
+def _docker() -> str:
+    return os.environ.get("DOCKER", "docker")
+
+
+def _docker_image() -> str:
+    return os.environ.get("SCA_HARNESS_IMAGE", "simple-coding-agent:harness")
+
+
+#: How long a proxied verb may take before the proxy reports failure. The
+#: suite enforces its own per-call timeout by killing the proxy, so this is
+#: only a backstop against hanging forever.
+_DOCKER_PROXY_TIMEOUT = 300.0
+
+
+def _run_docker(args: list[str], timeout: float = 60.0) -> subprocess.CompletedProcess[str]:
+    """Run one docker command; raise on spawn or timeout failures."""
+
+    return subprocess.run(
+        [_docker(), *args],
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+    )
+
+
+def _docker_host_state() -> dict | None:
+    """The host-side docker-mode record (container and volume names), if any."""
+
+    state = _load_state(state_dir())
+    if isinstance(state, dict) and state.get("docker_mode") is True:
+        return state
+    return None
+
+
+def _docker_inner(verb: str, params: dict, container: str) -> tuple[int, dict] | tuple[int, None]:
+    """Proxy one verb into the container's harness CLI; ``(exit, reply)``.
+
+    The reply is the parsed inner JSON document, or ``None`` when the proxy
+    itself broke (docker unavailable, container gone, non-JSON output).
+    """
+
+    request = json.dumps({"verb": verb, "params": params}, sort_keys=True)
+    try:
+        completed = _run_docker(
+            [
+                "exec",
+                "-w",
+                "/app",
+                container,
+                "python",
+                "-m",
+                "conformance_harness",
+                verb,
+                request,
+            ],
+            timeout=_DOCKER_PROXY_TIMEOUT,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return 1, None
+    try:
+        reply = json.loads(completed.stdout)
+    except ValueError:
+        return 1, None
+    if not isinstance(reply, dict):
+        return 1, None
+    return completed.returncode, reply
+
+
+def _docker_setup(params: dict) -> tuple[int, dict]:
+    """Create the volume and container, then run setup inside it."""
+
+    if _docker_host_state() is not None:
+        return _failed("setup", "an instance already exists; teardown first")
+    name = f"sca-{uuid.uuid4().hex[:12]}"
+    volume = f"{name}-data"
+    image = _docker_image()
+    try:
+        created = _run_docker(["volume", "create", volume])
+        if created.returncode != 0:
+            return _failed(
+                "setup", f"docker volume create failed: {created.stderr.strip()}"
+            )
+        run = _run_docker(
+            [
+                "run",
+                "-d",
+                "--name",
+                name,
+                "--volume",
+                f"{volume}:/data",
+                "--entrypoint",
+                "sleep",
+                image,
+                "infinity",
+            ],
+            timeout=120.0,
+        )
+        if run.returncode != 0:
+            _run_docker(["volume", "rm", volume])
+            return _failed("setup", f"docker run failed: {run.stderr.strip()}")
+    except (OSError, subprocess.TimeoutExpired) as error:
+        return _failed("setup", f"docker is unavailable: {error}")
+    exit_code, inner = _docker_inner("setup", params, name)
+    if inner is None or exit_code not in (0, 1, 3):
+        _run_docker(["rm", "--force", name])
+        _run_docker(["volume", "rm", volume])
+        detail = "the in-container setup broke" if inner is None else json.dumps(inner, sort_keys=True)
+        return _failed("setup", f"harness container setup failed: {detail}")
+    if exit_code != 0:
+        _run_docker(["rm", "--force", name])
+        _run_docker(["volume", "rm", volume])
+        return exit_code, inner
+    result = dict(inner.get("result") or {})
+    try:
+        inspected = _run_docker(["inspect", "--format", "{{.Id}}", image])
+        image_id = inspected.stdout.strip() if inspected.returncode == 0 else image
+    except (OSError, subprocess.TimeoutExpired):
+        image_id = image
+    result.update(
+        {
+            "container": name,
+            "image": image_id,
+            "volumes": [{"name": volume, "path": "/data"}],
+            "exec_user": "agent",
+        }
+    )
+    _save_state(
+        state_dir(),
+        {"version": 1, "docker_mode": True, "container": name, "volume": volume},
+    )
+    return 0, {
+        "harness": HARNESS_VERSION,
+        "verb": "setup",
+        "ok": True,
+        "result": result,
+    }
+
+
+def _docker_teardown() -> tuple[int, dict]:
+    """Run teardown inside the container, then remove it and the volume."""
+
+    state = _docker_host_state()
+    if state is None:
+        return _ok("teardown", {"removed": False})
+    container = str(state.get("container", ""))
+    volume = str(state.get("volume", ""))
+    if container:
+        _docker_inner("teardown", {}, container)
+        _run_docker(["rm", "--force", container])
+    if volume:
+        _run_docker(["volume", "rm", volume])
+    root = state_dir()
+    for name in ("state.json",):
+        try:
+            (root / name).unlink(missing_ok=True)
+        except OSError:
+            pass
+    return _ok("teardown", {"removed": True})
+
+
+def _docker_dispatch(verb: str, params: dict) -> tuple[int, dict]:
+    """Proxy one verb into the harness container (docker mode)."""
+
+    if verb == "setup":
+        return _docker_setup(params)
+    if verb == "teardown":
+        return _docker_teardown()
+    state = _docker_host_state()
+    if state is None:
+        return _failed(verb, "no instance; setup first")
+    container = str(state.get("container", ""))
+    if not container:
+        return _failed(verb, "no instance; setup first")
+    exit_code, inner = _docker_inner(verb, params, container)
+    if inner is None:
+        return _failed(verb, "the harness container is unreachable")
+    return exit_code, inner
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
@@ -913,6 +1120,8 @@ def run_harness(argv: list[str]) -> tuple[int, dict]:
     if error is not None:
         return _usage(verb, error)
     params = document["params"]
+    if _docker_mode():
+        return _docker_dispatch(verb, params)
     root = state_dir()
     if verb == "setup":
         return _verb_setup(root, params)

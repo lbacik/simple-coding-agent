@@ -18,6 +18,8 @@ from pathlib import Path
 
 import pytest
 
+from tests.contract_schema import validate_producer_envelope
+
 from simple_coding_agent import agentctl
 from simple_coding_agent.attempt_state import AttemptStateStore
 from simple_coding_agent.completion import (
@@ -121,7 +123,9 @@ def _run(argv: list[str]) -> tuple[int, dict, str, str]:
     stdout = out.getvalue()
     assert stdout.endswith("\n"), "stdout must end with exactly one newline"
     assert stdout.count("\n") == 1, "stdout must hold exactly one envelope"
-    return code, json.loads(stdout), stdout, err.getvalue()
+    envelope = json.loads(stdout)
+    validate_producer_envelope(envelope, argv, code)
+    return code, envelope, stdout, err.getvalue()
 
 
 def _mutation(
