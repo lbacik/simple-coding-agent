@@ -131,6 +131,13 @@ FROM base AS harness
 USER root
 COPY conformance_harness/ ./conformance_harness/
 COPY tests/fakes.py ./tests/fakes.py
+# The external producer suite reaches the producer only through real
+# `docker exec` (online reads and mutations, inheriting this container's
+# environment) and `docker run` (offline reads, which carry no environment,
+# so the volume paths must be image defaults): the harness state lives at
+# /data/harness on the named volume, DATA_DIR reads its instance dir, and
+# agentctl resolves the daemon's control endpoint for `docker exec`.
+ENV SCA_HARNESS_STATE_DIR=/data/harness DATA_DIR=/data/harness/instance AGENTCTL_SOCKET=/data/harness/daemon.sock
 USER agent
 ENTRYPOINT ["python", "-m", "conformance_harness"]
 

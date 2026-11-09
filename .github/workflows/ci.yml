@@ -79,3 +79,26 @@ jobs:
           git config --global user.name "CI"
           git config --global user.email "ci@example.invalid"
       - run: uv run pytest
+
+  producer:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.13"
+      - run: uv sync --extra dev
+      - run: docker build --target harness -t simple-coding-agent:harness .
+      - run: |
+          uv run python -m agent_operator_contract.producer_suite --harness scripts/harness.sh \
+            --capabilities stop-after,next-issue,operator-handoff,recovery-retry,recovery-release,errors-reset \
+            --require-all --timeout 180
+        env:
+          SCA_HARNESS_DOCKER: "1"
+          SCA_HARNESS_IMAGE: simple-coding-agent:harness
+      - run: |
+          uv run python -m agent_operator_contract.producer_suite --harness scripts/harness.sh \
+            --capabilities "" --timeout 180
+        env:
+          SCA_HARNESS_DOCKER: "1"
+          SCA_HARNESS_IMAGE: simple-coding-agent:harness

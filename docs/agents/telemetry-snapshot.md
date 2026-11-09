@@ -7,7 +7,7 @@ and its most recent events. A dashboard only reads it and tolerates versions
 it does not fully know. Term **telemetry snapshot** is the legacy-path name
 defined in `CONTEXT.md` (new consumers use the contract's Status Snapshot);
 **figure basis** is defined normatively in the [operator contract
-glossary](https://github.com/lbacik/agent-operator-contract/blob/06ee46c0204f0fc8a2465827cc397bc235dedc26/CONTEXT.md#observation)
+glossary](https://github.com/lbacik/agent-operator-contract/blob/v1.0.0/CONTEXT.md#observation)
 and linked from `CONTEXT.md`; the transport decision (serve through
 `agentctl` over the control socket, not HTTP) is
 [ADR 0006](../adr/0006-telemetry-through-agentctl-not-http.md), whose serving

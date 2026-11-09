@@ -363,7 +363,7 @@ def test_harness_smoke_reaches_every_state(tmp_path: Path) -> None:
     assert code == 0, offline
     assert offline["ok"] is True
     stopped = offline["result"]
-    assert stopped["instance"]["state"] == "paused"
+    assert stopped["instance"]["state"] == "stopped"
     assert stopped["instance"]["last_halt"] is None
     assert stopped["intake"]["state"] == "closed"
     assert stopped["current_attempt"] is None
@@ -390,7 +390,7 @@ def test_harness_smoke_reaches_every_state(tmp_path: Path) -> None:
     assert code == 0
     _wait_for_state(socket, "idle")
 
-    # -- halt from paused: close intake so the stopped volume reads paused --
+    # -- halt from paused: close intake so the stopped volume reads stopped --
     code, _ = _agentctl(
         socket, "stop", "--request-id", "req-smoke-stop-2",
         "--expect-repo", "octo/example",
@@ -406,7 +406,7 @@ def test_harness_smoke_reaches_every_state(tmp_path: Path) -> None:
     assert code == 0, offline
     assert offline["ok"] is True
     halted = offline["result"]
-    assert halted["instance"]["state"] == "paused"
+    assert halted["instance"]["state"] == "stopped"
     assert halted["instance"]["last_halt"]["reason"] == "harness-smoke"
     assert halted["current_attempt"] is None
 

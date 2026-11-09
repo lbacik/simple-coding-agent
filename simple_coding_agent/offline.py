@@ -208,6 +208,11 @@ def offline_status(data_dir: Path | None = None) -> dict:
     # one survived an unclean stop, belongs to no running process.
     if assembled.get("current_attempt") is not None:
         raise OfflineReadError("Offline status is inconsistent.")
+    # Offline reads always observe a stopped instance: the online engine
+    # never emits ``stopped`` (paused/draining while it holds the volume),
+    # but the pinned contract requires ``instance.state == 'stopped'``
+    # exactly when ``identity.mode == 'offline'``.
+    assembled["instance"]["state"] = "stopped"
     return assembled
 
 
