@@ -20,6 +20,8 @@ from types import SimpleNamespace
 
 import pytest
 
+from tests.contract_schema import validate_export_stream
+
 from simple_coding_agent import agentctl, attempt_history
 from simple_coding_agent.attempt_history import (
     AttemptHistoryError,
@@ -580,7 +582,10 @@ def _run_export_raw(
         wrapper.flush()
         sys.stdout = previous
     assert isinstance(code, int)
-    return code, raw.getvalue(), err.getvalue()
+    payload = raw.getvalue()
+    if code == 0:
+        validate_export_stream(payload)
+    return code, payload, err.getvalue()
 
 
 def test_contract_export_streams_tar_with_manifest_first(

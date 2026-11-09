@@ -22,6 +22,8 @@ from pathlib import Path
 
 import pytest
 
+from tests.contract_schema import validate_export_stream, validate_producer_envelope
+
 from simple_coding_agent import agentctl
 from simple_coding_agent.agent_version import agent_version
 from simple_coding_agent.attempt_state import AttemptStateStore
@@ -204,7 +206,9 @@ def _run(argv: list[str]) -> tuple[int, dict, str, str]:
     stdout = out.getvalue()
     assert stdout.endswith("\n"), "stdout must end with exactly one newline"
     assert stdout.count("\n") == 1, "stdout must hold exactly one envelope"
-    return code, json.loads(stdout), stdout, err.getvalue()
+    envelope = json.loads(stdout)
+    validate_producer_envelope(envelope, argv, code)
+    return code, envelope, stdout, err.getvalue()
 
 
 def _run_export_raw(argv: list[str]) -> tuple[int, bytes, str]:
@@ -222,7 +226,10 @@ def _run_export_raw(argv: list[str]) -> tuple[int, bytes, str]:
         wrapper.flush()
         sys.stdout = previous
     assert isinstance(code, int)
-    return code, raw.getvalue(), err.getvalue()
+    payload = raw.getvalue()
+    if code == 0:
+        validate_export_stream(payload)
+    return code, payload, err.getvalue()
 
 
 def _tar_members(payload: bytes) -> tuple[list[str], dict]:

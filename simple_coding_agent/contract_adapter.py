@@ -662,8 +662,6 @@ def _run_attempts_export(parsed: shared.ParsedCall) -> int:
             return _emit_error(
                 code="not_found",
                 message=f"unknown archive path {path!r} for attempt {attempt_id!r}",
-                exit_code=EXIT_NOT_FOUND,
-                retryable=False,
             )
     entries = [
         entry
@@ -676,8 +674,6 @@ def _run_attempts_export(parsed: shared.ParsedCall) -> int:
         return _emit_error(
             code="not_found",
             message=f"unknown attempt {attempt_id!r}",
-
-
         )
     live: dict[str, bytes] = {}
     for entry in entries:
@@ -692,8 +688,6 @@ def _run_attempts_export(parsed: shared.ParsedCall) -> int:
             return _emit_error(
                 code="internal",
                 message=f"the agent process could not serve 'attempts export': {error}",
-                exit_code=EXIT_INTERNAL,
-                retryable=True,
                 details={"stored": False},
             )
     attempt = projection.get("attempt")
@@ -840,8 +834,6 @@ def _mutation_error(
     return _emit_error(
         code="internal",
         message=message,
-        exit_code=EXIT_INTERNAL,
-        retryable=True,
         request_id=parsed.request_id,
         details={"stored": False} if reply.get("stored") is False else None,
     )
@@ -850,29 +842,26 @@ def _mutation_error(
 def _mutation_socket_op(parsed: shared.ParsedCall) -> tuple[str, dict]:
     """Map one parsed mutation onto its socket operation and payload."""
 
-    if parsed.name == "stop":
+    if parsed.operation == "stop":
+        if "after" in parsed.arguments:
+            return "stop_after", {"after": int(parsed.arguments["after"], 10)}
         return "stop", {}
-    if parsed.name == "resume":
+    if parsed.operation == "resume":
         return "resume", {}
-    if parsed.name == "stop --after":
-        return "stop_after", {"after": int(parsed.arguments["after"], 10)}
-    if parsed.name == "next issue":
+    if parsed.operation == "next-issue":
         return "next_issue", {"issue": int(parsed.arguments["issue"], 10)}
-    if parsed.name == "handoff now":
+    if parsed.operation == "handoff":
         return "handoff", {}
-    if parsed.name == "recovery retry":
+    if parsed.operation == "recovery-retry":
         return "recovery_retry", {"attempt_id": parsed.arguments["attempt_id"]}
-    if parsed.name == "recovery release":
-        return (
-            "recovery_release",
-            {
-                "attempt_id": parsed.arguments["attempt_id"],
-                "saved_at": parsed.arguments["saved_at"],
-            },
-        )
-    if parsed.name == "errors reset":
+    if parsed.operation == "recovery-release":
+        payload: dict = {"attempt_id": parsed.arguments["attempt_id"]}
+        if "saved_at" in parsed.arguments:
+            payload["saved_at"] = parsed.arguments["saved_at"]
+        return "recovery_release", payload
+    if parsed.operation == "errors-reset":
         return "errors_reset", {}
-    raise AssertionError(f"not a contract mutation: {parsed.name}")
+    raise AssertionError(f"not a contract mutation: {parsed.operation}")
 
 
 def _run_contract_mutation(parsed: shared.ParsedCall, op: str | None = None) -> int:
@@ -901,9 +890,7 @@ def _run_contract_mutation(parsed: shared.ParsedCall, op: str | None = None) -> 
     except _EngineFailed as error:
         return _emit_error(
             code="internal",
-            message=f"the agent process could not serve '{parsed.name}': {error}",
-
-
+            message=f"the agent process could not serve '{parsed.operation}': {error}",
             request_id=parsed.request_id,
             details={"stored": False},
         )
@@ -962,15 +949,11 @@ def _run_contract_command(request_id: str) -> int:
             return _emit_error(
                 code="not_found",
                 message=message,
-                exit_code=EXIT_NOT_FOUND,
-                retryable=False,
             )
         if kind == "invalid_argument":
             return _emit_error(
                 code="invalid_argument",
                 message=message,
-                exit_code=EXIT_REJECTED,
-                retryable=False,
             )
         stored: dict | None = None
         if reply.get("stored") is False:
@@ -1005,7 +988,9 @@ def _run_contract_command(request_id: str) -> int:
 
 
 def _request_id_for_error(parsed: shared.ParsedCall | None) -> str | None:
-    if parsed is not None and parsed.mutation:
+    """Echo the request ID for error envelopes (mutations carry one)."""
+
+    if parsed is not None and parsed.request_id is not None:
         return parsed.request_id
     return None
 
@@ -1013,135 +998,83 @@ def _request_id_for_error(parsed: shared.ParsedCall | None) -> str | None:
 def main(argv: list[str]) -> int:
     """Contract CLI entry point; ``argv`` starts with ``--contract``."""
 
-    if len(argv) < 2:
-        return _emit_error(
-            code="usage",
-            message="usage: missing contract major after '--contract'",
-            exit_code=EXIT_USAGE,
-            retryable=False,
-        )
-    if argv[1] != str(CONTRACT_MAJOR):
-        return _emit_error(
-            code="contract_mismatch",
-            message=f"this instance speaks contract major {CONTRACT_MAJOR}",
-            exit_code=EXIT_CONTRACT_MISMATCH,
-            retryable=False,
-            details={"supported": [CONTRACT_MAJOR]},
-        )
-    tokens = argv[2:]
-    offline = False
-    if tokens[:1] == ["--offline"]:
-        offline = True
-        tokens = tokens[1:]
-    if not tokens:
-        return _emit_error(
-            code="usage",
-            message="usage: missing operation after '--contract 1'",
-            exit_code=EXIT_USAGE,
-            retryable=False,
-        )
-    operation, rest = tokens[0], tokens[1:]
-    try:
-        parsed = _parse_operation(operation, rest)
-    except _Usage as error:
-        request_id = _scan_request_id(rest)
-        return _emit_error(
-            code="usage",
-            message=str(error),
-            exit_code=EXIT_USAGE,
-            retryable=False,
-            request_id=request_id,
-        )
-    if offline:
-        if parsed.mutation:
-            return _unsupported(
-                parsed.name,
-                capability=parsed.capability,
-                request_id=_request_id_for_error(parsed),
-                message=f"operation '{parsed.name}' is not available offline",
-                details={"offline": True},
-            )
-        return _run_offline(parsed)
-    if parsed.name == "identity":
+    if argv[2:3] == ["--offline"]:
+        result = shared.parse_argv(argv, capabilities=shared.OPERATOR_CAPABILITIES)
+        if isinstance(result, shared.ArgvFailure):
+            return _emit_failure(result)
+        return _run_offline(result)
+    early = shared.parse_argv(argv, capabilities=shared.OPERATOR_CAPABILITIES)
+    if isinstance(early, shared.ArgvFailure) and early.code in (
+        "usage",
+        "contract_mismatch",
+    ):
+        return _emit_failure(early)
+    if isinstance(early, shared.ParsedCall) and early.operation == "identity":
         return _run_identity()
     try:
         identity = _fetch_identity()
     except _Unreachable:
+        if isinstance(early, shared.ParsedCall):
+            is_mutation = early.operation in shared.MUTATIONS
+            request_id = early.request_id
+        else:
+            # A value failure on a mutation still leaves the outcome unknown.
+            is_mutation = True
+            request_id = early.request_id
         return _emit_error(
             code="agent_unreachable",
             message=(
                 "cannot reach the agent process; the outcome is unknown,"
                 " retry with the same request ID"
-                if parsed.mutation
+                if is_mutation
                 else "cannot reach the agent process"
             ),
-
-
-            request_id=_request_id_for_error(parsed),
+            request_id=request_id,
         )
     except _EngineFailed as error:
+        operation = (
+            early.operation if isinstance(early, shared.ParsedCall) else "contract"
+        )
         return _emit_error(
             code="internal",
-            message=f"the agent process could not serve '{parsed.name}': {error}",
-
-
-            request_id=_request_id_for_error(parsed),
+            message=f"the agent process could not serve '{operation}': {error}",
+            request_id=early.request_id,
             details={"stored": False},
         )
-    if (
-        parsed.capability is not None
-        and parsed.capability not in identity.get("capabilities", [])
-    ):
-        return _unsupported(
-            parsed.name,
-            capability=parsed.capability,
-            request_id=_request_id_for_error(parsed),
-            message=f"this instance does not advertise {parsed.capability}",
-            details={"capability": parsed.capability},
-        )
-    try:
-        _check_values(parsed)
-    except _InvalidArgument as error:
-        return _emit_error(
-            code="invalid_argument",
-            message=str(error),
-
-
-            request_id=_request_id_for_error(parsed),
-        )
-    if parsed.name == "status":
+    parsed = shared.parse_argv(argv, capabilities=identity.get("capabilities", []))
+    if isinstance(parsed, shared.ArgvFailure):
+        return _emit_failure(parsed)
+    if parsed.operation == "identity":
+        return _run_identity()
+    if parsed.operation == "status":
         return _run_status()
-    if parsed.name == "attempts list":
+    if parsed.operation == "attempts-list":
         return _run_attempts_list(parsed)
-    if parsed.name == "attempts show":
+    if parsed.operation == "attempts-show":
         return _run_attempts_show(parsed)
-    if parsed.name == "attempts export":
+    if parsed.operation == "attempts-export":
         return _run_attempts_export(parsed)
-    if parsed.name == "stop":
-        return _run_contract_mutation(parsed, "stop")
-    if parsed.name == "resume":
-        return _run_contract_mutation(parsed, "resume")
-    if parsed.name in (
-        "stop --after",
-        "next issue",
-        "handoff now",
-        "recovery retry",
-        "recovery release",
-        "errors reset",
+    if parsed.operation in (
+        "stop",
+        "resume",
+        "next-issue",
+        "handoff",
+        "recovery-retry",
+        "recovery-release",
+        "errors-reset",
     ):
         return _run_contract_mutation(parsed)
-    if parsed.name == "command":
+    if parsed.operation == "command":
         return _run_contract_command(parsed.arguments["request_id"])
-    # Later tickets project each remaining operation onto the contract's
-    # shared types (attempt archives). Until then the grammar and checks
-    # above are in place and the operation answers ``unsupported`` without
-    # storing anything.
+    # Forward-compatible fallback: the shared grammar only produces operations
+    # listed above, so this is unreachable today. A future operation answers
+    # ``unsupported`` without storing anything.
     return _unsupported(
-        parsed.name,
+        parsed.operation,
         capability=parsed.capability,
         request_id=_request_id_for_error(parsed),
-        message=f"operation '{parsed.name}' is not yet served by this producer",
-        details={"operation": parsed.name},
+        message=f"operation '{parsed.operation}' is not yet served by this producer",
+        details={"operation": parsed.operation},
     )
 
 
@@ -1166,16 +1099,9 @@ def _run_offline(parsed: shared.ParsedCall) -> int:
     from simple_coding_agent.control_offline import OfflineReadError
     from simple_coding_agent.volume_lock import VolumeLockError, is_volume_locked
 
-    try:
-        _check_values(parsed)
-    except _InvalidArgument as error:
-        return _emit_error(
-            code="invalid_argument",
-            message=str(error),
-
-
-            request_id=_request_id_for_error(parsed),
-        )
+    # Grammar and values are already validated by ``shared.parse_argv`` in
+    # :func:`main`; mutations never reach here (the shared parser answers
+    # ``unsupported`` with ``details.mode: "offline"`` first).
     data_dir = _export_data_dir()
     try:
         locked = is_volume_locked(data_dir)
@@ -1196,27 +1122,27 @@ def _run_offline(parsed: shared.ParsedCall) -> int:
 
             details={"reason": "instance_running"},
         )
-    if parsed.name == "attempts export":
+    if parsed.operation == "attempts-export":
         return _run_offline_attempts_export(parsed, data_dir)
     try:
-        if parsed.name == "identity":
+        if parsed.operation == "identity":
             return _emit_ok(offline_module.offline_identity(data_dir))
-        if parsed.name == "status":
+        if parsed.operation == "status":
             return _emit_ok(offline_module.offline_status(data_dir))
-        if parsed.name == "command":
+        if parsed.operation == "command":
             request_id = parsed.arguments.get("request_id")
             assert isinstance(request_id, str)
             return _emit_ok(
                 {"command": offline_module.offline_command(data_dir, request_id)}
             )
-        if parsed.name == "attempts list":
+        if parsed.operation == "attempts-list":
             raw_limit = parsed.arguments.get("limit")
             before = parsed.arguments.get("before")
             limit = int(raw_limit, 10) if raw_limit is not None else None
             return _emit_ok(
                 offline_module.offline_attempts_list(data_dir, limit, before)
             )
-        if parsed.name == "attempts show":
+        if parsed.operation == "attempts-show":
             attempt_id = parsed.arguments.get("attempt_id")
             assert isinstance(attempt_id, str)
             return _emit_ok(
@@ -1226,18 +1152,16 @@ def _run_offline(parsed: shared.ParsedCall) -> int:
         return _emit_error(
             code="internal",
             message=f"the stopped volume could not be read: {error}",
-
-
             details={"stored": False},
         )
     except AttemptHistoryError as error:
         return _offline_history_error(error)
     return _unsupported(
-        parsed.name,
+        parsed.operation,
         capability=parsed.capability,
         request_id=_request_id_for_error(parsed),
-        message=f"operation '{parsed.name}' is not available offline",
-        details={"offline": True},
+        message=f"operation '{parsed.operation}' is not available offline",
+        details={"mode": "offline"},
     )
 
 
@@ -1261,8 +1185,6 @@ def _offline_history_error(error: AttemptHistoryError) -> int:
     return _emit_error(
         code="internal",
         message=f"the stopped volume could not be read: {error}",
-        exit_code=EXIT_INTERNAL,
-        retryable=True,
         details={"stored": False},
     )
 
@@ -1309,8 +1231,6 @@ def _run_offline_attempts_export(
             return _emit_error(
                 code="not_found",
                 message=f"unknown archive path {path!r} for attempt {attempt_id!r}",
-                exit_code=EXIT_NOT_FOUND,
-                retryable=False,
             )
     entries = [
         entry
@@ -1338,8 +1258,6 @@ def _run_offline_attempts_export(
             return _emit_error(
                 code="internal",
                 message=f"the stopped volume could not be read: {error}",
-                exit_code=EXIT_INTERNAL,
-                retryable=True,
                 details={"stored": False},
             )
     attempt = projection.get("attempt")
@@ -1356,25 +1274,9 @@ def _run_offline_attempts_export(
         return _emit_error(
             code="internal",
             message=f"the stopped volume could not be read: {error}",
-
-
             details={"stored": False},
         )
     return EXIT_OK
-
-
-def _scan_request_id(tokens: list[str]) -> str | None:
-    """Best-effort ``--request-id`` extraction for malformed argv errors."""
-
-    for index, token in enumerate(tokens):
-        flag, inline = _split_flag(token)
-        if flag == "--request-id":
-            if inline is not None:
-                return inline
-            if index + 1 < len(tokens) and not tokens[index + 1].startswith("--"):
-                return tokens[index + 1]
-            return None
-    return None
 
 
 def _run_identity() -> int:

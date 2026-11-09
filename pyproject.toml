@@ -21,6 +21,7 @@ agentctl = "simple_coding_agent.agentctl:main"
 dev = [
     "pytest>=8.0,<9",
     "ruff==0.16.9",
+    "jsonschema>=4.0,<5",
 ]
 
 [tool.pytest.ini_options]
