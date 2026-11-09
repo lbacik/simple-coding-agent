@@ -295,7 +295,7 @@ class InMemoryWorkspace:
 
         return tuple(record.files for record in reversed(self._commits))
 
-    def conflict_state(self) -> ConflictState:
+    def conflict_state(self, prepared: object | None = None) -> ConflictState:
         return self._conflict
 
     def leave_conflict(
