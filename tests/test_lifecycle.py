@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import random
 from dataclasses import replace
 from pathlib import Path
 
@@ -127,8 +128,8 @@ def test_setup_failure_posts_result_then_releases_only_the_agent_claim(
     assert workspace.cleanup_calls == []
 
 
-def test_empty_queue_sleeps_once_without_attempting_work(tmp_path: Path) -> None:
-    sleeps: list[int] = []
+def test_empty_queue_sleeps_startup_spread_then_jittered_poll(tmp_path: Path) -> None:
+    sleeps: list[float] = []
     events: list[tuple[str, str, str]] = []
     lifecycle = AgentLifecycle(
         tracker=FakeTracker(),
@@ -138,6 +139,7 @@ def test_empty_queue_sleeps_once_without_attempting_work(tmp_path: Path) -> None
         publisher=FakePublisher(),
         poll_interval=17,
         sleeper=sleeps.append,
+        random_source=random.Random(5).random,
         event_log=lambda event, detail="", level="INFO", issue_number=None: events.append(
             (event, detail, level)
         ),
@@ -146,10 +148,19 @@ def test_empty_queue_sleeps_once_without_attempting_work(tmp_path: Path) -> None
     result = lifecycle.run_once()
 
     assert result.status is LifecycleStatus.IDLE
-    assert sleeps == [17]
+    # The first cycle spreads the whole-Pool start once, then sleeps the
+    # jittered poll interval; later cycles sleep only the jittered poll.
+    assert len(sleeps) == 2
+    startup, idle = sleeps
+    assert 0 <= startup <= 17 / 2
+    assert 0.8 * 17 <= idle <= 1.2 * 17
     assert [event for event, _, _ in events] == ["polling_for_issue", "no_eligible_issue_found"]
-    assert events[1][1] == "no eligible issue available; sleeping 17s"
+    assert events[1][1] == f"no eligible issue available; sleeping {idle}s"
     assert events[1][2] == "INFO"
+
+    assert lifecycle.run_once().status is LifecycleStatus.IDLE
+    assert len(sleeps) == 3
+    assert 0.8 * 17 <= sleeps[2] <= 1.2 * 17
 
 
 def test_stops_after_the_persisted_consecutive_infrastructure_error_limit(tmp_path: Path) -> None:

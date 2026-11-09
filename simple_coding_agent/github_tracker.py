@@ -7,6 +7,7 @@ from dataclasses import dataclass, replace
 from datetime import datetime
 import json
 import os
+import random
 import re
 import time
 from typing import Any, Literal, Protocol
@@ -43,6 +44,13 @@ MERGE_CONFLICT_LABEL_DESCRIPTION = (
 #: other assignee after this window and yield, so the issue returns to the
 #: runnable queue instead of being worked twice. Always on; no config knob.
 CLAIM_SETTLE_DELAY_SECONDS = 2.5
+
+#: Upper bound of the random back-off a worker sleeps after yielding a lost
+#: claim, before its next assign attempt. Uniform within ``[0, bound]``;
+#: racers that start together yield together and then retry out of phase, so
+#: the next attempt wins instead of colliding again. Always on; no config
+#: knob. Expressed in terms of the settle delay (twice it).
+CLAIM_LOST_BACKOFF_MAX_SECONDS = 2 * CLAIM_SETTLE_DELAY_SECONDS
 
 #: Prefix of the per-Worker claim marker label. With ``WORKER_ID`` set, a
 #: claimant is a ``(login, worker id)`` pair: after assigning, the worker
@@ -440,6 +448,7 @@ class GitHubTracker:
         max_conflict_attempts: int = 0,
         peer_logins: Iterable[str] | None = None,
         worker_id: str = "",
+        random_source: Callable[[], float] | None = None,
         event_log: Callable[..., None] = (
             lambda event, detail="", level="INFO", issue_number=None: None
         ),
@@ -470,6 +479,9 @@ class GitHubTracker:
         self._max_conflict_attempts = max_conflict_attempts
         self._peer_logins = _peer_login_set(peer_logins)
         self._worker_id = worker_id
+        self._random_source = (
+            random_source if random_source is not None else random.random
+        )
         self._event_log = event_log
 
     @property
@@ -794,7 +806,9 @@ class GitHubTracker:
         returns to the runnable queue for a later poll (liveness only).
         Yielding never changes queue labels, comments, or checkpoints (this
         runs before ``attempt_state.start``). Emits a ``claim_lost`` event
-        carrying the issue number and the other claimants, then raises
+        carrying the issue number and the other claimants, sleeps a random
+        back-off uniform within ``[0, CLAIM_LOST_BACKOFF_MAX_SECONDS]`` so
+        simultaneous racers retry out of phase, then raises
         :class:`ClaimLostError`. The winner's snapshot is returned so stale
         labels can be removed after verification.
         """
@@ -825,6 +839,12 @@ class GitHubTracker:
                 issue_number=issue.number,
             )
             self._yield_losing_claim(fresh, identity)
+            # Break the whole-Pool lockstep: every loser sleeps a different
+            # random back-off before its next assign attempt (the next
+            # candidate in ``claim_next``, or the FIFO fallback after a lost
+            # priority target), so racers that yielded together retry out of
+            # phase instead of colliding again.
+            time.sleep(self._random_source() * CLAIM_LOST_BACKOFF_MAX_SECONDS)
             raise ClaimLostError(issue.number, claimants)
         return fresh
 
@@ -888,7 +908,8 @@ class GitHubTracker:
         ``claimed-by:<worker-id>`` marker), the claim is verified through
         the shared settle-window helper: when another assignee or another
         Worker's marker is seen, this worker yields as in
-        :meth:`_yield_losing_claim`, emits ``claim_lost``, and raises
+        :meth:`_yield_losing_claim`, emits ``claim_lost``, sleeps a random
+        back-off, and raises
         :class:`ClaimLostError` without touching queue labels. Only the
         verified winner removes a stale ``round-finished`` label, as in
         :meth:`claim_next`. The returned claim carries the pre-removal
@@ -914,8 +935,10 @@ class GitHubTracker:
         through the shared settle-window helper: when another assignee
         (another worker or a human) or another Worker's marker is seen, this
         worker yields as in :meth:`_yield_losing_claim`, emits
-        ``claim_lost``, and continues with the next candidate in the same
-        cycle. Only the verified winner removes a stale ``round-finished``
+        ``claim_lost``, sleeps a random back-off so a simultaneous racer
+        retries out of phase, and continues with the next candidate in the
+        same cycle. Only the verified winner removes a stale
+        ``round-finished``
         label, so two workers yielding never strands the issue without its
         queue signal; the issue simply returns to the runnable queue and a
         later poll wins. The returned claim carries the pre-removal

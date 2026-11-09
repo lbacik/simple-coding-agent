@@ -19,6 +19,7 @@ The new contract:
 
 from __future__ import annotations
 
+import random
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -194,6 +195,7 @@ def make_lifecycle(
         control_store=store,
         poll_interval=60,
         sleeper=sleeps.append,
+        random_source=random.Random(5).random,
         event_log=lambda event, detail="", level="INFO", issue_number=None: events.append(
             (event, detail, level)
         ),
