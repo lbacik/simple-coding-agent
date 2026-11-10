@@ -226,9 +226,13 @@ def project_intake(
         requested = stop_plan.get("requested")
         remaining = stop_plan.get("remaining")
         if isinstance(requested, int) and isinstance(remaining, int):
+            # The contract's ``remaining`` is the plan's N as requested (the
+            # reference producer and the producer suite read it that way);
+            # only ``counted`` advances. The store's own ``remaining`` is the
+            # count still to go, so ``counted`` is the difference.
             plan = {
                 "request_id": stop_plan.get("request_id"),
-                "remaining": remaining,
+                "remaining": requested,
                 "counted": max(0, requested - remaining),
             }
     priority: dict | None = None

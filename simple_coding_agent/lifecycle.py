@@ -1644,6 +1644,11 @@ class AgentLifecycle:
                 self._conflict_model_executor = conflict_model_executor
             if conflict_issue_comments is not None:
                 self._conflict_issue_comments = conflict_issue_comments
+        if telemetry is not None:
+            # Production builds telemetry only after provenance, so the
+            # constructor's seed found no reporter: seed the reporter that
+            # arrives here, or last_finished reads null after every restart.
+            self._seed_telemetry_last_finished()
 
     def mark_starting(self, startup_check: str | None = "provenance") -> None:
         """Enter the early-serving ``starting`` state (control endpoint is up)."""

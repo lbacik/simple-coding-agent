@@ -63,6 +63,11 @@ _CLAIM_NATIVE_EVENTS = frozenset({"issue_claimed", "next_issue_claimed"})
 #: Native event for the phase-transition Contract Event.
 _PHASE_NATIVE_EVENT = "attempt_phase_transitioned"
 
+#: Contract Events that pass through by name and require an Attempt ID.
+_ATTEMPT_SCOPED_EVENTS = frozenset(
+    {"outcome_recorded", "attempt_finished", "attempt_released", "sealed"}
+)
+
 #: Native levels onto the contract vocabulary (validated, never invented).
 _LEVELS = {
     "DEBUG": "debug",
@@ -175,6 +180,17 @@ def to_contract_event(
             "event": name,
             "text": _event_text(record.get("detail", "")),
         }
+        if clean_attempt is None and (
+            name in _CLAIM_NATIVE_EVENTS
+            or name == _PHASE_NATIVE_EVENT
+            or name in _ATTEMPT_SCOPED_EVENTS
+        ):
+            # The contract requires an Attempt ID on every attempt-scoped
+            # event. Without one (``next_issue_claimed`` fires at the
+            # priority boundary, before the checkpoint names the Attempt)
+            # the record stays native; the Claim opens at ``issue_claimed``.
+            event["event"] = f"native.{name}"
+            return event
         if name in _CLAIM_NATIVE_EVENTS:
             event["event"] = "claim_opened"
             if clean_attempt is not None:

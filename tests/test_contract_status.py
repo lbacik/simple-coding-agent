@@ -655,3 +655,24 @@ def test_contract_status_is_served_from_prepared_state_without_live_lookups(
         server.stop()
     assert reply["ok"] is True
     assert set(reply["contract_status"]) == STATUS_RESULT_KEYS
+
+
+def test_stop_plan_remaining_keeps_the_requested_count_while_counted_grows() -> None:
+    """``remaining`` is the plan's N; only ``counted`` advances (producer suite)."""
+
+    from simple_coding_agent.contract_status import project_intake
+    from simple_coding_agent.control import IntakeState
+
+    intake = project_intake(
+        intake=IntakeState.RUNNING,
+        pending_record=None,
+        stop_plan={"request_id": "req-plan-1", "requested": 2, "remaining": 1},
+        next_issue=None,
+        observed_at="2026-11-10T12:00:00Z",
+    )
+
+    assert intake["stop_plan"] == {
+        "request_id": "req-plan-1",
+        "remaining": 2,
+        "counted": 1,
+    }
