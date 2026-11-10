@@ -452,7 +452,7 @@ def test_harness_smoke_reaches_every_state(tmp_path: Path) -> None:
     assert snapshot["current_attempt"]["issue"]["number"] == 7
 
     # A hold scoped to the active attempt answers the held attempt id.
-    held = call("hold", {"point": "after-outcome", "scope": "active"})
+    held = call("hold", {"point": "after-claim", "scope": "active"})
     assert held["attempt_id"] == attempt_id
 
     # -- draining: close intake while the attempt is held ------------------
@@ -465,7 +465,7 @@ def test_harness_smoke_reaches_every_state(tmp_path: Path) -> None:
     assert snapshot["intake"]["state"] == "closed"
 
     # -- finish: the held attempt cannot finish on its own, so finish-attempt
-    #    (which releases the hold itself) is race-free ---------------------
+    #    (which releases a hold that blocks the executor) is race-free -----
     finished = call("finish-attempt", {"native_outcome": "complete"})
     assert finished["attempt_id"] == attempt_id
     assert finished["native_outcome"] == "complete"
@@ -936,3 +936,120 @@ def test_an_interrupted_handoff_ends_not_fulfilled_after_recovery(
     code, reply = engine.agentctl("command", "req-383-crash")
     assert code == 0, reply
     assert reply["result"]["command"]["acknowledgement"] == "not_fulfilled"
+
+
+# ---------------------------------------------------------------------------
+# After-outcome hold, archive growth and the halt seen after a restart (#384)
+# ---------------------------------------------------------------------------
+
+
+def _events_named(snapshot: dict, name: str) -> list[dict]:
+    return [event for event in snapshot["recent_events"] if event.get("event") == name]
+
+
+def test_finish_attempt_under_an_after_outcome_hold_leaves_the_attempt_unsealed(
+    engine: _Engine,
+) -> None:
+    engine.call("set-issue", {"issue": 31, "eligible": True})
+    engine.call("release", {})
+    attempt_id = engine.status()["current_attempt"]["attempt_id"]
+    engine.call("hold", {"point": "after-outcome", "scope": "active"})
+
+    finished = engine.call("finish-attempt", {"native_outcome": "complete"})
+
+    assert finished == {"attempt_id": attempt_id, "native_outcome": "complete"}
+    # The hold is still armed: the outcome is in, finalization is paused.
+    assert (engine.root / "flags" / "hold.json").exists()
+    code, shown = engine.agentctl("attempts", "show", attempt_id)
+    assert code == 0, shown
+    attempt = shown["result"]["attempt"]
+    assert attempt["sealed"] is False
+    assert attempt["outcome"]["native"] == "complete"
+    assert _events_named(engine.status(), "sealed") == []
+
+    assert engine.call("release", {}) == {"released": True}
+
+    # No polling: the seal is visible as soon as release answers.
+    sealed = _events_named(engine.status(), "sealed")
+    assert [event["attempt_id"] for event in sealed] == [attempt_id]
+    code, shown = engine.agentctl("attempts", "show", attempt_id)
+    assert code == 0, shown
+    assert shown["result"]["attempt"]["sealed"] is True
+
+
+def test_finish_attempt_still_clears_a_hold_that_blocks_the_executor(
+    engine: _Engine,
+) -> None:
+    engine.call("set-issue", {"issue": 32, "eligible": True})
+    engine.call("release", {})
+    attempt_id = engine.status()["current_attempt"]["attempt_id"]
+    engine.call("hold", {"point": "after-claim", "scope": "active"})
+
+    finished = engine.call("finish-attempt", {"native_outcome": "no_changes"})
+
+    assert finished == {"attempt_id": attempt_id, "native_outcome": "no_changes"}
+    assert not (engine.root / "flags" / "hold.json").exists()
+    assert engine.status()["current_attempt"] is None
+
+
+def test_grow_archive_finds_the_archive_of_a_colon_bearing_attempt_id(
+    engine: _Engine,
+) -> None:
+    engine.call("set-issue", {"issue": 33, "eligible": True})
+    engine.call("release", {})
+    attempt_id = engine.status()["current_attempt"]["attempt_id"]
+    assert ":" in attempt_id
+
+    for requested in (attempt_id, None):  # ``None`` names the active attempt
+        grown = engine.call(
+            "grow-archive", {"attempt_id": requested, "append_bytes": 16}
+        )
+
+        target = Path(grown["path"])
+        assert grown["appended_bytes"] == 16
+        assert target.read_bytes().endswith(b"x" * 16)
+        assert target.parent.parent.name == "33"
+
+    # The archive record still names the attempt after the growth.
+    code, shown = engine.agentctl("attempts", "show", attempt_id)
+    assert code == 0, shown
+    assert shown["result"]["attempt"]["attempt_id"] == attempt_id
+    engine.call("finish-attempt", {"native_outcome": "no_changes"})
+
+
+def test_grow_archive_fails_without_an_unsealed_archive(engine: _Engine) -> None:
+    code, reply = invoke(
+        "grow-archive",
+        request("grow-archive", {"attempt_id": None, "append_bytes": 8}),
+        state_dir=engine.root,
+    )
+
+    assert code == 1
+    assert reply["error"]["message"] == "no unsealed archive to grow"
+
+
+def test_a_restart_after_a_halt_reports_one_halted_event(engine: _Engine) -> None:
+    assert _events_named(engine.status(), "halted") == []
+    engine.call("halt", {"reason": "harness-halt-test"})
+    engine.call("start-container", {})
+    engine.call("release", {})
+
+    snapshot = engine.status()
+
+    assert snapshot["instance"]["last_halt"]["reason"] == "harness-halt-test"
+    halted = _events_named(snapshot, "halted")
+    assert [event["reason"] for event in halted] == ["harness-halt-test"]
+    assert halted[0]["at"] == snapshot["instance"]["last_halt"]["at"]
+    # Oldest first: the halt predates everything this process emitted.
+    assert snapshot["recent_events"][0] == halted[0]
+
+
+def test_a_restart_without_a_halt_reports_no_halted_event(engine: _Engine) -> None:
+    engine.call("stop-container", {})
+    engine.call("start-container", {})
+    engine.call("release", {})
+
+    snapshot = engine.status()
+
+    assert snapshot["instance"]["last_halt"] is None
+    assert _events_named(snapshot, "halted") == []

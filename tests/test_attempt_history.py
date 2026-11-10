@@ -14,7 +14,11 @@ from pathlib import Path
 
 import pytest
 
-from simple_coding_agent.attempt_history import ActiveAttempt, list_attempts
+from simple_coding_agent.attempt_history import (
+    ActiveAttempt,
+    list_attempts,
+    show_attempt,
+)
 from simple_coding_agent.observability import AttemptArchive
 
 
@@ -488,3 +492,35 @@ def test_conflict_claim_records_attempt_identity_in_the_archive(
     assert record.get("started_at") == checkpoint.started_at
     assert record.get("issue_number") == 7
     assert record.get("attempt_kind") == "conflict"
+
+
+def test_active_attempt_reports_the_outcome_already_recorded(tmp_path: Path) -> None:
+    """Outcome recorded, finalization still writing: active, unsealed, outcome in."""
+
+    archive = AttemptArchive(
+        tmp_path, issue_number=7, started_at="2026-11-06T08:01:10Z"
+    )
+    archive.write_attempt(
+        {
+            "started_at": "2026-11-06T08:01:10Z",
+            "issue_number": 7,
+            "outcome": "complete",
+            "completed_at": "2026-11-06T08:05:00Z",
+        }
+    )
+    active = ActiveAttempt(
+        attempt_id="2026-11-06T08:01:10Z",
+        issue_number=7,
+        issue_title="Fix pagination",
+        phase="publishing",
+    )
+    expected = {"label": "Complete", "native": "complete", "reason": None}
+
+    shown = show_attempt(tmp_path, "2026-11-06T08:01:10Z", active=active, held=set())
+    (listed,) = list_attempts(tmp_path, active=active)["attempts"]
+
+    for summary in (shown["attempt"], listed):
+        assert summary["outcome"] == expected
+        assert summary["lifecycle_state"] == "publishing"
+        assert summary["sealed"] is False
+        assert summary["finished_at"] is None

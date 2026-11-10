@@ -33,6 +33,7 @@ from simple_coding_agent.contract_events import (
     ContractEventsBuffer,
     halted_detail,
     process_started_detail,
+    seed_recorded_halt,
     startup_check_detail,
 )
 from simple_coding_agent.config import (
@@ -176,6 +177,9 @@ def main() -> None:
 
     recent_events = RecentEventsBuffer()
     contract_events = ContractEventsBuffer()
+    # The previous process's ``halted`` event died with its buffer: replay
+    # it from the durable halt record before this process emits anything.
+    seed_recorded_halt(contract_events, halt_store)
     logger = JsonEventLogger(
         sys.stdout,
         redactions=config.credential_redactions,

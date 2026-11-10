@@ -27,7 +27,9 @@ import threading
 
 
 #: How many Contract Events the process-local ring keeps, newest last.
-#: In-memory only, so it starts empty after a restart.
+#: In-memory only, so it starts empty after a restart, except for the
+#: ``halted`` event seeded from the durable halt record
+#: (:func:`seed_recorded_halt`).
 CONTRACT_EVENTS_LIMIT = 50
 
 #: How many characters of an event's text survive into a Contract Event.
@@ -279,6 +281,41 @@ class ContractEventsBuffer:
                 return [dict(entry) for entry in self._entries]
         except Exception:
             return []
+
+
+def seed_recorded_halt(buffer: ContractEventsBuffer, halt_store: object) -> bool:
+    """Seed a fresh buffer with the ``halted`` event of the recorded halt.
+
+    The engine emits ``halted`` right before an engine-decided exit, so the
+    in-memory ring loses it with the process. The durable halt record
+    (``halt_store.read()``) survives, so the next start replays it as one
+    ``halted`` Contract Event stamped with the halt's own time. Call it on
+    the empty buffer, before the process emits anything, so the ring stays
+    oldest first. Returns whether an event was seeded: a start with no
+    recorded halt (or an unreadable record) seeds nothing. Never raises.
+    """
+
+    try:
+        halt = halt_store.read()  # type: ignore[attr-defined]
+        if halt is None:
+            return False
+        reason, at = halt.reason, halt.at
+        if not isinstance(reason, str) or not reason:
+            return False
+        if not isinstance(at, str) or not at:
+            return False
+        return buffer.record(
+            to_contract_event(
+                {
+                    "timestamp": at,
+                    "level": "ERROR",
+                    "event": "halted",
+                    "detail": halted_detail(reason),
+                }
+            )
+        )
+    except Exception:
+        return False
 
 
 # ---------------------------------------------------------------------------
