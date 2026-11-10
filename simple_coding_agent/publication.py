@@ -298,6 +298,17 @@ class ConflictPublicationRequest:
             requeue_source_marker(self.requeue_source)
 
 
+def _default_sleeper(seconds: float) -> None:
+    """Sleep through the module ``time`` binding (production retry back-off).
+
+    Resolved at construction (not captured at function-definition time) so
+    the suite can replace this binding with an instant stub (see
+    ``tests/conftest.py``); production always really sleeps.
+    """
+
+    time.sleep(seconds)
+
+
 class Publisher:
     """Own push, pull-request, and concise attempt-result comment publication."""
 
@@ -310,7 +321,7 @@ class Publisher:
         max_retries: int = 3,
         publish_timeout: float = 120,
         attempt_state: AttemptStateStore | None = None,
-        sleeper: Callable[[float], None] = time.sleep,
+        sleeper: Callable[[float], None] | None = None,
         monotonic: Callable[[], float] = time.monotonic,
         event_log: Callable[..., None] = (
             lambda event, detail="", level="INFO", issue_number=None: None
@@ -326,7 +337,7 @@ class Publisher:
         self._max_retries = max_retries
         self._publish_timeout = publish_timeout
         self._attempt_state = attempt_state
-        self._sleeper = sleeper
+        self._sleeper = sleeper if sleeper is not None else _default_sleeper
         self._monotonic = monotonic
         self._event_log = event_log
         self._auto_merge = _normalize_auto_merge(auto_merge)

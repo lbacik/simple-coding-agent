@@ -1320,6 +1320,17 @@ class ModelAttemptRunner:
         return preparation
 
 
+def _default_sleeper(seconds: float) -> None:
+    """Sleep through the module ``time`` binding (production idle back-off).
+
+    Resolved at construction (not captured at function-definition time) so
+    the suite can replace this binding with an instant stub (see
+    ``tests/conftest.py``); production always really sleeps.
+    """
+
+    time.sleep(seconds)
+
+
 class AgentLifecycle:
     """Connect claim, checkpoint, setup, publication, cleanup, and polling.
 
@@ -1337,7 +1348,7 @@ class AgentLifecycle:
         publisher: Publisher,
         attempt_runner: Callable[[Claim, RepositoryProfile, object], AttemptEvidence] | None = None,
         poll_interval: int = 60,
-        sleeper: Callable[[float], None] = time.sleep,
+        sleeper: Callable[[float], None] | None = None,
         error_store: ConsecutiveErrorStore | None = None,
         max_consecutive_errors: int = 3,
         max_auto_continuations: int = 0,
@@ -1371,7 +1382,7 @@ class AgentLifecycle:
         self._publisher = publisher
         self._attempt_runner = attempt_runner
         self._poll_interval = poll_interval
-        self._sleeper = sleeper
+        self._sleeper = sleeper if sleeper is not None else _default_sleeper
         self._error_store = error_store
         self._max_consecutive_errors = max_consecutive_errors
         self._max_auto_continuations = max_auto_continuations

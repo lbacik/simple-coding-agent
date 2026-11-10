@@ -1415,7 +1415,9 @@ def build_lifecycle(
         )
 
     attempt_state = AttemptStateStore(data_dir)
-    workspace = GitWorkspace(clone_dir, str(remote), token_provider=lambda: "token")
+    workspace = GitWorkspace(
+        clone_dir, str(remote), token_provider=lambda: "token", sleeper=lambda _: None
+    )
     tracker_kwargs: dict = {}
     if event_log is not None:
         tracker_kwargs["event_log"] = event_log

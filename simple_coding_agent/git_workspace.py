@@ -142,6 +142,17 @@ def attempt_start_epoch(attempt_id: str) -> int | None:
 GitRunner = Callable[[tuple[str, ...], Path | None, dict[str, str]], str]
 
 
+def _default_sleeper(seconds: float) -> None:
+    """Sleep through the module ``time`` binding (production push-retry delay).
+
+    Resolved at construction (not captured at function-definition time) so
+    the suite can replace this binding with an instant stub (see
+    ``tests/conftest.py``); production always really sleeps.
+    """
+
+    time.sleep(seconds)
+
+
 class GitWorkspace:
     """Own the clone, branch preparation, inspection, and local cleanup."""
 
@@ -158,7 +169,7 @@ class GitWorkspace:
         self._repository_url = repository_url
         self._token_provider = token_provider
         self._run = run or _run_git
-        self._sleeper = sleeper or time.sleep
+        self._sleeper = sleeper if sleeper is not None else _default_sleeper
 
     @property
     def working_directory(self) -> Path:
