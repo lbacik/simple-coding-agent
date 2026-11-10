@@ -116,6 +116,7 @@ def make_lifecycle(
     publisher: FakePublisher | None = None,
     attempt_runner=None,
     seed_data_dir: bool = True,
+    attach_telemetry: bool = True,
 ) -> tuple[AgentLifecycle, FakeTracker, AttemptStateStore]:
     tracker = FakeTracker({7: tracked_issue(7, title="Fix the widget")}, fifo=[7])
     state = AttemptStateStore(tmp_path)
@@ -134,7 +135,9 @@ def make_lifecycle(
         else (lambda claim, profile, prepared: complete_attempt_evidence()),
         control_store=ControlStore(tmp_path),
         repository="owner/repo",
-        telemetry=reporter if reporter is not None else make_reporter(),
+        telemetry=(reporter if reporter is not None else make_reporter())
+        if attach_telemetry
+        else None,
         sleeper=lambda seconds: None,
         max_auto_continuations=2,
         attempt_archive_factory=archive_factory(tmp_path),
@@ -382,6 +385,20 @@ def test_restart_seeds_last_finished_from_disk(tmp_path: Path) -> None:
 
     restarted_reporter = make_reporter()
     restarted, _, _ = make_lifecycle(tmp_path, reporter=restarted_reporter)
+
+    assert restarted.telemetry_snapshot()["current_attempt"] is None
+    assert restarted.telemetry_snapshot()["last_finished"] == expected
+
+
+def test_restart_seeds_last_finished_when_telemetry_attaches_after_provenance(
+    tmp_path: Path,
+) -> None:
+    """Production attaches telemetry post-provenance; the seed must still run."""
+
+    expected = _run_one_finished_attempt(tmp_path)
+
+    restarted, _, _ = make_lifecycle(tmp_path, reporter=None, attach_telemetry=False)
+    restarted.attach_post_provenance(telemetry=make_reporter())
 
     assert restarted.telemetry_snapshot()["current_attempt"] is None
     assert restarted.telemetry_snapshot()["last_finished"] == expected

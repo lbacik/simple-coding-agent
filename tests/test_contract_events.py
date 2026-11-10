@@ -74,6 +74,34 @@ def test_claim_natives_map_to_claim_opened() -> None:
         assert event["issue"] == 7
 
 
+def test_attempt_events_without_an_attempt_id_stay_native() -> None:
+    """A prioritized claim's first native fires before the Attempt exists.
+
+    ``next_issue_claimed`` is emitted at the priority boundary, before the
+    checkpoint names an Attempt ID; the Claim itself opens at
+    ``issue_claimed``. An attempt-scoped Contract Event with no Attempt ID
+    would break the schema, so it stays a ``native.`` event instead.
+    """
+
+    claim = to_contract_event(
+        _native("next_issue_claimed", "title='x'", issue_number=7), attempt_id=None
+    )
+    assert claim["event"] == "native.next_issue_claimed"
+    assert "attempt_id" not in claim
+    validate_contract_event(claim)
+
+    for native in (
+        "attempt_phase_transitioned",
+        "outcome_recorded",
+        "attempt_finished",
+        "attempt_released",
+        "sealed",
+    ):
+        event = to_contract_event(_native(native, "", issue_number=7), attempt_id=None)
+        assert event["event"] == f"native.{native}", native
+        validate_contract_event(event)
+
+
 def test_phase_transition_maps_to_phase_changed() -> None:
     event = to_contract_event(
         _native("attempt_phase_transitioned", "phase=model_running", issue_number=7),
