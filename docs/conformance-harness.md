@@ -85,5 +85,12 @@ SCA_HARNESS_DOCKER=1 SCA_HARNESS_IMAGE=simple-coding-agent:harness \
 entrypoint), then run `setup` through `docker exec` so the engine starts
 inside the container on the volume; every later verb is the same
 `docker exec` proxy, and `teardown` removes the container and the volume.
+The container runs with `--init`: each verb's `docker exec` ends after
+spawning the engine, which is orphaned to PID 1, and a real init reaps it
+once it exits, so a crashed engine is gone and `start-container` can
+restart it. The harness also treats an unreaped zombie engine as gone. The
+spawned engine gets a fixed git commit identity (`GIT_AUTHOR_*` and
+`GIT_COMMITTER_*`, unless already set), because the harness image has none
+and sealing attempt work commits in the fake clone.
 `DOCKER` selects the docker executable. Without the flag the harness stays
 process-local (unit tests, local smoke runs).

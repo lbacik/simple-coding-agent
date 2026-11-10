@@ -32,7 +32,9 @@ class ControlSurface(Protocol):
 
     def submit_next_issue(self, request_id: str, issue: object) -> object: ...
 
-    def submit_resume(self, request_id: str) -> object: ...
+    def submit_resume(
+        self, request_id: str, *, reject_open_intake: bool = ...
+    ) -> object: ...
 
     def submit_handoff(self, request_id: str) -> object: ...
 
@@ -395,13 +397,28 @@ class ControlServer:
             PayloadMismatchError,
             RequestIdError,
             ResumeBlockedError,
+            ResumeIntakeOpenError,
         )
+
+        # The operator contract only lets ``resume`` reopen closed intake; the
+        # legacy surface keeps answering an idempotent ``completed`` no-op.
+        contract_mode = _is_contract_request(request)
+
+        def submit(request_id: object) -> object:
+            if contract_mode:
+                return self._control.submit_resume(request_id, reject_open_intake=True)
+            return self._control.submit_resume(request_id)
 
         _reply_mutating(
             connection,
             request,
-            self._control.submit_resume,
-            rejected=(RequestIdError, PayloadMismatchError, ResumeBlockedError),
+            submit,
+            rejected=(
+                RequestIdError,
+                PayloadMismatchError,
+                ResumeBlockedError,
+                ResumeIntakeOpenError,
+            ),
             repository=self._repository(),
             check_expect_repo=True,
             control=self._control,

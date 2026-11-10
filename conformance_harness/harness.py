@@ -24,7 +24,8 @@ container for the external producer suite, which speaks to the producer
 only through real ``docker exec``/``docker run`` (spec section 3): ``setup``
 creates a named volume and a container from ``SCA_HARNESS_IMAGE`` (default
 ``simple-coding-agent:harness``) whose entrypoint is overridden to
-``sleep infinity``, then proxies every verb through ``docker exec`` into
+``sleep infinity`` behind ``--init`` (so orphaned engines are reaped), then
+proxies every verb through ``docker exec`` into
 the in-container harness CLI, which manages the engine on the volume
 exactly as in process-local mode. The suite's ``docker exec`` and offline
 ``docker run`` reach the same volume because the harness image bakes the
@@ -402,6 +403,15 @@ def _repo_root() -> Path:
 _SPAWNED: dict[int, subprocess.Popen] = {}
 
 
+#: The commit identity the fakes-wired engine uses when none is configured.
+_HARNESS_GIT_IDENTITY = {
+    "GIT_AUTHOR_NAME": "Conformance Harness",
+    "GIT_AUTHOR_EMAIL": "harness@example.invalid",
+    "GIT_COMMITTER_NAME": "Conformance Harness",
+    "GIT_COMMITTER_EMAIL": "harness@example.invalid",
+}
+
+
 def _spawn_daemon(root: Path, repository: str) -> int:
     """Start the fakes-wired engine; return its pid."""
 
@@ -412,6 +422,13 @@ def _spawn_daemon(root: Path, repository: str) -> int:
     repo = str(_repo_root())
     python_path = environ.get("PYTHONPATH", "")
     environ["PYTHONPATH"] = repo + (os.pathsep + python_path if python_path else "")
+    # Sealing attempt work commits in the fake clone, and the harness image
+    # has no git identity, so an unconfigured commit would fail and retain
+    # every attempt for recovery. ``GIT_*`` variables already in the
+    # environment win; otherwise these also take precedence over a host's
+    # git config, which only affects commits in the throwaway fake clone.
+    for name, value in _HARNESS_GIT_IDENTITY.items():
+        environ.setdefault(name, value)
     log_file = paths["log"].open("ab")
     try:
         process = subprocess.Popen(
@@ -460,12 +477,36 @@ def _stop_daemon(root: Path, *, kill: bool = False, timeout: float = 15.0) -> bo
     return gone
 
 
+#: Where the process table is read to tell a zombie from a live process.
+#: Module-level so tests can point it at a fake table.
+_PROC_ROOT = Path("/proc")
+
+
+def _is_zombie(pid: int) -> bool:
+    """Whether ``pid`` has exited but was never reaped (Linux ``/proc`` only).
+
+    Without a readable ``/proc/<pid>/stat`` (another platform, or the process
+    is already gone) the answer is ``False`` and callers fall back to the
+    signal probe.
+    """
+
+    try:
+        stat = (_PROC_ROOT / str(pid) / "stat").read_text(encoding="utf-8")
+    except (OSError, ValueError):
+        return False
+    # The command name is parenthesised and may itself hold spaces or
+    # parentheses, so the state field is the first one after the last ")".
+    fields = stat[stat.rfind(")") + 1 :].split()
+    return bool(fields) and fields[0] == "Z"
+
+
 def _pid_gone(pid: int) -> bool:
     # Reap our own exited engines first: a zombie is still signalable, so
     # ``kill(pid, 0)`` alone reports it alive and every stop/halt wait burns
     # its full timeout. Engines spawned by a different CLI process are not
-    # our children (``waitpid`` raises ``ChildProcessError``); those fall through
-    # to the signal probe and are reaped by init once orphaned.
+    # our children (``waitpid`` raises ``ChildProcessError``). Those are
+    # reaped by init once orphaned, but only when PID 1 is a real init; a
+    # zombie nobody reaps still counts as gone, which ``/proc`` reveals.
     handle = _SPAWNED.get(pid)
     if handle is not None:
         if handle.poll() is None:
@@ -481,6 +522,8 @@ def _pid_gone(pid: int) -> bool:
     else:
         if done == pid:
             return True
+    if _is_zombie(pid):
+        return True
     try:
         os.kill(pid, 0)
     except OSError:
@@ -790,6 +833,10 @@ def _verb_start_container(root: Path) -> tuple[int, dict]:
         return _failed("start-container", "the container is already running")
     if not _daemon_module_available():
         return _failed("start-container", "the harness engine is not installed")
+    # An engine that crashed (``os._exit``) never removes its ready marker;
+    # left in place it would let this restart report ready before the new
+    # engine serves its control socket.
+    _paths(root)["ready"].unlink(missing_ok=True)
     pid = _spawn_daemon(root, state.get("repository", ""))
     state = _load_state(root) or {}
     state["engine_pid"] = pid
@@ -1002,6 +1049,10 @@ def _docker_setup(params: dict) -> tuple[int, dict]:
                 name,
                 "--volume",
                 f"{volume}:/data",
+                # Every verb runs in its own ``docker exec``, so the engine
+                # it spawns is orphaned to PID 1; ``sleep`` never reaps it,
+                # and a crashed engine would linger as a zombie.
+                "--init",
                 "--entrypoint",
                 "sleep",
                 image,
