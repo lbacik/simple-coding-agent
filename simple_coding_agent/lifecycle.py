@@ -1764,17 +1764,21 @@ class AgentLifecycle:
                 )
             )
 
-    def submit_resume(self, request_id: str) -> CommandRecord:
+    def submit_resume(
+        self, request_id: str, *, reject_open_intake: bool = False
+    ) -> CommandRecord:
         """Durably record ``resume`` and permit later issue intake.
 
         A pending stop plan is replaced without interrupting the active
         attempt, which continues with its ordinary outcome. While startup
         reconciliation or retained work/finalization remains unresolved the
         command is rejected with the affected attempt and reason, and intake
-        is unchanged. Resume never requeues an issue: the next claim still
-        goes through the serialized intake check and the ordinary runnable
-        queue, so a ``round-finished`` issue stays ineligible until a
-        separate human-approved requeue.
+        is unchanged. ``reject_open_intake`` applies the operator-contract
+        rule: resume on already-open intake with nothing to replace is
+        rejected and stored nowhere. Resume never requeues an issue: the
+        next claim still goes through the serialized intake check and the
+        ordinary runnable queue, so a ``round-finished`` issue stays
+        ineligible until a separate human-approved requeue.
         """
 
         if self._control_store is None:
@@ -1802,6 +1806,7 @@ class AgentLifecycle:
                             phase=None,
                             reason=detail,
                         ),
+                        reject_open_intake=reject_open_intake,
                     )
                 )
             return self._record_command_commit(
@@ -1809,6 +1814,7 @@ class AgentLifecycle:
                     request_id,
                     has_active_attempt=checkpoint is not None,
                     recovery_hold=self._recovery_hold_locked(checkpoint),
+                    reject_open_intake=reject_open_intake,
                 )
             )
 

@@ -66,6 +66,15 @@ class ResumeBlockedError(ValueError):
     """
 
 
+class ResumeIntakeOpenError(ValueError):
+    """Raised when ``resume`` finds intake already open with nothing to replace.
+
+    Only raised when the caller asks for the operator-contract rule
+    (``resume`` only reopens closed intake); nothing is stored, so the
+    request ID stays unused.
+    """
+
+
 class StopAfterRejectedError(ValueError):
     """Raised when ``stop --after N`` is rejected without a control change.
 
@@ -368,6 +377,7 @@ class ControlStore:
         *,
         has_active_attempt: bool,
         recovery_hold: RecoveryHold | None = None,
+        reject_open_intake: bool = False,
     ) -> CommandRecord:
         """Durably record ``resume`` and permit later issue intake.
 
@@ -375,10 +385,13 @@ class ControlStore:
         is pending the plan is durably replaced (the earlier accepted stops
         become ``superseded`` naming this request) and the active attempt
         continues with its ordinary outcome. In ``running`` with no pending
-        plan the command completes idempotently. A ``recovery_hold`` rejects
-        the command without changing intake or the command record, and the
-        rejection names the affected attempt and reason. Resume never
-        requeues an issue: it only changes the intake state.
+        plan the command completes idempotently, unless
+        ``reject_open_intake`` asks for the operator-contract rule: then it
+        raises :class:`ResumeIntakeOpenError` and stores nothing. A
+        ``recovery_hold`` rejects the command without changing intake or
+        the command record, and the rejection names the affected attempt
+        and reason. Resume never requeues an issue: it only changes the
+        intake state.
         """
 
         _check_request_id(request_id)
@@ -434,6 +447,12 @@ class ControlStore:
                         and pending is None
                         and not superseded_ids
                     ):
+                        if reject_open_intake:
+                            connection.execute("ROLLBACK")
+                            raise ResumeIntakeOpenError(
+                                "intake is already open and no stop or stop plan"
+                                " is pending; resume only reopens closed intake"
+                            )
                         acknowledgement = CommandAcknowledgement.COMPLETED
                         detail = "intake already running"
                     else:
@@ -478,7 +497,12 @@ class ControlStore:
                     self._clear_stop_plan_locked(connection)
                     connection.execute("COMMIT")
                     return record
-            except (PayloadMismatchError, RequestIdError, ResumeBlockedError):
+            except (
+                PayloadMismatchError,
+                RequestIdError,
+                ResumeBlockedError,
+                ResumeIntakeOpenError,
+            ):
                 raise
             except sqlite3.Error as error:
                 raise ControlStoreError("Control command could not be committed") from error

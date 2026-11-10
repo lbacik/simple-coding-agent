@@ -199,6 +199,129 @@ def test_teardown_without_instance_removes_nothing(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Engine liveness and the docker container (issue #375)
+# ---------------------------------------------------------------------------
+
+
+def _fake_proc_stat(proc_root: Path, pid: int, state: str) -> None:
+    stat = proc_root / str(pid) / "stat"
+    stat.parent.mkdir(parents=True)
+    # A command name may itself hold spaces and parentheses.
+    stat.write_text(f"{pid} (py (x) y) {state} 1 1 1 0 -1 4194560\n", encoding="utf-8")
+
+
+def test_pid_gone_treats_a_zombie_that_is_not_our_child_as_gone(
+    tmp_path: Path, monkeypatch
+) -> None:
+    # The parent process is alive and signalable but is not our child, like
+    # an engine spawned by an earlier harness CLI under ``docker exec``.
+    pid = os.getppid()
+    _fake_proc_stat(tmp_path, pid, "Z")
+    monkeypatch.setattr(harness_module, "_PROC_ROOT", tmp_path)
+
+    assert harness_module._pid_gone(pid) is True
+
+
+def test_pid_gone_keeps_a_running_process_that_is_not_our_child_alive(
+    tmp_path: Path, monkeypatch
+) -> None:
+    pid = os.getppid()
+    _fake_proc_stat(tmp_path, pid, "S")
+    monkeypatch.setattr(harness_module, "_PROC_ROOT", tmp_path)
+
+    assert harness_module._pid_gone(pid) is False
+
+
+def test_pid_gone_without_proc_falls_back_to_the_signal_probe(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setattr(harness_module, "_PROC_ROOT", tmp_path / "missing")
+
+    assert harness_module._pid_gone(os.getppid()) is False
+
+
+def test_docker_setup_runs_the_container_with_an_init(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A real init reaps the orphaned engine once its ``docker exec`` exits."""
+
+    import subprocess
+
+    calls: list[list[str]] = []
+
+    def fake_run_docker(args: list[str], timeout: float = 60.0):
+        calls.append(args)
+        return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+    monkeypatch.setenv("SCA_HARNESS_STATE_DIR", str(tmp_path))
+    monkeypatch.setattr(harness_module, "_run_docker", fake_run_docker)
+    monkeypatch.setattr(
+        harness_module, "_docker_inner", lambda verb, params, container: (1, None)
+    )
+
+    harness_module._docker_setup({})
+
+    run = next(args for args in calls if args[0] == "run")
+    assert "--init" in run
+    assert run.index("--init") < run.index("--entrypoint")
+
+
+def test_start_container_after_a_crash_waits_for_the_new_engine(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A crashed engine leaves its ready marker; the restart must not trust it."""
+
+    harness_module._save_state(
+        tmp_path,
+        {"repository": "octo/example", "engine_pid": None, "container_running": True},
+    )
+    # The marker the crashed engine wrote before ``os._exit``.
+    (tmp_path / "daemon.ready").write_text("12345", encoding="utf-8")
+    # The new engine never gets ready.
+    monkeypatch.setattr(harness_module, "_spawn_daemon", lambda root, repository: 0)
+    monkeypatch.setattr(harness_module, "_DAEMON_READY_TIMEOUT_SECONDS", 0.2)
+
+    code, reply = invoke(
+        "start-container", request("start-container", {}), state_dir=tmp_path
+    )
+
+    assert code == 1
+    assert "did not become ready" in reply["error"]["message"]
+
+
+def test_spawned_engine_has_a_commit_identity(tmp_path: Path, monkeypatch) -> None:
+    """The harness container has no git identity; sealing attempt work commits."""
+
+    seen: dict[str, str] = {}
+
+    class _Process:
+        pid = 4242
+
+    def fake_popen(argv, **kwargs):
+        seen.update(kwargs["env"])
+        return _Process()
+
+    for name in (
+        "GIT_AUTHOR_NAME",
+        "GIT_AUTHOR_EMAIL",
+        "GIT_COMMITTER_NAME",
+        "GIT_COMMITTER_EMAIL",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("GIT_AUTHOR_NAME", "Operator")
+    monkeypatch.setattr(harness_module.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(harness_module, "_SPAWNED", {})
+
+    assert harness_module._spawn_daemon(tmp_path, "octo/example") == 4242
+
+    # An identity already in the environment wins; the rest is filled in.
+    assert seen["GIT_AUTHOR_NAME"] == "Operator"
+    assert seen["GIT_AUTHOR_EMAIL"]
+    assert seen["GIT_COMMITTER_NAME"]
+    assert seen["GIT_COMMITTER_EMAIL"]
+
+
+# ---------------------------------------------------------------------------
 # Smoke test: every harness verb, every protocol state
 # ---------------------------------------------------------------------------
 

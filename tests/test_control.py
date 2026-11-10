@@ -21,6 +21,7 @@ from simple_coding_agent.control import (
     RecoveryHold,
     RequestIdError,
     ResumeBlockedError,
+    ResumeIntakeOpenError,
 )
 
 
@@ -227,6 +228,114 @@ def test_resume_while_running_without_plan_completes_idempotently(
     assert store.intake_state() is IntakeState.RUNNING
     assert store.pending_command_id() is None
     assert (first.sequence, second.sequence) == (1, 2)
+
+
+def test_resume_rejecting_open_intake_stores_nothing(tmp_path: Path) -> None:
+    """The contract rule: ``resume`` only reopens closed intake."""
+
+    store = ControlStore(tmp_path)
+
+    with pytest.raises(ResumeIntakeOpenError, match="already open"):
+        store.submit_resume(
+            "req-r1", has_active_attempt=False, reject_open_intake=True
+        )
+
+    assert store.get_command("req-r1") is None
+    assert store.intake_state() is IntakeState.RUNNING
+    assert store.pending_command_id() is None
+    # The refused request ID is not consumed: a later command may use it.
+    stop = store.submit_stop("req-r1", has_active_attempt=False)
+    assert stop.sequence == 1
+
+
+def test_resume_rejecting_open_intake_still_supersedes_a_stop_plan(
+    tmp_path: Path,
+) -> None:
+    """Open intake with a pending ``stop --after`` plan is not a no-op."""
+
+    store = ControlStore(tmp_path)
+    plan = store.submit_stop_after("req-plan", 2, has_active_attempt=False)
+    assert plan.acknowledgement is CommandAcknowledgement.ACCEPTED
+
+    resume = store.submit_resume(
+        "req-resume", has_active_attempt=False, reject_open_intake=True
+    )
+
+    assert resume.acknowledgement is CommandAcknowledgement.COMPLETED
+    replaced = store.get_command("req-plan")
+    assert replaced is not None
+    assert replaced.acknowledgement is CommandAcknowledgement.SUPERSEDED
+
+
+def test_resume_rejecting_open_intake_reopens_stopped_intake(tmp_path: Path) -> None:
+    store = ControlStore(tmp_path)
+    store.submit_stop("req-stop", has_active_attempt=False)
+
+    resume = store.submit_resume(
+        "req-resume", has_active_attempt=False, reject_open_intake=True
+    )
+
+    assert resume.acknowledgement is CommandAcknowledgement.COMPLETED
+    assert store.intake_state() is IntakeState.RUNNING
+
+
+def test_resume_rejecting_open_intake_still_replays_a_stored_resume(
+    tmp_path: Path,
+) -> None:
+    store = ControlStore(tmp_path)
+    store.submit_stop("req-stop", has_active_attempt=False)
+    first = store.submit_resume(
+        "req-resume", has_active_attempt=False, reject_open_intake=True
+    )
+
+    retry = store.submit_resume(
+        "req-resume", has_active_attempt=False, reject_open_intake=True
+    )
+
+    assert retry == first
+
+
+def test_resume_rejecting_open_intake_still_supersedes_a_pending_handoff(
+    tmp_path: Path,
+) -> None:
+    store = ControlStore(tmp_path)
+    handoff = store.submit_handoff("req-handoff", has_active_attempt=True)
+    assert handoff.acknowledgement is CommandAcknowledgement.ACCEPTED
+
+    resume = store.submit_resume(
+        "req-resume", has_active_attempt=True, reject_open_intake=True
+    )
+
+    assert resume.acknowledgement is CommandAcknowledgement.COMPLETED
+    replaced = store.get_command("req-handoff")
+    assert replaced is not None
+    assert replaced.acknowledgement is CommandAcknowledgement.SUPERSEDED
+    assert store.intake_state() is IntakeState.RUNNING
+
+
+def test_resume_rejecting_open_intake_reports_a_recovery_hold_first(
+    tmp_path: Path,
+) -> None:
+    """A recovery hold names the retained attempt, not the open intake."""
+
+    store = ControlStore(tmp_path)
+    hold = RecoveryHold(
+        issue_number=24,
+        attempt_id="2026-09-24T00:00:00Z",
+        branch="agent/issue-24",
+        phase="publishing",
+        reason="publication is unconfirmed; retained work is preserved for recovery",
+    )
+
+    with pytest.raises(ResumeBlockedError, match="issue #24"):
+        store.submit_resume(
+            "req-resume",
+            has_active_attempt=True,
+            recovery_hold=hold,
+            reject_open_intake=True,
+        )
+
+    assert store.get_command("req-resume") is None
 
 
 def test_resume_supersedes_pending_stop_and_names_the_replacement(

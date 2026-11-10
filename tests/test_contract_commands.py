@@ -418,6 +418,52 @@ def test_resume_supersedes_accepted_stop_and_reopens_intake(command_server) -> N
         assert not worker.is_alive()
 
 
+def test_second_resume_on_open_intake_is_rejected_and_not_stored(
+    command_server,
+) -> None:
+    _, _, _, _ = command_server
+    stop_code, _, _, _ = _run(_mutation(["stop"], request_id="req-close-1"))
+    assert stop_code == 0
+    open_code, open_envelope, _, _ = _run(
+        _mutation(["resume"], request_id="req-reopen-1")
+    )
+    assert open_code == 0
+    assert _result(open_envelope)["command"]["acknowledgement"] == "completed"
+
+    code, envelope, _, err = _run(_mutation(["resume"], request_id="req-reopen-2"))
+
+    assert err == ""
+    assert code == 1
+    assert envelope["ok"] is False
+    assert envelope["error"]["code"] == "rejected"
+    assert envelope["error"]["request_id"] == "req-reopen-2"
+    lookup_code, lookup_envelope, _, _ = _run(
+        ["--contract", "1", "command", "req-reopen-2"]
+    )
+    assert lookup_code == 5
+    assert lookup_envelope["error"]["code"] == "not_found"
+    status_code, status_envelope, _, _ = _run(["--contract", "1", "status"])
+    assert status_code == 0
+    assert _result(status_envelope)["intake"]["state"] == "open"
+
+
+def test_local_resume_on_running_intake_still_completes(
+    command_server, tmp_path: Path
+) -> None:
+    """The legacy ``agentctl resume`` keeps its idempotent no-op reply."""
+
+    _, _, store, _ = command_server
+    out = io.StringIO()
+    with redirect_stdout(out):
+        code = agentctl.main(["resume", "--request-id", "req-local-resume"])
+
+    assert code == 0
+    record = store.get_command("req-local-resume")
+    assert record is not None
+    assert record.acknowledgement.value == "completed"
+    assert "already running" in record.detail
+
+
 # ---------------------------------------------------------------------------
 # Command lookup and responsiveness
 # ---------------------------------------------------------------------------
