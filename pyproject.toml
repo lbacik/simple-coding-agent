@@ -8,7 +8,9 @@ version = "0.9.0"
 description = "An unattended coding agent for one GitHub repository."
 requires-python = ">=3.11"
 dependencies = [
-    "agent-operator-contract==1.0.0",
+    # Not on PyPI: a direct reference so both pip (the Docker image) and uv
+    # resolve the pinned tag; this is the only place the version is pinned.
+    "agent-operator-contract @ git+https://github.com/lbacik/agent-operator-contract@v1.0.0",
     "claude-agent-sdk==0.2.179",
     "python-dotenv==1.2.4",
     "PyYAML>=6.0,<7",
@@ -24,6 +26,11 @@ dev = [
     "jsonschema>=4.0,<5",
 ]
 
+[tool.hatch.metadata]
+# Required for the git direct reference to agent-operator-contract in
+# [project] dependencies.
+allow-direct-references = true
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 
@@ -33,6 +40,3 @@ target-version = "py311"
 [tool.ruff.lint]
 # Pyflakes, syntax errors and bugbear only; widen once the backlog is fixed.
 select = ["F", "E9", "B"]
-
-[tool.uv.sources]
-agent-operator-contract = { git = "https://github.com/lbacik/agent-operator-contract", rev = "v1.0.0" }
