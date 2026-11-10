@@ -15,6 +15,8 @@ import os
 import time
 from pathlib import Path
 
+import pytest
+
 from conformance_harness import harness as harness_module
 from conformance_harness.harness import HARNESS_VERSION, run_harness
 
@@ -269,15 +271,16 @@ def test_docker_setup_runs_the_container_with_an_init(
 def test_start_container_after_a_crash_waits_for_the_new_engine(
     tmp_path: Path, monkeypatch
 ) -> None:
-    """A crashed engine leaves its ready marker; the restart must not trust it."""
+    """A crashed engine leaves its markers; the restart must not trust them."""
 
     harness_module._save_state(
         tmp_path,
         {"repository": "octo/example", "engine_pid": None, "container_running": True},
     )
-    # The marker the crashed engine wrote before ``os._exit``.
+    # The markers the crashed engine wrote before ``os._exit``.
     (tmp_path / "daemon.ready").write_text("12345", encoding="utf-8")
-    # The new engine never gets ready.
+    (tmp_path / "daemon.serving").write_text("12345", encoding="utf-8")
+    # The new engine never serves.
     monkeypatch.setattr(harness_module, "_spawn_daemon", lambda root, repository: 0)
     monkeypatch.setattr(harness_module, "_DAEMON_READY_TIMEOUT_SECONDS", 0.2)
 
@@ -286,7 +289,7 @@ def test_start_container_after_a_crash_waits_for_the_new_engine(
     )
 
     assert code == 1
-    assert "did not become ready" in reply["error"]["message"]
+    assert "did not serve the control endpoint" in reply["error"]["message"]
 
 
 def test_spawned_engine_has_a_commit_identity(tmp_path: Path, monkeypatch) -> None:
@@ -434,13 +437,16 @@ def test_harness_smoke_reaches_every_state(tmp_path: Path) -> None:
     assert offline["error"]["code"] == "rejected"
     assert offline["error"]["details"]["reason"] == "instance_running"
 
-    # -- active: hold after the claim, then make an issue eligible ---------
-    assert call("hold", {"point": "after-claim"})["attempt_id"] is None
+    # -- active: make an issue eligible, then let the claim through ---------
+    #    (no claim opens on its own; the attempt then waits for
+    #    finish-attempt, so it stays active without any hold) --------------
     assert call("set-issue", {"issue": 7, "eligible": True}) == {
         "issue": 7,
         "eligible": True,
     }
-    snapshot = _wait_for_state(socket, "active")
+    assert call("release", {}) == {"released": False}
+    snapshot = _contract_status(socket)
+    assert snapshot["instance"]["state"] == "active"
     attempt_id = snapshot["current_attempt"]["attempt_id"]
     assert snapshot["current_attempt"]["issue"]["number"] == 7
 
@@ -491,14 +497,20 @@ def test_harness_smoke_reaches_every_state(tmp_path: Path) -> None:
     assert stopped["intake"]["state"] == "closed"
     assert stopped["current_attempt"] is None
 
-    # -- recovering: an unreadable checkpoint holds intake for recovery ----
+    # -- a restarted instance stays starting until release ----------------
     assert call("start-container", {}) == {"running": True}
+    snapshot = _contract_status(socket)
+    assert snapshot["instance"]["state"] == "starting"
+    assert call("release", {}) == {"released": True}
     snapshot = _wait_for_state(socket, "paused")
+
+    # -- recovering: an unreadable checkpoint holds intake for recovery ----
     assert call("stop-container", {}) == {"running": False}
     (root / "instance" / "state" / "attempt.json").write_text(
         "{not valid json", encoding="utf-8"
     )
     assert call("start-container", {}) == {"running": True}
+    assert call("release", {}) == {"released": True}
     snapshot = _wait_for_state(socket, "recovering", timeout=60.0)
 
     # Repair the checkpoint: the hold clears and intake goes quiet.
@@ -537,3 +549,144 @@ def test_harness_smoke_reaches_every_state(tmp_path: Path) -> None:
     code, reply = invoke("teardown", request("teardown", {}), state_dir=root)
     assert code == 0
     assert reply["result"] == {"removed": True}
+
+
+# ---------------------------------------------------------------------------
+# Harness timing semantics the producer suite relies on (issue #376)
+# ---------------------------------------------------------------------------
+
+#: Many daemon poll intervals (0.2 s each), and longer than one whole claim
+#: including the tracker's assignment settle window, so a spontaneous claim
+#: would have produced an attempt checkpoint by the end of it.
+_NO_SPONTANEOUS_CLAIM_WINDOW_SECONDS = 3.5
+
+
+class _Engine:
+    """One running fakes-wired engine behind the process-local harness."""
+
+    def __init__(self, root: Path) -> None:
+        self.root = root
+        self.socket = root / "daemon.sock"
+
+    def call(self, verb: str, params: dict) -> dict:
+        code, reply = invoke(verb, request(verb, params), state_dir=self.root)
+        assert code == 0, reply
+        assert reply["ok"] is True
+        return reply["result"]
+
+    def status(self) -> dict:
+        return _contract_status(self.socket)
+
+    def agentctl(self, *tokens: str) -> tuple[int, dict]:
+        return _agentctl_json(self.socket, *tokens)
+
+
+@pytest.fixture
+def engine(tmp_path: Path):
+    harness = _Engine(tmp_path / "harness")
+    harness.call(
+        "setup",
+        {"repository": "octo/example", "config": {"native.startup_hold_ms": 100}},
+    )
+    try:
+        _wait_for_state(harness.socket, "idle")
+        yield harness
+    finally:
+        invoke("teardown", request("teardown", {}), state_dir=harness.root)
+
+
+def test_an_eligible_issue_is_claimed_only_through_release(engine: _Engine) -> None:
+    engine.call("set-issue", {"issue": 11, "eligible": True})
+    time.sleep(_NO_SPONTANEOUS_CLAIM_WINDOW_SECONDS)
+    snapshot = engine.status()
+    assert snapshot["current_attempt"] is None
+    assert snapshot["last_finished"] is None  # no attempt ran meanwhile either
+    assert not (engine.root / "instance" / "state" / "attempt.json").exists()
+
+    assert engine.call("release", {}) == {"released": False}
+
+    # No polling: the claim is visible as soon as release answers.
+    current = engine.status()["current_attempt"]
+    assert current is not None
+    assert current["issue"]["number"] == 11
+
+
+def test_stop_behind_a_before_claim_hold_completes_at_once(engine: _Engine) -> None:
+    engine.call("set-issue", {"issue": 12, "eligible": True})
+    engine.call("hold", {"point": "before-claim", "scope": "next"})
+
+    code, reply = engine.agentctl(
+        "stop", "--request-id", "req-376-stop", "--expect-repo", "octo/example"
+    )
+
+    assert code == 0, reply
+    assert reply["result"]["command"]["acknowledgement"] == "completed"
+
+
+def test_a_claimed_attempt_waits_for_finish_attempt(engine: _Engine) -> None:
+    engine.call("set-issue", {"issue": 13, "eligible": True})
+    engine.call("release", {})
+    attempt_id = engine.status()["current_attempt"]["attempt_id"]
+
+    time.sleep(_NO_SPONTANEOUS_CLAIM_WINDOW_SECONDS)
+    snapshot = engine.status()
+    assert snapshot["current_attempt"] is not None
+    assert snapshot["current_attempt"]["attempt_id"] == attempt_id
+    assert not (engine.root / "flags" / "scripted_outcome.json").exists()
+
+    finished = engine.call(
+        "finish-attempt", {"native_outcome": "infrastructure_error", "reason": "boom"}
+    )
+
+    assert finished == {"attempt_id": attempt_id, "native_outcome": "infrastructure_error"}
+    snapshot = engine.status()
+    assert snapshot["current_attempt"] is None
+    assert snapshot["last_finished"]["attempt_id"] == attempt_id
+    assert snapshot["last_finished"]["outcome"]["native"] == "infrastructure_error"
+    # The outcome was consumed by that attempt, never left for the next one.
+    assert not (engine.root / "flags" / "scripted_outcome.json").exists()
+
+
+def test_status_during_hold_lock_serves_the_prepared_snapshot(engine: _Engine) -> None:
+    import threading
+
+    before = engine.status()
+    held: list[dict] = []
+    holder = threading.Thread(
+        target=lambda: held.append(engine.call("hold-lock", {"duration_ms": 4000}))
+    )
+    holder.start()
+    try:
+        time.sleep(0.5)
+        started = time.monotonic()
+        during = engine.status()
+        elapsed = time.monotonic() - started
+        still_held = holder.is_alive()
+    finally:
+        holder.join(timeout=30.0)
+
+    assert still_held
+    assert elapsed < 3.0
+    assert held and held[0]["held_ms"] >= 4000
+    for section in ("instance", "intake"):
+        assert during[section]["observed_at"] <= before[section]["observed_at"]
+
+
+def test_release_returns_promptly_with_nothing_eligible(engine: _Engine) -> None:
+    started = time.monotonic()
+    assert engine.call("release", {}) == {"released": False}
+    assert time.monotonic() - started < 3.0
+    assert engine.status()["current_attempt"] is None
+
+
+def test_release_returns_promptly_with_intake_closed(engine: _Engine) -> None:
+    code, _ = engine.agentctl(
+        "stop", "--request-id", "req-376-close", "--expect-repo", "octo/example"
+    )
+    assert code == 0
+    engine.call("set-issue", {"issue": 14, "eligible": True})
+
+    started = time.monotonic()
+    assert engine.call("release", {}) == {"released": False}
+    assert time.monotonic() - started < 3.0
+    assert engine.status()["current_attempt"] is None

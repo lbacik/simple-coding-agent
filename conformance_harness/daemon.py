@@ -6,8 +6,15 @@ fakes (``FakeGitHub`` per issue plus ``FakeModelExecutor`` from
 ``tests/fakes.py`` — reused, never copied) over a real git remote, serving
 the contract on a Unix control socket. The host-side harness CLI
 (:mod:`conformance_harness.harness`) steers this process through flag
-files: holds, one-shot crashes, scripted native outcomes, halt requests
-and the deferred-publication one-shot.
+files: holds, one-shot crashes, scripted native outcomes, halt requests,
+the deferred-publication one-shot, the claim gate and the engine lock.
+
+The engine advances only when a harness verb asks it to, as the contract's
+reference stub producer does: a Claim opens only through the gate that
+``release`` arms (:class:`GatedTracker`), a claimed attempt waits for the
+outcome ``finish-attempt`` scripts (:class:`BlockingExecutor`), and
+``hold-lock`` makes this process hold the engine's own control lock
+(:func:`_hold_control_lock_while_held`).
 
 Only the ``harness`` Docker build stage contains this module and the
 fakes; the production image has neither.
@@ -19,6 +26,7 @@ import fcntl
 import json
 import os
 import sys
+import threading
 import time
 from datetime import UTC, datetime
 from pathlib import Path
@@ -50,6 +58,46 @@ def _take_json(path: Path) -> dict | None:
     return payload if payload is not None else {}
 
 
+def _write_json(path: Path, payload: dict) -> None:
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
+    os.replace(tmp, path)
+
+
+#: One-shot claim gate armed by ``release`` (``{"token": ...}``).
+CLAIM_GATE = "claim_gate.json"
+#: How the daemon answered one armed gate (``{"token": ..., "claimed": ...}``).
+CLAIM_GATE_RESULT = "claim_gate_result.json"
+#: Written while this process holds the engine control lock for ``hold-lock``.
+ENGINE_LOCK_HELD = "engine_lock.held"
+#: Armed by ``start-container``: the engine stays ``starting`` until ``release``.
+STARTUP_HOLD = "startup_hold"
+#: Armed by ``start-container`` over a retained attempt: reconciliation waits
+#: (the engine reports ``recovering``) until ``release``.
+RECOVERY_HOLD = "recovery_hold"
+#: Written once the first engine iteration after startup has returned.
+STARTUP_RECONCILED = "startup_reconciled"
+
+
+def claim_gate_token(flags: Path) -> str | None:
+    """The token of the armed claim gate, or ``None`` while it is closed."""
+
+    payload = _read_json(flags / CLAIM_GATE)
+    token = payload.get("token") if payload else None
+    return token if isinstance(token, str) and token else None
+
+
+def _answer_claim_gate(flags: Path, token: str, *, claimed: bool) -> None:
+    """Close the gate ``token`` armed and tell ``release`` what happened."""
+
+    try:
+        _write_json(flags / CLAIM_GATE_RESULT, {"token": token, "claimed": claimed})
+        if claim_gate_token(flags) == token:
+            (flags / CLAIM_GATE).unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
 class HarnessTransport:
     """Route every transport call to the per-issue shared ``FakeGitHub``.
 
@@ -58,8 +106,29 @@ class HarnessTransport:
     all behaviour stays in the shared doubles.
     """
 
-    def __init__(self, issues: dict[int, object]) -> None:
+    def __init__(self, issues: dict[int, object], spec_path: Path | None = None) -> None:
         self._issues = issues
+        self._spec_path = spec_path
+        self._sync_lock = threading.Lock()
+
+    def sync(self) -> None:
+        """Apply the harness issue map (``issues.json``) to the per-issue fakes.
+
+        Reads sync first, so an issue ``set-issue`` just wrote is visible
+        to the very next engine read (a ``next issue`` validation, a claim)
+        without waiting for a daemon loop iteration.
+        """
+
+        if self._spec_path is None:
+            return
+        try:
+            spec = json.loads(self._spec_path.read_text(encoding="utf-8"))
+        except (FileNotFoundError, ValueError, OSError):
+            spec = {}
+        if not isinstance(spec, dict):
+            return
+        with self._sync_lock:
+            _sync_issues(self._issues, spec)
 
     def _for_issue(self, number: int) -> object:
         try:
@@ -85,6 +154,7 @@ class HarnessTransport:
     def list_issues(self, repository: str, cursor: str | None) -> object:
         from simple_coding_agent.github_tracker import IssuePage
 
+        self.sync()
         ordered = sorted(self._issues)
         return IssuePage(
             issues=tuple(self._issues[number]._current() for number in ordered),  # noqa: SLF001
@@ -100,6 +170,7 @@ class HarnessTransport:
         return PullRequestPage(pull_requests=tuple(pulls), next_cursor=None)
 
     def get_issue(self, repository: str, number: int) -> object | None:
+        self.sync()
         fake = self._issues.get(number)
         if fake is None:
             return None
@@ -187,6 +258,57 @@ class HarnessTransport:
         raise AssertionError(f"unknown handoff comment {comment_id!r}")
 
 
+class GatedTracker:
+    """Let the engine cross the Claim boundary only through ``release``.
+
+    Wraps the real tracker. The daemon loop allows one armed gate token per
+    ``run_once``; a claim begins only while that same token is still armed,
+    and a successful claim (FIFO ``claim_next`` or the prioritized
+    ``claim_verified``) consumes it. With no gate allowed the FIFO queue
+    reads as empty, so startup reconciliation, recovery and pending stop
+    completion keep running while no claim opens.
+    """
+
+    def __init__(self, inner: object, flags: Path) -> None:
+        self._inner = inner
+        self._flags = flags
+        #: The gate token the current ``run_once`` may consume, if any.
+        self.allowed: str | None = None
+
+    def _open(self) -> bool:
+        return self.allowed is not None and claim_gate_token(self._flags) == self.allowed
+
+    def _consume(self) -> None:
+        if self.allowed is not None:
+            _answer_claim_gate(self._flags, self.allowed, claimed=True)
+
+    def claim_next(self) -> object | None:
+        if not self._open():
+            return None
+        claim = self._inner.claim_next()
+        if claim is not None:
+            self._consume()
+        return claim
+
+    def claim_verified(self, issue: object) -> object:
+        # Reached only with the gate allowed: the daemon loop does not run
+        # the engine while a priority waits behind a closed gate.
+        claim = self._inner.claim_verified(issue)
+        self._consume()
+        return claim
+
+    def recover_claim(self, issue_number: int) -> object | None:
+        # Startup reconciliation of an interrupted attempt passes here with
+        # the engine reporting ``recovering``; after a restart the harness
+        # keeps it there until ``release`` (spec: the recovery hold).
+        while (self._flags / RECOVERY_HOLD).exists():
+            time.sleep(0.05)
+        return self._inner.recover_claim(issue_number)
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self.__dict__["_inner"], name)
+
+
 def _wait_while_held(flags: Path, poll: float = 0.05) -> None:
     """Block while a hold flag file exists (release removes it)."""
 
@@ -203,13 +325,22 @@ def _checkpoint_phase(data_dir: Path) -> str | None:
     return phase if isinstance(phase, str) else None
 
 
+def _checkpoint_attempt_id(data_dir: Path) -> str | None:
+    payload = _read_json(data_dir / "state" / "attempt.json")
+    if not payload:
+        return None
+    started_at = payload.get("started_at")
+    return started_at if isinstance(started_at, str) and started_at else None
+
+
 class BlockingExecutor:
-    """Fake model execution that honours harness holds and scripted outcomes.
+    """Fake model execution that waits for the outcome ``finish-attempt`` scripts.
 
     Delegates the actual turn to the shared ``FakeModelExecutor`` (with the
     shared ``write_handoff_note`` standing in for the handoff skill's note
-    commit); this wrapper only blocks while a hold is armed and selects the
-    scripted native outcome ``finish-attempt`` recorded.
+    commit). This wrapper only blocks while a hold is armed and until
+    ``finish-attempt`` records a scripted native outcome for this attempt;
+    a claimed attempt never finishes on its own.
     """
 
     def __init__(self, flags: Path, data_dir: Path) -> None:
@@ -229,6 +360,25 @@ class BlockingExecutor:
         ):
             return True
         return False
+
+    def _take_scripted_outcome(self, attempt_id: str | None) -> dict | None:
+        """Consume the outcome scripted for ``attempt_id``, if recorded yet.
+
+        Taking it removes it, so it can never finish a later attempt; an
+        outcome scripted for another attempt is stale and is dropped.
+        """
+
+        path = self._flags / "scripted_outcome.json"
+        scripted = _read_json(path)
+        if scripted is None:
+            return None
+        try:
+            path.unlink()
+        except OSError:
+            pass
+        if scripted.get("attempt_id") != attempt_id:
+            return None
+        return scripted
 
     async def execute(
         self,
@@ -251,9 +401,13 @@ class BlockingExecutor:
             except OSError:
                 pass
             os._exit(1)
-        while self._hold_applies():
+        attempt_id = _checkpoint_attempt_id(self._data_dir)
+        while True:
+            if not self._hold_applies():
+                scripted = self._take_scripted_outcome(attempt_id)
+                if scripted is not None:
+                    break
             time.sleep(0.05)
-        scripted = _read_json(self._flags / "scripted_outcome.json") or {}
         outcome = scripted.get("native_outcome", "complete")
         if outcome == "handoff":
             inner = FakeModelExecutor(
@@ -461,7 +615,33 @@ def _engine_lock_held(flags: Path) -> bool:
         handle.close()
 
 
-def _sync_issues(transport: HarnessTransport, issues: dict[int, object], spec: dict) -> None:
+def _hold_control_lock_while_held(flags: Path, control_lock: object) -> None:
+    """Hold the engine's control lock whenever ``hold-lock`` holds its file lock.
+
+    ``hold-lock`` runs in another process, so it cannot take the engine's
+    in-process control lock itself; this watcher takes it on its behalf
+    and marks that with :data:`ENGINE_LOCK_HELD`. Meanwhile the engine's
+    own prepared-state path applies: a status read waits at most
+    ``CONTROL_LOCK_TIMEOUT_SECONDS`` and serves the last built snapshot.
+    """
+
+    marker = flags / ENGINE_LOCK_HELD
+    while True:
+        if _engine_lock_held(flags):
+            with control_lock:
+                try:
+                    marker.write_text(str(os.getpid()), encoding="utf-8")
+                except OSError:
+                    pass
+                try:
+                    while _engine_lock_held(flags):
+                        time.sleep(0.02)
+                finally:
+                    marker.unlink(missing_ok=True)
+        time.sleep(0.02)
+
+
+def _sync_issues(issues: dict[int, object], spec: dict) -> None:
     """Create missing per-issue fakes and steer eligibility labels."""
 
     from datetime import UTC as _UTC
@@ -506,27 +686,50 @@ def _sync_issues(transport: HarnessTransport, issues: dict[int, object], spec: d
             fake.labels.discard("ready-for-agent")
 
 
-def _build_engine(root: Path, repository: str, transport: HarnessTransport) -> object:
-    """Wire the real lifecycle to the shared fakes (mirrors ``build_lifecycle``)."""
+class _Engine:
+    """The wired engine pieces the daemon loop steers."""
 
+    def __init__(self, **parts: object) -> None:
+        self.__dict__.update(parts)
+
+
+def _build_engine(root: Path, repository: str, transport: HarnessTransport) -> _Engine:
+    """Wire the real lifecycle to the shared fakes, mirroring production ``main``.
+
+    Everything production wires is wired the same way (event logger with
+    its per-attempt sink and contract buffers, attempt archives, halt
+    store, telemetry); only the GitHub transport, the model executor and
+    provenance are fakes.
+    """
+
+    from simple_coding_agent.__main__ import emit_process_started, emit_startup_check
+    from simple_coding_agent.agent_version import agent_version
     from simple_coding_agent.attempt_state import AttemptStateStore
     from simple_coding_agent.command_runner import CommandRunner
     from simple_coding_agent.completion import CompletionEvaluator, VerificationRunner
     from simple_coding_agent.config import RepositoryProfile
+    from simple_coding_agent.contract_events import ContractEventsBuffer
     from simple_coding_agent.control import ControlStore
     from simple_coding_agent.finalization import AttemptCompletionStore
     from simple_coding_agent.git_workspace import GitWorkspace
     from simple_coding_agent.github_tracker import GitHubTracker
+    from simple_coding_agent.halt import HaltStore
     from simple_coding_agent.handoff_record import HandoffPublicationStore
     from simple_coding_agent.lifecycle import AgentLifecycle, ModelAttemptRunner
-    from simple_coding_agent.observability import AttemptArchive
+    from simple_coding_agent.observability import AttemptArchive, JsonEventLogger
     from simple_coding_agent.operating import ConsecutiveErrorStore
     from simple_coding_agent.publication import Publisher
+    from simple_coding_agent.telemetry import (
+        RecentEventsBuffer,
+        TelemetryReporter,
+        format_timestamp,
+    )
 
     data_dir = root / "instance"
     clone_dir = root / "clone"
     remote = root / "remote.git"
     flags = root / "flags"
+    process_started_at = format_timestamp(datetime.now(UTC))
 
     def default_profile() -> RepositoryProfile:
         return RepositoryProfile(
@@ -538,23 +741,50 @@ def _build_engine(root: Path, repository: str, transport: HarnessTransport) -> o
             env={},
         )
 
+    halt_store = HaltStore(data_dir)
     attempt_state = AttemptStateStore(data_dir)
+    control_store = ControlStore(data_dir)
+
+    def archive_factory(issue_number: int, started_at: str) -> AttemptArchive:
+        return AttemptArchive(
+            data_dir, issue_number=issue_number, started_at=started_at, redactions=()
+        )
+
+    def attempt_sink(issue_number: int) -> AttemptArchive | None:
+        checkpoint = attempt_state.read()
+        if checkpoint is None or checkpoint.issue_number != issue_number:
+            return None
+        return archive_factory(issue_number, checkpoint.started_at)
+
+    recent_events = RecentEventsBuffer()
+    contract_events = ContractEventsBuffer()
+    logger = JsonEventLogger(
+        sys.stdout,
+        attempt_sink=attempt_sink,
+        recent_events=recent_events,
+        contract_events=contract_events,
+    )
+
+    def event_log(phase: str, default_level: str = "INFO"):
+        def emit(event, detail="", level=default_level, issue_number=None, attempt_id=None):
+            logger.emit(
+                event,
+                phase=phase,
+                detail=detail,
+                level=level,
+                issue_number=issue_number,
+                attempt_id=attempt_id,
+            )
+
+        return emit
+
+    emit_process_started(logger)
+    emit_startup_check(logger, "provenance", "started")
     workspace = GitWorkspace(
         clone_dir, str(remote), token_provider=lambda: "token"
     )
-    tracker = GitHubTracker(transport, repository)
-    executor = BlockingExecutor(flags, data_dir)
-    runner = ModelAttemptRunner(
-        attempt_state=attempt_state,
-        workspace=workspace,
-        verifier=VerificationRunner(CommandRunner()),
-        evaluator=CompletionEvaluator(frozenset({"blocking"})),
-        model_executor=executor,
-        issue_comments=tracker.trusted_comments,
-        attempt_archive_factory=lambda issue_number, started_at: AttemptArchive(
-            data_dir, issue_number=issue_number, started_at=started_at, redactions=()
-        ),
-    )
+    github_tracker = GitHubTracker(transport, repository, event_log=event_log("polling"))
+    tracker = GatedTracker(github_tracker, flags)
     publisher = GatedPublisher(
         Publisher(
             workspace,
@@ -564,39 +794,97 @@ def _build_engine(root: Path, repository: str, transport: HarnessTransport) -> o
             sleeper=lambda _: None,
             handoff_comment_mode="verbose",
             handoff_store=HandoffPublicationStore(data_dir),
+            event_log=event_log("publication"),
         ),
         flags,
         data_dir,
     )
-    control_store = ControlStore(data_dir)
-    return AgentLifecycle(
+    lifecycle = AgentLifecycle(
         tracker=tracker,
         attempt_state=attempt_state,
         workspace=workspace,
         profile_loader=lambda _: default_profile(),
         publisher=publisher,
-        attempt_runner=runner,
+        attempt_runner=None,
         sleeper=lambda _: None,
         poll_interval=60,
         error_store=ConsecutiveErrorStore(data_dir),
+        event_log=event_log("polling"),
+        attempt_archive_factory=archive_factory,
         completion_store=AttemptCompletionStore(data_dir),
         control_store=control_store,
+        contract_events=contract_events,
         repository=repository,
         data_dir=data_dir,
         mode="online",
-        process_started_at=datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+        process_started_at=process_started_at,
         starting=True,
         startup_check="provenance",
+        halt_store=halt_store,
     )
+    # Post-provenance construction (the fake provenance always verifies).
+    runner = ModelAttemptRunner(
+        attempt_state=attempt_state,
+        workspace=workspace,
+        verifier=VerificationRunner(CommandRunner()),
+        evaluator=CompletionEvaluator(frozenset({"blocking"})),
+        model_executor=BlockingExecutor(flags, data_dir),
+        issue_comments=github_tracker.trusted_comments,
+        prompt_comments=github_tracker.prompt_comments,
+        attempt_archive_factory=archive_factory,
+        event_log=event_log("setup", "ERROR"),
+    )
+    telemetry = TelemetryReporter(
+        repository=repository,
+        agent_version=agent_version(),
+        sdk_version="harness",
+        cli_version="harness",
+        process_started_at=process_started_at,
+        recent_events=recent_events,
+    )
+    return _Engine(
+        lifecycle=lifecycle,
+        tracker=tracker,
+        control_store=control_store,
+        halt_store=halt_store,
+        logger=logger,
+        event_log=event_log,
+        attach=lambda: lifecycle.attach_post_provenance(
+            attempt_runner=runner, telemetry=telemetry
+        ),
+        provenance_ok=lambda: emit_startup_check(logger, "provenance", "ok"),
+    )
+
+
+def _priority_waits_behind_closed_gate(control_store: object, flags: Path) -> bool:
+    """Whether a ``next issue`` priority would be claimed with the gate closed.
+
+    The prioritized claim does not go through ``claim_next``, so while the
+    gate is closed the daemon keeps the engine away from a Claim boundary
+    with intake open and a priority pending.
+    """
+
+    from simple_coding_agent.control import IntakeState
+
+    if claim_gate_token(flags) is not None:
+        return False
+    try:
+        return (
+            control_store.next_issue_snapshot() is not None
+            and control_store.intake_state() is IntakeState.RUNNING
+        )
+    except Exception:
+        return False
 
 
 def run_daemon(root: Path) -> int:
     """Run the fakes-wired engine until asked to stop; never returns normally."""
 
+    from simple_coding_agent.__main__ import emit_halted
     from simple_coding_agent.agent_version import agent_version
     from simple_coding_agent.control_server import ControlServer
-    from simple_coding_agent.halt import HaltStore
     from simple_coding_agent.instance import record_instance
+    from simple_coding_agent.lifecycle import LifecycleStatus
     from simple_coding_agent.volume_lock import VolumeLock, VolumeLockError
     from tests.fakes import repository_with_main
 
@@ -621,30 +909,44 @@ def run_daemon(root: Path) -> int:
     flags = root / "flags"
     flags.mkdir(parents=True, exist_ok=True)
     issues: dict[int, object] = {}
-    transport = HarnessTransport(issues)
-    lifecycle = _build_engine(root, repository, transport)
+    transport = HarnessTransport(issues, root / "issues.json")
+    engine = _build_engine(root, repository, transport)
+    lifecycle = engine.lifecycle
+    tracker = engine.tracker
+    control_store = engine.control_store
+    halt_store = engine.halt_store
+    threading.Thread(
+        target=_hold_control_lock_while_held,
+        args=(flags, control_store.lock),
+        name="harness-engine-lock",
+        daemon=True,
+    ).start()
     proxy = GateProxy(lifecycle, flags)
-    server = ControlServer(root / "daemon.sock", proxy)
+    server = ControlServer(root / "daemon.sock", proxy, event_log=engine.event_log("control"))
     try:
         server.start()
     except Exception as error:
         print(f"harness daemon: control endpoint: {error}", file=sys.stderr)
         return 1
+    (root / "daemon.serving").write_text(str(os.getpid()), encoding="utf-8")
     # Early serving: the control endpoint answers ``starting`` while the
-    # (instant, fake) provenance check is reported in flight.
+    # (instant, fake) provenance check is reported in flight: for at least
+    # ``native.startup_hold_ms``, and after a restart until ``release``.
     deadline = time.monotonic() + max(0, startup_hold_ms) / 1000.0
-    while time.monotonic() < deadline:
+    while time.monotonic() < deadline or (flags / STARTUP_HOLD).exists():
         if (flags / "halt_request.json").exists():
             break
         time.sleep(0.05)
+    engine.provenance_ok()
+    engine.attach()
     lifecycle.mark_started()
     try:
         lifecycle.contract_status_snapshot()
     except Exception:
         pass
     (root / "daemon.ready").write_text(str(os.getpid()), encoding="utf-8")
-    halt_store = HaltStore(data_dir)
     poll_interval = 0.2
+    reconciled = False
     while True:
         halt_request = _take_json(flags / "halt_request.json") if (flags / "halt_request.json").exists() else None
         if halt_request is not None:
@@ -654,6 +956,7 @@ def run_daemon(root: Path) -> int:
                 halt_store.record(reason, detail if isinstance(detail, str) else "")
             except Exception as error:
                 print(f"harness daemon: halt record: {error}", file=sys.stderr)
+            emit_halted(engine.logger, reason)
             server.stop()
             try:
                 lifecycle.shutdown()
@@ -671,12 +974,7 @@ def run_daemon(root: Path) -> int:
             except OSError:
                 pass
             os._exit(1)
-        try:
-            spec = json.loads((root / "issues.json").read_text(encoding="utf-8"))
-        except (FileNotFoundError, ValueError, OSError):
-            spec = {}
-        if isinstance(spec, dict):
-            _sync_issues(transport, issues, spec)
+        transport.sync()
         hold = _read_json(flags / "hold.json")
         if (
             hold is not None
@@ -688,12 +986,34 @@ def run_daemon(root: Path) -> int:
         if _engine_lock_held(flags):
             time.sleep(poll_interval)
             continue
+        if _priority_waits_behind_closed_gate(control_store, flags):
+            time.sleep(poll_interval)
+            continue
+        gate = claim_gate_token(flags)
+        tracker.allowed = gate
+        result = None
         try:
-            lifecycle.run_once()
+            result = lifecycle.run_once()
         except SystemExit:
             raise
         except Exception as error:
             print(f"harness daemon: run_once: {type(error).__name__}: {error}", file=sys.stderr)
+        finally:
+            tracker.allowed = None
+        if not reconciled:
+            reconciled = True
+            try:
+                (flags / STARTUP_RECONCILED).write_text("1", encoding="utf-8")
+            except OSError:
+                pass
+        if (
+            gate is not None
+            and claim_gate_token(flags) == gate
+            and (result is None or result.status is LifecycleStatus.IDLE)
+        ):
+            # The engine passed the Claim boundary (or failed before it)
+            # without claiming: release stops waiting for a claim.
+            _answer_claim_gate(flags, gate, claimed=False)
         time.sleep(poll_interval)
 
 
