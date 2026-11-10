@@ -22,6 +22,7 @@ settle delay itself stays fixed.
 from __future__ import annotations
 
 import random
+from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -29,6 +30,7 @@ import pytest
 
 import simple_coding_agent.github_tracker as tracker_module
 from simple_coding_agent.attempt_state import AttemptStateStore
+from simple_coding_agent.control import ControlStore, ResumeBlockedError
 from simple_coding_agent.completion import (
     AttemptOutcome,
     CompletionDecision,
@@ -202,20 +204,20 @@ class PoolTransport:
 
 
 def _pool_worker(
-    transport: PoolTransport, worker_id: str, source: object
+    transport: PoolTransport, worker_id: str, source: Callable[[], float]
 ) -> GitHubTracker:
     return GitHubTracker(
         transport,
         REPO,
         worker_id=worker_id,
-        random_source=source,  # type: ignore[arg-type]
+        random_source=source,
         event_log=transport.event_log,
     )
 
 
 def _recording_source(
     rng: random.Random, draws: list[float],
-) -> object:
+) -> Callable[[], float]:
     def draw() -> float:
         value = rng.random()
         draws.append(value)
@@ -622,3 +624,83 @@ def test_startup_reconciliation_is_not_delayed(tmp_path: Path) -> None:
 
     assert lifecycle.run_once().status is LifecycleStatus.ATTEMPTED
     assert sleeps == []
+
+
+def _controlled_lifecycle(
+    tmp_path: Path,
+    tracker: FakeTracker,
+    *,
+    sleeps: list[float],
+    events: list[tuple],
+) -> AgentLifecycle:
+    return AgentLifecycle(
+        tracker=tracker,
+        attempt_state=AttemptStateStore(tmp_path),
+        workspace=InMemoryWorkspace(tmp_path / "repo"),
+        profile_loader=lambda _: type("Profile", (), {"base_branch": "main"})(),
+        publisher=FakePublisher(),
+        attempt_runner=lambda received_claim, profile, prepared: _evidence(),
+        control_store=ControlStore(tmp_path),
+        poll_interval=POLL_INTERVAL,
+        sleeper=sleeps.append,
+        random_source=random.Random(5).random,
+        event_log=lambda event, detail="", level="INFO", issue_number=None: events.append(
+            (event, detail, level, issue_number)
+        ),
+    )
+
+
+def test_startup_delay_waits_until_intake_can_claim(tmp_path: Path) -> None:
+    """A Pool booted with intake stopped still spreads its first claims.
+
+    Stopped cycles sleep only the jittered poll; the one-off startup delay is
+    kept for the first cycle whose intake may actually claim, so Workers
+    resumed together do not race the same issue in lockstep.
+    """
+
+    sleeps: list[float] = []
+    events: list[tuple] = []
+    lifecycle = _controlled_lifecycle(
+        tmp_path,
+        FakeTracker(next_claim=Claim(issue(24), Assignment("issue-24", "agent-id"))),
+        sleeps=sleeps,
+        events=events,
+    )
+    lifecycle.submit_stop("req-stop")
+
+    assert lifecycle.run_once().status is LifecycleStatus.IDLE
+    assert len(sleeps) == 1
+    assert 0.8 * POLL_INTERVAL <= sleeps[0] <= 1.2 * POLL_INTERVAL
+
+    lifecycle.submit_resume("req-resume")
+
+    assert lifecycle.run_once().status is LifecycleStatus.ATTEMPTED
+    assert len(sleeps) == 2
+    assert 0 <= sleeps[1] <= POLL_INTERVAL / 2
+
+
+def test_hold_heartbeat_from_a_control_command_names_the_next_idle_sleep(
+    tmp_path: Path,
+) -> None:
+    """A hold entered from a control thread announces the sleep then used.
+
+    ``resume`` with an unreadable checkpoint enters the startup hold outside
+    ``run_once``; the heartbeat it logs must name the idle sleep the next
+    cycle actually takes, not a figure from the previous cycle.
+    """
+
+    sleeps: list[float] = []
+    events: list[tuple] = []
+    lifecycle = _controlled_lifecycle(
+        tmp_path, FakeTracker(), sleeps=sleeps, events=events
+    )
+    assert lifecycle.run_once().status is LifecycleStatus.IDLE
+    (tmp_path / "state" / "attempt.json").write_text("{not json")
+
+    with pytest.raises(ResumeBlockedError):
+        lifecycle.submit_resume("req-resume")
+    assert lifecycle.run_once().status is LifecycleStatus.IDLE
+
+    held = [detail for event, detail, _, _ in events if event == "intake_held_for_recovery"]
+    assert len(held) == 1
+    assert held[0].endswith(f" sleeping {sleeps[-1]}s")

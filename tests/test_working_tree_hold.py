@@ -42,7 +42,9 @@ def test_dirty_tree_with_intake_stopped_stays_up_and_logs_nothing(tmp_path: Path
 
     assert result.status is LifecycleStatus.IDLE
     assert tracker.claimed == []
-    assert_spread_then_jittered(sleeps, cycles=1)
+    # Intake is stopped, so the startup spread delay is kept for the first
+    # cycle that can claim; this cycle sleeps only the jittered poll.
+    assert_spread_then_jittered(sleeps, cycles=1, spread=False)
     # The ``submit_stop`` setup commits a stop command (terminal without an
     # active attempt, so ``command_resolved``); the poll itself only logs the
     # intake gate while the tree holds the claim.
@@ -207,19 +209,22 @@ def workspace_of(lifecycle: AgentLifecycle) -> DirtyHoldWorkspace:
     return lifecycle._workspace  # noqa: SLF001 - test seam
 
 
-def assert_spread_then_jittered(sleeps: list[float], *, cycles: int) -> None:
+def assert_spread_then_jittered(
+    sleeps: list[float], *, cycles: int, spread: bool = True
+) -> None:
     """Assert the startup spread plus one jittered poll sleep per idle cycle.
 
-    The first idle cycle sleeps twice — the one-off pre-first-claim spread
-    (uniform within ``[0, POLL_INTERVAL / 2]``) then that cycle's jittered
-    poll sleep (uniform within ±20% of ``POLL_INTERVAL``) — and every later
-    idle cycle appends exactly one more jittered poll sleep.
+    With ``spread``, the first idle cycle sleeps twice — the one-off
+    pre-first-claim spread (uniform within ``[0, POLL_INTERVAL / 2]``) then
+    that cycle's jittered poll sleep (uniform within ±20% of
+    ``POLL_INTERVAL``). Every idle cycle sleeps exactly one jittered poll.
     """
 
-    poll_interval = 60
-    assert len(sleeps) == cycles + 1
-    assert 0 <= sleeps[0] <= poll_interval / 2
-    for idle in sleeps[1:]:
+    poll_interval = 60  # matches ``make_lifecycle``
+    assert len(sleeps) == cycles + (1 if spread else 0)
+    if spread:
+        assert 0 <= sleeps[0] <= poll_interval / 2
+    for idle in sleeps[1 if spread else 0:]:
         assert 0.8 * poll_interval <= idle <= 1.2 * poll_interval
 
 

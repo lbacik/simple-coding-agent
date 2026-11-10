@@ -1388,13 +1388,15 @@ class AgentLifecycle:
         self._random_source = (
             random_source if random_source is not None else random.random
         )
-        # This idle cycle's poll sleep, drawn fresh in ``run_once`` before
-        # any heartbeat or hold message is emitted, so every message that
-        # announces a sleep names the exact duration the cycle then sleeps.
-        self._idle_sleep_seconds = float(poll_interval)
+        # The next idle poll sleep, drawn ahead: the following value is
+        # drawn as each idle sleep begins, so every heartbeat or hold
+        # message (from ``run_once`` or a control-command thread) names the
+        # exact duration the next idle sleep then uses.
+        self._idle_sleep_seconds = self._poll_sleep_seconds()
         # Whether the one pre-first-claim spread delay has been taken. It is
-        # consumed only once intake really runs (never while ``_starting``),
-        # and never before startup reconciliation.
+        # consumed only once intake can really claim (never while
+        # ``_starting``, held, or stopped), and never before startup
+        # reconciliation.
         self._startup_delay_done = False
         self._error_store = error_store
         self._max_consecutive_errors = max_consecutive_errors
@@ -4628,6 +4630,22 @@ class AgentLifecycle:
 
         return round(self._random_source() * self._poll_interval / 2, 1)
 
+    def _intake_may_claim(self) -> bool:
+        """Whether this cycle's intake could claim, ignoring tree and queue.
+
+        False while the instance is starting, under a startup hold, or with
+        operator intake not running. Used only to keep the startup spread
+        delay for the first cycle that can actually claim.
+        """
+
+        with self._control_lock:
+            if self._starting or self._startup_hold_detail is not None:
+                return False
+            return (
+                self._control_store is None
+                or self._control_store.intake_state() is IntakeState.RUNNING
+            )
+
     def run_once(self) -> LifecycleResult:
         """Claim and process one issue, or sleep once when the queue is empty.
 
@@ -4636,11 +4654,6 @@ class AgentLifecycle:
         stopped instance stays quiet), logs once per episode, and sleeps
         a jittered poll interval with the control socket still serving.
         """
-
-        # One draw per cycle, before reconciliation: every heartbeat or hold
-        # message emitted below that announces a sleep names this exact
-        # duration, and the idle sleep at the end uses it.
-        self._idle_sleep_seconds = self._poll_sleep_seconds()
 
         if not self._startup_reconciled:
             self._startup_reconciled = True
@@ -4652,18 +4665,22 @@ class AgentLifecycle:
             if recovered is not None:
                 return LifecycleResult(LifecycleStatus.ATTEMPTED, recovered)
 
-        if not self._startup_delay_done and not self._starting:
-            # Spread the whole-Pool start: the first real claim attempt waits
-            # out a random fraction of half the poll interval. Reconciliation
-            # above already ran undelayed, and ``starting`` defers this until
-            # the control endpoint clears, so the delay always precedes the
-            # first intake that can actually claim.
+        if not self._startup_delay_done and self._intake_may_claim():
+            # Spread the pool start: the first real claim attempt waits out
+            # a random fraction of half the poll interval. Reconciliation
+            # above already ran undelayed, and the delay is kept while the
+            # instance is starting, held, or stopped, so Workers resumed
+            # together still spread their first claims.
             self._startup_delay_done = True
             self._sleeper(self._startup_delay_seconds())
 
         claim, checkpoint = self._gated_claim()
         if claim is None:
-            self._sleeper(self._idle_sleep_seconds)
+            slept = self._idle_sleep_seconds
+            # Draw the next idle sleep before this one starts, so a hold
+            # message logged meanwhile by a control command names it.
+            self._idle_sleep_seconds = self._poll_sleep_seconds()
+            self._sleeper(slept)
             return LifecycleResult(LifecycleStatus.IDLE)
 
         self._event_log(
