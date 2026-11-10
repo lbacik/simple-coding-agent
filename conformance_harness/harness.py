@@ -88,10 +88,33 @@ _NATIVE_OUTCOMES = (
 
 _REPOSITORY_RE = re.compile(r"^[^/\s]+/[^/\s]+$")
 
+# Flag files under ``flags/`` that the CLI and the engine daemon
+# (:mod:`conformance_harness.daemon`) share.
+#: One-shot claim gate armed by ``release`` (``{"token": ...}``).
+CLAIM_GATE = "claim_gate.json"
+#: How the daemon answered one armed gate (``{"token": ..., "claimed": ...}``).
+CLAIM_GATE_RESULT = "claim_gate_result.json"
+#: Written while the daemon holds the engine control lock for ``hold-lock``.
+ENGINE_LOCK_HELD = "engine_lock.held"
+#: Armed by ``start-container``: the engine stays ``starting`` until ``release``.
+STARTUP_HOLD = "startup_hold"
+#: Armed by ``start-container`` over a retained attempt: reconciliation waits
+#: (the engine reports ``recovering``) until ``release``.
+RECOVERY_HOLD = "recovery_hold"
+#: Written once the first engine iteration after startup has returned.
+STARTUP_RECONCILED = "startup_reconciled"
+
 #: How long ``setup``/``start-container`` wait for the engine to serve.
 _DAEMON_READY_TIMEOUT_SECONDS = 30.0
 #: How long ``finish-attempt``/``halt`` wait for the engine to react.
 _COMPLETION_TIMEOUT_SECONDS = 120.0
+#: How long ``release`` waits for the Claim it lets through to show.
+_RELEASE_CLAIM_TIMEOUT_SECONDS = 10.0
+#: How long ``release`` waits for the engine to leave a startup or
+#: recovery hold it ended.
+_RELEASE_STARTUP_TIMEOUT_SECONDS = 30.0
+#: How long ``hold-lock`` waits for the engine to take its control lock.
+_ENGINE_LOCK_ACK_TIMEOUT_SECONDS = 5.0
 
 
 # ---------------------------------------------------------------------------
@@ -117,6 +140,7 @@ def _paths(root: Path) -> dict[str, Path]:
         "socket": root / "daemon.sock",
         "pid": root / "daemon.pid",
         "ready": root / "daemon.ready",
+        "serving": root / "daemon.serving",
         "log": root / "daemon.log",
         "flags": root / "flags",
         "hold": root / "flags" / "hold.json",
@@ -126,6 +150,12 @@ def _paths(root: Path) -> dict[str, Path]:
         "deferred_publication": root / "flags" / "deferred_publication",
         "pending_publication": root / "flags" / "pending_publication.json",
         "engine_lock": root / "flags" / "engine.lock",
+        "claim_gate": root / "flags" / CLAIM_GATE,
+        "claim_gate_result": root / "flags" / CLAIM_GATE_RESULT,
+        "engine_lock_held": root / "flags" / ENGINE_LOCK_HELD,
+        "startup_hold": root / "flags" / STARTUP_HOLD,
+        "recovery_hold": root / "flags" / RECOVERY_HOLD,
+        "startup_reconciled": root / "flags" / STARTUP_RECONCILED,
     }
 
 
@@ -612,7 +642,7 @@ def _verb_setup(root: Path, params: dict) -> tuple[int, dict]:
             shutil.rmtree(target, ignore_errors=True)
         elif target.exists():
             target.unlink(missing_ok=True)
-    for name in ("daemon.ready", "daemon.pid"):
+    for name in ("daemon.ready", "daemon.serving", "daemon.pid"):
         (root / name).unlink(missing_ok=True)
     flags = _paths(root)["flags"]
     if flags.is_dir():
@@ -642,7 +672,7 @@ def _verb_setup(root: Path, params: dict) -> tuple[int, dict]:
     # Wait only for the control endpoint: the suite must be able to observe
     # ``starting`` itself, so setup returns before startup checks finish.
     serving = _wait_for(
-        lambda: _paths(root)["socket"].exists(),
+        lambda: _paths(root)["serving"].exists(),
         timeout=_DAEMON_READY_TIMEOUT_SECONDS,
     )
     if not serving:
@@ -670,8 +700,8 @@ def _verb_teardown(root: Path) -> tuple[int, dict]:
     import shutil
 
     for name in ("instance", "remote.git", "clone", "flags", "daemon.sock",
-                 "daemon.pid", "daemon.ready", "daemon.log", "state.json",
-                 "issues.json"):
+                 "daemon.pid", "daemon.ready", "daemon.serving", "daemon.log",
+                 "state.json", "issues.json"):
         target = root / name
         if target.is_dir() and not target.is_symlink():
             shutil.rmtree(target, ignore_errors=True)
@@ -718,13 +748,95 @@ def _verb_hold(root: Path, params: dict) -> tuple[int, dict]:
 
 
 def _verb_release(root: Path) -> tuple[int, dict]:
+    """Release any hold and let exactly one Claim through the gate.
+
+    No claim opens on its own in this harness (the daemon's claim gate
+    starts closed): ``release`` is what lets the next one through. With
+    intake open, no attempt active, the engine neither starting nor
+    recovering, and an eligible issue waiting, it returns once that claim
+    shows in ``status`` as ``current_attempt``; otherwise it returns at
+    once. Either way the gate is closed again before it returns, so no
+    claim opens between two harness verbs. After ``start-container`` it
+    first ends the startup hold, and on the next call the recovery hold,
+    waiting (bounded) until the engine settles in its next state.
+    """
+
     state, error = _require_instance(root, "release")
     if error is not None:
         return error
-    hold_path = _paths(root)["hold"]
-    released = hold_path.exists()
-    hold_path.unlink(missing_ok=True)
+    paths = _paths(root)
+    released = paths["hold"].exists()
+    paths["hold"].unlink(missing_ok=True)
+    if paths["startup_hold"].exists():
+        # Ends ``starting``: the engine moves on to ``recovering`` (held
+        # again when a retained attempt waits) or to ready.
+        released = True
+        paths["startup_hold"].unlink(missing_ok=True)
+        if _engine_alive(root):
+            _wait_for(
+                lambda: _left_starting(root),
+                timeout=_RELEASE_STARTUP_TIMEOUT_SECONDS,
+                interval=0.05,
+            )
+    elif paths["recovery_hold"].exists():
+        # Ends ``recovering``: startup reconciliation finishes the retained
+        # attempt (or holds it for an operator recovery command).
+        released = True
+        paths["recovery_hold"].unlink(missing_ok=True)
+        if _engine_alive(root):
+            _wait_for(
+                lambda: paths["startup_reconciled"].exists(),
+                timeout=_RELEASE_STARTUP_TIMEOUT_SECONDS,
+                interval=0.05,
+            )
+    # A ready engine then gets its one claim, as the stub claims on the next
+    # read once its startup or recovery hold clears (a pending ``next
+    # issue`` priority included); a still-held engine returns at once.
+    if _engine_alive(root) and _active_attempt_id(root) is None:
+        _let_one_claim_through(root)
     return _ok("release", {"released": released})
+
+
+def _left_starting(root: Path) -> bool:
+    """Whether the engine left ``starting`` and settled where it will wait."""
+
+    status = _engine_status(root)
+    if status is None:
+        return False
+    state = status.get("instance", {}).get("state")
+    if state == "starting":
+        return False
+    return state == "recovering" or _paths(root)["startup_reconciled"].exists()
+
+
+def _let_one_claim_through(root: Path) -> None:
+    status = _engine_status(root)
+    if status is None:
+        return
+    if status.get("instance", {}).get("state") in ("starting", "recovering"):
+        return
+    if status.get("intake", {}).get("state") != "open":
+        return
+    paths = _paths(root)
+    token = uuid.uuid4().hex
+    paths["claim_gate_result"].unlink(missing_ok=True)
+    _write_json_file(paths["claim_gate"], {"token": token})
+
+    def settled() -> bool:
+        answer = _read_json_file(paths["claim_gate_result"])
+        if answer is not None and answer.get("token") == token and not answer.get("claimed"):
+            return True  # the engine passed the Claim boundary with nothing to claim
+        if _active_attempt_id(root) is None:
+            return False
+        current = _engine_status(root)
+        return current is not None and current.get("current_attempt") is not None
+
+    try:
+        _wait_for(settled, timeout=_RELEASE_CLAIM_TIMEOUT_SECONDS, interval=0.05)
+    finally:
+        gate = _read_json_file(paths["claim_gate"])
+        if gate is not None and gate.get("token") == token:
+            paths["claim_gate"].unlink(missing_ok=True)
 
 
 def _verb_finish_attempt(root: Path, params: dict) -> tuple[int, dict]:
@@ -739,34 +851,63 @@ def _verb_finish_attempt(root: Path, params: dict) -> tuple[int, dict]:
     attempt_id = _active_attempt_id(root)
     if attempt_id is None:
         return _failed("finish-attempt", "no active attempt")
-    scripted = {"native_outcome": outcome}
+    # The outcome names its attempt: the blocked executor takes only its
+    # own, so an outcome left unconsumed can never finish a later attempt.
+    scripted = {"native_outcome": outcome, "attempt_id": attempt_id}
     if params.get("reason") is not None:
         scripted["reason"] = params["reason"]
-    _write_json_file(_paths(root)["scripted_outcome"], scripted)
+    scripted_path = _paths(root)["scripted_outcome"]
+    _write_json_file(scripted_path, scripted)
     # Release any hold so the blocked attempt can run to finalization.
     _paths(root)["hold"].unlink(missing_ok=True)
-    finished = _wait_for(
-        lambda: _active_attempt_id(root) is None,
-        timeout=_COMPLETION_TIMEOUT_SECONDS,
-    )
+    try:
+        # A one-shot crash armed for finalization, or the deferred
+        # publication, ends the engine with the attempt still recorded:
+        # the outcome is in, and the restart recovers the rest.
+        finished = _wait_for(
+            lambda: _active_attempt_id(root) is None or not _engine_alive(root),
+            timeout=_COMPLETION_TIMEOUT_SECONDS,
+        )
+    finally:
+        left = _read_json_file(scripted_path)
+        if left is not None and left.get("attempt_id") == attempt_id:
+            scripted_path.unlink(missing_ok=True)
     if not finished:
         return _failed("finish-attempt", "the attempt did not finish in time")
     return _ok("finish-attempt", {"attempt_id": attempt_id, "native_outcome": outcome})
 
 
 def _verb_hold_lock(root: Path, params: dict) -> tuple[int, dict]:
+    """Hold the engine lock for ``duration_ms``.
+
+    The file lock taken here is the harness side of the hold: while it is
+    held, the running engine also holds its own control lock (the daemon's
+    lock watcher), so status reads exercise the engine's prepared-state
+    path and mutations wait for the hold to end. The duration counts from
+    the moment the engine confirms its lock is held.
+    """
+
     state, error = _require_instance(root, "hold-lock")
     if error is not None:
         return error
     import fcntl
 
     duration_ms = params["duration_ms"]
-    lock_path = _paths(root)["engine_lock"]
+    paths = _paths(root)
+    lock_path = paths["engine_lock"]
     lock_path.parent.mkdir(parents=True, exist_ok=True)
+    # Nobody holds the lock yet, so a marker left now is stale.
+    paths["engine_lock_held"].unlink(missing_ok=True)
     started = time.monotonic()
     with lock_path.open("w") as handle:
         fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
         try:
+            if _engine_alive(root) and not _wait_for(
+                lambda: paths["engine_lock_held"].exists(),
+                timeout=_ENGINE_LOCK_ACK_TIMEOUT_SECONDS,
+                interval=0.01,
+            ):
+                return _failed("hold-lock", "the engine did not take its control lock")
             time.sleep(duration_ms / 1000.0)
         finally:
             fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
@@ -833,21 +974,34 @@ def _verb_start_container(root: Path) -> tuple[int, dict]:
         return _failed("start-container", "the container is already running")
     if not _daemon_module_available():
         return _failed("start-container", "the harness engine is not installed")
-    # An engine that crashed (``os._exit``) never removes its ready marker;
-    # left in place it would let this restart report ready before the new
+    paths = _paths(root)
+    # An engine that crashed (``os._exit``) never removes its markers; left
+    # in place they would let this restart report serving before the new
     # engine serves its control socket.
-    _paths(root)["ready"].unlink(missing_ok=True)
+    for name in ("ready", "serving", "startup_reconciled"):
+        paths[name].unlink(missing_ok=True)
+    # As the contract's reference stub does, a started instance stays
+    # ``starting`` until ``release``, and an attempt the previous engine
+    # left behind holds it in ``recovering`` until the next ``release``.
+    paths["flags"].mkdir(parents=True, exist_ok=True)
+    paths["startup_hold"].write_text("armed", encoding="utf-8")
+    if _active_attempt_id(root) is not None:
+        paths["recovery_hold"].write_text("armed", encoding="utf-8")
+    else:
+        paths["recovery_hold"].unlink(missing_ok=True)
     pid = _spawn_daemon(root, state.get("repository", ""))
     state = _load_state(root) or {}
     state["engine_pid"] = pid
     state["container_running"] = True
     _save_state(root, state)
-    ready = _wait_for(
-        lambda: _paths(root)["ready"].exists(),
+    serving = _wait_for(
+        lambda: paths["serving"].exists(),
         timeout=_DAEMON_READY_TIMEOUT_SECONDS,
     )
-    if not ready:
-        return _failed("start-container", "the engine did not become ready; see daemon.log")
+    if not serving:
+        return _failed(
+            "start-container", "the engine did not serve the control endpoint; see daemon.log"
+        )
     return _ok("start-container", {"running": True})
 
 

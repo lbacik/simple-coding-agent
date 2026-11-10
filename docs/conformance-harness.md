@@ -20,9 +20,12 @@ the shared test fakes (`tests/fakes.py` — reused, never copied):
 - `set-issue` — seed one issue and steer its eligibility label.
 - `hold` / `release` — arm and clear a hold (`before-claim`, `after-claim`,
   `native-phase`, `after-outcome`, optionally scoped to the active attempt).
+  `release` also lets exactly one Claim through (see below), ends the
+  startup hold after `start-container`, and then ends the recovery hold.
 - `finish-attempt` — script one native outcome for the active attempt and
   release any hold so it runs to finalization.
-- `hold-lock` — hold the cross-process engine lock for `duration_ms`.
+- `hold-lock` — hold the engine lock for `duration_ms`: the harness file
+  lock plus, inside the running engine, its own control lock.
 - `crash` — kill the engine now, or arm a one-shot crash at
   `between-commit-and-reply`, `before-claim`, `after-claim`, or
   `during-finalization`.
@@ -35,6 +38,37 @@ the shared test fakes (`tests/fakes.py` — reused, never copied):
 
 `setup` answers `unsupported` naming an unknown Operator Capability, and
 `finish-attempt` answers `unsupported` naming an unknown native outcome.
+
+## Timing: the engine advances only through verbs
+
+Like the contract's reference stub producer, the engine never advances
+between two harness verbs:
+
+- **Claims open only through `release`.** The daemon's claim gate starts
+  closed, so an eligible issue is not claimed on its own. `release` arms
+  the gate for one Claim. With intake open, no active attempt, the engine
+  neither `starting` nor `recovering`, and an eligible issue waiting, it
+  returns once `status` shows the claim as `current_attempt`. Otherwise it
+  returns at once. Either way the gate is closed again before it answers.
+  A `before-claim` hold still blocks the claim, and a pending `next issue`
+  priority is honoured at the claim `release` lets through.
+- **Attempts wait for `finish-attempt`.** A claimed attempt blocks in the
+  fake model execution until `finish-attempt` scripts its outcome. The
+  outcome names its attempt and that attempt consumes it, so no stale
+  outcome can finish a later attempt.
+- **`hold-lock` holds the engine's control lock.** While the harness holds
+  the file lock, the daemon holds `AgentLifecycle`'s control lock for it.
+  So `status` serves the engine's last prepared snapshot (spec §14, ADR
+  0009), and mutations wait for the hold to end.
+- **Restarts hold `starting`, then `recovering`.** `start-container`
+  keeps the engine `starting` until `release`. If the previous engine left
+  an attempt behind, startup reconciliation then waits in `recovering`
+  until the next `release`.
+
+The engine is wired like production `main`: the event logger with its
+per-attempt sink and contract event buffers, attempt archives, the halt
+store and telemetry. Only the GitHub transport, the model execution and
+provenance are fakes.
 
 ## State directory
 
