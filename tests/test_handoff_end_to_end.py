@@ -1262,3 +1262,91 @@ def test_shared_lifecycle_serves_status_over_the_control_socket(
         assert agentctl_main(["--socket", str(socket_path), "status"]) == 0
 
     assert "octo/example" in capsys.readouterr().out
+
+
+# --- Operator Handoff over the real workspace (#383) ---------------------------
+
+
+class _OperatorHandoffExecutor:
+    """Serves a ``handoff now`` accepted while the model runs, as the real executor would.
+
+    The request is committed during execution (intake is open at claim time),
+    picked up through the operator seams, reported delivered then begun, and
+    answered with partial work plus an ``operator_request`` Handoff note.
+    """
+
+    def __init__(self, data_dir: Path, request_id: str) -> None:
+        self._data_dir = data_dir
+        self._request_id = request_id
+        self._provider = None
+        self._reporter = None
+        self._latched: str | None = None
+
+    def set_operator_handoff_provider(self, provider) -> None:
+        self._provider = provider
+
+    def set_operator_handoff_reporter(self, reporter) -> None:
+        self._reporter = reporter
+
+    @property
+    def operator_request_id(self) -> str | None:
+        return self._latched
+
+    async def execute(self, *, issue_body, working_directory, issue_number=None, archive=None):
+        from simple_coding_agent.control import ControlStore
+
+        ControlStore(self._data_dir).submit_handoff(
+            self._request_id, has_active_attempt=True
+        )
+        handoff = self._provider()
+        assert handoff is not None and handoff.request_id == self._request_id
+        self._latched = handoff.request_id
+        self._reporter("delivered", handoff.request_id)
+        self._reporter("begun", handoff.request_id)
+        return await FakeModelExecutor(
+            actions=[
+                lambda wd: (
+                    write_and_commit(wd, "parser.py", "half done", "Half-finish the parser"),
+                    write_handoff_note(
+                        wd, issue_number, "Operator asked.", reason="operator_request"
+                    ),
+                )
+            ],
+            handoff=True,
+        ).execute(
+            issue_body=issue_body,
+            working_directory=working_directory,
+            issue_number=issue_number,
+            archive=archive,
+        )
+
+
+def test_an_operator_handoff_completes_once_cleanup_returns_the_tree_to_base(
+    tmp_path: Path,
+) -> None:
+    """The valid note is judged on the attempt's tree, not the cleaned-up base.
+
+    Cleanup checks the base back out before the final budget recheck, so a
+    recheck that read the note from the working tree again would always find
+    it missing and leave the handoff ``not_fulfilled``.
+    """
+
+    from simple_coding_agent.control import CommandAcknowledgement, ControlStore
+
+    remote, _ = repository_with_main(tmp_path)
+    github = FakeGitHub(issue(24, body="Rewrite the parser."))
+    data_dir = tmp_path / "data"
+    clone_dir = tmp_path / "clone"
+    executor = _OperatorHandoffExecutor(data_dir, "req-383-operator")
+    lifecycle = build_lifecycle(remote, clone_dir, data_dir, github, executor)
+
+    result = lifecycle.run_once()
+
+    assert result.outcome is AttemptOutcome.HANDOFF
+    record = ControlStore(data_dir).get_command("req-383-operator")
+    assert record.acknowledgement is CommandAcknowledgement.COMPLETED, record.detail
+    assert git(clone_dir, "branch", "--show-current") == "main"
+    assert remote_branch_subjects(remote, "agent/issue-24")[:2] == [
+        "Handoff note: issue #24",
+        "Half-finish the parser",
+    ]

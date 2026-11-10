@@ -68,6 +68,10 @@ _Avoid_: Progress note, status update, summary
 A Handoff note written by the runtime, not the model, when the model reaches a limit without having written one. It states its own provenance and carries only what the runtime can reconstruct (changes, activity, budget facts); it never claims to know what work remains. When an earlier round left a complete note, it preserves that note at its immutable revision as older context, clearly distinguished from the current runtime evidence; a missing or unreadable previous note is said explicitly.
 _Avoid_: Fallback note, synthetic note
 
+**Operator Handoff**:
+An operator-requested, bounded handover of the active implementation attempt's partial work (`handoff now`), as opposed to the model's own handoff near a resource limit. It ends the attempt with the `handoff` outcome and a Handoff note. Submitting it only commits it: the reply may still be `accepted`, and it reaches its final acknowledgement later, `completed` once publication, issue release and cleanup have finished durably, otherwise `not_fulfilled` with the work retained for recovery. Defined in the [operator contract glossary](https://github.com/lbacik/agent-operator-contract/blob/v1.0.0/CONTEXT.md#control).
+_Avoid_: handoff (unqualified), handoff request
+
 **Attempt workspace**:
 The working tree in which one implementation attempt makes its changes, prepared from the verified base and holding the attempt's branch. It belongs to a single attempt at a time; after the attempt it returns to the base without carrying any of the attempt's changes with it.
 _Avoid_: Repo, checkout, sandbox

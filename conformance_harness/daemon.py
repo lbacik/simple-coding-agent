@@ -32,6 +32,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from conformance_harness.harness import (
     CLAIM_GATE,
@@ -42,6 +43,12 @@ from conformance_harness.harness import (
     STARTUP_RECONCILED,
 )
 from conformance_harness.harness import _write_json_file as _write_json
+
+if TYPE_CHECKING:
+    from simple_coding_agent.model_execution import (
+        OperatorHandoffProvider,
+        OperatorHandoffReporter,
+    )
 
 
 def _state_root() -> Path:
@@ -337,14 +344,58 @@ class BlockingExecutor:
     Delegates the actual turn to the shared ``FakeModelExecutor`` (with the
     shared ``write_handoff_note`` standing in for the handoff skill's note
     commit). This wrapper only blocks while a hold is armed and until
-    ``finish-attempt`` records a scripted native outcome for this attempt;
-    a claimed attempt never finishes on its own.
+    ``finish-attempt`` records a scripted native outcome for this attempt,
+    or until an Operator Handoff is pending; a claimed attempt never
+    finishes on its own.
+
+    It carries the same operator seams as the real executor: a pending
+    ``handoff now`` is picked up at the next poll, reported ``delivered``
+    then ``begun`` (so a second request is rejected from there), and the
+    attempt ends with the ``handoff`` outcome and an ``operator_request``
+    note. The engine's own finalization decides ``completed`` or
+    ``not_fulfilled``.
     """
 
     def __init__(self, flags: Path, data_dir: Path) -> None:
         self._flags = flags
         self._data_dir = data_dir
         self.calls = 0
+        self._operator_handoff_provider: OperatorHandoffProvider | None = None
+        self._operator_handoff_reporter: OperatorHandoffReporter | None = None
+        self._operator_request_id: str | None = None
+
+    def set_operator_handoff_provider(
+        self, provider: OperatorHandoffProvider | None
+    ) -> None:
+        self._operator_handoff_provider = provider
+
+    def set_operator_handoff_reporter(
+        self, reporter: OperatorHandoffReporter | None
+    ) -> None:
+        self._operator_handoff_reporter = reporter
+
+    @property
+    def operator_request_id(self) -> str | None:
+        """The Operator Handoff this execution carried out, if any."""
+
+        return self._operator_request_id
+
+    def _take_operator_handoff(self) -> str | None:
+        """Deliver and begin a pending Operator Handoff; return its request ID."""
+
+        provider = self._operator_handoff_provider
+        if provider is None:
+            return None
+        handoff = provider()
+        if handoff is None:
+            return None
+        request_id = handoff.request_id
+        self._operator_request_id = request_id
+        reporter = self._operator_handoff_reporter
+        if reporter is not None:
+            reporter("delivered", request_id)
+            reporter("begun", request_id)
+        return request_id
 
     def _hold_applies(self) -> bool:
         hold = _read_json(self._flags / "hold.json")
@@ -389,6 +440,7 @@ class BlockingExecutor:
         from tests.fakes import FakeModelExecutor, write_handoff_note
 
         self.calls += 1
+        self._operator_request_id = None
         # A one-shot crash armed for after-claim fires before the model runs.
         armed_path = self._flags / "armed_crash.json"
         armed = _read_json(armed_path)
@@ -399,18 +451,29 @@ class BlockingExecutor:
                 pass
             os._exit(1)
         attempt_id = _checkpoint_attempt_id(self._data_dir)
+        operator_request: str | None = None
         while True:
             if not self._hold_applies():
                 scripted = self._take_scripted_outcome(attempt_id)
                 if scripted is not None:
+                    outcome = scripted.get("native_outcome", "complete")
+                    break
+                operator_request = self._take_operator_handoff()
+                if operator_request is not None:
+                    outcome = "handoff"
                     break
             time.sleep(0.05)
-        outcome = scripted.get("native_outcome", "complete")
         if outcome == "handoff":
+            note_reason = (
+                "operator_request" if operator_request is not None else "token_soft_threshold"
+            )
             inner = FakeModelExecutor(
                 actions=[
                     lambda wd: write_handoff_note(
-                        wd, issue_number or 0, "harness scripted handoff"
+                        wd,
+                        issue_number or 0,
+                        "harness scripted handoff",
+                        reason=note_reason,
                     )
                 ],
                 handoff=True,

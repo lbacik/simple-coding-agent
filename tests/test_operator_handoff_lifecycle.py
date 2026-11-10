@@ -928,6 +928,47 @@ def test_restart_with_an_invalid_recovered_note_reports_incomplete_not_infrastru
     assert "reason" in decision.reasons[0].lower()
 
 
+def test_a_handoff_interrupted_by_a_crash_is_not_fulfilled_and_recovery_finalizes(
+    tmp_path: Path,
+) -> None:
+    """``handoff now`` in progress, crash: ``not_fulfilled``, work retained (spec §14).
+
+    The process died after the valid operator note was committed but before
+    publication. Recovery still finishes the interrupted attempt's recorded
+    effects (publishing the handoff and its partial work), but the handoff
+    command was interrupted, so it ends ``not_fulfilled`` instead of being
+    completed by the next process.
+    """
+
+    working_directory = tmp_path / "work"
+    working_directory.mkdir()
+    workspace = seeded_workspace(working_directory, note=True, work_subject="Half-finish the parser")
+    write_operator_note(working_directory, last_work_commit=work_revision(workspace))
+    lifecycle, tracker, store = make_lifecycle(
+        tmp_path, next_claim=None, workspace=workspace, attempt_runner=lambda c, p, r: None
+    )
+    attempt_state = AttemptStateStore(tmp_path)
+    attempt_state.start(issue_number=ISSUE_NUMBER, branch=f"agent/issue-{ISSUE_NUMBER}")
+    attempt_state.transition(AttemptPhase.SETUP)
+    attempt_state.transition(AttemptPhase.MODEL_RUNNING)
+    store.submit_handoff("req-crash", has_active_attempt=True)
+    store.mark_handoff_delivering("req-crash")
+    store.mark_handoff_begun("req-crash")
+    attempt_state.transition(AttemptPhase.PUSHING)
+
+    result = lifecycle.run_once()
+
+    assert result.outcome is AttemptOutcome.HANDOFF
+    stored = store.get_command("req-crash")
+    assert stored is not None
+    assert stored.acknowledgement is CommandAcknowledgement.NOT_FULFILLED
+    assert "process ended" in stored.detail
+    assert store.intake_state() is IntakeState.STOPPED
+    # Recovery finalized the attempt: the checkpoint is gone, the issue released.
+    assert attempt_state.read() is None
+    assert tracker.cleanup == [(ISSUE_NUMBER, "round-finished", "agent-id")]
+
+
 def test_retry_with_an_invalid_recovered_note_reports_incomplete_not_infrastructure_error(
     tmp_path: Path,
 ) -> None:

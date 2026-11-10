@@ -4997,11 +4997,14 @@ class AgentLifecycle:
                         # Publication already confirmed (comment posted) before
                         # release began: only the whole-command budget still
                         # applies, not the concluded publication window.
+                        # Cleanup has checked the base back out, so the note
+                        # is not re-read from the tree: the check before
+                        # release already validated it on the attempt's tree.
                         hold = self._hold_failed_handoff(
                             issue_number=claim.issue.number,
                             attempt_id=checkpoint.started_at,
                             outcome=outcome,
-                            prepared=prepared,
+                            prepared=None,
                             publication_started_at=publication_started_at,
                             check_allowance=False,
                         )
@@ -5015,7 +5018,7 @@ class AgentLifecycle:
                             issue_number=claim.issue.number,
                             attempt_id=checkpoint.started_at,
                             outcome=outcome,
-                            prepared=prepared,
+                            prepared=None,  # tree already cleaned up
                             publication_started_at=publication_started_at,
                             check_allowance=False,
                         )
@@ -5719,8 +5722,9 @@ class AgentLifecycle:
         """Whether the branch carries a valid ``operator_request`` note.
 
         Without the prepared working tree (a crash replay after every other
-        boundary went durable) prior validation is trusted: only a begun
-        handoff with a handoff outcome reaches here.
+        boundary went durable, or the rechecks after cleanup returned the
+        tree to the base) prior validation is trusted: only a begun handoff
+        with a handoff outcome reaches here.
         """
 
         if prepared is None:
@@ -5762,6 +5766,17 @@ class AgentLifecycle:
             )
         return True, "valid"
 
+    def _fail_interrupted_handoff(self, issue_number: int) -> None:
+        """Fail a handoff left in progress by a process that ended mid-attempt."""
+
+        self._fail_accepted_handoff(
+            "the process ended while the handoff was in progress; recovery"
+            " finishes the interrupted attempt's recorded effects and its"
+            " partial work is retained.",
+            "the process ended while the handoff was in progress",
+            issue_number=issue_number,
+        )
+
     def _fail_orphan_handoff_locked(self) -> None:
         """Fail a pending handoff whose active attempt is already gone.
 
@@ -5770,27 +5785,51 @@ class AgentLifecycle:
         fulfilled`` and intake stops instead of waiting forever.
         """
 
+        self._fail_accepted_handoff(
+            "the active attempt ended without finalizing through the agent, so"
+            " no model execution can still observe the request.",
+            "the active attempt is gone",
+        )
+
+    def _fail_accepted_handoff(
+        self, cause: str, log_detail: str, *, issue_number: int | None = None
+    ) -> None:
+        """Mark the tracked handoff ``not fulfilled`` when it is still ``accepted``.
+
+        A completed or already failed request is left untouched, so replays
+        resolve it at most once. An unreadable or unwritable control store
+        leaves the request waiting and is logged instead of raised.
+        """
+
         store = self._control_store
         if store is None:
             return
-        snapshot = store.handoff_snapshot()
-        if snapshot is None or snapshot.get("acknowledgement") != "accepted":
+        try:
+            snapshot = store.handoff_snapshot()
+            if snapshot is None or snapshot.get("acknowledgement") != "accepted":
+                return
+            request_id = snapshot.get("request_id")
+            if not isinstance(request_id, str) or not request_id:
+                return
+            resolved = store.fail_handoff(
+                request_id,
+                f"Operator handoff {request_id} is not fulfilled: {cause}",
+            )
+        except (ControlStoreError, RuntimeError, OSError) as error:
+            self._event_log(
+                "operator_handoff_resolution_unavailable",
+                f"{_exception_detail(error)} The pending handoff keeps waiting;",
+                level="ERROR",
+                issue_number=issue_number,
+            )
             return
-        request_id = snapshot.get("request_id")
-        if not isinstance(request_id, str) or not request_id:
-            return
-        resolved_orphan = store.fail_handoff(
-            request_id,
-            f"Operator handoff {request_id} is not fulfilled: the active"
-            " attempt ended without finalizing through the agent, so no model"
-            " execution can still observe the request.",
-        )
-        if resolved_orphan is not None:
-            self._emit_command_resolved(resolved_orphan)
+        if resolved is not None:
+            self._emit_command_resolved(resolved)
         self._event_log(
             "operator_handoff_not_fulfilled",
-            f"request={request_id}; the active attempt is gone",
+            f"request={request_id}; {log_detail}",
             level="WARNING",
+            issue_number=issue_number,
         )
 
     def _record_control_finalization(
@@ -6277,6 +6316,13 @@ class AgentLifecycle:
             self._telemetry_finish()
             self._active_issue_number = None
             return None
+        # The attempt was interrupted before its durable boundary, so a
+        # handoff that was still in progress can no longer be fulfilled:
+        # fail it now (spec §14). Recovery below still finishes the
+        # attempt's recorded effects and finalizes it with the recorded
+        # verdict; the reason names no attempt hold, so the failure never
+        # retains the attempt by itself.
+        self._fail_interrupted_handoff(checkpoint.issue_number)
         claim = self._tracker.recover_claim(checkpoint.issue_number)
         if claim is None:
             # With ``WORKER_ID`` the issue can exist while this Worker's
@@ -6636,11 +6682,14 @@ class AgentLifecycle:
                         # Publication already confirmed (comment posted) before
                         # release began: only the whole-command budget still
                         # applies, not the concluded publication window.
+                        # Cleanup has checked the base back out, so the note
+                        # is not re-read from the tree: the check before
+                        # release already validated it on the attempt's tree.
                         hold = self._hold_failed_handoff(
                             issue_number=claim.issue.number,
                             attempt_id=checkpoint.started_at,
                             outcome=outcome,
-                            prepared=prepared,
+                            prepared=None,
                             publication_started_at=publication_started_at,
                             check_allowance=False,
                         )
@@ -6654,7 +6703,7 @@ class AgentLifecycle:
                             issue_number=claim.issue.number,
                             attempt_id=checkpoint.started_at,
                             outcome=outcome,
-                            prepared=prepared,
+                            prepared=None,  # tree already cleaned up
                             publication_started_at=publication_started_at,
                             check_allowance=False,
                         )
