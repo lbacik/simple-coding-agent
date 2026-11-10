@@ -10,10 +10,17 @@ import threading
 from datetime import UTC, datetime
 from pathlib import Path
 
+import pytest
+
 from simple_coding_agent.agentctl import format_status
 from simple_coding_agent.attempt_state import AttemptStateStore
 from simple_coding_agent.completion import AttemptOutcome, CompletionDecision, PublicationPath
-from simple_coding_agent.control import CommandAcknowledgement, ControlStore, IntakeState
+from simple_coding_agent.control import (
+    CommandAcknowledgement,
+    ControlStore,
+    ErrorsResetRejectedError,
+    IntakeState,
+)
 from simple_coding_agent.github_tracker import Assignment, Claim, TrackerIssue
 from simple_coding_agent.lifecycle import AgentLifecycle
 from simple_coding_agent.operating import ConsecutiveErrorStore
@@ -245,6 +252,67 @@ def test_infrastructure_error_after_a_reset_counts_from_one(tmp_path: Path) -> N
 
 
 # ---------------------------------------------------------------------------
+# reset on a clear guard (issue #385)
+# ---------------------------------------------------------------------------
+
+
+def test_reset_on_a_clear_guard_is_rejected_and_stores_nothing(tmp_path: Path) -> None:
+    lifecycle, _, store, error_store, events = make_lifecycle(tmp_path)
+    assert error_store.read().count == 0
+
+    with pytest.raises(ErrorsResetRejectedError, match="already clear"):
+        lifecycle.submit_errors_reset("req-reset-clear")
+
+    assert store.get_command("req-reset-clear") is None
+    assert store.recent_commands() == []
+    assert not any(event == "consecutive_errors_reset" for event, _ in events)
+    assert error_store.read().count == 0
+
+    # The request ID stays reusable once the guard has something to clear.
+    error_store.record(AttemptOutcome.INFRASTRUCTURE_ERROR, "attempt-a")
+    record = lifecycle.submit_errors_reset("req-reset-clear")
+    assert record.acknowledgement is CommandAcknowledgement.COMPLETED
+
+
+def test_reset_on_a_clear_guard_still_reports_an_invalid_request_id(
+    tmp_path: Path,
+) -> None:
+    from simple_coding_agent.control import RequestIdError
+
+    lifecycle, _, _, _, _ = make_lifecycle(tmp_path)
+
+    with pytest.raises(RequestIdError):
+        lifecycle.submit_errors_reset("")
+
+
+def test_a_second_reset_right_after_a_reset_is_rejected(tmp_path: Path) -> None:
+    lifecycle, _, store, error_store, _ = make_lifecycle(tmp_path)
+    error_store.record(AttemptOutcome.INFRASTRUCTURE_ERROR, "attempt-a")
+
+    first = lifecycle.submit_errors_reset("req-reset-first")
+    assert first.acknowledgement is CommandAcknowledgement.COMPLETED
+    with pytest.raises(ErrorsResetRejectedError, match="already clear"):
+        lifecycle.submit_errors_reset("req-reset-second")
+
+    assert store.get_command("req-reset-second") is None
+    assert len(store.recent_commands()) == 1
+
+
+def test_reset_with_an_unreadable_count_still_resets(tmp_path: Path) -> None:
+    lifecycle, _, store, error_store, _ = make_lifecycle(tmp_path)
+    state_path = tmp_path / "state" / "consecutive_errors.json"
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    state_path.write_text("{not-json")
+
+    record = lifecycle.submit_errors_reset("req-reset-unreadable")
+
+    assert record.acknowledgement is CommandAcknowledgement.COMPLETED
+    assert record.detail == "consecutive errors reset to 0"
+    assert error_store.read().count == 0
+    assert store.get_command("req-reset-unreadable") is not None
+
+
+# ---------------------------------------------------------------------------
 # reset while an attempt is active
 # ---------------------------------------------------------------------------
 
@@ -307,8 +375,6 @@ def test_control_store_reset_is_completed_and_idempotent(tmp_path: Path) -> None
 def test_control_store_reset_rejects_a_reused_id_with_a_different_kind(
     tmp_path: Path,
 ) -> None:
-    import pytest
-
     from simple_coding_agent.control import PayloadMismatchError
 
     store = ControlStore(tmp_path)
@@ -358,11 +424,12 @@ def test_errors_reset_over_the_socket_and_cli(tmp_path: Path, capsys) -> None:
         server.stop()
 
 
-def test_errors_reset_alias_consecutive_errors(tmp_path: Path, capsys) -> None:
+def test_errors_reset_alias_resets_and_both_spellings_reject_a_clear_guard(tmp_path: Path, capsys) -> None:
     from simple_coding_agent.agentctl import main as agentctl_main
     from simple_coding_agent.control_server import ControlServer
 
-    lifecycle, _, _, error_store, _ = make_lifecycle(tmp_path)
+    lifecycle, _, store, error_store, _ = make_lifecycle(tmp_path)
+    error_store.record(AttemptOutcome.INFRASTRUCTURE_ERROR, "attempt-a")
     socket_path = tmp_path / "run" / "control.sock"
     server = ControlServer(socket_path, lifecycle)
     server.start()
@@ -372,5 +439,25 @@ def test_errors_reset_alias_consecutive_errors(tmp_path: Path, capsys) -> None:
         )
         assert code == 0
         assert error_store.read().count == 0
+
+        # The guard is clear now: both spellings are rejected, non-zero.
+        capsys.readouterr()
+        for spelling in ("consecutive-errors", "errors"):
+            code = agentctl_main(
+                [
+                    "--socket",
+                    str(socket_path),
+                    spelling,
+                    "reset",
+                    "--request-id",
+                    f"req-clear-{spelling}",
+                ]
+            )
+            assert code == 1
+            captured = capsys.readouterr()
+            assert captured.out == ""
+            assert f"req-clear-{spelling} rejected" in captured.err
+            assert "already clear" in captured.err
+            assert store.get_command(f"req-clear-{spelling}") is None
     finally:
         server.stop()

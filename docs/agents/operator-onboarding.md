@@ -641,6 +641,19 @@ an operator clears it:
 Both commands print a durable request ID and accept `--request-id` for an
 identical retry after an ambiguous connection loss, like `stop`.
 
+Both commands answer by attempt ID:
+
+- An ID that matches neither the retained attempt nor any attempt the agent
+  recorded is rejected with nothing stored. With `--contract` the error code
+  is `not_found` (exit 5); without it the command exits 1 like any other
+  rejection.
+- `recovery retry` for an attempt that is already finalized completes as a
+  no-op: the command is recorded as `completed` with an effect saying
+  nothing remained to retry, and the recorded outcome, archive, labels, and
+  intake stay as they were.
+- `recovery release` for an attempt that is already finalized is rejected:
+  no retained work remains to release.
+
 A related hold covers unexplained dirty or untracked work with no attempt
 identity behind it. It also blocks intake and `resume`, and `status` reports
 it with the repair instruction — but no `recovery` subcommand can clear it:
@@ -706,6 +719,11 @@ A restart alone does **not** reset the guard.  To recover:
    event with the previous count. It applies immediately even with an
    active attempt. (`consecutive-errors reset` is an accepted alias.)
    A non-infrastructure outcome also resets the counter automatically.
+
+   When the guard is already clear (the count is 0), the reset is rejected
+   with a non-zero exit (1, and error code `rejected` with `--contract`):
+   nothing is recorded, no `consecutive_errors_reset` event is logged, and
+   the request ID stays reusable. A count that cannot be read still resets.
 3. Restart the agent if it already exited.
 
 An operator's auto-restart policy (e.g. `restart: unless-stopped` in Compose)

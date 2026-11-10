@@ -26,6 +26,22 @@ class RecoveryRejectedError(ValueError):
     """
 
 
+class RecoveryAttemptNotFoundError(RecoveryRejectedError):
+    """The attempt ID matches neither the retained nor any recorded attempt.
+
+    The operator contract answers ``not_found`` for it; the legacy path
+    reports it like any other rejection. Nothing is stored.
+    """
+
+
+class RecoveryAlreadyFinalizedError(RecoveryRejectedError):
+    """The attempt ID belongs to an attempt recorded as finalized.
+
+    ``recovery release`` rejects it; ``recovery retry`` completes as a
+    no-op, since no safe finalization step remains to retry.
+    """
+
+
 def parse_attempt_id(value: object) -> str:
     """Validate a recovery ``<attempt-id>``; raise without side effects."""
 

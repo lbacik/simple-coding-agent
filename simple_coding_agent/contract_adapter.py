@@ -813,6 +813,13 @@ def _mutation_error(
             request_id=parsed.request_id,
             details=details,
         )
+    if kind == "not_found":
+        return _emit_error(
+            code="not_found",
+            message=message,
+            request_id=parsed.request_id,
+            details=details,
+        )
     if kind == "internal":
         stored: dict | None = None
         if reply.get("stored") is False:

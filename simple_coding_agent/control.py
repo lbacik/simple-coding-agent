@@ -103,6 +103,15 @@ class HandoffRejectedError(ValueError):
     """
 
 
+class ErrorsResetRejectedError(ValueError):
+    """Raised when ``errors reset`` is rejected without a control change.
+
+    A readable consecutive-error count of 0 means the guard is already
+    clear: nothing is reset, no command is recorded, and the request ID
+    stays reusable.
+    """
+
+
 @dataclass(frozen=True)
 class CommandRecord:
     """One durably recorded operator command."""
@@ -1109,7 +1118,13 @@ class ControlStore:
 
     # -- recovery ---------------------------------------------------------
 
-    def submit_recovery_retry(self, request_id: str, attempt_id: str) -> CommandRecord:
+    def submit_recovery_retry(
+        self,
+        request_id: str,
+        attempt_id: str,
+        *,
+        completed_detail: str | None = None,
+    ) -> CommandRecord:
         """Durably record ``recovery retry`` as accepted for one attempt identity.
 
         The command itself never changes intake; the lifecycle applies the
@@ -1117,12 +1132,18 @@ class ControlStore:
         ``completed`` (hold cleared) or ``not fulfilled`` (hold remains).
         Retrying the same request ID with the identical attempt returns the
         stored record; reuse with different content is rejected.
+
+        With ``completed_detail`` a fresh request is committed directly as
+        ``completed`` in one transaction: the no-op path for an attempt that
+        is already finalized, where nothing runs after acceptance.
         """
 
         from simple_coding_agent.recovery import parse_attempt_id
 
         _check_request_id(request_id)
         parsed = parse_attempt_id(attempt_id)
+        if completed_detail is not None and not completed_detail.strip():
+            raise ControlStoreError("A completed recovery command must carry a detail")
         with self.lock:
             try:
                 with self._connect() as connection:
@@ -1142,8 +1163,16 @@ class ControlStore:
                         request_id,
                         _RECOVERY_RETRY_KIND,
                         {"attempt_id": parsed},
-                        CommandAcknowledgement.ACCEPTED,
-                        f"recovery retry for attempt {parsed} accepted",
+                        (
+                            CommandAcknowledgement.ACCEPTED
+                            if completed_detail is None
+                            else CommandAcknowledgement.COMPLETED
+                        ),
+                        (
+                            f"recovery retry for attempt {parsed} accepted"
+                            if completed_detail is None
+                            else completed_detail.strip()
+                        ),
                     )
                     connection.execute("COMMIT")
                     return record
