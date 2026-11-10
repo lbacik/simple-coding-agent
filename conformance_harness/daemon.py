@@ -28,8 +28,20 @@ import os
 import sys
 import threading
 import time
+from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+
+from conformance_harness.harness import (
+    CLAIM_GATE,
+    CLAIM_GATE_RESULT,
+    ENGINE_LOCK_HELD,
+    RECOVERY_HOLD,
+    STARTUP_HOLD,
+    STARTUP_RECONCILED,
+)
+from conformance_harness.harness import _write_json_file as _write_json
 
 
 def _state_root() -> Path:
@@ -58,25 +70,6 @@ def _take_json(path: Path) -> dict | None:
     return payload if payload is not None else {}
 
 
-def _write_json(path: Path, payload: dict) -> None:
-    tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
-    os.replace(tmp, path)
-
-
-#: One-shot claim gate armed by ``release`` (``{"token": ...}``).
-CLAIM_GATE = "claim_gate.json"
-#: How the daemon answered one armed gate (``{"token": ..., "claimed": ...}``).
-CLAIM_GATE_RESULT = "claim_gate_result.json"
-#: Written while this process holds the engine control lock for ``hold-lock``.
-ENGINE_LOCK_HELD = "engine_lock.held"
-#: Armed by ``start-container``: the engine stays ``starting`` until ``release``.
-STARTUP_HOLD = "startup_hold"
-#: Armed by ``start-container`` over a retained attempt: reconciliation waits
-#: (the engine reports ``recovering``) until ``release``.
-RECOVERY_HOLD = "recovery_hold"
-#: Written once the first engine iteration after startup has returned.
-STARTUP_RECONCILED = "startup_reconciled"
 
 
 def claim_gate_token(flags: Path) -> str | None:
@@ -291,8 +284,11 @@ class GatedTracker:
         return claim
 
     def claim_verified(self, issue: object) -> object:
-        # Reached only with the gate allowed: the daemon loop does not run
-        # the engine while a priority waits behind a closed gate.
+        # The daemon loop keeps the engine away from a pending priority
+        # while the gate is closed; a priority committed after that check
+        # must still not be claimed. Failing here keeps it pending.
+        if not self._open():
+            raise RuntimeError("the harness claim gate is closed")
         claim = self._inner.claim_verified(issue)
         self._consume()
         return claim
@@ -302,6 +298,8 @@ class GatedTracker:
         # the engine reporting ``recovering``; after a restart the harness
         # keeps it there until ``release`` (spec: the recovery hold).
         while (self._flags / RECOVERY_HOLD).exists():
+            if (self._flags / "halt_request.json").exists():
+                break  # a halt ends the hold, as it ends the startup hold
             time.sleep(0.05)
         return self._inner.recover_claim(issue_number)
 
@@ -364,20 +362,19 @@ class BlockingExecutor:
     def _take_scripted_outcome(self, attempt_id: str | None) -> dict | None:
         """Consume the outcome scripted for ``attempt_id``, if recorded yet.
 
-        Taking it removes it, so it can never finish a later attempt; an
-        outcome scripted for another attempt is stale and is dropped.
+        Taking it removes it, so it can never finish a later attempt. An
+        outcome scripted for another attempt is ignored (``finish-attempt``
+        removes its own once it stops waiting).
         """
 
         path = self._flags / "scripted_outcome.json"
         scripted = _read_json(path)
-        if scripted is None:
+        if scripted is None or scripted.get("attempt_id") != attempt_id:
             return None
         try:
             path.unlink()
         except OSError:
             pass
-        if scripted.get("attempt_id") != attempt_id:
-            return None
         return scripted
 
     async def execute(
@@ -548,25 +545,8 @@ class GateProxy:
         return self._inner.repository
 
     def _wait_for_engine_lock(self) -> None:
-        lock_path = self._flags / "engine.lock"
-        while True:
-            try:
-                handle = open(lock_path, "a+")
-            except OSError:
-                return
-            try:
-                try:
-                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-                except OSError:
-                    time.sleep(0.05)
-                    continue
-                try:
-                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-                except OSError:
-                    pass
-                return
-            finally:
-                handle.close()
+        while _engine_lock_held(self._flags):
+            time.sleep(0.05)
 
     def _maybe_crash(self) -> None:
         armed_path = self._flags / "armed_crash.json"
@@ -593,9 +573,19 @@ class GateProxy:
         return _gated
 
 
+#: ``flock`` locks belong to open file descriptions, so two probes in this
+#: process would see each other's probe as a hold; probes take turns.
+_PROBE_LOCK = threading.Lock()
+
+
 def _engine_lock_held(flags: Path) -> bool:
     """Whether ``hold-lock`` currently holds the cross-process engine lock."""
 
+    with _PROBE_LOCK:
+        return _probe_engine_lock(flags)
+
+
+def _probe_engine_lock(flags: Path) -> bool:
     lock_path = flags / "engine.lock"
     try:
         handle = open(lock_path, "a+")
@@ -686,14 +676,25 @@ def _sync_issues(issues: dict[int, object], spec: dict) -> None:
             fake.labels.discard("ready-for-agent")
 
 
-class _Engine:
+@dataclass(frozen=True)
+class _WiredEngine:
     """The wired engine pieces the daemon loop steers."""
 
-    def __init__(self, **parts: object) -> None:
-        self.__dict__.update(parts)
+    lifecycle: object
+    tracker: GatedTracker
+    control_store: object
+    halt_store: object
+    logger: object
+    event_log: Callable[..., Callable[..., None]]
+    #: Attach the post-provenance pieces (attempt runner, telemetry).
+    attach_post_provenance: Callable[[], None]
+    #: Emit ``startup_check provenance ok`` (the fake provenance verifies).
+    report_provenance_ok: Callable[[], None]
 
 
-def _build_engine(root: Path, repository: str, transport: HarnessTransport) -> _Engine:
+def _build_engine(
+    root: Path, repository: str, transport: HarnessTransport
+) -> _WiredEngine:
     """Wire the real lifecycle to the shared fakes, mirroring production ``main``.
 
     Everything production wires is wired the same way (event logger with
@@ -842,17 +843,17 @@ def _build_engine(root: Path, repository: str, transport: HarnessTransport) -> _
         process_started_at=process_started_at,
         recent_events=recent_events,
     )
-    return _Engine(
+    return _WiredEngine(
         lifecycle=lifecycle,
         tracker=tracker,
         control_store=control_store,
         halt_store=halt_store,
         logger=logger,
         event_log=event_log,
-        attach=lambda: lifecycle.attach_post_provenance(
+        attach_post_provenance=lambda: lifecycle.attach_post_provenance(
             attempt_runner=runner, telemetry=telemetry
         ),
-        provenance_ok=lambda: emit_startup_check(logger, "provenance", "ok"),
+        report_provenance_ok=lambda: emit_startup_check(logger, "provenance", "ok"),
     )
 
 
@@ -937,8 +938,8 @@ def run_daemon(root: Path) -> int:
         if (flags / "halt_request.json").exists():
             break
         time.sleep(0.05)
-    engine.provenance_ok()
-    engine.attach()
+    engine.report_provenance_ok()
+    engine.attach_post_provenance()
     lifecycle.mark_started()
     try:
         lifecycle.contract_status_snapshot()

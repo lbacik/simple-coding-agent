@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 import time
 from pathlib import Path
 
@@ -648,8 +649,6 @@ def test_a_claimed_attempt_waits_for_finish_attempt(engine: _Engine) -> None:
 
 
 def test_status_during_hold_lock_serves_the_prepared_snapshot(engine: _Engine) -> None:
-    import threading
-
     before = engine.status()
     held: list[dict] = []
     holder = threading.Thread(
@@ -690,3 +689,28 @@ def test_release_returns_promptly_with_intake_closed(engine: _Engine) -> None:
     assert engine.call("release", {}) == {"released": False}
     assert time.monotonic() - started < 3.0
     assert engine.status()["current_attempt"] is None
+
+
+def test_a_restart_holds_starting_and_release_honours_the_priority(
+    engine: _Engine,
+) -> None:
+    engine.call("hold", {"point": "before-claim", "scope": "next"})
+    engine.call("set-issue", {"issue": 21, "eligible": True})
+    engine.call("set-issue", {"issue": 22, "eligible": True})
+    code, reply = engine.agentctl(
+        "next", "issue", "22", "--request-id", "req-376-next",
+        "--expect-repo", "octo/example",
+    )
+    assert code == 0, reply
+    assert reply["result"]["command"]["acknowledgement"] == "accepted"
+
+    engine.call("stop-container", {})
+    engine.call("start-container", {})
+    time.sleep(1.0)  # well past native.startup_hold_ms: only release ends it
+    assert engine.status()["instance"]["state"] == "starting"
+
+    assert engine.call("release", {}) == {"released": True}
+
+    snapshot = engine.status()
+    assert snapshot["current_attempt"]["issue"]["number"] == 22
+    assert snapshot["intake"]["priority"] is None
