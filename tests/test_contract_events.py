@@ -32,6 +32,7 @@ from simple_coding_agent.contract_events import (
 from simple_coding_agent.control import CommandAcknowledgement
 from simple_coding_agent.lifecycle import LifecycleStatus
 from simple_coding_agent.observability import AttemptArchive, JsonEventLogger
+from tests.contract_schema import validate_contract_event
 from tests.fakes import (
     FakeGitHub,
     FakeModelExecutor,
@@ -104,6 +105,48 @@ def test_contract_natives_pass_through_with_extras() -> None:
     assert finished["attempt_id"] == "attempt-9"
 
 
+def test_outcome_recorded_without_reason_projects_null_reason() -> None:
+    event = to_contract_event(
+        _native("outcome_recorded", outcome_recorded_detail("complete"), issue_number=7),
+        attempt_id="attempt-1",
+    )
+    assert event["event"] == "outcome_recorded"
+    assert event["attempt_id"] == "attempt-1"
+    assert event["outcome"] == "complete"
+    assert "reason" in event
+    assert event["reason"] is None
+    validate_contract_event(event)
+
+
+def test_outcome_recorded_with_reason_projects_reason_text() -> None:
+    event = to_contract_event(
+        _native(
+            "outcome_recorded",
+            outcome_recorded_detail("incomplete", reason="tests failed"),
+            issue_number=7,
+        ),
+        attempt_id="attempt-1",
+    )
+    assert event["outcome"] == "incomplete"
+    assert event["reason"] == "tests failed"
+    validate_contract_event(event)
+
+    blank = to_contract_event(
+        _native("outcome_recorded", "outcome=complete; reason="),
+        attempt_id="attempt-1",
+    )
+    assert blank["reason"] is None
+
+
+def test_optional_extras_stay_omitted_on_other_events() -> None:
+    halted = to_contract_event(_native("halted", ""))
+    assert "reason" not in halted
+    started = to_contract_event(_native("process_started", ""))
+    assert "agent_version" not in started
+    resolved = to_contract_event(_native("command_resolved", "request_id=r1"))
+    assert "acknowledgement" not in resolved
+
+
 def test_non_contract_events_gain_native_prefix() -> None:
     event = to_contract_event(_native("workspace_prepared", "branch=x"))
     assert event["event"] == "native.workspace_prepared"
@@ -133,6 +176,10 @@ def test_detail_builders_round_trip_through_mapper() -> None:
     assert parse_detail_fields(halted_detail("boom")) == {"reason": "boom"}
     assert parse_detail_fields(outcome_recorded_detail("complete")) == {
         "outcome": "complete"
+    }
+    assert parse_detail_fields(outcome_recorded_detail("incomplete", reason="why")) == {
+        "outcome": "incomplete",
+        "reason": "why",
     }
     accepted = to_contract_event(
         _native("command_accepted", command_accepted_detail("r1", "stop", "accepted"))

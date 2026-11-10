@@ -88,6 +88,13 @@ _EXTRA_KEYS = {
     "command_resolved": ("request_id", "acknowledgement"),
 }
 
+#: Extra fields the contract requires even when the engine has no value
+#: for them: they project as ``null`` instead of being omitted. Every other
+#: extra stays omitted when its detail value is absent or empty.
+_NULLABLE_KEYS = {
+    "outcome_recorded": frozenset({"reason"}),
+}
+
 
 def parse_detail_fields(detail: object) -> dict[str, str]:
     """Parse a ``key=value; key=value`` native detail into its fields.
@@ -149,7 +156,9 @@ def to_contract_event(
     included whenever it names a real attempt. ``phase`` is included only
     for ``phase_changed`` (parsed from the native detail), never the
     logger's own phase label. Extra fields follow the spec table; unknown
-    detail keys are dropped. Never raises.
+    detail keys are dropped. An absent extra is omitted, except the ones the
+    contract requires (``_NULLABLE_KEYS``), which project as ``null``.
+    Never raises.
     """
 
     try:
@@ -186,12 +195,15 @@ def to_contract_event(
             event["event"] = name
             if clean_attempt is not None:
                 event["attempt_id"] = clean_attempt
+            nullable = _NULLABLE_KEYS.get(name, frozenset())
             for key in _EXTRA_KEYS.get(name, ()):
                 if key == "attempt_id":
                     continue  # resolved above, never parsed from free text
                 value = fields.get(key)
                 if isinstance(value, str) and value:
                     event[key] = value
+                elif key in nullable:
+                    event[key] = None
             return event
         event["event"] = f"native.{name}"
         if clean_attempt is not None:
@@ -276,10 +288,16 @@ def halted_detail(reason: str) -> str:
     return f"reason={reason}"
 
 
-def outcome_recorded_detail(outcome: str) -> str:
-    """Detail for the ``outcome_recorded`` native event."""
+def outcome_recorded_detail(outcome: str, reason: str | None = None) -> str:
+    """Detail for the ``outcome_recorded`` native event.
 
-    return f"outcome={outcome}"
+    ``reason`` is optional: without one the projected Contract Event carries
+    ``reason: null``.
+    """
+
+    if not reason:
+        return f"outcome={outcome}"
+    return f"outcome={outcome}; reason={reason}"
 
 
 def command_accepted_detail(request_id: str, kind: str, acknowledgement: str) -> str:

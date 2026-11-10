@@ -1,10 +1,11 @@
 """Validate CLI envelopes against the pinned contract JSON Schemas.
 
 Every contract ``_run`` helper routes its parsed envelope through
-:func:`validate_producer_envelope`, and every export-stream helper routes its
-tar bytes through :func:`validate_export_stream`, so the in-repo suite fails
-on any drift between our projections and agent-operator-contract ``v1.0.0``
---- not just on the local assertions.
+:func:`validate_producer_envelope`, every export-stream helper routes its
+tar bytes through :func:`validate_export_stream`, and Contract Event tests
+route single events through :func:`validate_contract_event`, so the in-repo
+suite fails on any drift between our projections and agent-operator-contract
+``v1.0.0`` --- not just on the local assertions.
 
 The checks layer the shared validators from the pinned library
 (:mod:`agent_operator_contract.documents`) under strict ``jsonschema``
@@ -151,5 +152,16 @@ def validate_export_stream(payload: bytes) -> None:
     problems.extend(_schema_problems("export-manifest", manifest))
     assert not problems, (
         "export manifest violates the pinned contract schemas:\n"
+        + "\n".join(f"  - {problem}" for problem in problems)
+    )
+
+
+def validate_contract_event(event: dict) -> None:
+    """Assert one Contract Event matches the pinned ``contract-event`` schema."""
+
+    problems = list(documents.validate_contract_event(event))
+    problems.extend(_schema_problems("contract-event", event))
+    assert not problems, (
+        "contract event violates the pinned contract schemas:\n"
         + "\n".join(f"  - {problem}" for problem in problems)
     )
