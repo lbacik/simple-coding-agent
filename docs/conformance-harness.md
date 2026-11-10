@@ -23,7 +23,9 @@ the shared test fakes (`tests/fakes.py` — reused, never copied):
   `release` also lets exactly one Claim through (see below), ends the
   startup hold after `start-container`, and then ends the recovery hold.
 - `finish-attempt` — script one native outcome for the active attempt and
-  release any hold so it runs to finalization.
+  release a hold that blocks the model execution (`after-claim`,
+  `native-phase`) so it runs to finalization. An `after-outcome` hold stays
+  armed (see below).
 - `hold-lock` — hold the engine lock for `duration_ms`: the harness file
   lock plus, inside the running engine, its own control lock.
 - `crash` — kill the engine now, or arm a one-shot crash at
@@ -33,7 +35,8 @@ the shared test fakes (`tests/fakes.py` — reused, never copied):
 - `stop-container` / `start-container` — stop and restart the engine while
   keeping the volume, for Offline Read and recovery coverage.
 - `halt` — record a halt and exit the engine by decision.
-- `grow-archive` — append bytes to the newest unsealed archive file.
+- `grow-archive` — append bytes to the newest file of an unsealed archive:
+  the one of the given contract Attempt ID, or of the active attempt.
 - `defer-publication` — arm the one-shot deferred-publication crash.
 
 `setup` answers `unsupported` naming an unknown Operator Capability, and
@@ -56,6 +59,12 @@ between two harness verbs:
   fake model execution until `finish-attempt` scripts its outcome. The
   outcome names its attempt and that attempt consumes it, so no stale
   outcome can finish a later attempt.
+- **`after-outcome` pauses finalization with the outcome recorded.** The
+  hold takes effect right after the engine emits `outcome_recorded`: the
+  outcome is in the archive record, the attempt is still active and its
+  archive unsealed. `finish-attempt` returns once the engine waits there.
+  The next `release` lets finalization run on and returns once `status`
+  shows the attempt finished, so its `sealed` event is already there.
 - **`hold-lock` holds the engine's control lock.** While the harness holds
   the file lock, the daemon holds `AgentLifecycle`'s control lock for it.
   So `status` serves the engine's last prepared snapshot (spec §14, ADR

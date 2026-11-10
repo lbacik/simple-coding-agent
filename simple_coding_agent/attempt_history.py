@@ -154,10 +154,11 @@ def show_attempt(
             "invalid_argument", "invalid attempt ID: must not be empty"
         )
     directories = _archive_directories(data_dir)
-    if active is not None and active.attempt_id == attempt_id:
-        summary = _live_summary(active, held=held)
-        return {"attempt": summary, "manifest": _manifest(directories, attempt_id)}
     run_dir = find_run_directory(data_dir, attempt_id)
+    if active is not None and active.attempt_id == attempt_id:
+        record = _read_record(run_dir / "attempt.json") if run_dir is not None else {}
+        summary = _live_summary(active, held=held, outcome=_outcome(record))
+        return {"attempt": summary, "manifest": _manifest(directories, attempt_id)}
     if run_dir is None:
         raise AttemptHistoryError(
             "not_found", f"unknown attempt {attempt_id!r}"
@@ -292,7 +293,12 @@ def _collect_entries(
 
     archived = _read_archived_summaries(data_dir, held=held)
     if active is not None:
-        archived[active.attempt_id] = _live_summary(active, held=held)
+        recorded = archived.get(active.attempt_id)
+        archived[active.attempt_id] = _live_summary(
+            active,
+            held=held,
+            outcome=recorded["outcome"] if recorded is not None else None,
+        )
     return sorted(archived.items(), key=lambda item: _sort_key(item[0]), reverse=True)
 
 
@@ -322,10 +328,20 @@ def _read_archived_summaries(
     return summaries
 
 
-def _live_summary(active: ActiveAttempt, *, held: Container[str]) -> dict[str, Any]:
-    """Build the moving-snapshot summary of the active Attempt."""
+def _live_summary(
+    active: ActiveAttempt,
+    *,
+    held: Container[str],
+    outcome: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Build the moving-snapshot summary of the active Attempt.
 
-    return _summary(
+    ``outcome`` is the one already in the archive record, if any: the
+    outcome is recorded before finalization removes the checkpoint and
+    seals, so an Attempt can be active and unsealed with its outcome in.
+    """
+
+    summary = _summary(
         attempt_id=active.attempt_id,
         issue_number=active.issue_number,
         issue_title=active.issue_title,
@@ -335,6 +351,8 @@ def _live_summary(active: ActiveAttempt, *, held: Container[str]) -> dict[str, A
         record={},
         held=held,
     )
+    summary["outcome"] = outcome
+    return summary
 
 
 def _archived_summary(

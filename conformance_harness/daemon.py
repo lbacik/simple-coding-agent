@@ -35,6 +35,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from conformance_harness.harness import (
+    AFTER_OUTCOME_HELD,
     CLAIM_GATE,
     CLAIM_GATE_RESULT,
     ENGINE_LOCK_HELD,
@@ -322,6 +323,39 @@ def _wait_while_held(flags: Path, poll: float = 0.05) -> None:
         time.sleep(poll)
 
 
+def hold_after_outcome(
+    emit: Callable[..., None], flags: Path, data_dir: Path
+) -> Callable[..., None]:
+    """Wrap the lifecycle's event log so ``after-outcome`` holds finalization.
+
+    The engine emits ``outcome_recorded`` once the outcome is in the
+    archive record and before it removes the checkpoint and seals. Holding
+    right after that emit pauses finalization exactly there: the attempt is
+    still active and unsealed, and its outcome is recorded. The marker
+    lasts as long as the wait, so the harness never has to guess whether
+    the engine reached the hold.
+    """
+
+    def gated(event: str, *args: object, **kwargs: object) -> None:
+        emit(event, *args, **kwargs)
+        if event != "outcome_recorded":
+            return
+        hold = _read_json(flags / "hold.json")
+        if hold is None or hold.get("point") != "after-outcome":
+            return
+        marker = flags / AFTER_OUTCOME_HELD
+        try:
+            _write_json(marker, {"attempt_id": _checkpoint_attempt_id(data_dir)})
+        except OSError:
+            pass
+        try:
+            _wait_while_held(flags)
+        finally:
+            marker.unlink(missing_ok=True)
+
+    return gated
+
+
 def _checkpoint_phase(data_dir: Path) -> str | None:
     payload = _read_json(data_dir / "state" / "attempt.json")
     if not payload:
@@ -523,11 +557,11 @@ class BlockingExecutor:
 class GatedPublisher:
     """Real publication gated by harness holds, crashes and deferral.
 
-    Delegates every call to the real publisher; the gates only pause or
-    interrupt around it. ``after-outcome`` holds while the outcome is
-    recorded but finalization has not run; ``defer-publication`` arms a
-    one-shot that leaves the publication effect pending across the restart
-    so recovery finishes it before new claims open.
+    Delegates every call to the real publisher; the gates only interrupt
+    around it. ``defer-publication`` arms a one-shot that leaves the
+    publication effect pending across the restart so recovery finishes it
+    before new claims open. The ``after-outcome`` hold is not here: the
+    outcome is recorded only after publication (:func:`hold_after_outcome`).
     """
 
     def __init__(self, inner: object, flags: Path, data_dir: Path) -> None:
@@ -560,9 +594,6 @@ class GatedPublisher:
             except OSError:
                 pass
             os._exit(1)
-        hold = _read_json(self._flags / "hold.json")
-        if hold is not None and hold.get("point") == "after-outcome":
-            _wait_while_held(self._flags)
 
     def publish(self, request: object, *, timeout: float | None = None) -> object:
         self._gate()
@@ -772,7 +803,7 @@ def _build_engine(
     from simple_coding_agent.command_runner import CommandRunner
     from simple_coding_agent.completion import CompletionEvaluator, VerificationRunner
     from simple_coding_agent.config import RepositoryProfile
-    from simple_coding_agent.contract_events import ContractEventsBuffer
+    from simple_coding_agent.contract_events import ContractEventsBuffer, seed_recorded_halt
     from simple_coding_agent.control import ControlStore
     from simple_coding_agent.finalization import AttemptCompletionStore
     from simple_coding_agent.git_workspace import GitWorkspace
@@ -822,6 +853,7 @@ def _build_engine(
 
     recent_events = RecentEventsBuffer()
     contract_events = ContractEventsBuffer()
+    seed_recorded_halt(contract_events, halt_store)
     logger = JsonEventLogger(
         sys.stdout,
         attempt_sink=attempt_sink,
@@ -873,7 +905,7 @@ def _build_engine(
         sleeper=lambda _: None,
         poll_interval=60,
         error_store=ConsecutiveErrorStore(data_dir),
-        event_log=event_log("polling"),
+        event_log=hold_after_outcome(event_log("polling"), flags, data_dir),
         attempt_archive_factory=archive_factory,
         completion_store=AttemptCompletionStore(data_dir),
         control_store=control_store,
@@ -972,6 +1004,8 @@ def run_daemon(root: Path) -> int:
         repository_with_main(root)
     flags = root / "flags"
     flags.mkdir(parents=True, exist_ok=True)
+    # A previous engine killed inside an after-outcome hold left its marker.
+    (flags / AFTER_OUTCOME_HELD).unlink(missing_ok=True)
     issues: dict[int, object] = {}
     transport = HarnessTransport(issues, root / "issues.json")
     engine = _build_engine(root, repository, transport)

@@ -26,10 +26,12 @@ from simple_coding_agent.contract_events import (
     outcome_recorded_detail,
     parse_detail_fields,
     process_started_detail,
+    seed_recorded_halt,
     startup_check_detail,
     to_contract_event,
 )
 from simple_coding_agent.control import CommandAcknowledgement
+from simple_coding_agent.halt import HaltStore
 from simple_coding_agent.lifecycle import LifecycleStatus
 from simple_coding_agent.observability import AttemptArchive, JsonEventLogger
 from tests.contract_schema import validate_contract_event
@@ -496,3 +498,43 @@ def test_command_accepted_then_resolved(tmp_path: Path) -> None:
     ]
     assert resolved["request_id"] == "cmd-1"
     assert resolved["acknowledgement"] == "completed"
+
+
+# -- the halted event seeded from the durable halt record (#384) -------------
+
+
+def test_a_recorded_halt_seeds_one_valid_halted_event(tmp_path: Path) -> None:
+    store = HaltStore(tmp_path)
+    recorded = store.record("consecutive_error_limit_reached", "five in a row")
+    buffer = ContractEventsBuffer()
+
+    assert seed_recorded_halt(buffer, store) is True
+
+    (halted,) = buffer.snapshot()
+    assert halted == {
+        "at": recorded.at,
+        "level": "error",
+        "event": "halted",
+        "text": "reason=consecutive_error_limit_reached",
+        "reason": "consecutive_error_limit_reached",
+    }
+    validate_contract_event(halted)
+
+
+def test_no_recorded_halt_seeds_nothing(tmp_path: Path) -> None:
+    buffer = ContractEventsBuffer()
+
+    assert seed_recorded_halt(buffer, HaltStore(tmp_path)) is False
+
+    assert buffer.snapshot() == []
+
+
+def test_an_unreadable_halt_record_seeds_nothing(tmp_path: Path) -> None:
+    store = HaltStore(tmp_path)
+    store.path.parent.mkdir(parents=True)
+    store.path.write_text("not json")
+    buffer = ContractEventsBuffer()
+
+    assert seed_recorded_halt(buffer, store) is False
+
+    assert buffer.snapshot() == []

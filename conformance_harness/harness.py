@@ -103,6 +103,9 @@ STARTUP_HOLD = "startup_hold"
 RECOVERY_HOLD = "recovery_hold"
 #: Written once the first engine iteration after startup has returned.
 STARTUP_RECONCILED = "startup_reconciled"
+#: Written by the daemon while finalization waits in an ``after-outcome``
+#: hold; names the held attempt for ``finish-attempt`` and ``release``.
+AFTER_OUTCOME_HELD = "after_outcome_held.json"
 
 #: How long ``setup``/``start-container`` wait for the engine to serve.
 _DAEMON_READY_TIMEOUT_SECONDS = 30.0
@@ -156,6 +159,7 @@ def _paths(root: Path) -> dict[str, Path]:
         "startup_hold": root / "flags" / STARTUP_HOLD,
         "recovery_hold": root / "flags" / RECOVERY_HOLD,
         "startup_reconciled": root / "flags" / STARTUP_RECONCILED,
+        "after_outcome_held": root / "flags" / AFTER_OUTCOME_HELD,
     }
 
 
@@ -758,7 +762,9 @@ def _verb_release(root: Path) -> tuple[int, dict]:
     once. Either way the gate is closed again before it returns, so no
     claim opens between two harness verbs. After ``start-container`` it
     first ends the startup hold, and on the next call the recovery hold,
-    waiting (bounded) until the engine settles in its next state.
+    waiting (bounded) until the engine settles in its next state. Releasing
+    an ``after-outcome`` hold the engine waits in returns once that
+    attempt's finalization (sealing included) shows in ``status``.
     """
 
     state, error = _require_instance(root, "release")
@@ -766,7 +772,18 @@ def _verb_release(root: Path) -> tuple[int, dict]:
         return error
     paths = _paths(root)
     released = paths["hold"].exists()
+    held_after_outcome = _held_after_outcome(root)
     paths["hold"].unlink(missing_ok=True)
+    if held_after_outcome is not None:
+        # Finalization was paused with the outcome recorded: it now runs
+        # on, and the seal is visible in ``status`` before this answers.
+        finalized = _wait_for(
+            lambda: _finalized(root, held_after_outcome) or not _engine_alive(root),
+            timeout=_COMPLETION_TIMEOUT_SECONDS,
+            interval=0.05,
+        )
+        if not finalized:
+            return _failed("release", "the held attempt did not finalize in time")
     if paths["startup_hold"].exists():
         # Ends ``starting``: the engine moves on to ``recovering`` (held
         # again when a retained attempt waits) or to ready.
@@ -795,6 +812,28 @@ def _verb_release(root: Path) -> tuple[int, dict]:
     if _engine_alive(root) and _active_attempt_id(root) is None:
         _let_one_claim_through(root)
     return _ok("release", {"released": released})
+
+
+def _held_after_outcome(root: Path) -> str | None:
+    """The attempt whose finalization waits in an ``after-outcome`` hold."""
+
+    marker = _read_json_file(_paths(root)["after_outcome_held"])
+    attempt_id = marker.get("attempt_id") if marker else None
+    return attempt_id if isinstance(attempt_id, str) and attempt_id else None
+
+
+def _finalized(root: Path, attempt_id: str) -> bool:
+    """Whether ``status`` reports ``attempt_id`` finished (sealing included).
+
+    ``last_finished`` is the engine's last finalization step, after the
+    archive is Sealed and ``sealed`` is emitted.
+    """
+
+    status = _engine_status(root)
+    if status is None:
+        return False
+    last_finished = status.get("last_finished")
+    return isinstance(last_finished, dict) and last_finished.get("attempt_id") == attempt_id
 
 
 def _left_starting(root: Path) -> bool:
@@ -858,16 +897,24 @@ def _verb_finish_attempt(root: Path, params: dict) -> tuple[int, dict]:
         scripted["reason"] = params["reason"]
     scripted_path = _paths(root)["scripted_outcome"]
     _write_json_file(scripted_path, scripted)
-    # Release any hold so the blocked attempt can run to finalization.
-    _paths(root)["hold"].unlink(missing_ok=True)
-    try:
+    # Release a hold that blocks the executor so the attempt can run to
+    # finalization. An after-outcome hold stays armed: it pauses
+    # finalization once the outcome is recorded, until ``release``.
+    hold = _read_json_file(_paths(root)["hold"])
+    after_outcome = hold is not None and hold.get("point") == "after-outcome"
+    if not after_outcome:
+        _paths(root)["hold"].unlink(missing_ok=True)
+
+    def settled() -> bool:
         # A one-shot crash armed for finalization, or the deferred
         # publication, ends the engine with the attempt still recorded:
         # the outcome is in, and the restart recovers the rest.
-        finished = _wait_for(
-            lambda: _active_attempt_id(root) is None or not _engine_alive(root),
-            timeout=_COMPLETION_TIMEOUT_SECONDS,
-        )
+        if _active_attempt_id(root) is None or not _engine_alive(root):
+            return True
+        return after_outcome and _held_after_outcome(root) == attempt_id
+
+    try:
+        finished = _wait_for(settled, timeout=_COMPLETION_TIMEOUT_SECONDS)
     finally:
         left = _read_json_file(scripted_path)
         if left is not None and left.get("attempt_id") == attempt_id:
@@ -1031,23 +1078,33 @@ def _verb_halt(root: Path, params: dict) -> tuple[int, dict]:
 
 
 def _archive_candidates(root: Path, attempt_id: str | None) -> list[Path]:
-    """Candidate unsealed archive files, newest first."""
+    """Candidate unsealed archive files, newest first.
 
-    logs = _paths(root)["instance"] / "logs"
-    if not logs.is_dir():
-        return []
-    files: list[Path] = []
-    for issue_dir in sorted(logs.iterdir()):
-        if not issue_dir.is_dir():
-            continue
-        for run_dir in sorted(issue_dir.iterdir()):
-            if not run_dir.is_dir():
-                continue
-            if attempt_id is not None and attempt_id not in run_dir.name:
-                continue
-            for member in sorted(run_dir.rglob("*")):
-                if member.is_file() and member.suffix != ".tmp":
-                    files.append(member)
+    ``attempt_id`` is the contract Attempt ID; its archive directory is the
+    one the engine itself resolves for that ID (the directory name is a
+    sanitised form of it, so the two never compare equal). ``None`` takes
+    every unsealed archive.
+    """
+
+    from simple_coding_agent.attempt_history import find_run_directory
+    from simple_coding_agent.observability import SEALING_FILENAME
+
+    instance = _paths(root)["instance"]
+    if attempt_id is not None:
+        found = find_run_directory(instance, attempt_id)
+        run_dirs = [found] if found is not None else []
+    else:
+        run_dirs = [path for path in instance.glob("logs/*/*") if path.is_dir()]
+    files = [
+        member
+        for run_dir in run_dirs
+        if not (run_dir / SEALING_FILENAME).exists()
+        for member in run_dir.rglob("*")
+        # Never the attempt record: appended bytes would leave it
+        # unparseable, and the engine finds the archive of an Attempt ID
+        # through that record.
+        if member.is_file() and member.suffix != ".tmp" and member.name != "attempt.json"
+    ]
     # Newest first so growth lands on the live run.
     files.sort(key=lambda path: path.stat().st_mtime, reverse=True)
     return files
