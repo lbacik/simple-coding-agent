@@ -468,6 +468,7 @@ def run_handoff_once(
     publisher = FakePublisher(handoff_posted=handoff_posted)
     state = AttemptStateStore(tmp_path / "state")
     lifecycle = AgentLifecycle(
+        sleeper=lambda _: None,
         tracker=tracker,
         attempt_state=state,
         workspace=workspace,

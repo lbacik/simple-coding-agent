@@ -80,6 +80,7 @@ def test_keyboard_interrupt_still_publishes_a_terminal_outcome(tmp_path: Path) -
         raise KeyboardInterrupt("operator stop")
 
     lifecycle = AgentLifecycle(
+        sleeper=lambda _: None,
         tracker=tracker,
         attempt_state=state,
         workspace=workspace,
@@ -109,6 +110,7 @@ def test_setup_failure_posts_result_then_releases_only_the_agent_claim(
     workspace = InMemoryWorkspace(tmp_path / "repo", issue_number=24)
     publisher = FakePublisher()
     lifecycle = AgentLifecycle(
+        sleeper=lambda _: None,
         tracker=tracker,
         attempt_state=state,
         workspace=workspace,
@@ -166,6 +168,7 @@ def test_empty_queue_sleeps_startup_spread_then_jittered_poll(tmp_path: Path) ->
 def test_stops_after_the_persisted_consecutive_infrastructure_error_limit(tmp_path: Path) -> None:
     events: list[tuple[str, str]] = []
     lifecycle = AgentLifecycle(
+        sleeper=lambda _: None,
         tracker=FakeTracker(next_claim=Claim(issue(24), Assignment("issue-24", "agent-id"))),
         attempt_state=AttemptStateStore(tmp_path),
         workspace=InMemoryWorkspace(tmp_path / "repo", issue_number=24),
@@ -469,6 +472,7 @@ def test_attempt_runs_the_injected_workflow_then_publishes_before_cleanup(tmp_pa
         )
 
     lifecycle = AgentLifecycle(
+        sleeper=lambda _: None,
         tracker=tracker,
         attempt_state=AttemptStateStore(tmp_path),
         workspace=workspace,
@@ -511,6 +515,7 @@ def test_partial_push_failure_keeps_incomplete_and_retains_the_local_branch(
         )
 
     lifecycle = AgentLifecycle(
+        sleeper=lambda _: None,
         tracker=tracker,
         attempt_state=AttemptStateStore(tmp_path),
         workspace=workspace,
@@ -633,6 +638,7 @@ def test_logs_every_stage_from_claiming_the_issue_to_dispatching_the_model(
         )
 
     lifecycle = AgentLifecycle(
+        sleeper=lambda _: None,
         tracker=tracker,
         attempt_state=AttemptStateStore(tmp_path),
         workspace=workspace,
@@ -667,6 +673,7 @@ def test_keeps_the_checkpoint_when_remote_cleanup_is_interrupted(tmp_path: Path)
         next_claim=Claim(issue(24), Assignment("issue-24", "agent-id"))
     )
     lifecycle = AgentLifecycle(
+        sleeper=lambda _: None,
         tracker=tracker,
         attempt_state=state,
         workspace=InMemoryWorkspace(tmp_path / "repo", issue_number=24),
@@ -683,6 +690,7 @@ def test_keeps_the_checkpoint_when_remote_cleanup_is_interrupted(tmp_path: Path)
 def test_recreates_the_attempt_branch_from_a_profile_base_branch(tmp_path: Path) -> None:
     workspace = InMemoryWorkspace(tmp_path / "repo", issue_number=24)
     lifecycle = AgentLifecycle(
+        sleeper=lambda _: None,
         tracker=FakeTracker(next_claim=Claim(issue(24), Assignment("issue-24", "agent-id"))),
         attempt_state=AttemptStateStore(tmp_path),
         workspace=workspace,
@@ -704,6 +712,7 @@ def test_does_not_start_cleanup_when_the_result_comment_was_not_posted(tmp_path:
     tracker = FakeTracker(next_claim=Claim(issue(24), Assignment("issue-24", "agent-id")))
     workspace = InMemoryWorkspace(tmp_path / "repo", issue_number=24)
     lifecycle = AgentLifecycle(
+        sleeper=lambda _: None,
         tracker=tracker,
         attempt_state=state,
         workspace=workspace,
@@ -792,6 +801,7 @@ def test_unresolved_rebase_conflict_after_the_model_reports_infrastructure_error
         )
 
     lifecycle = AgentLifecycle(
+        sleeper=lambda _: None,
         tracker=FakeTracker(next_claim=claim),
         attempt_state=AttemptStateStore(tmp_path),
         workspace=workspace,
@@ -844,6 +854,7 @@ def test_rebase_conflict_on_the_profile_base_reports_infrastructure_error(tmp_pa
         )
 
     lifecycle = AgentLifecycle(
+        sleeper=lambda _: None,
         tracker=FakeTracker(next_claim=claim),
         attempt_state=AttemptStateStore(tmp_path),
         workspace=workspace,
@@ -891,6 +902,7 @@ def test_conflicted_prepare_still_dispatches_the_model(tmp_path: Path) -> None:
         )
 
     lifecycle = AgentLifecycle(
+        sleeper=lambda _: None,
         tracker=FakeTracker(next_claim=claim),
         attempt_state=AttemptStateStore(tmp_path),
         workspace=workspace,
@@ -918,6 +930,7 @@ def test_non_main_profile_prepares_the_attempt_only_onto_the_profile_base(
 
     workspace = InMemoryWorkspace(tmp_path / "repo", issue_number=24)
     lifecycle = AgentLifecycle(
+        sleeper=lambda _: None,
         tracker=FakeTracker(next_claim=Claim(issue(24), Assignment("issue-24", "agent-id"))),
         attempt_state=AttemptStateStore(tmp_path),
         workspace=workspace,
@@ -1090,6 +1103,7 @@ def test_live_attempt_records_the_claim_time_lease_at_start(tmp_path: Path) -> N
         )
 
     lifecycle = AgentLifecycle(
+        sleeper=lambda _: None,
         tracker=tracker,
         attempt_state=AttemptStateStore(tmp_path),
         workspace=workspace,

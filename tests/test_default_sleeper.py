@@ -51,6 +51,26 @@ def _idle_lifecycle(
     return lifecycle
 
 
+def _assert_first_cycle_sleeps(seconds: list[float], *, spread: bool) -> None:
+    """Assert one first-cycle idle run's sleeps through the default sleeper.
+
+    With ``spread`` (intake may claim) the cycle first takes the one-off
+    startup spread delay, uniform within ``[0, POLL_INTERVAL / 2]``; every
+    idle cycle then sleeps one jittered poll, uniform within ±20% of
+    ``POLL_INTERVAL``.
+    """
+
+    assert len(seconds) == (2 if spread else 1)
+    if spread:
+        assert 0 <= seconds[0] <= POLL_INTERVAL / 2
+    assert 0.8 * POLL_INTERVAL <= seconds[-1] <= 1.2 * POLL_INTERVAL
+
+
+def _lifecycle_sleeps(calls: list[tuple[str, float]]) -> list[float]:
+    assert {source for source, _ in calls} <= {"lifecycle"}
+    return [seconds for _, seconds in calls]
+
+
 def test_sleeper_defaults_are_none_so_lookup_happens_at_call_time() -> None:
     """A definition-time ``time.sleep`` default would bypass every test stub."""
 
@@ -70,7 +90,7 @@ def test_empty_queue_without_sleeper_is_instant(
 
     assert result.status is LifecycleStatus.IDLE
     assert elapsed < INSTANT_ENOUGH
-    assert default_sleeper_calls == [("lifecycle", POLL_INTERVAL)]
+    _assert_first_cycle_sleeps(_lifecycle_sleeps(default_sleeper_calls), spread=True)
     default_sleeper_calls.clear()
 
 
@@ -86,7 +106,9 @@ def test_stopped_intake_without_sleeper_is_instant(
 
     assert result.status is LifecycleStatus.IDLE
     assert elapsed < INSTANT_ENOUGH
-    assert default_sleeper_calls == [("lifecycle", POLL_INTERVAL)]
+    # Intake is stopped, so the startup spread is kept for the first cycle
+    # that can claim; this cycle sleeps only the jittered poll.
+    _assert_first_cycle_sleeps(_lifecycle_sleeps(default_sleeper_calls), spread=False)
     default_sleeper_calls.clear()
 
 
@@ -99,7 +121,7 @@ def test_dirty_tree_hold_without_sleeper_is_instant(
 
     assert result.status is LifecycleStatus.IDLE
     assert elapsed < INSTANT_ENOUGH
-    assert default_sleeper_calls == [("lifecycle", POLL_INTERVAL)]
+    _assert_first_cycle_sleeps(_lifecycle_sleeps(default_sleeper_calls), spread=True)
     default_sleeper_calls.clear()
 
 
@@ -112,7 +134,7 @@ def test_production_default_sleeper_calls_the_real_time_sleep_binding(
     stub for this test only, mirroring how the claim-hardening tests
     override the settle stub) and records what the module ``time`` binding
     receives, so the assertion proves the call-time lookup reaches the real
-    sleep with the exact idle duration.
+    sleep with the startup spread and the jittered idle duration.
     """
 
     monkeypatch.setattr(
@@ -126,5 +148,5 @@ def test_production_default_sleeper_calls_the_real_time_sleep_binding(
     result = _idle_lifecycle(tmp_path, dirty=True).run_once()
 
     assert result.status is LifecycleStatus.IDLE
-    assert calls == [POLL_INTERVAL]
+    _assert_first_cycle_sleeps(calls, spread=True)
     assert default_sleeper_calls == []
