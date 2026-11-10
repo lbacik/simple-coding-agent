@@ -861,8 +861,11 @@ def _verb_finish_attempt(root: Path, params: dict) -> tuple[int, dict]:
     # Release any hold so the blocked attempt can run to finalization.
     _paths(root)["hold"].unlink(missing_ok=True)
     try:
+        # A one-shot crash armed for finalization, or the deferred
+        # publication, ends the engine with the attempt still recorded:
+        # the outcome is in, and the restart recovers the rest.
         finished = _wait_for(
-            lambda: _active_attempt_id(root) is None,
+            lambda: _active_attempt_id(root) is None or not _engine_alive(root),
             timeout=_COMPLETION_TIMEOUT_SECONDS,
         )
     finally:

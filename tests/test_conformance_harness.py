@@ -714,3 +714,20 @@ def test_a_restart_holds_starting_and_release_honours_the_priority(
     snapshot = engine.status()
     assert snapshot["current_attempt"]["issue"]["number"] == 22
     assert snapshot["intake"]["priority"] is None
+
+
+def test_finish_attempt_answers_when_deferred_publication_ends_the_engine(
+    engine: _Engine,
+) -> None:
+    engine.call("set-issue", {"issue": 23, "eligible": True})
+    engine.call("release", {})
+    attempt_id = engine.status()["current_attempt"]["attempt_id"]
+    engine.call("defer-publication", {})
+
+    started = time.monotonic()
+    finished = engine.call("finish-attempt", {"native_outcome": "complete"})
+
+    assert finished == {"attempt_id": attempt_id, "native_outcome": "complete"}
+    assert time.monotonic() - started < 30.0
+    # The publication is left pending for the restart to recover.
+    assert (engine.root / "instance" / "state" / "attempt.json").exists()
