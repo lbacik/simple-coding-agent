@@ -66,6 +66,7 @@ def test_finalized_attempt_is_recorded_once_before_a_new_claim(
     completions = AttemptCompletionStore(tmp_path)
     errors = ConsecutiveErrorStore(tmp_path)
     lifecycle = AgentLifecycle(
+        sleeper=lambda _: None,
         tracker=tracker,
         attempt_state=AttemptStateStore(tmp_path),
         workspace=workspace,
@@ -292,7 +293,7 @@ def test_dirty_tree_without_checkpoint_holds_intake(
 ) -> None:
     """A dirty tree with no checkpoint holds the claim without exiting.
 
-    The process stays up (no ``SystemExit``), sleeps the poll interval,
+    The process stays up (no ``SystemExit``), sleeps a jittered poll interval,
     and keeps serving the control socket, so the operator retains a live
     view while the tree awaits manual repair.
     """
@@ -329,6 +330,7 @@ def test_error_limit_trips_before_the_completion_record(
     completions = AttemptCompletionStore(tmp_path)
     errors = ConsecutiveErrorStore(tmp_path)
     lifecycle = AgentLifecycle(
+        sleeper=lambda _: None,
         tracker=FakeTracker(next_claim=claim),
         attempt_state=AttemptStateStore(tmp_path),
         workspace=workspace,
@@ -356,6 +358,7 @@ def test_error_limit_survives_restart_replay_without_a_new_claim(
     completions = AttemptCompletionStore(tmp_path)
     errors = ConsecutiveErrorStore(tmp_path)
     first = AgentLifecycle(
+        sleeper=lambda _: None,
         tracker=FakeTracker(next_claim=claim),
         attempt_state=AttemptStateStore(tmp_path),
         workspace=workspace,
@@ -372,6 +375,7 @@ def test_error_limit_survives_restart_replay_without_a_new_claim(
 
     tracker = FakeTracker({24: _issue(24)})
     second = AgentLifecycle(
+        sleeper=lambda _: None,
         tracker=tracker,
         attempt_state=AttemptStateStore(tmp_path),
         workspace=workspace,
@@ -443,6 +447,7 @@ def test_cleanup_failure_holds_with_a_visible_event(
     claim = Claim(_issue(24), Assignment("issue-24", "agent-id"))
     events: list[str] = []
     lifecycle = AgentLifecycle(
+        sleeper=lambda _: None,
         tracker=FakeTracker(next_claim=claim),
         attempt_state=AttemptStateStore(tmp_path),
         workspace=CleanupFailingWorkspace(tmp_path / "repo"),

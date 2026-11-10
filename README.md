@@ -152,8 +152,9 @@ python -m simple_coding_agent
 It claims one issue at a time. On every terminal outcome, it posts the result,
 removes only its queue label (`ready-for-agent`, or `merge-conflict` for a
 conflict attempt) and assignment, then removes the
-checkpoint. If the queue is empty, it sleeps for `POLL_INTERVAL` before polling
-again.
+checkpoint. If the queue is empty, it sleeps a jittered `POLL_INTERVAL`
+(uniform within ±20% of the configured interval, so simultaneous polls drift
+apart instead of polling in lockstep) before polling again.
 
 ## Docker Compose operation
 
@@ -174,6 +175,12 @@ To run a shared-login pool instead, run one container per Worker — each with
 its own `DATA_DIR` (which holds that Worker's durable checkpoint) and a
 distinct `WORKER_ID` on the same GitHub login; see
 [Shared-login worker pool](docs/agents/operator-onboarding.md#shared-login-worker-pool-worker_id).
+Workers that start together do not claim in lockstep: each sleeps a random
+spread delay (uniform within half of `POLL_INTERVAL`) before its first claim,
+yields sleep a random back-off (uniform within twice the claim settle delay)
+before the next assign, and every idle poll sleeps a jittered interval
+(±20% of `POLL_INTERVAL`), so racers converge on different issues within a
+cycle or two while the "never both work one issue" guarantee holds.
 
 For a one-shot run (useful for testing or manual invocation):
 

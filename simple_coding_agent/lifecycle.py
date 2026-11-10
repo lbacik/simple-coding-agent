@@ -10,6 +10,7 @@ from datetime import UTC, datetime
 from enum import StrEnum
 import os
 from pathlib import Path
+import random
 import re
 import signal
 import subprocess
@@ -1349,6 +1350,7 @@ class AgentLifecycle:
         attempt_runner: Callable[[Claim, RepositoryProfile, object], AttemptEvidence] | None = None,
         poll_interval: int = 60,
         sleeper: Callable[[float], None] | None = None,
+        random_source: Callable[[], float] | None = None,
         error_store: ConsecutiveErrorStore | None = None,
         max_consecutive_errors: int = 3,
         max_auto_continuations: int = 0,
@@ -1383,6 +1385,19 @@ class AgentLifecycle:
         self._attempt_runner = attempt_runner
         self._poll_interval = poll_interval
         self._sleeper = sleeper if sleeper is not None else _default_sleeper
+        self._random_source = (
+            random_source if random_source is not None else random.random
+        )
+        # The next idle poll sleep, drawn ahead: the following value is
+        # drawn as each idle sleep begins, so every heartbeat or hold
+        # message (from ``run_once`` or a control-command thread) names the
+        # exact duration the next idle sleep then uses.
+        self._idle_sleep_seconds = self._poll_sleep_seconds()
+        # Whether the one pre-first-claim spread delay has been taken. It is
+        # consumed only once intake can really claim (never while
+        # ``_starting``, held, or stopped), and never before startup
+        # reconciliation.
+        self._startup_delay_done = False
         self._error_store = error_store
         self._max_consecutive_errors = max_consecutive_errors
         self._max_auto_continuations = max_auto_continuations
@@ -2443,7 +2458,7 @@ class AgentLifecycle:
         The caller holds the control lock with intake already permitted.
         Returns True when the claim must wait: the branch, checkpoint
         (none here), and working tree are left untouched for the
-        operator, and the caller sleeps the normal poll interval with
+        operator, and the caller sleeps a jittered poll interval with
         the control socket still serving. Logs ``working_tree_dirty``
         once per dirty episode (naming the first offending paths) and
         ``working_tree_clean`` on recovery, so a stopped instance stays
@@ -2553,7 +2568,7 @@ class AgentLifecycle:
         self._startup_hold_reported = True
         self._event_log(
             "intake_held_for_recovery",
-            f"{detail} sleeping {self._poll_interval}s",
+            f"{detail} sleeping {self._idle_sleep_seconds}s",
             level="WARNING",
             issue_number=issue_number,
         )
@@ -4590,13 +4605,54 @@ class AgentLifecycle:
             else f"{next_action} {release_next_action()}",
         }
 
+    def _poll_sleep_seconds(self) -> float:
+        """This idle cycle's poll sleep: uniform within ±20% of the interval.
+
+        Workers that start together (a whole-Pool ``docker compose up``, a
+        rebuild, a host reboot) would otherwise poll in lockstep forever, so
+        every idle sleep is jittered; the ±20% band keeps the operator's
+        ``POLL_INTERVAL`` expectation while spreading simultaneous polls.
+        Rounded to a tenth of a second so the event detail names the exact
+        duration slept. Always on; no config knob.
+        """
+
+        return round(self._poll_interval * (0.8 + 0.4 * self._random_source()), 1)
+
+    def _startup_delay_seconds(self) -> float:
+        """This process's one pre-first-claim spread delay.
+
+        Uniform within ``[0, poll_interval / 2]``: a whole Pool starting at
+        the same instant fans its first claims out instead of racing the same
+        issue in the same settle window. Taken once, through the normal
+        sleeper so control handling matches an ordinary idle sleep. Always
+        on; no config knob.
+        """
+
+        return round(self._random_source() * self._poll_interval / 2, 1)
+
+    def _intake_may_claim(self) -> bool:
+        """Whether this cycle's intake could claim, ignoring tree and queue.
+
+        False while the instance is starting, under a startup hold, or with
+        operator intake not running. Used only to keep the startup spread
+        delay for the first cycle that can actually claim.
+        """
+
+        with self._control_lock:
+            if self._starting or self._startup_hold_detail is not None:
+                return False
+            return (
+                self._control_store is None
+                or self._control_store.intake_state() is IntakeState.RUNNING
+            )
+
     def run_once(self) -> LifecycleResult:
         """Claim and process one issue, or sleep once when the queue is empty.
 
         A dirty working tree blocks the claim but never exits the process:
         the hold lives in ``_gated_claim`` (after the intake gate, so a
         stopped instance stays quiet), logs once per episode, and sleeps
-        the normal poll interval with the control socket still serving.
+        a jittered poll interval with the control socket still serving.
         """
 
         if not self._startup_reconciled:
@@ -4609,9 +4665,22 @@ class AgentLifecycle:
             if recovered is not None:
                 return LifecycleResult(LifecycleStatus.ATTEMPTED, recovered)
 
+        if not self._startup_delay_done and self._intake_may_claim():
+            # Spread the pool start: the first real claim attempt waits out
+            # a random fraction of half the poll interval. Reconciliation
+            # above already ran undelayed, and the delay is kept while the
+            # instance is starting, held, or stopped, so Workers resumed
+            # together still spread their first claims.
+            self._startup_delay_done = True
+            self._sleeper(self._startup_delay_seconds())
+
         claim, checkpoint = self._gated_claim()
         if claim is None:
-            self._sleeper(self._poll_interval)
+            slept = self._idle_sleep_seconds
+            # Draw the next idle sleep before this one starts, so a hold
+            # message logged meanwhile by a control command names it.
+            self._idle_sleep_seconds = self._poll_sleep_seconds()
+            self._sleeper(slept)
             return LifecycleResult(LifecycleStatus.IDLE)
 
         self._event_log(
@@ -5024,7 +5093,7 @@ class AgentLifecycle:
                     self._event_log(
                         "intake_stopped",
                         f"issue intake is {self._control_store.intake_state().value};"
-                        f" sleeping {self._poll_interval}s",
+                        f" sleeping {self._idle_sleep_seconds}s",
                         level="INFO",
                     )
                     return (None, None)
@@ -5045,7 +5114,7 @@ class AgentLifecycle:
                         "intake_held_for_recovery",
                         f"retained attempt {retained.started_at!r} for issue"
                         f" #{retained.issue_number} is held for recovery;"
-                        f" sleeping {self._poll_interval}s",
+                        f" sleeping {self._idle_sleep_seconds}s",
                         level="WARNING",
                         issue_number=retained.issue_number,
                     )
@@ -5054,7 +5123,7 @@ class AgentLifecycle:
                 # No claim while unexplained work sits in the tree; the
                 # branch, checkpoint (none here), and working tree are left
                 # untouched for the operator, and the caller sleeps the
-                # normal poll interval with the socket still serving.
+                # jittered poll interval with the socket still serving.
                 return (None, None)
             if self._control_store is not None:
                 prioritized = self._claim_prioritized_locked()
@@ -5069,7 +5138,7 @@ class AgentLifecycle:
             if claim is None:
                 self._event_log(
                     "no_eligible_issue_found",
-                    f"no eligible issue available; sleeping {self._poll_interval}s",
+                    f"no eligible issue available; sleeping {self._idle_sleep_seconds}s",
                     level="INFO",
                 )
                 return (None, None)

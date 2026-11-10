@@ -53,6 +53,7 @@ def run_complete_attempt(tmp_path: Path, tracker: FakeTracker, runner=None):
     workspace = InMemoryWorkspace(tmp_path / "repo", issue_number=24)
     publisher = FakePublisher()
     lifecycle = AgentLifecycle(
+        sleeper=lambda _: None,
         tracker=tracker,
         attempt_state=AttemptStateStore(tmp_path),
         workspace=workspace,

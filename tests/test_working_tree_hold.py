@@ -10,15 +10,16 @@ control socket, ``agentctl status`` could not connect.
 The new contract:
 - cleanliness is checked only when a claim could happen (after the intake
   gate), never while intake is stopped;
-- a dirty tree blocks the claim but the process stays up, sleeps the
-  normal poll interval, and keeps serving ``agentctl status`` (which
-  reports the hold in its ``recovery`` block);
+- a dirty tree blocks the claim but the process stays up, sleeps a jittered
+  poll interval, and keeps serving ``agentctl status`` (which reports the
+  hold in its ``recovery`` block);
 - ``working_tree_dirty`` is logged once per dirty episode (naming the
   first offending paths), not on every poll.
 """
 
 from __future__ import annotations
 
+import random
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -41,7 +42,9 @@ def test_dirty_tree_with_intake_stopped_stays_up_and_logs_nothing(tmp_path: Path
 
     assert result.status is LifecycleStatus.IDLE
     assert tracker.claimed == []
-    assert sleeps == [60]
+    # Intake is stopped, so the startup spread delay is kept for the first
+    # cycle that can claim; this cycle sleeps only the jittered poll.
+    assert_spread_then_jittered(sleeps, cycles=1, spread=False)
     # The ``submit_stop`` setup commits a stop command (terminal without an
     # active attempt, so ``command_resolved``); the poll itself only logs the
     # intake gate while the tree holds the claim.
@@ -66,7 +69,7 @@ def test_dirty_tree_with_intake_running_holds_claim_and_logs_once_with_paths(
     assert first.status is LifecycleStatus.IDLE
     assert second.status is LifecycleStatus.IDLE
     assert tracker.claimed == []
-    assert sleeps == [60, 60]
+    assert_spread_then_jittered(sleeps, cycles=2)
     dirty_logs = [detail for event, detail, _ in events if event == "working_tree_dirty"]
     assert len(dirty_logs) == 1
     assert "core.6458" in dirty_logs[0]
@@ -126,7 +129,7 @@ def test_unreadable_tree_holds_without_claiming(tmp_path: Path) -> None:
 
     assert result.status is LifecycleStatus.IDLE
     assert tracker.claimed == []
-    assert sleeps == [60]
+    assert_spread_then_jittered(sleeps, cycles=1)
     assert len([event for event, _, _ in events if event == "working_tree_dirty"]) == 1
 
 
@@ -194,6 +197,7 @@ def make_lifecycle(
         control_store=store,
         poll_interval=60,
         sleeper=sleeps.append,
+        random_source=random.Random(5).random,
         event_log=lambda event, detail="", level="INFO", issue_number=None: events.append(
             (event, detail, level)
         ),
@@ -203,6 +207,25 @@ def make_lifecycle(
 
 def workspace_of(lifecycle: AgentLifecycle) -> DirtyHoldWorkspace:
     return lifecycle._workspace  # noqa: SLF001 - test seam
+
+
+def assert_spread_then_jittered(
+    sleeps: list[float], *, cycles: int, spread: bool = True
+) -> None:
+    """Assert the startup spread plus one jittered poll sleep per idle cycle.
+
+    With ``spread``, the first idle cycle sleeps twice — the one-off
+    pre-first-claim spread (uniform within ``[0, POLL_INTERVAL / 2]``) then
+    that cycle's jittered poll sleep (uniform within ±20% of
+    ``POLL_INTERVAL``). Every idle cycle sleeps exactly one jittered poll.
+    """
+
+    poll_interval = 60  # matches ``make_lifecycle``
+    assert len(sleeps) == cycles + (1 if spread else 0)
+    if spread:
+        assert 0 <= sleeps[0] <= poll_interval / 2
+    for idle in sleeps[1 if spread else 0:]:
+        assert 0.8 * poll_interval <= idle <= 1.2 * poll_interval
 
 
 class DirtyHoldWorkspace(InMemoryWorkspace):
