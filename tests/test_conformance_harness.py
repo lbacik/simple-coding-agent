@@ -731,3 +731,208 @@ def test_finish_attempt_answers_when_deferred_publication_ends_the_engine(
     assert time.monotonic() - started < 30.0
     # The publication is left pending for the restart to recover.
     assert (engine.root / "instance" / "state" / "attempt.json").exists()
+
+
+# ---------------------------------------------------------------------------
+# Operator Handoff through the harness executor (#383)
+# ---------------------------------------------------------------------------
+
+
+def _run_executor_bounded(executor: object, working: Path, flags: Path) -> object:
+    """Run one ``execute`` on a thread, unblocking it if it never returns.
+
+    The harness executor blocks until something ends the attempt; when the
+    behaviour under test is missing, a scripted outcome (matching the
+    checkpoint-less attempt id ``None``) frees the thread so the test fails
+    instead of hanging.
+    """
+
+    import asyncio
+
+    result: list[object] = []
+    worker = threading.Thread(
+        target=lambda: result.append(
+            asyncio.run(
+                executor.execute(
+                    issue_body="body", working_directory=working, issue_number=31
+                )
+            )
+        ),
+        daemon=True,
+    )
+    worker.start()
+    worker.join(timeout=10.0)
+    if worker.is_alive():
+        (flags / "scripted_outcome.json").write_text(
+            json.dumps({"attempt_id": None, "native_outcome": "infrastructure_error"}),
+            encoding="utf-8",
+        )
+        worker.join(timeout=10.0)
+        raise AssertionError("the executor never acted on the pending handoff")
+    return result[0]
+
+
+def test_the_harness_executor_carries_out_a_pending_operator_handoff(
+    tmp_path: Path,
+) -> None:
+    from datetime import datetime
+
+    from conformance_harness.daemon import BlockingExecutor
+    from simple_coding_agent.control import ControlStore, HandoffRejectedError
+    from simple_coding_agent.model_execution import (
+        ModelExecutionStatus,
+        OperatorHandoff,
+    )
+    from tests.fakes import git, repository_with_main
+
+    _, working = repository_with_main(tmp_path / "repo")
+    data_dir = tmp_path / "data"
+    (data_dir / "state").mkdir(parents=True)
+    flags = tmp_path / "flags"
+    flags.mkdir()
+    store = ControlStore(data_dir)
+    store.submit_handoff("req-383-1", has_active_attempt=True)
+
+    def provider() -> OperatorHandoff | None:
+        snapshot = store.handoff_snapshot()
+        if snapshot is None or snapshot["acknowledgement"] != "accepted":
+            return None
+        accepted_at = datetime.fromisoformat(
+            snapshot["accepted_at"].replace("Z", "+00:00")
+        )
+        return OperatorHandoff(snapshot["request_id"], accepted_at)
+
+    events: list[tuple[str, str, str]] = []
+
+    def reporter(event: str, request_id: str) -> None:
+        if event == "delivered":
+            store.mark_handoff_delivering(request_id)
+        elif event == "begun":
+            store.mark_handoff_begun(request_id)
+        # The note is committed only after the handoff has begun.
+        note = working / ".agent" / "handoff" / "31.md"
+        events.append((event, request_id, "note" if note.exists() else "no note"))
+
+    executor = BlockingExecutor(flags, data_dir)
+    executor.set_operator_handoff_provider(provider)
+    executor.set_operator_handoff_reporter(reporter)
+
+    execution = _run_executor_bounded(executor, working, flags)
+
+    assert execution.status is ModelExecutionStatus.HANDOFF_REQUESTED
+    assert events == [
+        ("delivered", "req-383-1", "no note"),
+        ("begun", "req-383-1", "no note"),
+    ]
+    assert executor.operator_request_id == "req-383-1"
+    note = (working / ".agent" / "handoff" / "31.md").read_text()
+    assert "- reason: operator_request" in note
+    assert git(working, "log", "-1", "--format=%s") == "Handoff note: issue #31"
+    snapshot = store.handoff_snapshot()
+    assert snapshot["begun"] is True
+    assert snapshot["acknowledgement"] == "accepted"  # the engine finalizes it
+    # Once begun, a second handoff now cannot undo it.
+    with pytest.raises(HandoffRejectedError, match="already begun"):
+        store.submit_handoff("req-383-2", has_active_attempt=True)
+
+
+def test_the_harness_executor_latches_no_handoff_without_a_pending_one(
+    tmp_path: Path,
+) -> None:
+    from conformance_harness.daemon import BlockingExecutor
+    from simple_coding_agent.model_execution import ModelExecutionStatus
+    from tests.fakes import repository_with_main
+
+    _, working = repository_with_main(tmp_path / "repo")
+    data_dir = tmp_path / "data"
+    (data_dir / "state").mkdir(parents=True)
+    flags = tmp_path / "flags"
+    flags.mkdir()
+    reported: list[tuple[str, str]] = []
+    executor = BlockingExecutor(flags, data_dir)
+    executor.set_operator_handoff_provider(lambda: None)
+    executor.set_operator_handoff_reporter(lambda *event: reported.append(event))
+    (flags / "scripted_outcome.json").write_text(
+        json.dumps({"attempt_id": None, "native_outcome": "infrastructure_error"}),
+        encoding="utf-8",
+    )
+
+    execution = _run_executor_bounded(executor, working, flags)
+
+    assert execution.status is ModelExecutionStatus.INFRASTRUCTURE_ERROR
+    assert executor.operator_request_id is None
+    assert reported == []
+
+
+def _await_final_acknowledgement(
+    engine: _Engine, request_id: str, timeout: float = 60.0
+) -> dict:
+    deadline = time.monotonic() + timeout
+    while True:
+        code, reply = engine.agentctl("command", request_id)
+        assert code == 0, reply
+        record = reply["result"]["command"]
+        if record["acknowledgement"] != "accepted" or time.monotonic() >= deadline:
+            return record
+        time.sleep(0.2)
+
+
+def test_handoff_now_completes_the_held_attempt_as_handoff(engine: _Engine) -> None:
+    engine.call("set-issue", {"issue": 31, "eligible": True})
+    engine.call("release", {})
+    attempt_id = engine.status()["current_attempt"]["attempt_id"]
+    engine.call("set-issue", {"issue": 31, "eligible": False})
+
+    code, reply = engine.agentctl(
+        "handoff", "now", "--request-id", "req-383-handoff",
+        "--expect-repo", "octo/example",
+    )
+
+    assert code == 0, reply
+    assert reply["result"]["command"]["acknowledgement"] in ("accepted", "completed")
+    record = _await_final_acknowledgement(engine, "req-383-handoff")
+    assert record["acknowledgement"] == "completed", record
+    snapshot = engine.status()
+    assert snapshot["current_attempt"] is None
+    finished = snapshot["last_finished"]
+    assert finished["attempt_id"] == attempt_id
+    assert finished["outcome"]["native"] == "handoff"
+    assert finished["sealed"] is True
+
+
+def test_an_interrupted_handoff_ends_not_fulfilled_after_recovery(
+    engine: _Engine,
+) -> None:
+    engine.call("set-issue", {"issue": 32, "eligible": True})
+    engine.call("release", {})
+    attempt_id = engine.status()["current_attempt"]["attempt_id"]
+    engine.call("crash", {"point": "during-finalization"})
+
+    engine.agentctl(
+        "handoff", "now", "--request-id", "req-383-crash",
+        "--expect-repo", "octo/example",
+    )
+    deadline = time.monotonic() + 60.0
+    while (engine.root / "flags" / "armed_crash.json").exists():
+        assert time.monotonic() < deadline, "the armed crash never fired"
+        time.sleep(0.2)
+
+    engine.call("stop-container", {})
+    engine.call("start-container", {})
+    assert engine.status()["instance"]["state"] == "starting"
+    code, reply = engine.agentctl("command", "req-383-crash")
+    assert code == 0, reply
+    assert reply["result"]["command"]["acknowledgement"] in ("accepted", "not_fulfilled")
+
+    engine.call("release", {})
+    snapshot = engine.status()
+    assert snapshot["instance"]["state"] == "recovering"
+    assert snapshot["current_attempt"]["attempt_id"] == attempt_id
+    engine.call("set-issue", {"issue": 32, "eligible": False})
+    engine.call("release", {})
+
+    snapshot = engine.status()
+    assert snapshot["last_finished"]["attempt_id"] == attempt_id
+    code, reply = engine.agentctl("command", "req-383-crash")
+    assert code == 0, reply
+    assert reply["result"]["command"]["acknowledgement"] == "not_fulfilled"
