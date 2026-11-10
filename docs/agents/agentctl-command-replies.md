@@ -104,6 +104,25 @@ an `expect_repo` field whenever one is present — the contract path always
 sends it — comparing before the idempotency lookup like every other
 mutation.
 
+## Clear guard and finalized attempts (since v0.9.1)
+
+Two legacy replies change so that both paths agree with the operator
+contract:
+
+- `errors reset` (and its alias `consecutive-errors reset`) is rejected
+  with exit 1 while the consecutive-error guard is already clear (the
+  count is 0). Nothing is recorded and the request ID stays reusable. It
+  used to commit a `completed` no-op with exit 0. A count above 0, or one
+  that cannot be read, still resets and completes.
+- `recovery retry <attempt>` for an attempt that is already finalized
+  commits a `completed` no-op with exit 0, with an effect saying nothing
+  remained to retry. It used to be rejected with exit 1.
+  `recovery release` for such an attempt stays rejected.
+
+`recovery retry` and `recovery release` for an attempt ID that no retained
+or recorded attempt has stay rejected with exit 1 here; with `--contract`
+the error code is `not_found` (exit 5).
+
 ## Exit codes
 
 - `0`: committed. The reply above is on stdout.

@@ -15,6 +15,7 @@ from simple_coding_agent.finalization import AttemptCompletionStore
 from simple_coding_agent.github_tracker import Assignment, Claim, TrackerIssue
 from simple_coding_agent.lifecycle import AgentLifecycle, LifecycleStatus
 from simple_coding_agent.recovery import (
+    RecoveryAttemptNotFoundError,
     RecoveryRejectedError,
     parse_attempt_id,
     parse_saved_at,
@@ -249,30 +250,27 @@ def test_retry_clears_the_hold_and_finalizes_once(tmp_path: Path) -> None:
     assert len(AttemptCompletionStore(tmp_path).read_all()) == 1
 
 
-def test_retry_rejects_unknown_mismatched_and_finalized_ids(tmp_path: Path) -> None:
-    checkpoint = start_checkpoint(tmp_path)
-    assert checkpoint is not None
-    lifecycle, _, _, _, store = make_lifecycle(tmp_path)
+def _empty_lifecycle(root: Path) -> AgentLifecycle:
+    """A lifecycle with no retained attempt and an empty completion ledger."""
 
-    with pytest.raises(RecoveryRejectedError, match="does not match"):
-        lifecycle.submit_recovery_retry("req-bad", "mismatched-id")
-    with pytest.raises(RecoveryRejectedError, match="unknown attempt"):
-        AgentLifecycle(
-            tracker=_default_tracker(),
-            attempt_state=AttemptStateStore(tmp_path.parent / "empty"),
-            workspace=InMemoryWorkspace(tmp_path.parent / "empty-workspace", issue_number=24),
-            profile_loader=lambda _: type("Profile", (), {"base_branch": "main"})(),
-            publisher=FakePublisher(),
-            control_store=ControlStore(tmp_path.parent / "empty"),
-            completion_store=AttemptCompletionStore(tmp_path.parent / "empty"),
-            sleeper=lambda seconds: None,
-        ).submit_recovery_retry("req-unknown", "no-such-attempt")
+    return AgentLifecycle(
+        tracker=_default_tracker(),
+        attempt_state=AttemptStateStore(root),
+        workspace=InMemoryWorkspace(root / "workspace", issue_number=24),
+        profile_loader=lambda _: type("Profile", (), {"base_branch": "main"})(),
+        publisher=FakePublisher(),
+        control_store=ControlStore(root),
+        completion_store=AttemptCompletionStore(root),
+        sleeper=lambda seconds: None,
+    )
 
-    lifecycle.submit_recovery_retry("req-ok", checkpoint.started_at)
-    assert store.get_command("req-ok") is not None  # sanity: retry cleared it
-    # A leftover checkpoint whose ID is already in the ledger (crash between
-    # finalization and checkpoint removal) is finalized: rejected, never
-    # re-executed. Simulate it with a fresh checkpoint + manual ledger entry.
+
+def _leftover_finalized_checkpoint(tmp_path: Path):
+    """A checkpoint whose ID is already in the ledger.
+
+    Simulates a crash between finalization and checkpoint removal.
+    """
+
     leftover = AttemptStateStore(tmp_path).start(issue_number=24, branch="agent/issue-24")
     AttemptCompletionStore(tmp_path).record(
         attempt_id=leftover.started_at,
@@ -280,11 +278,155 @@ def test_retry_rejects_unknown_mismatched_and_finalized_ids(tmp_path: Path) -> N
         branch="agent/issue-24",
         outcome=AttemptOutcome.INFRASTRUCTURE_ERROR,
     )
-    with pytest.raises(RecoveryRejectedError, match="already finalized"):
-        lifecycle.submit_recovery_retry("req-again", leftover.started_at)
+    return leftover
 
+
+def test_recovery_answers_not_found_for_ids_no_attempt_ever_had(tmp_path: Path) -> None:
+    checkpoint = start_checkpoint(tmp_path)
+    assert checkpoint is not None
+    lifecycle, _, _, _, store = make_lifecycle(tmp_path)
+
+    # An ID that differs from the retained attempt and is in no ledger.
+    with pytest.raises(RecoveryAttemptNotFoundError, match="does not match"):
+        lifecycle.submit_recovery_retry("req-bad", "mismatched-id")
+    with pytest.raises(RecoveryAttemptNotFoundError, match="does not match"):
+        lifecycle.submit_recovery_release("req-bad-release", "mismatched-id", "s3://b/w")
+    # No retained attempt at all.
+    empty_root = tmp_path.parent / "empty"
+    empty = _empty_lifecycle(empty_root)
+    with pytest.raises(RecoveryAttemptNotFoundError, match="unknown attempt"):
+        empty.submit_recovery_retry("req-unknown", "no-such-attempt")
+    with pytest.raises(RecoveryAttemptNotFoundError, match="unknown attempt"):
+        empty.submit_recovery_release("req-unknown-release", "no-such-attempt", "s3://b/w")
+
+    # Nothing is stored, so every request ID stays reusable.
     assert store.get_command("req-bad") is None
-    assert store.get_command("req-again") is None
+    assert store.get_command("req-bad-release") is None
+    empty_store = ControlStore(empty_root)
+    assert empty_store.get_command("req-unknown") is None
+    assert empty_store.get_command("req-unknown-release") is None
+    assert AttemptStateStore(tmp_path).read() == checkpoint
+
+
+def test_retry_on_a_finalized_attempt_completes_without_changing_anything(
+    tmp_path: Path,
+) -> None:
+    checkpoint = start_checkpoint(tmp_path, AttemptPhase.PUSHING)
+    assert checkpoint is not None
+    lifecycle, tracker, _, publisher, store = make_lifecycle(tmp_path)
+    lifecycle.submit_recovery_retry("req-finalize", checkpoint.started_at)
+    ledger = AttemptCompletionStore(tmp_path)
+    recorded = ledger.read_all()
+    assert list(recorded) == [checkpoint.started_at]
+    cleanup = list(tracker.cleanup)
+    requests = list(publisher.requests)
+    comments = {number: list(rows) for number, rows in tracker.comments.items()}
+    intake = store.intake_state()
+
+    record = lifecycle.submit_recovery_retry("req-noop", checkpoint.started_at)
+
+    assert record.kind == "recovery_retry"
+    assert record.acknowledgement is CommandAcknowledgement.COMPLETED
+    assert "nothing remained to retry" in record.detail
+    stored = store.get_command_with_payload("req-noop")
+    assert stored is not None
+    assert stored[1] == {"attempt_id": checkpoint.started_at}
+    # The recorded outcome and every side effect stay as they were.
+    assert ledger.read_all() == recorded
+    assert tracker.cleanup == cleanup
+    assert publisher.requests == requests
+    assert tracker.comments == comments
+    assert store.intake_state() is intake
+    assert AttemptStateStore(tmp_path).read() is None
+
+    replay = lifecycle.submit_recovery_retry("req-noop", checkpoint.started_at)
+
+    assert replay.sequence == record.sequence
+    assert replay.acknowledgement is CommandAcknowledgement.COMPLETED
+    assert replay.detail == record.detail
+    assert ledger.read_all() == recorded
+
+
+def test_retry_on_a_finalized_attempt_completes_beside_another_retained_attempt(
+    tmp_path: Path,
+) -> None:
+    lifecycle, _, _, _, store = make_lifecycle(tmp_path)
+    AttemptCompletionStore(tmp_path).record(
+        attempt_id="finished-earlier",
+        issue_number=23,
+        branch="agent/issue-23",
+        outcome=AttemptOutcome.COMPLETE,
+    )
+    retained = start_checkpoint(tmp_path)
+
+    record = lifecycle.submit_recovery_retry("req-earlier", "finished-earlier")
+
+    assert record.acknowledgement is CommandAcknowledgement.COMPLETED
+    assert AttemptStateStore(tmp_path).read() == retained
+    assert store.get_command("req-earlier") is not None
+
+
+def test_retry_on_a_leftover_finalized_checkpoint_completes_as_a_no_op(
+    tmp_path: Path,
+) -> None:
+    lifecycle, tracker, _, publisher, store = make_lifecycle(tmp_path)
+    leftover = _leftover_finalized_checkpoint(tmp_path)
+
+    record = lifecycle.submit_recovery_retry("req-again", leftover.started_at)
+
+    # Finalized: completed as a no-op, never re-executed.
+    assert record.acknowledgement is CommandAcknowledgement.COMPLETED
+    assert "nothing remained to retry" in record.detail
+    # The leftover checkpoint is untouched and the detail says it still holds.
+    assert "leftover checkpoint still holds intake" in record.detail
+    assert AttemptStateStore(tmp_path).read() == leftover
+    assert publisher.requests == []
+    assert tracker.cleanup == []
+    assert len(AttemptCompletionStore(tmp_path).read_all()) == 1
+    assert store.get_command("req-again") is not None
+
+
+def test_retry_resolves_an_accepted_record_whose_attempt_finalized_meanwhile(
+    tmp_path: Path,
+) -> None:
+    lifecycle, tracker, _, publisher, store = make_lifecycle(tmp_path)
+    AttemptCompletionStore(tmp_path).record(
+        attempt_id="finished-meanwhile",
+        issue_number=24,
+        branch="agent/issue-24",
+        outcome=AttemptOutcome.COMPLETE,
+    )
+    # A previous process accepted the retry and stopped before finishing it.
+    accepted = store.submit_recovery_retry("req-accepted", "finished-meanwhile")
+    assert accepted.acknowledgement is CommandAcknowledgement.ACCEPTED
+
+    record = lifecycle.submit_recovery_retry("req-accepted", "finished-meanwhile")
+
+    assert record.sequence == accepted.sequence
+    assert record.acknowledgement is CommandAcknowledgement.COMPLETED
+    assert "nothing remained to retry" in record.detail
+    assert "leftover checkpoint" not in record.detail
+    assert publisher.requests == []
+    assert tracker.cleanup == []
+
+
+def test_release_of_a_finalized_attempt_stays_rejected(tmp_path: Path) -> None:
+    lifecycle, tracker, _, _, store = make_lifecycle(tmp_path)
+    leftover = _leftover_finalized_checkpoint(tmp_path)
+
+    with pytest.raises(RecoveryRejectedError, match="already finalized") as leftover_error:
+        lifecycle.submit_recovery_release("req-rel", leftover.started_at, "s3://b/w")
+    assert not isinstance(leftover_error.value, RecoveryAttemptNotFoundError)
+
+    # The same holds once no checkpoint remains for the finalized attempt.
+    AttemptStateStore(tmp_path).delete()
+    with pytest.raises(RecoveryRejectedError, match="already finalized") as gone_error:
+        lifecycle.submit_recovery_release("req-rel-gone", leftover.started_at, "s3://b/w")
+    assert not isinstance(gone_error.value, RecoveryAttemptNotFoundError)
+
+    assert store.get_command("req-rel") is None
+    assert store.get_command("req-rel-gone") is None
+    assert tracker.comments == {}
 
 
 def test_retry_rejected_while_reconciliation_is_running(tmp_path: Path) -> None:

@@ -477,13 +477,17 @@ class ControlServer:
         )
 
     def _reply_errors_reset(self, connection: socket.socket, request: dict) -> None:
-        from simple_coding_agent.control import PayloadMismatchError, RequestIdError
+        from simple_coding_agent.control import (
+            ErrorsResetRejectedError,
+            PayloadMismatchError,
+            RequestIdError,
+        )
 
         _reply_mutating(
             connection,
             request,
             self._control.submit_errors_reset,
-            rejected=(RequestIdError, PayloadMismatchError),
+            rejected=(RequestIdError, PayloadMismatchError, ErrorsResetRejectedError),
             repository=self._repository(),
             check_expect_repo=True,
             control=self._control,
@@ -1114,12 +1118,17 @@ def _rejection_kind(error: Exception) -> str:
         RequestIdError,
         StopAfterRejectedError,
     )
-    from simple_coding_agent.recovery import RecoveryRejectedError
+    from simple_coding_agent.recovery import (
+        RecoveryAttemptNotFoundError,
+        RecoveryRejectedError,
+    )
 
     if isinstance(error, PayloadMismatchError):
         return "payload_mismatch"
     if isinstance(error, RequestIdError):
         return "invalid_argument"
+    if isinstance(error, RecoveryAttemptNotFoundError):
+        return "not_found"
     if isinstance(
         error, (StopAfterRejectedError, NextIssueRejectedError, RecoveryRejectedError)
     ) and str(error).startswith("Invalid"):

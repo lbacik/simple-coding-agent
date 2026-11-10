@@ -114,7 +114,9 @@ def make_lifecycle(
     tracker: FakeTracker,
     runner=None,
     publisher=None,
+    error_store=None,
 ):
+    from simple_coding_agent.finalization import AttemptCompletionStore
     from simple_coding_agent.lifecycle import AgentLifecycle
 
     if runner is None:
@@ -132,6 +134,8 @@ def make_lifecycle(
         publisher=publisher if publisher is not None else FakePublisher(),
         attempt_runner=runner,
         control_store=store,
+        completion_store=AttemptCompletionStore(tmp_path),
+        error_store=error_store,
         repository=REPOSITORY,
         telemetry=make_reporter(),
         sleeper=lambda seconds: None,
@@ -145,8 +149,9 @@ def start_server(
     monkeypatch: pytest.MonkeyPatch,
     runner=None,
     publisher=None,
+    error_store=None,
 ):
-    lifecycle, store = make_lifecycle(tmp_path, tracker, runner, publisher)
+    lifecycle, store = make_lifecycle(tmp_path, tracker, runner, publisher, error_store)
     socket_path = tmp_path / "state" / "contract-remaining.sock"
     server = ControlServer(socket_path, lifecycle)  # type: ignore[arg-type]
     server.start()
@@ -563,7 +568,7 @@ def test_handoff_now_not_fulfilled_with_work_retained(
 # ---------------------------------------------------------------------------
 
 
-def test_recovery_retry_unknown_attempt_is_rejected_without_storage(
+def test_recovery_retry_unknown_attempt_is_not_found_without_storage(
     command_server,
 ) -> None:
     _, _, _ = command_server
@@ -571,10 +576,11 @@ def test_recovery_retry_unknown_attempt_is_rejected_without_storage(
         _mutation(["recovery", "retry", "no-such-attempt"], request_id="req-rec-unknown")
     )
     assert err == ""
-    assert code == 1
+    assert code == 5
     error = _error(envelope)
-    assert error["code"] == "rejected"
+    assert error["code"] == "not_found"
     assert error["retryable"] is False
+    assert error["request_id"] == "req-rec-unknown"
 
     lookup_code, lookup_envelope, _, _ = _run(
         ["--contract", "1", "command", "req-rec-unknown"]
@@ -637,7 +643,9 @@ def test_recovery_retry_not_fulfilled_is_stored_replayable_and_durable(
         server3.stop()
 
 
-def test_recovery_release_rejected_for_unknown_attempt(command_server) -> None:
+def test_recovery_release_unknown_attempt_is_not_found_without_storage(
+    command_server,
+) -> None:
     _, _, _ = command_server
     code, envelope, _, err = _run(
         _mutation(
@@ -646,8 +654,72 @@ def test_recovery_release_rejected_for_unknown_attempt(command_server) -> None:
         )
     )
     assert err == ""
-    assert code == 1
-    assert _error(envelope)["code"] == "rejected"
+    assert code == 5
+    assert _error(envelope)["code"] == "not_found"
+
+    lookup_code, lookup_envelope, _, _ = _run(
+        ["--contract", "1", "command", "req-rel-unknown"]
+    )
+    assert lookup_code == 5
+    assert lookup_envelope["error"]["code"] == "not_found"
+
+
+def _finalized_attempt(tmp_path: Path) -> str:
+    from simple_coding_agent.finalization import AttemptCompletionStore
+
+    AttemptCompletionStore(tmp_path).record(
+        attempt_id="finished-attempt",
+        issue_number=24,
+        branch="agent/issue-24",
+        outcome=AttemptOutcome.COMPLETE,
+    )
+    return "finished-attempt"
+
+
+def test_recovery_retry_of_a_finalized_attempt_completes_and_replays(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    attempt_id = _finalized_attempt(tmp_path)
+    server, _, _ = start_server(tmp_path, FakeTracker(), monkeypatch)
+    try:
+        argv = _mutation(["recovery", "retry", attempt_id], request_id="req-rec-noop")
+        code, envelope, _, err = _run(argv)
+        assert err == "", err
+        assert code == 0
+        submitted = _result(envelope)
+        assert submitted["command"]["kind"] == "recovery_retry"
+        assert submitted["command"]["acknowledgement"] == "completed"
+        assert submitted["command"]["arguments"] == {"attempt_id": attempt_id}
+        assert submitted["replayed"] is False
+
+        replay_code, replay_envelope, _, _ = _run(argv)
+        assert replay_code == 0
+        replayed = _result(replay_envelope)
+        assert replayed["replayed"] is True
+        assert replayed["command"]["sequence"] == submitted["command"]["sequence"]
+    finally:
+        server.stop()
+
+
+def test_recovery_release_of_a_finalized_attempt_stays_rejected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    attempt_id = _finalized_attempt(tmp_path)
+    server, _, _ = start_server(tmp_path, FakeTracker(), monkeypatch)
+    try:
+        code, envelope, _, err = _run(
+            _mutation(
+                ["recovery", "release", attempt_id, "--saved-at", "s3://bucket/work"],
+                request_id="req-rel-finalized",
+            )
+        )
+        assert err == ""
+        assert code == 1
+        error = _error(envelope)
+        assert error["code"] == "rejected"
+        assert "already finalized" in error["message"]
+    finally:
+        server.stop()
 
 
 def test_recovery_release_stores_saved_at_echoes_it_and_survives_restart(
@@ -742,6 +814,41 @@ def test_errors_reset_completes_and_replays(command_server) -> None:
     replayed = _result(replay_envelope)
     assert replayed["replayed"] is True
     assert replayed["command"]["sequence"] == first["command"]["sequence"]
+
+
+def test_errors_reset_on_a_clear_guard_is_rejected_without_storage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from simple_coding_agent.operating import ConsecutiveErrorStore
+
+    error_store = ConsecutiveErrorStore(tmp_path)
+    server, _, store = start_server(
+        tmp_path, FakeTracker(), monkeypatch, error_store=error_store
+    )
+    try:
+        argv = _mutation(["errors", "reset"], request_id="req-errors-clear")
+        code, envelope, _, err = _run(argv)
+        assert err == ""
+        assert code == 1
+        error = _error(envelope)
+        assert error["code"] == "rejected"
+        assert "already clear" in error["message"]
+        assert store.get_command("req-errors-clear") is None
+
+        # The request ID stays reusable once there is something to reset.
+        error_store.record(AttemptOutcome.INFRASTRUCTURE_ERROR, "attempt-a")
+        code, envelope, _, _ = _run(argv)
+        assert code == 0
+        assert _result(envelope)["command"]["acknowledgement"] == "completed"
+        assert error_store.read().count == 0
+
+        spent_code, spent_envelope, _, _ = _run(
+            _mutation(["errors", "reset"], request_id="req-errors-spent")
+        )
+        assert spent_code == 1
+        assert _error(spent_envelope)["code"] == "rejected"
+    finally:
+        server.stop()
 
 
 # ---------------------------------------------------------------------------

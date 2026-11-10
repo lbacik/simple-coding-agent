@@ -33,6 +33,7 @@ from simple_coding_agent.control import (
     CommandRecord,
     ControlStore,
     ControlStoreError,
+    ErrorsResetRejectedError,
     HANDOFF_ABSOLUTE_DEADLINE_SECONDS,
     HANDOFF_PUBLICATION_ALLOWANCE_SECONDS,
     IntakeState,
@@ -1983,14 +1984,20 @@ class AgentLifecycle:
 
         The command runs through the live channel with a durable request ID.
         It never invokes the model, renews a handoff deadline, or overwrites
-        ambiguous or conflicting evidence. Unknown, mismatched,
-        already-finalized, or concurrently changing attempt IDs are rejected
-        without a control change. On success the hold is cleared and the
-        command completes; otherwise the remaining reason is reported and
-        intake stays blocked.
+        ambiguous or conflicting evidence. Unknown or concurrently changing
+        attempt IDs are rejected without a control change. On success the
+        hold is cleared and the command completes; otherwise the remaining
+        reason is reported and intake stays blocked.
+
+        An attempt recorded as finalized has nothing left to retry: the
+        command is committed as ``completed`` and changes nothing else (the
+        recorded outcome, archive, labels, and intake stay as they were).
         """
 
-        from simple_coding_agent.recovery import parse_attempt_id
+        from simple_coding_agent.recovery import (
+            RecoveryAlreadyFinalizedError,
+            parse_attempt_id,
+        )
 
         if self._control_store is None:
             raise ControlStoreError("Operator control is not configured")
@@ -2014,11 +2021,32 @@ class AgentLifecycle:
                 # An accepted record for the same ID means this process already
                 # accepted it but never finished: fall through and finish it
                 # once instead of recording twice.
-                checkpoint = self._validated_recovery_checkpoint_locked(parsed)
+                try:
+                    checkpoint = self._validated_recovery_checkpoint_locked(parsed)
+                except RecoveryAlreadyFinalizedError:
+                    # Finalized in the meantime: resolve the accepted record.
+                    completed = store.complete_recovery_command(
+                        request_id, self._finalized_retry_detail_locked(parsed)
+                    )
+                    resolved = (
+                        completed if completed is not None else store.get_command(request_id)
+                    )
+                    return self._record_command_commit(
+                        resolved if resolved is not None else record
+                    )
                 self._attempt_processing = True
                 self._recovery_executing = True
             else:
-                checkpoint = self._validated_recovery_checkpoint_locked(parsed)
+                try:
+                    checkpoint = self._validated_recovery_checkpoint_locked(parsed)
+                except RecoveryAlreadyFinalizedError:
+                    return self._record_command_commit(
+                        store.submit_recovery_retry(
+                            request_id,
+                            parsed,
+                            completed_detail=self._finalized_retry_detail_locked(parsed),
+                        )
+                    )
                 record = store.submit_recovery_retry(request_id, parsed)
                 self._emit_command_accepted(record)
                 self._attempt_processing = True
@@ -2112,18 +2140,49 @@ class AgentLifecycle:
                 self._emit_command_resolved(resolved)
             return resolved  # type: ignore[return-value]
 
+    def _finalized_retry_detail_locked(self, attempt_id: str) -> str:
+        """The detail of a ``recovery retry`` that found its attempt finalized.
+
+        Caller holds the control lock. A leftover checkpoint for the
+        finalized attempt (a crash between finalization and checkpoint
+        removal) is left alone and named, so the operator is not told the
+        hold is gone while it still blocks intake.
+        """
+
+        detail = (
+            f"attempt {attempt_id} is already finalized;"
+            " nothing remained to retry and nothing was changed"
+        )
+        try:
+            checkpoint = self._attempt_state.read()
+        except AttemptStateError:
+            return detail
+        if checkpoint is not None and checkpoint.started_at == attempt_id:
+            detail += (
+                "; its leftover checkpoint still holds intake until startup"
+                " reconciliation removes it at the next restart"
+            )
+        return detail
+
     def _validated_recovery_checkpoint_locked(
         self, attempt_id: str
     ) -> AttemptCheckpoint:
         """Return the retained checkpoint for ``attempt_id`` or reject the command.
 
-        Caller holds the control lock. Rejections cover unknown IDs (no
-        checkpoint, or a workspace hold without a recoverable identity),
-        mismatched identities, already-finalized attempts, and attempts that
-        are concurrently changing (startup reconciliation or active work).
+        Caller holds the control lock. Rejections cover attempts that are
+        concurrently changing (startup reconciliation or active work), an
+        unreadable checkpoint or completion ledger, and a workspace hold
+        without a recoverable identity. An ID recorded as finalized raises
+        :class:`RecoveryAlreadyFinalizedError`; an ID that matches neither
+        the retained attempt nor any recorded attempt raises
+        :class:`RecoveryAttemptNotFoundError`.
         """
 
-        from simple_coding_agent.recovery import RecoveryRejectedError
+        from simple_coding_agent.recovery import (
+            RecoveryAlreadyFinalizedError,
+            RecoveryAttemptNotFoundError,
+            RecoveryRejectedError,
+        )
 
         if self._recovering:
             raise RecoveryRejectedError(
@@ -2144,40 +2203,41 @@ class AgentLifecycle:
                 f"Recovery is rejected: the attempt checkpoint cannot be read ({error})."
                 " No control change was accepted."
             ) from error
-        if checkpoint is None:
-            if self._workspace_is_dirty():
-                raise RecoveryRejectedError(
-                    "Recovery is rejected: the working tree holds unexplained"
-                    " dirty or untracked work with no recoverable attempt"
-                    " identity; manual repair is required before intake."
-                    " No control change was accepted."
-                )
+        if checkpoint is None and self._workspace_is_dirty():
             raise RecoveryRejectedError(
-                f"Recovery is rejected: unknown attempt ID {attempt_id!r};"
-                " no retained attempt matches it."
+                "Recovery is rejected: the working tree holds unexplained"
+                " dirty or untracked work with no recoverable attempt"
+                " identity; manual repair is required before intake."
                 " No control change was accepted."
             )
-        if checkpoint.started_at != attempt_id:
-            raise RecoveryRejectedError(
-                f"Recovery is rejected: attempt ID {attempt_id!r} does not match"
-                f" the retained attempt {checkpoint.started_at!r} for issue"
-                f" #{checkpoint.issue_number}. No control change was accepted."
-            )
+        finalized = False
         if self._completion_store is not None:
             try:
-                if self._completion_store.is_finalized(attempt_id):
-                    raise RecoveryRejectedError(
-                        f"Recovery is rejected: attempt {attempt_id!r} is already"
-                        " finalized; no retained work remains."
-                        " No control change was accepted."
-                    )
-            except RecoveryRejectedError:
-                raise
+                finalized = self._completion_store.is_finalized(attempt_id)
             except Exception as error:
                 raise RecoveryRejectedError(
                     f"Recovery is rejected: the completion ledger cannot be read ({error})."
                     " No control change was accepted."
                 ) from error
+        if finalized:
+            raise RecoveryAlreadyFinalizedError(
+                f"Recovery is rejected: attempt {attempt_id!r} is already"
+                " finalized; no retained work remains."
+                " No control change was accepted."
+            )
+        if checkpoint is None:
+            raise RecoveryAttemptNotFoundError(
+                f"Recovery is rejected: unknown attempt ID {attempt_id!r};"
+                " no retained or recorded attempt matches it."
+                " No control change was accepted."
+            )
+        if checkpoint.started_at != attempt_id:
+            raise RecoveryAttemptNotFoundError(
+                f"Recovery is rejected: unknown attempt ID {attempt_id!r};"
+                f" it does not match the retained attempt {checkpoint.started_at!r}"
+                f" for issue #{checkpoint.issue_number} or any recorded attempt."
+                " No control change was accepted."
+            )
         return checkpoint
 
     def _recovery_hold_locked(
@@ -3985,6 +4045,10 @@ class AgentLifecycle:
         acknowledgement without touching the counter again. The reset
         applies immediately even with an active attempt: it only changes
         the counter the next terminal outcome is compared against.
+
+        A readable count of 0 means the guard is already clear: the reset
+        is rejected with nothing stored and nothing logged, so the request
+        ID stays reusable. An unreadable count still resets.
         """
 
         if self._control_store is None:
@@ -4000,6 +4064,14 @@ class AgentLifecycle:
             if existing is not None:
                 return self._record_command_commit(store.submit_errors_reset(request_id))
             previous_count = self._consecutive_error_count_or_none()
+            if previous_count == 0:
+                # An invalid request ID keeps its own rejection reason.
+                _check_recovery_request_id(request_id)
+                raise ErrorsResetRejectedError(
+                    "Errors reset is rejected: the consecutive-error guard is"
+                    " already clear (the count is 0)."
+                    " No control change was accepted."
+                )
             self._reset_consecutive_errors()
             record = store.submit_errors_reset(
                 request_id, previous_count=previous_count
