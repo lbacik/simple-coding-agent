@@ -6,7 +6,7 @@ the production image. The producer suite invokes it as
 reply from stdout, in the same style as ``agentctl`` (operator contract
 §15.1). It wires the real lifecycle to the shared test fakes (fake GitHub
 and fake model execution from ``tests/fakes.py`` — never copies) and
-implements the fourteen harness verbs so the suite can bring the instance
+implements every harness protocol 1.1 verb so the suite can bring the instance
 into every state it tests.
 
 Local use::
