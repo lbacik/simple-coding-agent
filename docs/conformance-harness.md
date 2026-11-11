@@ -66,8 +66,10 @@ between two harness verbs:
   outcome names its attempt and that attempt consumes it, so no stale
   outcome can finish a later attempt.
 - **`after-outcome` pauses finalization with the outcome recorded.** The
-  hold takes effect right after the engine emits `outcome_recorded`: the
-  outcome is in the archive record, the attempt is still active and its
+  hold takes effect right after the engine emits `outcome_recorded`, which
+  it does as soon as publication decides the verdict (ADR 0010): the
+  verdict is in the checkpoint and the outcome in the archive record, the
+  result comment is not yet confirmed, the attempt is still active and its
   archive unsealed. `finish-attempt` returns once the engine waits there.
   The next `release` lets finalization run on and returns once `status`
   shows the attempt finished, so its `sealed` event is already there.

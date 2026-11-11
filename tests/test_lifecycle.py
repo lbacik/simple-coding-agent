@@ -190,12 +190,16 @@ def test_stops_after_the_persisted_consecutive_infrastructure_error_limit(tmp_pa
         "issue_claimed",
         "workspace_prepared_for_profile_read",
         "attempt_exception",
+        # The verdict is announced when publication decides it (ADR 0010),
+        # before finalization reaches the error limit.
+        "outcome_recorded",
         "consecutive_error_limit_reached",
         "halted",
     ]
     assert events[3][1] == "OSError: profile is missing"
     assert events[3][2] == 24
-    assert events[4][2] == 24
+    assert events[4][1] == "outcome=infrastructure_error"
+    assert events[5][2] == 24
     assert ConsecutiveErrorStore(tmp_path).read().count == 1
 
 

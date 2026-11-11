@@ -653,6 +653,9 @@ def test_failed_handoff_retains_everything_and_blocks_claims_until_recovery(
     with pytest.raises(ResumeBlockedError):
         lifecycle.submit_resume("req-resume")
     assert store.intake_state() is IntakeState.STOPPED
+    # The production publisher marks the attempt publishing before it opens
+    # the pull request of a complete verdict; the fake publisher does not.
+    _mark_publishing(AttemptStateStore(tmp_path))
     # Recovery can still finish the retained attempt exactly once.
     retry = lifecycle.submit_recovery_retry(
         "req-retry", AttemptStateStore(tmp_path).read().started_at
@@ -1546,3 +1549,13 @@ def test_format_status_renders_the_original_handoff_deadlines() -> None:
     assert "2026-09-22T12:00:00Z" in text
     assert "2026-09-22T12:04:00Z" in text
     assert "2026-09-22T12:06:00Z" in text
+
+
+def _mark_publishing(state: AttemptStateStore) -> None:
+    """Advance the retained checkpoint to publishing, as publication would."""
+
+    order = list(AttemptPhase)
+    checkpoint = state.read()
+    assert checkpoint is not None
+    for phase in order[order.index(checkpoint.phase) + 1 :]:
+        state.transition(phase)
