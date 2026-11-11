@@ -7,7 +7,8 @@ fakes (``FakeGitHub`` per issue plus ``FakeModelExecutor`` from
 the contract on a Unix control socket. The host-side harness CLI
 (:mod:`conformance_harness.harness`) steers this process through flag
 files: holds, one-shot crashes, scripted native outcomes, halt requests,
-the deferred-publication one-shot, the claim gate and the engine lock.
+the deferred-publication and failed-finalization one-shots, the claim gate
+and the engine lock.
 
 The engine advances only when a harness verb asks it to, as the contract's
 reference stub producer does: a Claim opens only through the gate that
@@ -39,6 +40,7 @@ from conformance_harness.harness import (
     CLAIM_GATE,
     CLAIM_GATE_RESULT,
     ENGINE_LOCK_HELD,
+    FAILED_FINALIZATION,
     RECOVERY_HOLD,
     STARTUP_HOLD,
     STARTUP_RECONCILED,
@@ -610,6 +612,34 @@ class GatedPublisher:
         return getattr(self._inner, name)
 
 
+class FinalizationFailingTransport:
+    """Fail the publisher's next comment when ``fail-finalization`` armed it.
+
+    Wraps the transport only the publisher uses. The armed one-shot makes
+    the next ``add_comment`` raise, as an unavailable GitHub would. For a
+    finishing attempt that is its result comment: the publisher reports it
+    unconfirmed, and the engine keeps the attempt as a Retained Attempt for
+    ``recovery retry`` or ``recovery release`` (spec section 14). Every
+    other call is delegated unchanged.
+    """
+
+    def __init__(self, inner: object, flags: Path) -> None:
+        self._inner = inner
+        self._flags = flags
+
+    def add_comment(self, repository: str, issue_number: int, body: str) -> None:
+        armed = self._flags / FAILED_FINALIZATION
+        if armed.exists():
+            # Disarm before failing; an unlink error propagates (the post
+            # fails either way) rather than leaving the one-shot armed.
+            armed.unlink(missing_ok=True)
+            raise ConnectionError("harness fail-finalization: the result comment failed")
+        self._inner.add_comment(repository, issue_number, body)
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self.__dict__["_inner"], name)
+
+
 class GateProxy:
     """Serialize control mutations with the harness engine lock and crash gate.
 
@@ -884,7 +914,7 @@ def _build_engine(
     publisher = GatedPublisher(
         Publisher(
             workspace,
-            transport,
+            FinalizationFailingTransport(transport, flags),
             repository,
             attempt_state=attempt_state,
             sleeper=lambda _: None,

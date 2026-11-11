@@ -9,8 +9,9 @@ parameters are usage errors.
 
 ## Verbs
 
-Fourteen verbs, all implemented against the real `AgentLifecycle` wired to
-the shared test fakes (`tests/fakes.py` — reused, never copied):
+Every verb of harness protocol 1.1, all implemented against the real
+`AgentLifecycle` wired to the shared test fakes (`tests/fakes.py` —
+reused, never copied):
 
 - `setup` — create a fresh state volume and start the fakes-wired engine.
   Reports the six discovery facts (container, image, volumes, exec user,
@@ -38,6 +39,11 @@ the shared test fakes (`tests/fakes.py` — reused, never copied):
 - `grow-archive` — append bytes to the newest file of an unsealed archive:
   the one of the given contract Attempt ID, or of the active attempt.
 - `defer-publication` — arm the one-shot deferred-publication crash.
+- `fail-finalization` — arm a one-shot failure at the next attempt's
+  finalization boundary: the next comment the publisher posts (its result
+  comment) fails, as an unavailable GitHub would, so the engine keeps it
+  as a Retained Attempt (see below). `finish-attempt` on a Retained
+  Attempt is `failed`: it is no longer active.
 
 `setup` answers `unsupported` naming an unknown Operator Capability, and
 `finish-attempt` answers `unsupported` naming an unknown native outcome.
@@ -69,6 +75,11 @@ between two harness verbs:
   the file lock, the daemon holds `AgentLifecycle`'s control lock for it.
   So `status` serves the engine's last prepared snapshot (spec §14, ADR
   0009), and mutations wait for the hold to end.
+- **A failed finalization retains the attempt in a running engine.** After
+  `fail-finalization`, `finish-attempt` returns once the attempt is a
+  Retained Attempt: still the `current_attempt`, `instance.state` is
+  `recovering`, its archive is unsealed with `attention_required`, and no
+  Claim opens until `recovery retry` or `recovery release` decides it.
 - **Restarts hold `starting`, then `recovering`.** `start-container`
   keeps the engine `starting` until `release`. If the previous engine left
   an attempt behind, startup reconciliation then waits in `recovering`

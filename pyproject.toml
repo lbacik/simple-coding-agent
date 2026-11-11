@@ -10,7 +10,7 @@ requires-python = ">=3.11"
 dependencies = [
     # Not on PyPI: a direct reference so both pip (the Docker image) and uv
     # resolve the pinned tag; this is the only place the version is pinned.
-    "agent-operator-contract @ git+https://github.com/lbacik/agent-operator-contract@v1.0.1",
+    "agent-operator-contract @ git+https://github.com/lbacik/agent-operator-contract@v1.0.3",
     "claude-agent-sdk==0.2.179",
     "python-dotenv==1.2.4",
     "PyYAML>=6.0,<7",

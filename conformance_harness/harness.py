@@ -13,11 +13,12 @@ The harness manages one current instance at a time under
 (the real lifecycle against the shared test fakes from ``tests/fakes.py``);
 ``teardown`` stops it and removes the volume.
 
-Supported verbs: all fourteen. ``unsupported`` answers name what the engine
-cannot do: ``capability`` (a requested Operator Capability the fixed engine
+Supported verbs: every verb of harness protocol 1.1. ``unsupported``
+answers name what the engine cannot do: ``capability`` (a requested Operator Capability the fixed engine
 set does not advertise) and ``native-outcome`` (a ``finish-attempt``
 outcome the engine has no notion of). Every hold point, crash point, verb
-and the ``defer-publication`` one-shot are supported.
+and the ``defer-publication`` and ``fail-finalization`` one-shots are
+supported.
 
 Docker mode (``SCA_HARNESS_DOCKER=1``) runs the same verbs inside a
 container for the external producer suite, which speaks to the producer
@@ -47,7 +48,7 @@ import uuid
 from pathlib import Path
 
 
-HARNESS_VERSION = "1.0"
+HARNESS_VERSION = "1.1"
 
 VERBS = (
     "setup",
@@ -64,6 +65,7 @@ VERBS = (
     "halt",
     "grow-archive",
     "defer-publication",
+    "fail-finalization",
 )
 
 _HOLD_POINTS = ("before-claim", "after-claim", "native-phase", "after-outcome")
@@ -103,6 +105,9 @@ STARTUP_HOLD = "startup_hold"
 RECOVERY_HOLD = "recovery_hold"
 #: Written once the first engine iteration after startup has returned.
 STARTUP_RECONCILED = "startup_reconciled"
+#: Armed by ``fail-finalization``: the next result comment fails to post, so
+#: the finishing attempt becomes a Retained Attempt (spec section 14).
+FAILED_FINALIZATION = "failed_finalization"
 #: Written by the daemon while finalization waits in an ``after-outcome``
 #: hold; names the held attempt for ``finish-attempt`` and ``release``.
 AFTER_OUTCOME_HELD = "after_outcome_held.json"
@@ -151,6 +156,7 @@ def _paths(root: Path) -> dict[str, Path]:
         "scripted_outcome": root / "flags" / "scripted_outcome.json",
         "halt_request": root / "flags" / "halt_request.json",
         "deferred_publication": root / "flags" / "deferred_publication",
+        "failed_finalization": root / "flags" / FAILED_FINALIZATION,
         "pending_publication": root / "flags" / "pending_publication.json",
         "engine_lock": root / "flags" / "engine.lock",
         "claim_gate": root / "flags" / CLAIM_GATE,
@@ -325,7 +331,7 @@ def _validate(verb: str, params: object) -> str | None:
                 return f"setup.config allows only native.* keys: {', '.join(bad)}"
         return None
     if verb in ("teardown", "release", "terminate", "stop-container", "start-container",
-                "defer-publication"):
+                "defer-publication", "fail-finalization"):
         error = _check_no_unknown(verb, params, set())
         if error:
             return error
@@ -836,6 +842,21 @@ def _finalized(root: Path, attempt_id: str) -> bool:
     return isinstance(last_finished, dict) and last_finished.get("attempt_id") == attempt_id
 
 
+def _retained(root: Path, attempt_id: str) -> bool:
+    """Whether ``attempt_id`` is a Retained Attempt of the running engine.
+
+    A Retained Attempt stays the ``current_attempt`` of a ``recovering``
+    instance (spec section 14) until ``recovery retry`` or ``recovery
+    release`` decides it.
+    """
+
+    status = _engine_status(root)
+    if status is None or status.get("instance", {}).get("state") != "recovering":
+        return False
+    current = status.get("current_attempt")
+    return isinstance(current, dict) and current.get("attempt_id") == attempt_id
+
+
 def _left_starting(root: Path) -> bool:
     """Whether the engine left ``starting`` and settled where it will wait."""
 
@@ -890,6 +911,10 @@ def _verb_finish_attempt(root: Path, params: dict) -> tuple[int, dict]:
     attempt_id = _active_attempt_id(root)
     if attempt_id is None:
         return _failed("finish-attempt", "no active attempt")
+    if _retained(root, attempt_id):
+        # The checkpoint outlives the attempt's processing: a Retained
+        # Attempt, or one startup reconciliation still holds, is not active.
+        return _failed("finish-attempt", "no active attempt")
     # The outcome names its attempt: the blocked executor takes only its
     # own, so an outcome left unconsumed can never finish a later attempt.
     scripted = {"native_outcome": outcome, "attempt_id": attempt_id}
@@ -911,7 +936,12 @@ def _verb_finish_attempt(root: Path, params: dict) -> tuple[int, dict]:
         # the outcome is in, and the restart recovers the rest.
         if _active_attempt_id(root) is None or not _engine_alive(root):
             return True
-        return after_outcome and _held_after_outcome(root) == attempt_id
+        if after_outcome and _held_after_outcome(root) == attempt_id:
+            return True
+        # A failed finalization keeps the attempt as a Retained Attempt
+        # of a running engine: it stays the checkpoint, and the engine
+        # reports ``recovering`` once the attempt's processing has ended.
+        return _retained(root, attempt_id)
 
     try:
         finished = _wait_for(settled, timeout=_COMPLETION_TIMEOUT_SECONDS)
@@ -1129,13 +1159,33 @@ def _verb_grow_archive(root: Path, params: dict) -> tuple[int, dict]:
     )
 
 
-def _verb_defer_publication(root: Path) -> tuple[int, dict]:
-    state, error = _require_instance(root, "defer-publication")
+def _arm_one_shot(root: Path, verb: str, flag: str) -> tuple[int, dict]:
+    """Arm the one-shot flag file the daemon consumes for ``verb``."""
+
+    state, error = _require_instance(root, verb)
     if error is not None:
         return error
     _paths(root)["flags"].mkdir(parents=True, exist_ok=True)
-    _paths(root)["deferred_publication"].write_text("armed", encoding="utf-8")
-    return _ok("defer-publication", {"armed": True})
+    _paths(root)[flag].write_text("armed", encoding="utf-8")
+    return _ok(verb, {"armed": True})
+
+
+def _verb_defer_publication(root: Path) -> tuple[int, dict]:
+    return _arm_one_shot(root, "defer-publication", "deferred_publication")
+
+
+def _verb_fail_finalization(root: Path) -> tuple[int, dict]:
+    """Arm a one-shot failure at the next attempt's finalization boundary.
+
+    The daemon fails the next comment the publisher posts, as an
+    unavailable GitHub would, after the attempt's verdict is decided. The
+    engine then keeps the attempt as a Retained Attempt: still the
+    ``current_attempt`` of a ``recovering`` instance, unsealed, with no
+    Claim opening until ``recovery retry`` or ``recovery release`` (spec
+    section 14).
+    """
+
+    return _arm_one_shot(root, "fail-finalization", "failed_finalization")
 
 
 _VERB_HANDLERS = {
@@ -1152,6 +1202,7 @@ _VERB_HANDLERS = {
     "halt": _verb_halt,
     "grow-archive": _verb_grow_archive,
     "defer-publication": lambda root, params: _verb_defer_publication(root),
+    "fail-finalization": lambda root, params: _verb_fail_finalization(root),
 }
 
 

@@ -190,6 +190,33 @@ def test_verbs_without_instance_are_failed(tmp_path: Path) -> None:
         assert reply["error"]["code"] == "failed"
 
 
+def test_the_harness_speaks_the_pinned_suite_protocol() -> None:
+    from agent_operator_contract.documents import HARNESS_VERBS
+    from agent_operator_contract.documents import HARNESS_VERSION as SUITE_VERSION
+
+    assert HARNESS_VERSION == SUITE_VERSION
+    assert set(harness_module.VERBS) == set(HARNESS_VERBS)
+
+
+def test_fail_finalization_takes_no_parameters(tmp_path: Path) -> None:
+    code, reply = invoke(
+        "fail-finalization",
+        request("fail-finalization", {"boundary": "publication"}),
+        state_dir=tmp_path,
+    )
+    assert code == 2
+    assert reply["error"]["code"] == "usage"
+
+
+def test_fail_finalization_without_instance_is_failed(tmp_path: Path) -> None:
+    code, reply = invoke(
+        "fail-finalization", request("fail-finalization", {}), state_dir=tmp_path
+    )
+    assert code == 1
+    assert reply["verb"] == "fail-finalization"
+    assert reply["error"]["code"] == "failed"
+
+
 def test_teardown_without_instance_removes_nothing(tmp_path: Path) -> None:
     code, reply = invoke("teardown", request("teardown", {}), state_dir=tmp_path)
     assert code == 0
@@ -1053,3 +1080,101 @@ def test_a_restart_without_a_halt_reports_no_halted_event(engine: _Engine) -> No
 
     assert snapshot["instance"]["last_halt"] is None
     assert _events_named(snapshot, "halted") == []
+
+
+# ---------------------------------------------------------------------------
+# A failed finalization retains the attempt (#388, harness protocol 1.1)
+# ---------------------------------------------------------------------------
+
+
+def _retain_one_attempt(engine: _Engine, issue: int) -> str:
+    """Claim ``issue``, fail its finalization and return the attempt ID."""
+
+    engine.call("set-issue", {"issue": issue, "eligible": True})
+    engine.call("release", {})
+    attempt_id = engine.status()["current_attempt"]["attempt_id"]
+    engine.call("set-issue", {"issue": issue, "eligible": False})
+    assert engine.call("fail-finalization", {}) == {"armed": True}
+
+    started = time.monotonic()
+    finished = engine.call("finish-attempt", {"native_outcome": "complete"})
+
+    assert finished == {"attempt_id": attempt_id, "native_outcome": "complete"}
+    assert time.monotonic() - started < 30.0
+    return attempt_id
+
+
+def test_a_failed_finalization_leaves_a_retained_attempt(engine: _Engine) -> None:
+    attempt_id = _retain_one_attempt(engine, 41)
+
+    snapshot = engine.status()
+    assert snapshot["instance"]["state"] == "recovering"
+    assert snapshot["current_attempt"]["attempt_id"] == attempt_id
+    last_finished = snapshot["last_finished"]
+    assert last_finished is None or last_finished["attempt_id"] != attempt_id
+    code, reply = engine.agentctl("attempts", "show", attempt_id)
+    assert code == 0, reply
+    summary = reply["result"]["attempt"]
+    assert summary["attention_required"] is True
+    assert summary["sealed"] is False
+
+    # No Claim opens while the Retained Attempt exists.
+    engine.call("set-issue", {"issue": 42, "eligible": True})
+    assert engine.call("release", {}) == {"released": False}
+    assert engine.status()["current_attempt"]["attempt_id"] == attempt_id
+
+
+def test_finish_attempt_on_a_retained_attempt_is_failed(engine: _Engine) -> None:
+    _retain_one_attempt(engine, 45)
+
+    code, reply = invoke(
+        "finish-attempt",
+        request("finish-attempt", {"native_outcome": "complete"}),
+        state_dir=engine.root,
+    )
+
+    assert code == 1, reply
+    assert reply["error"]["code"] == "failed"
+    assert engine.status()["instance"]["state"] == "recovering"
+
+
+def test_recovery_retry_finalizes_a_retained_attempt_as_complete(
+    engine: _Engine,
+) -> None:
+    attempt_id = _retain_one_attempt(engine, 43)
+
+    code, reply = engine.agentctl(
+        "recovery", "retry", attempt_id, "--request-id", "req-388-retry",
+        "--expect-repo", "octo/example",
+    )
+
+    assert code == 0, reply
+    assert reply["result"]["command"]["acknowledgement"] == "completed", reply
+    snapshot = engine.status()
+    assert snapshot["current_attempt"] is None
+    assert snapshot["last_finished"]["attempt_id"] == attempt_id
+    assert snapshot["last_finished"]["outcome"]["native"] == "complete"
+
+
+@pytest.mark.xfail(
+    reason="#390: recovery release recomputes the outcome instead of keeping"
+    " the recorded verdict (contract section 14)",
+    strict=True,
+)
+def test_recovery_release_finalizes_a_retained_attempt(engine: _Engine) -> None:
+    attempt_id = _retain_one_attempt(engine, 44)
+
+    code, reply = engine.agentctl(
+        "recovery", "release", attempt_id, "--saved-at", "https://example.test/saved",
+        "--request-id", "req-388-release", "--expect-repo", "octo/example",
+    )
+
+    assert code == 0, reply
+    assert reply["result"]["command"]["acknowledgement"] == "completed", reply
+    snapshot = engine.status()
+    assert snapshot["current_attempt"] is None
+    finished = snapshot["last_finished"]
+    assert finished["attempt_id"] == attempt_id
+    assert finished["lifecycle_state"] == "released"
+    # No command may change the recorded verdict (contract section 14).
+    assert finished["outcome"]["native"] == "complete"
