@@ -65,7 +65,7 @@ The attempt outcome (with a short reason) written durably into the attempt check
 _Avoid_: Inferred outcome, final outcome
 
 **Retained Attempt**:
-An attempt whose model work has ended but whose finalization was interrupted or not fulfilled (publication unconfirmed, issue release or cleanup failing, a failed Operator Handoff, or a restart): its checkpoint, branch and working tree are kept and intake is held until an operator decides with `recovery retry` or `recovery release`. Defined in the [operator contract glossary](https://github.com/lbacik/agent-operator-contract/blob/v1.0.3/CONTEXT.md#attempts-and-archives).
+An attempt whose model work has ended but whose finalization was interrupted or not fulfilled (publication unconfirmed, issue release or cleanup failing, a failed Operator Handoff, or a restart): its checkpoint, branch and working tree are kept and intake is held until an operator decides with `recovery retry` or `recovery release`. Defined in the [operator contract glossary](https://github.com/lbacik/agent-operator-contract/blob/v1.0.4/CONTEXT.md#attempts-and-archives).
 _Avoid_: Held attempt, stuck attempt, orphan
 
 **Handoff note**:
