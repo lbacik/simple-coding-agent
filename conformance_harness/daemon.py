@@ -330,10 +330,12 @@ def hold_after_outcome(
 ) -> Callable[..., None]:
     """Wrap the lifecycle's event log so ``after-outcome`` holds finalization.
 
-    The engine emits ``outcome_recorded`` once the outcome is in the
-    archive record and before it removes the checkpoint and seals. Holding
-    right after that emit pauses finalization exactly there: the attempt is
-    still active and unsealed, and its outcome is recorded. The marker
+    The engine emits ``outcome_recorded`` as soon as publication decides
+    the verdict (ADR 0010): the verdict is in the checkpoint and the outcome
+    in the archive record, before the result comment is confirmed and long
+    before the checkpoint is removed and the archive sealed. Holding right
+    after that emit pauses finalization exactly there: the attempt is still
+    active and unsealed, and its outcome is recorded. The marker
     lasts as long as the wait, so the harness never has to guess whether
     the engine reached the hold.
     """

@@ -25,6 +25,7 @@ from simple_coding_agent.attempt_state import (
     AttemptPhase,
     AttemptStateError,
     AttemptStateStore,
+    RecordedVerdict,
 )
 from simple_coding_agent.attempt_workspace import AttemptWorkspace, ConflictState
 from simple_coding_agent.control import (
@@ -1457,6 +1458,10 @@ class AgentLifecycle:
         # retained checkpoint is still a hold then: resume must stay rejected
         # until the command finishes, even though _attempt_processing is set.
         self._recovery_executing = False
+        # Attempt IDs whose ``outcome_recorded`` this process already emitted
+        # at publication (ADR 0010), so finalization never announces the
+        # verdict a second time even when the checkpoint cannot be re-read.
+        self._verdict_announced: set[str] = set()
         # Whether the pre-claim dirty-tree hold already logged
         # ``working_tree_dirty`` for the current dirty episode. The hold logs
         # once (naming the first offending paths) instead of on every poll,
@@ -2377,6 +2382,100 @@ class AgentLifecycle:
         except Exception:
             return
 
+    def _after_publication(
+        self, issue_number: int, attempt_id: str, published: object
+    ) -> None:
+        """Absorb the publisher's verified result in every publishing flow.
+
+        Remembers the result for telemetry (no extra lookup), writes the
+        pull request into the archive record so the telemetry seed finds it
+        after a restart, observes the workspace right after publication,
+        and records the verdict publication decided (ADR 0010). Never raises.
+        """
+
+        self._remember_publication_result(attempt_id, published)
+        self._archive_pull_request(issue_number, attempt_id, published)
+        self._observe_and_remember_workspace_dirty(attempt_id)
+        self._record_verdict(issue_number, attempt_id, published)
+
+    def _record_verdict(
+        self, issue_number: int, attempt_id: str, published: object
+    ) -> None:
+        """Record the verdict publication just decided, then announce it.
+
+        Called as soon as the publisher returns, before the result comment
+        is checked, the issue released or the workspace cleaned up (ADR
+        0010): the outcome and a short reason go durably into the attempt
+        checkpoint and the outcome into the archive record, and
+        ``outcome_recorded`` is emitted once. A verdict already recorded
+        for this attempt (a recovery retry or startup reconciliation
+        publishing again) is kept and not announced again. When the
+        checkpoint cannot be written the verdict stays unrecorded and
+        finalization announces it instead. Never raises.
+        """
+
+        outcome = getattr(published, "outcome", None)
+        if not isinstance(outcome, AttemptOutcome):
+            return
+        try:
+            checkpoint = self._attempt_state.read()
+        except Exception:
+            checkpoint = None
+        if checkpoint is None or checkpoint.started_at != attempt_id:
+            return
+        if checkpoint.verdict is not None:
+            return
+        reason = _verdict_reason(outcome, getattr(published, "details", ""))
+        try:
+            self._attempt_state.record_verdict(attempt_id, outcome.value, reason)
+        except Exception as error:
+            self._event_log(
+                "verdict_record_failed",
+                f"the verdict {outcome.value} could not be recorded in the"
+                f" checkpoint ({_exception_detail(error)}); finalization"
+                " records it instead",
+                level="WARNING",
+                issue_number=issue_number,
+            )
+            return
+        try:
+            archive = self._archive_for(issue_number, attempt_id)
+            if archive is not None:
+                # The outcome only: ``completed_at`` still waits for the
+                # completion boundary, so the attempt never reads as finished.
+                archive.write_attempt({"outcome": outcome.value})
+        except Exception:
+            pass
+        self._verdict_announced.add(attempt_id)
+        self._event_log(
+            "outcome_recorded",
+            outcome_recorded_detail(outcome.value),
+            level="INFO",
+            issue_number=issue_number,
+        )
+
+    def _verdict_already_announced(self, checkpoint: object, attempt_id: str) -> bool:
+        """Whether ``outcome_recorded`` was already emitted for this attempt.
+
+        True when this process announced it at publication, or when the
+        checkpoint carries a recorded verdict (announced when it was
+        recorded, possibly before a restart).
+        """
+
+        if attempt_id in self._verdict_announced:
+            return True
+        if getattr(checkpoint, "verdict", None) is not None:
+            return True
+        try:
+            stored = self._attempt_state.read()
+        except Exception:
+            return False
+        return (
+            stored is not None
+            and stored.started_at == attempt_id
+            and stored.verdict is not None
+        )
+
     def _archive_pull_request(
         self, issue_number: int, started_at: str, published: object
     ) -> None:
@@ -2762,6 +2861,22 @@ class AgentLifecycle:
                 f" local evidence is missing or invalid"
                 f" ({_exception_detail(error)}); the hold remains. {hold_suffix}"
             )
+        # A verdict recorded at publication is never recomputed (ADR 0010):
+        # the republication aims at it, and inference only fills in the
+        # publication details when it already agrees.
+        recorded = _recorded_verdict(checkpoint)
+        if recorded is not None:
+            steered = _decision_for_recorded_verdict(
+                recorded[0], recorded[1], decision, details, note_sha, has_commits
+            )
+            if steered is None:
+                return False, (
+                    f"recovery retry for attempt {attempt_id} not fulfilled:"
+                    f" the recorded verdict {recorded[0].value} cannot be safely"
+                    " republished from the retained workspace; the verdict is"
+                    f" never recomputed, so the hold remains. {hold_suffix}"
+                )
+            decision, details, note_sha = steered
         shared_hold = self._recovery_shared_hold(
             claim.issue.number, attempt_id, decision.outcome
         )
@@ -2809,10 +2924,15 @@ class AgentLifecycle:
                 " the hold remains."
                 f" {hold_suffix}"
             )
-        self._remember_publication_result(attempt_id, published)
-        self._archive_pull_request(claim.issue.number, attempt_id, published)
-        self._observe_and_remember_workspace_dirty(attempt_id)
+        self._after_publication(claim.issue.number, attempt_id, published)
         outcome = published.outcome
+        if recorded is not None and outcome is not recorded[0]:
+            return False, (
+                f"recovery retry for attempt {attempt_id} not fulfilled:"
+                f" republication answered {outcome.value}, not the recorded"
+                f" verdict {recorded[0].value}; the verdict is never changed,"
+                f" so the hold remains. {hold_suffix}"
+            )
         comment_posted = _publication_confirmed(published)
         if not comment_posted and outcome is AttemptOutcome.HANDOFF and getattr(
             published, "handoff_posted", False
@@ -2927,7 +3047,9 @@ class AgentLifecycle:
 
         Confirms a deduplicated issue comment stating the actual outcome and
         failure before any label or assignee change, never claiming a
-        successful handoff or an unpublished branch. Only then runs the
+        successful handoff or an unpublished branch. The outcome is the
+        checkpoint's recorded verdict when publication recorded one (ADR
+        0010), otherwise it is inferred from the retained workspace. Only then runs the
         idempotent release, local cleanup, checkpoint finalization, and
         at-most-once accounting. Any failure keeps the hold.
         """
@@ -2989,9 +3111,23 @@ class AgentLifecycle:
                 f" the workspace cannot be safely prepared"
                 f" ({_exception_detail(error)}); no work was discarded."
             )
-        actual_outcome, failure_reason = self._infer_release_outcome(
-            checkpoint, claim, prepared
-        )
+        recorded = _recorded_verdict(checkpoint)
+        if recorded is not None:
+            # Publication already decided the verdict (ADR 0010): the
+            # release keeps it instead of inferring one from the workspace.
+            actual_outcome, recorded_reason = recorded
+            failure_reason = (
+                f"Publication recorded the verdict {actual_outcome.value}"
+                + (f" ({recorded_reason})" if recorded_reason else "")
+                + ", but finalization never reached its completion boundary"
+                f" (phase {checkpoint.phase.value}); the operator secured the"
+                " retained work and released the attempt with the recorded"
+                " verdict."
+            )
+        else:
+            actual_outcome, failure_reason = self._infer_release_outcome(
+                checkpoint, claim, prepared
+            )
         branch = prepared.branch
         marker = attempt_marker(attempt_id)
         source = _claim_time_requeue_source(claim, checkpoint)
@@ -3004,6 +3140,7 @@ class AgentLifecycle:
             branch=branch,
             requeue_source=source,
             worker_id=self._request_worker_id(),
+            verdict_recorded=recorded is not None,
         )
         confirmed = self._confirm_release_comment(
             claim, marker, comment_body, attempt_id, requeue_source=source
@@ -5534,15 +5671,7 @@ class AgentLifecycle:
             published = self._publisher.publish(request)
         else:
             published = self._publisher.publish(request, timeout=budget)
-        # Remember the verified result for telemetry (no extra lookup), plus
-        # the workspace state observed right after publication. The pull
-        # request is also written into the attempt's archive record here, at
-        # publication, so the telemetry seed finds it after a restart.
-        self._remember_publication_result(request.started_at, published)
-        self._archive_pull_request(
-            request.issue_number, request.started_at, published
-        )
-        self._observe_and_remember_workspace_dirty(request.started_at)
+        self._after_publication(request.issue_number, request.started_at, published)
         return published
 
     def _handoff_completion_cause(
@@ -6057,12 +6186,16 @@ class AgentLifecycle:
                 branch=branch,
                 outcome=outcome,
             )
-        self._event_log(
-            "outcome_recorded",
-            outcome_recorded_detail(outcome.value),
-            level="INFO",
-            issue_number=issue_number,
-        )
+        if not self._verdict_already_announced(checkpoint, attempt_id):
+            # No verdict was recorded at publication (an attempt interrupted
+            # before publication returned, or an older checkpoint): the
+            # outcome is decided here, so it is announced here, once.
+            self._event_log(
+                "outcome_recorded",
+                outcome_recorded_detail(outcome.value),
+                level="INFO",
+                issue_number=issue_number,
+            )
         self._record_control_finalization(attempt_id, outcome)
         self._event_log(
             "attempt_finished",
@@ -6079,6 +6212,7 @@ class AgentLifecycle:
             except Exception:
                 pass
         self._attempt_state.delete()
+        self._verdict_announced.discard(attempt_id)
         self._seal_archive_and_emit(archive, attempt_id, issue_number=issue_number)
         self._telemetry_finish(
             self._last_finished_summary(
@@ -6530,7 +6664,44 @@ class AgentLifecycle:
                 if note_commit is not None:
                     note_commit_sha = note_commit.revision
             publication_started_at = self._clock()
-            if _is_conflict_attempt(checkpoint):
+            # A verdict recorded before the restart is never recomputed (ADR
+            # 0010): republication aims at it, and when that cannot be done
+            # safely the attempt stays retained for the operator instead of
+            # finalizing with another outcome.
+            recorded = _recorded_verdict(checkpoint)
+            unreachable: str | None = None
+            if recorded is not None:
+                if _is_conflict_attempt(checkpoint):
+                    if recorded[0] is not AttemptOutcome.INFRASTRUCTURE_ERROR:
+                        unreachable = (
+                            "a retained conflict attempt republishes only as an"
+                            " infrastructure error"
+                        )
+                else:
+                    steered = _decision_for_recorded_verdict(
+                        recorded[0], recorded[1], decision, details,
+                        note_commit_sha, has_commits,
+                    )
+                    if steered is None:
+                        unreachable = (
+                            "the retained workspace no longer supports"
+                            " republishing it"
+                        )
+                    else:
+                        decision, details, note_commit_sha = steered
+            if recorded is not None and unreachable is not None:
+                outcome = recorded[0]
+                comment_posted = False
+                retain_branch = True
+                self._event_log(
+                    "recorded_verdict_held",
+                    f"the verdict {recorded[0].value} recorded before the restart"
+                    f" was not republished: {unreachable}; the attempt stays"
+                    " retained for `recovery retry` or `recovery release`.",
+                    level="WARNING",
+                    issue_number=claim.issue.number,
+                )
+            elif _is_conflict_attempt(checkpoint):
                 # A retained conflict attempt recovers as a conflict error
                 # (a failure toward the budget, possibly escalating), never
                 # as an ordinary result: an ordinary marker would stop the
@@ -6598,6 +6769,25 @@ class AgentLifecycle:
                         )
                     )
                 )
+            if (
+                recorded is not None
+                and unreachable is None
+                and outcome is not recorded[0]
+            ):
+                # The publisher answered another outcome: finalizing would
+                # change the recorded verdict, so the attempt stays retained.
+                self._event_log(
+                    "recorded_verdict_held",
+                    f"republication answered {outcome.value}, not the verdict"
+                    f" {recorded[0].value} recorded before the restart; the"
+                    " attempt stays retained for `recovery retry` or"
+                    " `recovery release`.",
+                    level="WARNING",
+                    issue_number=claim.issue.number,
+                )
+                outcome = recorded[0]
+                comment_posted = False
+                retain_branch = True
         except DirtyWorkspaceError as error:
             # Unexplained dirty or untracked work: hold intake and preserve
             # the branch, checkpoint, and entire working tree for inspection.
@@ -7650,13 +7840,7 @@ class AgentLifecycle:
         self._maybe_escalate_conflict_to_human(
             claim, published, getattr(published, "escalated", stamped.escalate)
         )
-        # Remember the verified result for telemetry (no extra lookup), plus
-        # the workspace state observed right after publication. The pull
-        # request is also written into the attempt's archive record here, at
-        # publication, so the telemetry seed finds it after a restart.
-        self._remember_publication_result(request.started_at, published)
-        self._archive_pull_request(request.issue_number, request.started_at, published)
-        self._observe_and_remember_workspace_dirty(request.started_at)
+        self._after_publication(request.issue_number, request.started_at, published)
         return published
 
     def _publish_terminal(
@@ -7693,9 +7877,7 @@ class AgentLifecycle:
             published = self._publisher.publish(request)
         else:
             published = self._publisher.publish(request, timeout=timeout)
-        self._remember_publication_result(started_at, published)
-        self._archive_pull_request(claim.issue.number, started_at, published)
-        self._observe_and_remember_workspace_dirty(started_at)
+        self._after_publication(claim.issue.number, started_at, published)
         return published
 
     def _publish_rebase_conflict(
@@ -9160,6 +9342,87 @@ def _is_iso8601(value: str) -> bool:
     except ValueError:
         return False
     return True
+
+
+#: The longest reason a recorded verdict keeps (the first line of the
+#: publication details); the full details stay in the result comment.
+_VERDICT_REASON_LIMIT = 500
+
+
+def _verdict_reason(outcome: AttemptOutcome, details: object) -> str | None:
+    """A short reason for a recorded verdict, or ``None`` when there is none.
+
+    ``complete`` needs no reason. Any other outcome keeps the first
+    non-empty line of the publication details, bounded in length.
+    """
+
+    if outcome is AttemptOutcome.COMPLETE or not isinstance(details, str):
+        return None
+    for line in details.splitlines():
+        text = line.strip()
+        if text:
+            return text[:_VERDICT_REASON_LIMIT]
+    return None
+
+
+def _recorded_verdict(checkpoint: object) -> tuple[AttemptOutcome, str | None] | None:
+    """The checkpoint's recorded verdict as an outcome, or ``None`` if absent."""
+
+    verdict = getattr(checkpoint, "verdict", None)
+    if not isinstance(verdict, RecordedVerdict):
+        return None
+    try:
+        return (AttemptOutcome(verdict.outcome), verdict.reason)
+    except ValueError:
+        return None
+
+
+def _decided_outcome(decision: CompletionDecision) -> AttemptOutcome | None:
+    """The outcome a publication decision aims at (``complete`` when eligible)."""
+
+    if decision.outcome is not None:
+        return decision.outcome
+    if decision.publication_eligible:
+        return AttemptOutcome.COMPLETE
+    return None
+
+
+def _decision_for_recorded_verdict(
+    outcome: AttemptOutcome,
+    reason: str | None,
+    inferred: CompletionDecision,
+    details: str,
+    note_sha: str | None,
+    has_commits: bool,
+) -> tuple[CompletionDecision, str, str | None] | None:
+    """Steer a recovery republication towards the recorded verdict.
+
+    Returns the ``(decision, details, note_sha)`` to publish, or ``None``
+    when safe republication cannot reach the recorded verdict: a recorded
+    ``handoff`` whose note inference no longer finds, or a recorded
+    ``complete`` the retained workspace no longer shows as published.
+    The inferred decision is kept whenever it already aims at the recorded
+    verdict; any other recorded outcome republishes as a plain result.
+    """
+
+    if _decided_outcome(inferred) is outcome:
+        return (inferred, details, note_sha)
+    if outcome in (AttemptOutcome.HANDOFF, AttemptOutcome.COMPLETE):
+        # A handoff needs its recovered note, which inference did not find.
+        # A recorded complete always reached publishing (the publisher marks
+        # it before opening the pull request), where inference agrees; from
+        # an earlier phase a complete republication would push the branch
+        # and then fail, so it is never forced.
+        return None
+    text = reason or (
+        f"Republishing the verdict {outcome.value} recorded at publication."
+    )
+    path = (
+        PublicationPath.PARTIAL
+        if outcome is AttemptOutcome.INCOMPLETE and has_commits
+        else PublicationPath.NONE
+    )
+    return (CompletionDecision(outcome, False, path, (text,)), text, None)
 
 
 def _infrastructure_decision(reason: str) -> CompletionDecision:

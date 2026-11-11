@@ -665,27 +665,46 @@ def release_comment_body(
     branch: str,
     requeue_source: str = REQUEUE_SOURCE_HUMAN,
     worker_id: str = "",
+    verdict_recorded: bool = False,
 ) -> str:
     """Build the abandonment comment for ``recovery release``.
 
     The comment states the actual attempt outcome and the failure, records
     where the operator secured the work, and never claims a successful
-    handoff or an unpublished branch as a success. With ``worker_id`` set
-    the comment carries the visible ``Worker:`` line and the hidden
-    ``agent-worker`` marker; without it the comment is byte-for-byte the
-    legacy body.
+    handoff or an unpublished branch as a success. With
+    ``verdict_recorded`` the outcome is the verdict publication recorded
+    (ADR 0010), which the release keeps; only a recorded ``complete``, whose
+    pull request already exists, drops the "not published as a success"
+    note from the branch line. Without it the outcome was inferred and the
+    comment is byte-for-byte the legacy body. With ``worker_id`` set the comment
+    carries the visible ``Worker:`` line and the hidden ``agent-worker``
+    marker.
     """
 
     marker = attempt_marker(attempt_id)
     source_marker = requeue_source_marker(requeue_source)
     worker_block, worker_marker_block = worker_blocks(worker_id)
+    branch_note = "retained work secured by the operator; not published as a success"
+    if verdict_recorded:
+        if actual_outcome == "complete":
+            branch_note = "retained work secured by the operator"
+        outcome_text = (
+            f"The attempt `{attempt_id}` for issue #{issue_number} recorded the"
+            f" verdict `{actual_outcome}` when it was published, but did not"
+            " complete finalization and was explicitly released by the"
+            " operator. The release keeps the recorded verdict."
+        )
+    else:
+        outcome_text = (
+            f"The attempt `{attempt_id}` for issue #{issue_number} did not complete"
+            " finalization and was explicitly released by the operator."
+        )
     return (
         f"## Agent Attempt Result: {actual_outcome}\n\n"
-        f"**Branch**: `{branch}` (retained work secured by the operator; not published as a success)\n"
+        f"**Branch**: `{branch}` ({branch_note})\n"
         f"{worker_block}\n"
         "### Outcome\n"
-        f"The attempt `{attempt_id}` for issue #{issue_number} did not complete"
-        f" finalization and was explicitly released by the operator.\n\n"
+        f"{outcome_text}\n\n"
         "### Failure\n"
         f"{failure_reason}\n\n"
         "### Saved work\n"

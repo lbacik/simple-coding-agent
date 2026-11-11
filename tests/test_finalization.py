@@ -685,6 +685,9 @@ def test_cleanup_hold_recovers_through_recovery_retry_after_repair(
     assert lifecycle.run_once().status is LifecycleStatus.IDLE
     assert state.read() is not None
 
+    # The production publisher marks the attempt publishing before it opens
+    # the pull request of a complete verdict; the fake publisher does not.
+    _mark_publishing(AttemptStateStore(tmp_path))
     record = lifecycle.submit_recovery_retry("req-retry", checkpoint.started_at)
 
     assert record.acknowledgement is CommandAcknowledgement.COMPLETED
@@ -727,3 +730,13 @@ def test_resume_is_rejected_while_the_startup_hold_is_active(
     resumed = lifecycle.submit_resume("req-resume-2")
 
     assert resumed.acknowledgement is CommandAcknowledgement.COMPLETED
+
+
+def _mark_publishing(state: AttemptStateStore) -> None:
+    """Advance the retained checkpoint to publishing, as publication would."""
+
+    order = list(AttemptPhase)
+    checkpoint = state.read()
+    assert checkpoint is not None
+    for phase in order[order.index(checkpoint.phase) + 1 :]:
+        state.transition(phase)

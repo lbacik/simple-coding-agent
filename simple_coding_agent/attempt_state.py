@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 import json
@@ -20,6 +20,13 @@ ATTEMPT_KIND_ORDINARY = "ordinary"
 ATTEMPT_KIND_CONFLICT = "conflict"
 
 ATTEMPT_KINDS = frozenset({ATTEMPT_KIND_ORDINARY, ATTEMPT_KIND_CONFLICT})
+
+#: The outcomes a recorded verdict may carry: the values of
+#: ``completion.AttemptOutcome``, repeated here because ``completion`` pulls
+#: in model execution, which this low-level store must not import.
+VERDICT_OUTCOMES = frozenset(
+    {"complete", "incomplete", "infrastructure_error", "no_changes", "handoff"}
+)
 
 
 class AttemptStateError(RuntimeError):
@@ -47,6 +54,19 @@ _ATTEMPT_FILENAME = "attempt.json"
 
 
 @dataclass(frozen=True)
+class RecordedVerdict:
+    """The outcome publication decided for an attempt, and a short reason.
+
+    Recorded when the publisher returns, before the finalization boundary
+    (ADR 0010), so a Retained Attempt keeps it across a failed finalization
+    and a restart. ``reason`` is ``None`` when publication gave none.
+    """
+
+    outcome: str
+    reason: str | None = None
+
+
+@dataclass(frozen=True)
 class AttemptCheckpoint:
     """The durable identity and current phase of an implementation attempt."""
 
@@ -66,6 +86,9 @@ class AttemptCheckpoint:
     #: fall back to today's observed lease instead of the recorded value.
     claim_branch_revision: str | None = None
     claim_lease_recorded: bool = False
+    #: The verdict publication decided, or ``None`` when publication has not
+    #: returned yet (and for checkpoints written before the verdict existed).
+    verdict: RecordedVerdict | None = None
 
 
 class AttemptStateStore:
@@ -175,20 +198,7 @@ class AttemptStateStore:
                 f"Cannot transition from {checkpoint.phase} to {phase}"
             )
 
-        transitioned = AttemptCheckpoint(
-            issue_number=checkpoint.issue_number,
-            branch=checkpoint.branch,
-            phase=phase,
-            started_at=checkpoint.started_at,
-            updated_at=self._next_timestamp(),
-            auto_merge_opt_in=checkpoint.auto_merge_opt_in,
-            requeue_source=checkpoint.requeue_source,
-            issue_title=checkpoint.issue_title,
-            continuation_index=checkpoint.continuation_index,
-            attempt_kind=checkpoint.attempt_kind,
-            claim_branch_revision=checkpoint.claim_branch_revision,
-            claim_lease_recorded=checkpoint.claim_lease_recorded,
-        )
+        transitioned = replace(checkpoint, phase=phase, updated_at=self._next_timestamp())
         self._write(transitioned)
         return transitioned
 
@@ -228,6 +238,33 @@ class AttemptStateStore:
         advanced = _with_claim_lease(checkpoint, revision, updated_at=self._next_timestamp())
         self._write(advanced)
         return advanced
+
+    def record_verdict(
+        self, attempt_id: str, outcome: str, reason: str | None
+    ) -> AttemptCheckpoint:
+        """Durably record the verdict publication decided for ``attempt_id``.
+
+        Only the first recording wins: a later publication of the same
+        attempt (a recovery retry, or startup reconciliation) never changes
+        the recorded verdict. Returns the stored checkpoint.
+        """
+
+        checkpoint = self.read()
+        if checkpoint is None:
+            raise AttemptStateError("No implementation attempt is active")
+        if checkpoint.started_at != attempt_id:
+            raise AttemptStateError(
+                f"Attempt {attempt_id} is not the active attempt"
+            )
+        verdict = RecordedVerdict(str(outcome), reason)
+        _validate_verdict(verdict)
+        if checkpoint.verdict is not None:
+            return checkpoint
+        recorded = replace(
+            checkpoint, updated_at=self._next_timestamp(), verdict=verdict
+        )
+        self._write(recorded)
+        return recorded
 
     def delete(self) -> None:
         """Remove the active checkpoint after its lifecycle cleanup completes."""
@@ -283,24 +320,42 @@ def _as_utc(value: datetime) -> datetime:
 
 
 def _with_claim_lease(
-    checkpoint: AttemptCheckpoint, revision: str | None, *, updated_at: datetime
+    checkpoint: AttemptCheckpoint, revision: str | None, *, updated_at: str
 ) -> AttemptCheckpoint:
     """Copy ``checkpoint`` with the claim-time lease set to ``revision``."""
 
-    return AttemptCheckpoint(
-        issue_number=checkpoint.issue_number,
-        branch=checkpoint.branch,
-        phase=checkpoint.phase,
-        started_at=checkpoint.started_at,
+    return replace(
+        checkpoint,
         updated_at=updated_at,
-        auto_merge_opt_in=checkpoint.auto_merge_opt_in,
-        requeue_source=checkpoint.requeue_source,
-        issue_title=checkpoint.issue_title,
-        continuation_index=checkpoint.continuation_index,
-        attempt_kind=checkpoint.attempt_kind,
         claim_branch_revision=revision,
         claim_lease_recorded=True,
     )
+
+
+def _validate_verdict(verdict: RecordedVerdict) -> None:
+    if not isinstance(verdict.outcome, str) or verdict.outcome not in VERDICT_OUTCOMES:
+        raise AttemptStateError("Verdict outcome must be a known attempt outcome")
+    if verdict.reason is not None and not isinstance(verdict.reason, str):
+        raise AttemptStateError("Verdict reason must be a string or None")
+
+
+def _verdict_to_json(verdict: RecordedVerdict | None) -> dict[str, str | None] | None:
+    if verdict is None:
+        return None
+    return {"outcome": verdict.outcome, "reason": verdict.reason}
+
+
+def _verdict_from_json(value: object) -> RecordedVerdict | None:
+    if value is None:
+        return None
+    if not isinstance(value, dict) or set(value) != {"outcome", "reason"}:
+        raise ValueError("invalid verdict shape")
+    verdict = RecordedVerdict(value["outcome"], value["reason"])
+    try:
+        _validate_verdict(verdict)
+    except AttemptStateError as error:
+        raise ValueError(str(error)) from error
+    return verdict
 
 
 def _validate_claim_lease(revision: str | None) -> None:
@@ -312,7 +367,7 @@ def _validate_claim_lease(revision: str | None) -> None:
         raise AttemptStateError("Claim lease revision must not contain whitespace")
 
 
-def _checkpoint_to_json(checkpoint: AttemptCheckpoint) -> dict[str, bool | int | str | None]:
+def _checkpoint_to_json(checkpoint: AttemptCheckpoint) -> dict[str, object]:
     return {
         "issue_number": checkpoint.issue_number,
         "branch": checkpoint.branch,
@@ -326,6 +381,7 @@ def _checkpoint_to_json(checkpoint: AttemptCheckpoint) -> dict[str, bool | int |
         "attempt_kind": checkpoint.attempt_kind,
         "claim_branch_revision": checkpoint.claim_branch_revision,
         "claim_lease_recorded": checkpoint.claim_lease_recorded,
+        "verdict": _verdict_to_json(checkpoint.verdict),
     }
 
 
@@ -345,6 +401,9 @@ def _checkpoint_from_json(value: object) -> AttemptCheckpoint:
         # read as unrecorded, so recovery falls back to today's observed lease.
         "claim_branch_revision",
         "claim_lease_recorded",
+        # Checkpoints written before the recorded verdict carry no key and
+        # read as "no recorded verdict", keeping today's inference.
+        "verdict",
     }
     if not isinstance(value, dict):
         raise ValueError("invalid checkpoint shape")
@@ -417,6 +476,7 @@ def _checkpoint_from_json(value: object) -> AttemptCheckpoint:
         # a stray revision without the recorded flag reads as unrecorded so
         # recovery falls back to today's observed lease.
         claim_branch_revision = None
+    verdict = _verdict_from_json(value.get("verdict"))
     _parse_timestamp(started_at)
     _parse_timestamp(updated_at)
     return AttemptCheckpoint(
@@ -432,6 +492,7 @@ def _checkpoint_from_json(value: object) -> AttemptCheckpoint:
         attempt_kind=attempt_kind,
         claim_branch_revision=claim_branch_revision,
         claim_lease_recorded=claim_lease_recorded,
+        verdict=verdict,
     )
 
 

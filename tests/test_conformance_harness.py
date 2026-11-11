@@ -1156,11 +1156,6 @@ def test_recovery_retry_finalizes_a_retained_attempt_as_complete(
     assert snapshot["last_finished"]["outcome"]["native"] == "complete"
 
 
-@pytest.mark.xfail(
-    reason="#390: recovery release recomputes the outcome instead of keeping"
-    " the recorded verdict (contract section 14)",
-    strict=True,
-)
 def test_recovery_release_finalizes_a_retained_attempt(engine: _Engine) -> None:
     attempt_id = _retain_one_attempt(engine, 44)
 

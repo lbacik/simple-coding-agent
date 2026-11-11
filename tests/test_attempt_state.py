@@ -7,6 +7,7 @@ from simple_coding_agent.attempt_state import (
     AttemptPhase,
     AttemptStateError,
     AttemptStateStore,
+    RecordedVerdict,
 )
 
 
@@ -373,3 +374,107 @@ def test_advance_claim_lease_rejects_an_absent_revision(tmp_path: Path) -> None:
 
     with pytest.raises(AttemptStateError, match="advance requires a revision"):
         store.advance_claim_lease(None)
+
+
+# ---------------------------------------------------------------------------
+# recorded verdict (#390)
+# ---------------------------------------------------------------------------
+
+
+def test_a_new_checkpoint_has_no_recorded_verdict(tmp_path: Path) -> None:
+    store = AttemptStateStore(tmp_path)
+    checkpoint = store.start(issue_number=42, branch="agent/issue-42")
+
+    assert checkpoint.verdict is None
+    assert store.read().verdict is None  # type: ignore[union-attr]
+
+
+def test_record_verdict_stores_the_outcome_and_reason(tmp_path: Path) -> None:
+    store = AttemptStateStore(tmp_path)
+    started = store.start(issue_number=42, branch="agent/issue-42")
+
+    recorded = store.record_verdict(started.started_at, "incomplete", "tests failed")
+
+    assert recorded.verdict == RecordedVerdict("incomplete", "tests failed")
+    assert store.read() == recorded
+
+
+def test_record_verdict_keeps_the_first_recording(tmp_path: Path) -> None:
+    store = AttemptStateStore(tmp_path)
+    started = store.start(issue_number=42, branch="agent/issue-42")
+    store.record_verdict(started.started_at, "complete", None)
+
+    again = store.record_verdict(started.started_at, "incomplete", "later")
+
+    assert again.verdict == RecordedVerdict("complete", None)
+    assert store.read().verdict == RecordedVerdict("complete", None)  # type: ignore[union-attr]
+
+
+def test_record_verdict_rejects_another_attempt(tmp_path: Path) -> None:
+    store = AttemptStateStore(tmp_path)
+    store.start(issue_number=42, branch="agent/issue-42")
+
+    with pytest.raises(AttemptStateError, match="not the active attempt"):
+        store.record_verdict("2000-01-01T00:00:00Z", "complete", None)
+
+
+def test_record_verdict_rejects_an_unknown_outcome(tmp_path: Path) -> None:
+    store = AttemptStateStore(tmp_path)
+    started = store.start(issue_number=42, branch="agent/issue-42")
+
+    with pytest.raises(AttemptStateError, match="outcome"):
+        store.record_verdict(started.started_at, "success", None)
+
+
+def test_recorded_verdict_survives_transitions_leases_and_reopening(tmp_path: Path) -> None:
+    store = AttemptStateStore(tmp_path)
+    started = store.start(issue_number=42, branch="agent/issue-42")
+    store.transition(AttemptPhase.SETUP)
+    store.record_verdict(started.started_at, "handoff", "note committed")
+    store.transition(AttemptPhase.MODEL_RUNNING)
+    store.record_claim_lease("abc123")
+    store.advance_claim_lease("def456")
+
+    reopened = AttemptStateStore(tmp_path).read()
+
+    assert reopened is not None
+    assert reopened.phase is AttemptPhase.MODEL_RUNNING
+    assert reopened.claim_branch_revision == "def456"
+    assert reopened.verdict == RecordedVerdict("handoff", "note committed")
+
+
+def test_checkpoint_without_a_verdict_reads_as_unrecorded(tmp_path: Path) -> None:
+    path = tmp_path / "state" / "attempt.json"
+    path.parent.mkdir()
+    path.write_text(
+        '{"branch": "agent/issue-42", "issue_number": 42, "phase": "publishing",'
+        ' "started_at": "2026-09-20T13:00:00Z", "updated_at": "2026-09-20T13:00:00Z"}'
+    )
+
+    checkpoint = AttemptStateStore(tmp_path).read()
+
+    assert checkpoint is not None
+    assert checkpoint.verdict is None
+
+
+@pytest.mark.parametrize(
+    "verdict",
+    [
+        '"complete"',
+        '{"outcome": "success", "reason": null}',
+        '{"outcome": "complete", "reason": 3}',
+        '{"outcome": "complete"}',
+        '{"outcome": "complete", "reason": null, "extra": 1}',
+    ],
+)
+def test_checkpoint_with_a_malformed_verdict_is_malformed(tmp_path: Path, verdict: str) -> None:
+    path = tmp_path / "state" / "attempt.json"
+    path.parent.mkdir()
+    path.write_text(
+        '{"branch": "agent/issue-42", "issue_number": 42, "phase": "publishing",'
+        ' "started_at": "2026-09-20T13:00:00Z", "updated_at": "2026-09-20T13:00:00Z",'
+        f' "verdict": {verdict}}}'
+    )
+
+    with pytest.raises(AttemptStateError, match="malformed"):
+        AttemptStateStore(tmp_path).read()
