@@ -35,6 +35,133 @@ def test_clones_once_fetches_and_prepares_an_attempt_from_the_verified_base(
     assert git(tmp_path / "clone", "branch", "--show-current") == "agent/issue-19"
 
 
+@pytest.mark.parametrize("operation", ["fetch", "ls-remote", "post-fetch-query"])
+@pytest.mark.parametrize("failures", [1, 2])
+def test_retries_restoring_a_published_branch_after_transient_git_failures(
+    tmp_path: Path, operation: str, failures: int,
+) -> None:
+    remote, seed = repository_with_main(tmp_path)
+    git(seed, "checkout", "-b", "agent/issue-19")
+    write_and_commit(seed, "published.txt", "retained work", "Published work")
+    git(seed, "push", "origin", "agent/issue-19")
+    published = git(seed, "rev-parse", "HEAD")
+    failed = 0
+    fetched = False
+    delays: list[float] = []
+    events: list[tuple[str, str, str, int | None]] = []
+
+    def flaky_run(command: tuple[str, ...], cwd: Path | None, env: dict[str, str]) -> str:
+        nonlocal failed, fetched
+        is_fetch = command[1:] == ("fetch", "origin", "agent/issue-19")
+        is_query = command[1:] == (
+            "ls-remote", "--heads", "origin", "refs/heads/agent/issue-19"
+        )
+        should_fail = (
+            (operation == "fetch" and is_fetch)
+            or (operation == "ls-remote" and is_query)
+            or (operation == "post-fetch-query" and is_query and fetched)
+        )
+        if should_fail and failed < failures:
+            failed += 1
+            raise subprocess.CalledProcessError(128, command, stderr="fatal: origin unavailable")
+        result = run_command(command, cwd=cwd, env=env)
+        fetched = fetched or is_fetch
+        return result
+
+    workspace = GitWorkspace(
+        tmp_path / "clone", str(remote), token_provider=lambda: "secret-token", run=flaky_run,
+        sleeper=delays.append,
+        event_log=lambda event, detail="", level="INFO", issue_number=None: events.append(
+            (event, detail, level, issue_number)
+        ),
+    )
+
+    prepared = workspace.prepare_attempt(base_branch="main", issue_number=19)
+
+    assert prepared.restored_from_remote
+    assert prepared.remote_branch_known
+    assert prepared.remote_branch_revision == published
+    assert git(tmp_path / "clone", "rev-parse", "HEAD") == published
+    assert delays == [2, 4][:failures]
+    assert len(events) == failures
+    for index, (event, detail, level, issue_number) in enumerate(events, start=1):
+        assert event == "attempt_branch_restore_failed"
+        assert f"attempt={index}/3" in detail
+        assert "exit code 128" in detail
+        assert "origin unavailable" in detail
+        assert (level, issue_number) == ("WARNING", 19)
+
+
+@pytest.mark.parametrize("operation", ["fetch", "ls-remote"])
+def test_unavailable_origin_is_not_reported_as_an_absent_branch(
+    tmp_path: Path, operation: str,
+) -> None:
+    remote, seed = repository_with_main(tmp_path)
+    git(seed, "checkout", "-b", "agent/issue-19")
+    git(seed, "push", "origin", "agent/issue-19")
+    failures = 0
+    events: list[str] = []
+    delays: list[float] = []
+    secret = "secret-token"
+
+    def unavailable(command: tuple[str, ...], cwd: Path | None, env: dict[str, str]) -> str:
+        nonlocal failures
+        if command[1] == operation and "origin" in command and any(
+            argument.endswith("agent/issue-19") for argument in command
+        ):
+            failures += 1
+            raise subprocess.CalledProcessError(
+                128, command, stderr=f"fatal: origin rejected credential {secret}"
+            )
+        return run_command(command, cwd=cwd, env=env)
+
+    workspace = GitWorkspace(
+        tmp_path / "clone", str(remote), token_provider=lambda: secret, run=unavailable,
+        max_retries=2, sleeper=delays.append,
+        event_log=lambda event, detail="", **kwargs: events.append(detail),
+    )
+
+    with pytest.raises(GitWorkspaceError, match="could not be restored after 2 attempts") as raised:
+        workspace.prepare_attempt(base_branch="main", issue_number=19)
+
+    assert failures == 2
+    assert delays == [2]
+    assert len(events) == 2
+    assert all("exit code 128" in detail and "[REDACTED]" in detail for detail in events)
+    assert secret not in str(raised.value)
+    assert all(secret not in detail for detail in events)
+    assert "[REDACTED]" in str(raised.value)
+    assert git(tmp_path / "clone", "branch", "--show-current") == "main"
+    with pytest.raises(subprocess.CalledProcessError):
+        git(tmp_path / "clone", "show-ref", "--verify", "refs/heads/agent/issue-19")
+
+
+def test_absent_attempt_branch_is_confirmed_without_retrying_or_fetching_it(tmp_path: Path) -> None:
+    remote, _ = repository_with_main(tmp_path)
+    queries: list[tuple[str, ...]] = []
+    events: list[str] = []
+    delays: list[float] = []
+
+    def recording_run(command: tuple[str, ...], cwd: Path | None, env: dict[str, str]) -> str:
+        assert command[1:] != ("fetch", "origin", "agent/issue-19")
+        if command[1] == "ls-remote":
+            queries.append(command)
+        return run_command(command, cwd=cwd, env=env)
+
+    workspace = GitWorkspace(
+        tmp_path / "clone", str(remote), token_provider=lambda: "secret-token", run=recording_run,
+        sleeper=delays.append,
+        event_log=lambda event, detail="", **kwargs: events.append(detail),
+    )
+
+    prepared = workspace.prepare_attempt(base_branch="main", issue_number=19)
+
+    assert not prepared.restored_from_remote
+    assert prepared.remote_branch_known
+    assert prepared.remote_branch_revision is None
+    assert queries == [("git", "ls-remote", "--heads", "origin", "refs/heads/agent/issue-19")]
+    assert delays == events == []
+
 def test_repairs_a_base_branch_that_diverges_from_origin_before_the_attempt(
     tmp_path: Path,
 ) -> None:
@@ -817,9 +944,9 @@ def test_claim_time_push_succeeds_when_the_lease_advances_after_each_push(
     assert pushes[0][2] == "--force-with-lease=agent/issue-23:"
     assert pushes[1][2] == f"--force-with-lease=agent/issue-23:{first}"
     # The claim-time path never refetches before pushing: the recorded lease
-    # is the lease, not a fresh observation. The single fetch is the one
-    # prepare_attempt performs at attempt start to observe the lease.
-    assert commands.count(("git", "fetch", "origin", "agent/issue-23")) == 1
+    # is the lease, not a fresh observation. Preparation confirmed absence
+    # without fetching, and neither push performs a branch fetch.
+    assert ("git", "fetch", "origin", "agent/issue-23") not in commands
     assert second == git(tmp_path / "clone", "rev-parse", "HEAD")
     assert second == git(tmp_path / "clone", "ls-remote", "origin", "refs/heads/agent/issue-23").split()[0]
 

@@ -196,6 +196,10 @@ def main() -> None:
         config.clone_dir,
         f"https://github.com/{config.target_repo}.git",
         token_provider=lambda: config.github_token,
+        max_retries=config.max_retries,
+        event_log=lambda event, detail="", level="INFO", issue_number=None: logger.emit(
+            event, phase="setup", detail=detail, level=level, issue_number=issue_number
+        ),
     )
     tracker = GitHubTracker(
         github,

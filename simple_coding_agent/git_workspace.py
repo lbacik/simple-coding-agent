@@ -164,7 +164,13 @@ class GitWorkspace:
         token_provider: Callable[[], str],
         run: GitRunner | None = None,
         sleeper: Callable[[float], None] | None = None,
+        max_retries: int = 3,
+        event_log: Callable[..., None] | None = None,
     ) -> None:
+        if max_retries <= 0:
+            raise GitWorkspaceError("Branch restoration retry count must be positive")
+        self._max_retries = max_retries
+        self._event_log = event_log or (lambda *args, **kwargs: None)
         self._clone_dir = clone_dir
         self._repository_url = repository_url
         self._token_provider = token_provider
@@ -266,7 +272,7 @@ class GitWorkspace:
         self._git("fetch", "origin")
         base_revision = self._ensure_verified_base(base_branch)
 
-        remote_branch_revision = self._fetch_attempt_branch(branch)
+        remote_branch_revision = self._fetch_attempt_branch(branch, issue_number=issue_number)
         if remote_branch_revision is not None:
             self._git("checkout", base_branch)
             self._git("branch", "-f", branch, remote_branch_revision)
@@ -315,14 +321,32 @@ class GitWorkspace:
                 )
         return base_revision
 
-    def _fetch_attempt_branch(self, branch: str) -> str | None:
-        """Best-effort fetch of a published attempt branch; a missing ref is not an error."""
+    def _fetch_attempt_branch(self, branch: str, *, issue_number: int) -> str | None:
+        """Restore a published branch, distinguishing absence from unavailable origin."""
 
-        try:
-            self._git("fetch", "origin", branch)
-        except GitWorkspaceError:
-            return None
-        return self._remote_branch_revision(branch)
+        last_error: GitWorkspaceError | None = None
+        for attempt in range(self._max_retries):
+            try:
+                # Only a successful origin query can prove that a branch is
+                # absent. A failed fetch must not discard a continuation.
+                if self._remote_branch_revision(branch) is None:
+                    return None
+                self._git("fetch", "origin", branch)
+                return self._remote_branch_revision(branch)
+            except GitWorkspaceError as error:
+                last_error = error
+                self._event_log(
+                    "attempt_branch_restore_failed",
+                    f"branch={branch}; attempt={attempt + 1}/{self._max_retries}; {error}",
+                    level="WARNING",
+                    issue_number=issue_number,
+                )
+                if attempt + 1 < self._max_retries:
+                    self._sleeper(min(2 * 2**attempt, 30))
+        raise GitWorkspaceError(
+            f"Attempt branch `{branch}` could not be restored after "
+            f"{self._max_retries} attempts: {last_error}"
+        ) from last_error
 
     def commits_added(self, prepared: PreparedAttempt) -> tuple[AttemptCommit, ...]:
         """Return commits reachable from the attempt branch but not its base."""
@@ -1066,7 +1090,18 @@ class GitWorkspace:
             try:
                 return self._run(("git", *arguments), working_directory, environment)
             except (OSError, subprocess.CalledProcessError) as error:
-                raise GitWorkspaceError("Git command failed") from error
+                detail = f"Git {arguments[0]} failed"
+                if isinstance(error, subprocess.CalledProcessError):
+                    detail += f" (exit code {error.returncode})"
+                    output = error.stderr or error.stdout
+                    if isinstance(output, bytes):
+                        output = output.decode("utf-8", errors="replace")
+                    if output:
+                        detail += f": {output.strip()}"
+                else:
+                    detail += f": {error}"
+                detail = detail.replace(github_token, "[REDACTED]")
+                raise GitWorkspaceError(detail[:2000]) from error
 
 
 def _porcelain_path(line: str) -> str:
