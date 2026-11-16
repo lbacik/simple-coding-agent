@@ -165,4 +165,5 @@ class BranchPusher(Protocol):
         deadline: float | None = None,
         expected_revision: str | None = None,
         lease_known: bool = False,
+        issue_number: int | None = None,
     ) -> str: ...

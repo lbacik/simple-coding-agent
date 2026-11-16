@@ -13,6 +13,7 @@ from simple_coding_agent.git_workspace import (
     GitWorkspaceError,
     GitWorkspaceRecoveryError,
     find_git_command_error,
+    git_failure_detail,
 )
 from simple_coding_agent.model_execution import ModelExecutionStatus
 from tests.fakes import git, repository_with_main, run_command, write_and_commit
@@ -1165,3 +1166,161 @@ def test_scoped_marker_scan_falls_back_to_all_files_when_unreadable(
         "sse.js" in problem
         for problem in workspace.rebase_resolution_problems(broken)
     )
+
+
+PUSH_TOKEN = "ghp_push_secret_token_value"
+
+
+def _token_leaking_push_run(
+    token: str, *, fail_pushes: int | None = None
+) -> object:
+    """A git runner whose push fails with stderr containing the token.
+
+    ``fail_pushes=None`` fails every push; otherwise only the first
+    ``fail_pushes`` pushes fail. A failed push still runs for real first
+    when ``land_despite_failure`` is set, so reconciliation finds the
+    remote at the local revision.
+    """
+
+    calls = {"push": 0}
+
+    def run(command: tuple[str, ...], cwd: Path | None, env: dict[str, str]) -> str:
+        if command[1] == "push":
+            calls["push"] += 1
+            if fail_pushes is None or calls["push"] <= fail_pushes:
+                raise subprocess.CalledProcessError(
+                    128,
+                    command,
+                    stderr=(
+                        f"fatal: unable to access "
+                        f"'https://x-access-token:{token}@github.com/octo/example.git/': "
+                        f"Could not resolve host for token {token}\n"
+                    ),
+                )
+        return run_command(command, cwd=cwd, env=env)
+
+    return run
+
+
+def _push_events() -> tuple[list, object]:
+    events: list[tuple[str, str, str, int | None]] = []
+
+    def event_log(event: str, detail: str = "", level: str = "INFO", issue_number: int | None = None) -> None:
+        events.append((event, detail, level, issue_number))
+
+    return events, event_log
+
+
+@pytest.mark.parametrize("lease_known", [False, True])
+def test_failed_push_retries_emit_a_warning_per_attempt_without_the_token(
+    tmp_path: Path, lease_known: bool
+) -> None:
+    remote, _ = repository_with_main(tmp_path)
+    events, event_log = _push_events()
+    workspace = GitWorkspace(
+        tmp_path / "clone",
+        str(remote),
+        token_provider=lambda: PUSH_TOKEN,
+        run=_token_leaking_push_run(PUSH_TOKEN),
+        sleeper=lambda _: None,
+        event_log=event_log,
+    )
+    prepared = workspace.prepare_attempt(base_branch="main", issue_number=23)
+    write_and_commit(tmp_path / "clone", "feature.txt", "done", "Implement feature")
+    push_kwargs: dict = {"max_retries": 3, "issue_number": 23}
+    if lease_known:
+        push_kwargs.update(
+            {"expected_revision": prepared.remote_branch_revision, "lease_known": True}
+        )
+
+    with pytest.raises(GitWorkspaceError, match="could not be pushed safely") as raised:
+        workspace.push_attempt_branch(prepared.branch, **push_kwargs)
+
+    push_failures = [event for event in events if event[0] == "attempt_branch_push_failed"]
+    assert len(push_failures) == 3
+    for index, (_, detail, level, issue_number) in enumerate(push_failures, start=1):
+        assert level == "WARNING"
+        assert issue_number == 23
+        assert f"branch={prepared.branch}" in detail
+        assert f"attempt={index}/3" in detail
+        assert PUSH_TOKEN not in detail
+        assert "[REDACTED]" in detail
+        assert "Git push failed" in detail
+    # The final publication_failed text follows the cause chain, so the git
+    # error that rejected the push is recorded redacted, not just the outer
+    # "could not be pushed safely" message.
+    publication_detail = f"Partial branch push failed: {git_failure_detail(raised.value)}"
+    assert "Could not resolve host" in publication_detail
+    assert PUSH_TOKEN not in publication_detail
+    assert "[REDACTED]" in publication_detail
+
+
+@pytest.mark.parametrize("lease_known", [False, True])
+def test_push_retry_then_success_emits_one_warning_and_no_publication_failure(
+    tmp_path: Path, lease_known: bool
+) -> None:
+    remote, _ = repository_with_main(tmp_path)
+    events, event_log = _push_events()
+    workspace = GitWorkspace(
+        tmp_path / "clone",
+        str(remote),
+        token_provider=lambda: PUSH_TOKEN,
+        run=_token_leaking_push_run(PUSH_TOKEN, fail_pushes=1),
+        sleeper=lambda _: None,
+        event_log=event_log,
+    )
+    prepared = workspace.prepare_attempt(base_branch="main", issue_number=23)
+    write_and_commit(tmp_path / "clone", "feature.txt", "done", "Implement feature")
+    push_kwargs: dict = {"max_retries": 3, "issue_number": 23}
+    if lease_known:
+        push_kwargs.update(
+            {"expected_revision": prepared.remote_branch_revision, "lease_known": True}
+        )
+
+    pushed = workspace.push_attempt_branch(prepared.branch, **push_kwargs)
+
+    assert pushed == git(tmp_path / "clone", "rev-parse", "HEAD")
+    push_failures = [event for event in events if event[0] == "attempt_branch_push_failed"]
+    assert len(push_failures) == 1
+    _, detail, level, issue_number = push_failures[0]
+    assert level == "WARNING"
+    assert issue_number == 23
+    assert "attempt=1/3" in detail
+    assert PUSH_TOKEN not in detail
+
+
+@pytest.mark.parametrize("lease_known", [False, True])
+def test_push_reported_failed_but_landed_emits_no_warning(
+    tmp_path: Path, lease_known: bool
+) -> None:
+    """A push the server accepted before the client lost its response succeeds."""
+
+    remote, _ = repository_with_main(tmp_path)
+    events, event_log = _push_events()
+
+    def ambiguous_run(command: tuple[str, ...], cwd: Path | None, env: dict[str, str]) -> str:
+        result = run_command(command, cwd=cwd, env=env)
+        if command[1] == "push":
+            raise subprocess.CalledProcessError(1, command)
+        return result
+
+    workspace = GitWorkspace(
+        tmp_path / "clone",
+        str(remote),
+        token_provider=lambda: "token",
+        run=ambiguous_run,
+        sleeper=lambda _: None,
+        event_log=event_log,
+    )
+    prepared = workspace.prepare_attempt(base_branch="main", issue_number=23)
+    write_and_commit(tmp_path / "clone", "feature.txt", "done", "Implement feature")
+    push_kwargs: dict = {"max_retries": 3, "issue_number": 23}
+    if lease_known:
+        push_kwargs.update(
+            {"expected_revision": prepared.remote_branch_revision, "lease_known": True}
+        )
+
+    pushed = workspace.push_attempt_branch(prepared.branch, **push_kwargs)
+
+    assert pushed == git(tmp_path / "clone", "rev-parse", "HEAD")
+    assert [event for event in events if event[0] == "attempt_branch_push_failed"] == []

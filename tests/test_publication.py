@@ -9,6 +9,7 @@ from simple_coding_agent.completion import AttemptOutcome, CompletionDecision, P
 from simple_coding_agent.attempt_state import AttemptPhase, AttemptStateError, AttemptStateStore
 from simple_coding_agent.git_workspace import (
     BranchMovedSinceClaimError,
+    GitCommandError,
     GitWorkspace,
     GitWorkspaceError,
 )
@@ -354,6 +355,7 @@ class PushFailingWorkspace:
         deadline: float | None = None,
         expected_revision: str | None = None,
         lease_known: bool = False,
+        issue_number: int | None = None,
     ) -> str:
         raise GitWorkspaceError("remote hung up unexpectedly")
 
@@ -881,6 +883,7 @@ class BranchMovedWorkspace:
         deadline: float | None = None,
         expected_revision: str | None = None,
         lease_known: bool = False,
+        issue_number: int | None = None,
     ) -> str:
         self.calls.append((expected_revision, lease_known))
         raise BranchMovedSinceClaimError(
@@ -904,6 +907,7 @@ class RecordingWorkspace:
         deadline: float | None = None,
         expected_revision: str | None = None,
         lease_known: bool = False,
+        issue_number: int | None = None,
     ) -> str:
         self.calls.append((expected_revision, lease_known))
         return self.sha
@@ -995,3 +999,72 @@ def test_claim_lease_advance_failure_is_not_reported_as_a_push_failure(
     assert "Claim lease advance failed" in events[0][1]
     assert inner.read() is not None
     assert inner.read().claim_branch_revision == "old-sha"
+
+
+class ChainedPushFailingWorkspace:
+    """A pusher double failing like an exhausted retry loop, cause chained.
+
+    Mirrors the production raise (``GitWorkspaceError ... from <git error>``)
+    with already-redacted output, as ``GitCommandError`` carries it.
+    """
+
+    def __init__(self) -> None:
+        self.issue_numbers: list[int | None] = []
+
+    def push_attempt_branch(
+        self,
+        branch: str,
+        *,
+        max_retries: int,
+        deadline: float | None = None,
+        expected_revision: str | None = None,
+        lease_known: bool = False,
+        issue_number: int | None = None,
+    ) -> str:
+        self.issue_numbers.append(issue_number)
+        try:
+            raise GitCommandError(
+                "push", 128, "fatal: could not read from remote: [REDACTED]"
+            )
+        except GitCommandError as cause:
+            raise GitWorkspaceError(
+                "Attempt branch could not be pushed safely"
+            ) from cause
+
+
+def test_partial_push_failure_carries_the_issue_number_and_names_the_git_cause(
+    tmp_path: Path,
+) -> None:
+    workspace = ChainedPushFailingWorkspace()
+    github = FakeGitHub()
+    events: list[tuple[str, str, str, int | None]] = []
+
+    result = Publisher(
+        workspace,
+        github,
+        "octo/example",
+        event_log=lambda event, detail="", level="INFO", issue_number=None: events.append(
+            (event, detail, level, issue_number)
+        ),
+    ).publish(
+        request(
+            CompletionDecision(
+                AttemptOutcome.INCOMPLETE,
+                False,
+                PublicationPath.PARTIAL,
+                ("Final authoritative check did not succeed.",),
+            ),
+            "agent/issue-23",
+        )
+    )
+
+    assert workspace.issue_numbers == [23]
+    assert result.outcome is AttemptOutcome.INCOMPLETE
+    assert "Partial branch push failed" in result.details
+    assert "Git push failed (exit code 128)" in result.details
+    failures = [event for event in events if event[0] == "publication_failed"]
+    assert len(failures) == 1
+    assert failures[0][2] == "ERROR"
+    assert failures[0][3] == 23
+    assert "could not read from remote" in failures[0][1]
+    assert "Git push failed (exit code 128)" in failures[0][1]

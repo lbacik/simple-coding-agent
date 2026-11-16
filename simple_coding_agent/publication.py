@@ -906,6 +906,7 @@ class Publisher:
             deadline=deadline,
             expected_revision=expected_revision,
             lease_known=lease_known,
+            issue_number=issue_number,
         )
         self._advance_claim_lease(pushed)
         return pushed

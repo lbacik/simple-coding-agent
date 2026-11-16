@@ -686,6 +686,7 @@ class GitWorkspace:
         deadline: float | None = None,
         expected_revision: str | None = None,
         lease_known: bool = False,
+        issue_number: int | None = None,
     ) -> str:
         """Push an attempt branch using a claim-time force-with-lease.
 
@@ -717,7 +718,12 @@ class GitWorkspace:
         local_revision = self._revision(branch, remote=False)
         if lease_known:
             return self._push_with_claim_lease(
-                branch, local_revision, expected_revision, max_retries=max_retries, deadline=deadline
+                branch,
+                local_revision,
+                expected_revision,
+                max_retries=max_retries,
+                deadline=deadline,
+                issue_number=issue_number,
             )
         last_error: GitWorkspaceError | None = None
         for attempt in range(max_retries):
@@ -742,6 +748,13 @@ class GitWorkspace:
                         return local_revision
                 except GitWorkspaceError:
                     pass
+                self._event_log(
+                    "attempt_branch_push_failed",
+                    f"branch={branch}; attempt={attempt + 1}/{max_retries};"
+                    f" {git_failure_detail(error)}",
+                    level="WARNING",
+                    issue_number=issue_number,
+                )
                 if attempt + 1 < max_retries:
                     self._push_retry_delay(attempt, deadline, error)
         raise GitWorkspaceError("Attempt branch could not be pushed safely") from last_error
@@ -764,6 +777,7 @@ class GitWorkspace:
         *,
         max_retries: int,
         deadline: float | None,
+        issue_number: int | None = None,
     ) -> str:
         """Push using the recorded claim-time lease, without refetching first."""
 
@@ -799,6 +813,13 @@ class GitWorkspace:
                         f"branch moved since claim: remote {branch} is {observed}, "
                         f"claim-time lease was {wanted}"
                     ) from error
+                self._event_log(
+                    "attempt_branch_push_failed",
+                    f"branch={branch}; attempt={attempt + 1}/{max_retries};"
+                    f" {git_failure_detail(error)}",
+                    level="WARNING",
+                    issue_number=issue_number,
+                )
                 if attempt + 1 < max_retries:
                     self._push_retry_delay(attempt, deadline, error)
         raise GitWorkspaceError("Attempt branch could not be pushed safely") from last_error
