@@ -78,7 +78,7 @@ jobs:
       - run: |
           git config --global user.name "CI"
           git config --global user.email "ci@example.invalid"
-      - run: uv run pytest
+      - run: uv run pytest --durations=15
 
   producer:
     runs-on: ubuntu-latest

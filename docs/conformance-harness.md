@@ -48,6 +48,23 @@ reused, never copied):
 `setup` answers `unsupported` naming an unknown Operator Capability, and
 `finish-attempt` answers `unsupported` naming an unknown native outcome.
 
+## Setup config
+
+`setup` accepts only `native.*` keys in `config`, each an integer number of
+milliseconds:
+
+- `native.startup_hold_ms` (default `500`) — the engine reports
+  `starting` for at least this long after every start; after
+  `start-container` it stays `starting` until `release`.
+- `native.recovery_hold_ms` (default `1500`) — accepted and recorded in
+  the instance state; the recovery hold after a restart lasts until
+  `release`.
+- `native.claim_settle_ms` (default `2500`, production's claim settle
+  delay) — how long the engine's tracker waits between assigning an issue
+  and re-reading it to verify the claim. Must not be negative. The
+  repository's own harness tests set it to `0`, so a claim fits in one
+  engine iteration; the external producer suite keeps the default.
+
 ## Timing: the engine advances only through verbs
 
 Like the contract's reference stub producer, the engine never advances
@@ -60,7 +77,11 @@ between two harness verbs:
   returns once `status` shows the claim as `current_attempt`. Otherwise it
   returns at once. Either way the gate is closed again before it answers.
   A `before-claim` hold still blocks the claim, and a pending `next issue`
-  priority is honoured at the claim `release` lets through.
+  priority is honoured at the claim `release` lets through. Every wait in
+  `release` is bounded: when one runs out (the engine never leaves
+  `starting`, startup reconciliation never finishes, or the claim never
+  settles) `release` answers `failed` with a message naming the wait,
+  never `ok`.
 - **Attempts wait for `finish-attempt`.** A claimed attempt blocks in the
   fake model execution until `finish-attempt` scripts its outcome. The
   outcome names its attempt and that attempt consumes it, so no stale
@@ -85,7 +106,10 @@ between two harness verbs:
 - **Restarts hold `starting`, then `recovering`.** `start-container`
   keeps the engine `starting` until `release`. If the previous engine left
   an attempt behind, startup reconciliation then waits in `recovering`
-  until the next `release`.
+  until the next `release`. A `next issue` priority pending across the
+  restart does not delay this: the engine finishes startup reconciliation
+  without reaching a Claim boundary, so `release` returns as soon as the
+  engine left `starting` and the prioritized claim shows in `status`.
 
 The engine is wired like production `main`: the event logger with its
 per-attempt sink and contract event buffers, attempt archives, the halt

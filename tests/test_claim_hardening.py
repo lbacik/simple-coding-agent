@@ -29,6 +29,7 @@ from simple_coding_agent.github_tracker import (
     ClaimLostError,
     GitHubIdentity,
     GitHubTracker,
+    GitHubTrackerError,
     IssuePage,
     TrackerIssue,
 )
@@ -172,6 +173,29 @@ def test_claim_verified_waits_the_settle_delay_before_verifying(
     tracker.claim_verified(transport._issues[1])
 
     assert calls == [CLAIM_SETTLE_DELAY_SECONDS]
+
+
+def test_an_injected_settle_delay_replaces_the_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = record_settle(monkeypatch)
+    transport = RaceTransport({1: issue(1)})
+    tracker = GitHubTracker(
+        transport,
+        "octo/example",
+        claim_settle_delay=0,
+        event_log=transport.event_log,
+    )
+
+    assert tracker.claim_next() is not None
+
+    assert calls == [0.0]
+
+
+@pytest.mark.parametrize("delay", [-0.1, True, "1"])
+def test_an_invalid_settle_delay_is_rejected(delay: object) -> None:
+    with pytest.raises(GitHubTrackerError):
+        GitHubTracker(RaceTransport({}), "octo/example", claim_settle_delay=delay)
 
 
 # ---------------------------------------------------------------------------

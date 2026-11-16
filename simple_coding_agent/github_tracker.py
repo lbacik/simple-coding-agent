@@ -450,10 +450,17 @@ class GitHubTracker:
         peer_logins: Iterable[str] | None = None,
         worker_id: str = "",
         random_source: Callable[[], float] | None = None,
+        claim_settle_delay: float | None = None,
         event_log: Callable[..., None] = (
             lambda event, detail="", level="INFO", issue_number=None: None
         ),
     ) -> None:
+        if claim_settle_delay is not None and (
+            isinstance(claim_settle_delay, bool)
+            or not isinstance(claim_settle_delay, (int, float))
+            or claim_settle_delay < 0
+        ):
+            raise GitHubTrackerError("The claim settle delay must be a non-negative number")
         if (
             isinstance(max_auto_continuations, bool)
             or not isinstance(max_auto_continuations, int)
@@ -484,6 +491,14 @@ class GitHubTracker:
             random_source if random_source is not None else random.random
         )
         self._event_log = event_log
+        #: Seconds between assigning and re-reading a claim. Production
+        #: never passes one and waits :data:`CLAIM_SETTLE_DELAY_SECONDS`;
+        #: the conformance harness engine injects its configured delay.
+        self._claim_settle_delay = (
+            CLAIM_SETTLE_DELAY_SECONDS
+            if claim_settle_delay is None
+            else float(claim_settle_delay)
+        )
 
     @property
     def peer_logins(self) -> frozenset[str]:
@@ -797,7 +812,8 @@ class GitHubTracker:
     def _verify_claim(self, issue: TrackerIssue, identity: GitHubIdentity) -> TrackerIssue:
         """Wait out the assign settle window, then yield if anyone else claimed it.
 
-        Re-reads the issue after :data:`CLAIM_SETTLE_DELAY_SECONDS` and
+        Re-reads the issue after the settle delay (by default
+        :data:`CLAIM_SETTLE_DELAY_SECONDS`) and
         yields when any assignee other than this worker is present (another
         worker or a human) or, with ``WORKER_ID`` set, when another Worker's
         ``claimed-by:*`` marker is present (the shared login assignment is
@@ -814,7 +830,7 @@ class GitHubTracker:
         labels can be removed after verification.
         """
 
-        time.sleep(CLAIM_SETTLE_DELAY_SECONDS)
+        time.sleep(self._claim_settle_delay)
         fresh = self._transport.get_issue(self._target_repo, issue.number)
         if fresh is None:
             self._event_log(

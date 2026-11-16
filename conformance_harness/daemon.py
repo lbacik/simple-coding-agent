@@ -39,6 +39,7 @@ from conformance_harness.harness import (
     AFTER_OUTCOME_HELD,
     CLAIM_GATE,
     CLAIM_GATE_RESULT,
+    DAEMON_POLL_INTERVAL_SECONDS,
     ENGINE_LOCK_HELD,
     FAILED_FINALIZATION,
     RECOVERY_HOLD,
@@ -819,14 +820,19 @@ class _WiredEngine:
 
 
 def _build_engine(
-    root: Path, repository: str, transport: HarnessTransport
+    root: Path,
+    repository: str,
+    transport: HarnessTransport,
+    *,
+    claim_settle_delay: float | None = None,
 ) -> _WiredEngine:
     """Wire the real lifecycle to the shared fakes, mirroring production ``main``.
 
     Everything production wires is wired the same way (event logger with
     its per-attempt sink and contract buffers, attempt archives, halt
     store, telemetry); only the GitHub transport, the model executor and
-    provenance are fakes.
+    provenance are fakes. ``claim_settle_delay`` (``native.claim_settle_ms``)
+    replaces the tracker's claim settle delay; ``None`` keeps production's.
     """
 
     from simple_coding_agent.__main__ import emit_process_started, emit_startup_check
@@ -911,7 +917,12 @@ def _build_engine(
     workspace = GitWorkspace(
         clone_dir, str(remote), token_provider=lambda: "token"
     )
-    github_tracker = GitHubTracker(transport, repository, event_log=event_log("polling"))
+    github_tracker = GitHubTracker(
+        transport,
+        repository,
+        claim_settle_delay=claim_settle_delay,
+        event_log=event_log("polling"),
+    )
     tracker = GatedTracker(github_tracker, flags)
     publisher = GatedPublisher(
         Publisher(
@@ -1024,6 +1035,10 @@ def run_daemon(root: Path) -> int:
         return 1
     repository = state.get("repository", "")
     startup_hold_ms = int(state.get("startup_hold_ms", 500))
+    claim_settle_ms = state.get("claim_settle_ms")
+    # ``setup`` validated the knob; an older state without it keeps the
+    # production delay.
+    claim_settle_delay = None if claim_settle_ms is None else int(claim_settle_ms) / 1000.0
     try:
         data_dir = root / "instance"
         lock = VolumeLock(data_dir)
@@ -1040,7 +1055,9 @@ def run_daemon(root: Path) -> int:
     (flags / AFTER_OUTCOME_HELD).unlink(missing_ok=True)
     issues: dict[int, object] = {}
     transport = HarnessTransport(issues, root / "issues.json")
-    engine = _build_engine(root, repository, transport)
+    engine = _build_engine(
+        root, repository, transport, claim_settle_delay=claim_settle_delay
+    )
     lifecycle = engine.lifecycle
     tracker = engine.tracker
     control_store = engine.control_store
@@ -1075,8 +1092,19 @@ def run_daemon(root: Path) -> int:
     except Exception:
         pass
     (root / "daemon.ready").write_text(str(os.getpid()), encoding="utf-8")
-    poll_interval = 0.2
+    poll_interval = DAEMON_POLL_INTERVAL_SECONDS
     reconciled = False
+
+    def mark_reconciled() -> None:
+        nonlocal reconciled
+        if reconciled:
+            return
+        reconciled = True
+        try:
+            (flags / STARTUP_RECONCILED).write_text("1", encoding="utf-8")
+        except OSError:
+            pass
+
     while True:
         halt_request = _take_json(flags / "halt_request.json") if (flags / "halt_request.json").exists() else None
         if halt_request is not None:
@@ -1117,6 +1145,18 @@ def run_daemon(root: Path) -> int:
             time.sleep(poll_interval)
             continue
         if _priority_waits_behind_closed_gate(control_store, flags):
+            if not reconciled:
+                # Startup reconciliation never reaches a Claim boundary, so
+                # it runs now: ``release`` waits for it to leave ``starting``
+                # before it opens the gate for the prioritized claim.
+                try:
+                    lifecycle.reconcile_startup()
+                except Exception as error:
+                    print(
+                        f"harness daemon: reconcile_startup: {type(error).__name__}: {error}",
+                        file=sys.stderr,
+                    )
+                mark_reconciled()
             time.sleep(poll_interval)
             continue
         gate = claim_gate_token(flags)
@@ -1130,12 +1170,7 @@ def run_daemon(root: Path) -> int:
             print(f"harness daemon: run_once: {type(error).__name__}: {error}", file=sys.stderr)
         finally:
             tracker.allowed = None
-        if not reconciled:
-            reconciled = True
-            try:
-                (flags / STARTUP_RECONCILED).write_text("1", encoding="utf-8")
-            except OSError:
-                pass
+        mark_reconciled()
         if (
             gate is not None
             and claim_gate_token(flags) == gate

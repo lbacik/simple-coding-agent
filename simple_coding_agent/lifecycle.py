@@ -4856,6 +4856,27 @@ class AgentLifecycle:
 
         return round(self._random_source() * self._poll_interval / 2, 1)
 
+    def reconcile_startup(self) -> AttemptOutcome | None:
+        """Run startup reconciliation once, without reaching a Claim boundary.
+
+        The first :meth:`run_once` calls this before it claims anything;
+        later calls (and calls after that first cycle) return ``None``
+        without doing anything. The instance reports ``recovering`` while
+        it runs. Returns the outcome of the durable attempt it finished, if
+        any. The conformance harness engine calls it directly so startup
+        reconciliation completes while it keeps the engine away from a
+        Claim boundary.
+        """
+
+        if self._startup_reconciled:
+            return None
+        self._startup_reconciled = True
+        self._recovering = True
+        try:
+            return self._reconcile_startup()
+        finally:
+            self._recovering = False
+
     def _intake_may_claim(self) -> bool:
         """Whether this cycle's intake could claim, ignoring tree and queue.
 
@@ -4882,12 +4903,7 @@ class AgentLifecycle:
         """
 
         if not self._startup_reconciled:
-            self._startup_reconciled = True
-            self._recovering = True
-            try:
-                recovered = self._reconcile_startup()
-            finally:
-                self._recovering = False
+            recovered = self.reconcile_startup()
             if recovered is not None:
                 return LifecycleResult(LifecycleStatus.ATTEMPTED, recovered)
 

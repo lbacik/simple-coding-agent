@@ -103,7 +103,9 @@ STARTUP_HOLD = "startup_hold"
 #: Armed by ``start-container`` over a retained attempt: reconciliation waits
 #: (the engine reports ``recovering``) until ``release``.
 RECOVERY_HOLD = "recovery_hold"
-#: Written once the first engine iteration after startup has returned.
+#: Written once startup reconciliation has finished: after the first engine
+#: iteration returns, or earlier when the daemon runs reconciliation alone
+#: because a ``next issue`` priority waits behind the closed claim gate.
 STARTUP_RECONCILED = "startup_reconciled"
 #: Armed by ``fail-finalization``: the next result comment fails to post, so
 #: the finishing attempt becomes a Retained Attempt (spec section 14).
@@ -123,6 +125,13 @@ _RELEASE_CLAIM_TIMEOUT_SECONDS = 10.0
 _RELEASE_STARTUP_TIMEOUT_SECONDS = 30.0
 #: How long ``hold-lock`` waits for the engine to take its control lock.
 _ENGINE_LOCK_ACK_TIMEOUT_SECONDS = 5.0
+
+#: How often the engine daemon loop polls its flag files and runs one
+#: engine iteration.
+DAEMON_POLL_INTERVAL_SECONDS = 0.2
+#: Default ``native.claim_settle_ms``: production's claim settle delay
+#: (``CLAIM_SETTLE_DELAY_SECONDS`` in ``simple_coding_agent.github_tracker``).
+DEFAULT_CLAIM_SETTLE_MS = 2500
 
 
 # ---------------------------------------------------------------------------
@@ -181,6 +190,7 @@ def _default_state() -> dict:
         "engine_pid": None,
         "startup_hold_ms": 500,
         "recovery_hold_ms": 1500,
+        "claim_settle_ms": DEFAULT_CLAIM_SETTLE_MS,
     }
 
 
@@ -640,8 +650,13 @@ def _verb_setup(root: Path, params: dict) -> tuple[int, dict]:
     try:
         startup_hold_ms = int(config.get("native.startup_hold_ms", 500))
         recovery_hold_ms = int(config.get("native.recovery_hold_ms", 1500))
+        claim_settle_ms = int(
+            config.get("native.claim_settle_ms", DEFAULT_CLAIM_SETTLE_MS)
+        )
     except (TypeError, ValueError):
         return _usage("setup", "native.* hold knobs must be integers")
+    if claim_settle_ms < 0:
+        return _usage("setup", "native.claim_settle_ms must not be negative")
     repository = params["repository"]
     # Fresh state volume: remove any previous instance data first.
     for name in ("instance", "remote.git", "clone"):
@@ -673,6 +688,7 @@ def _verb_setup(root: Path, params: dict) -> tuple[int, dict]:
         "container_running": True,
         "startup_hold_ms": startup_hold_ms,
         "recovery_hold_ms": recovery_hold_ms,
+        "claim_settle_ms": claim_settle_ms,
     }
     _save_state(root, payload)
     _save_issues(root, {})
@@ -684,6 +700,7 @@ def _verb_setup(root: Path, params: dict) -> tuple[int, dict]:
     serving = _wait_for(
         lambda: _paths(root)["serving"].exists(),
         timeout=_DAEMON_READY_TIMEOUT_SECONDS,
+        interval=0.02,
     )
     if not serving:
         return _failed(
@@ -770,7 +787,9 @@ def _verb_release(root: Path) -> tuple[int, dict]:
     first ends the startup hold, and on the next call the recovery hold,
     waiting (bounded) until the engine settles in its next state. Releasing
     an ``after-outcome`` hold the engine waits in returns once that
-    attempt's finalization (sealing included) shows in ``status``.
+    attempt's finalization (sealing included) shows in ``status``. When any
+    of these bounded waits runs out, ``release`` answers ``failed`` naming
+    the wait, never ``ok``.
     """
 
     state, error = _require_instance(root, "release")
@@ -795,29 +814,45 @@ def _verb_release(root: Path) -> tuple[int, dict]:
         # again when a retained attempt waits) or to ready.
         released = True
         paths["startup_hold"].unlink(missing_ok=True)
-        if _engine_alive(root):
-            _wait_for(
-                lambda: _left_starting(root),
-                timeout=_RELEASE_STARTUP_TIMEOUT_SECONDS,
-                interval=0.05,
-            )
+        if not _engine_settles(root, lambda: _left_starting(root)):
+            return _failed("release", "the engine did not leave starting in time")
     elif paths["recovery_hold"].exists():
         # Ends ``recovering``: startup reconciliation finishes the retained
         # attempt (or holds it for an operator recovery command).
         released = True
         paths["recovery_hold"].unlink(missing_ok=True)
-        if _engine_alive(root):
-            _wait_for(
-                lambda: paths["startup_reconciled"].exists(),
-                timeout=_RELEASE_STARTUP_TIMEOUT_SECONDS,
-                interval=0.05,
+        if not _engine_settles(root, paths["startup_reconciled"].exists):
+            return _failed(
+                "release", "startup reconciliation did not finish in time"
             )
     # A ready engine then gets its one claim, as the stub claims on the next
     # read once its startup or recovery hold clears (a pending ``next
     # issue`` priority included); a still-held engine returns at once.
-    if _engine_alive(root) and _active_attempt_id(root) is None:
-        _let_one_claim_through(root)
+    if (
+        _engine_alive(root)
+        and _active_attempt_id(root) is None
+        and not _let_one_claim_through(root)
+    ):
+        return _failed(
+            "release", "the engine did not settle the claim it was let through in time"
+        )
     return _ok("release", {"released": released})
+
+
+def _engine_settles(root: Path, settled) -> bool:
+    """Wait (bounded) for ``settled`` after ``release`` ended a startup hold.
+
+    A dead engine (or one that dies meanwhile) counts as settled: there is
+    nothing left to wait for. ``False`` means the wait ran out.
+    """
+
+    if not _engine_alive(root):
+        return True
+    return _wait_for(
+        lambda: settled() or not _engine_alive(root),
+        timeout=_RELEASE_STARTUP_TIMEOUT_SECONDS,
+        interval=0.05,
+    )
 
 
 def _held_after_outcome(root: Path) -> str | None:
@@ -869,14 +904,21 @@ def _left_starting(root: Path) -> bool:
     return state == "recovering" or _paths(root)["startup_reconciled"].exists()
 
 
-def _let_one_claim_through(root: Path) -> None:
+def _let_one_claim_through(root: Path) -> bool:
+    """Arm the claim gate once and wait (bounded) for the engine to settle.
+
+    Returns ``False`` only when the engine neither claimed nor passed the
+    Claim boundary in time; ``True`` when it settled, died meanwhile (an
+    armed crash fired), or had no Claim to let through.
+    """
+
     status = _engine_status(root)
     if status is None:
-        return
+        return True
     if status.get("instance", {}).get("state") in ("starting", "recovering"):
-        return
+        return True
     if status.get("intake", {}).get("state") != "open":
-        return
+        return True
     paths = _paths(root)
     token = uuid.uuid4().hex
     paths["claim_gate_result"].unlink(missing_ok=True)
@@ -886,13 +928,14 @@ def _let_one_claim_through(root: Path) -> None:
         answer = _read_json_file(paths["claim_gate_result"])
         if answer is not None and answer.get("token") == token and not answer.get("claimed"):
             return True  # the engine passed the Claim boundary with nothing to claim
-        if _active_attempt_id(root) is None:
-            return False
-        current = _engine_status(root)
-        return current is not None and current.get("current_attempt") is not None
+        if _active_attempt_id(root) is not None:
+            current = _engine_status(root)
+            if current is not None and current.get("current_attempt") is not None:
+                return True
+        return not _engine_alive(root)  # an armed crash ended the engine
 
     try:
-        _wait_for(settled, timeout=_RELEASE_CLAIM_TIMEOUT_SECONDS, interval=0.05)
+        return _wait_for(settled, timeout=_RELEASE_CLAIM_TIMEOUT_SECONDS, interval=0.05)
     finally:
         gate = _read_json_file(paths["claim_gate"])
         if gate is not None and gate.get("token") == token:
@@ -1074,6 +1117,7 @@ def _verb_start_container(root: Path) -> tuple[int, dict]:
     serving = _wait_for(
         lambda: paths["serving"].exists(),
         timeout=_DAEMON_READY_TIMEOUT_SECONDS,
+        interval=0.02,
     )
     if not serving:
         return _failed(
