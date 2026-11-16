@@ -773,6 +773,104 @@ class GitWorkspace:
                 "Attempt branch revision is unavailable in the local clone"
             ) from error
 
+    def remote_branch_revision(self, branch: str) -> str | None:
+        """The remote tip revision of an attempt branch (``None`` when absent).
+
+        Raises :class:`GitWorkspaceError` when the remote cannot be read, so
+        the caller never mistakes an unreachable origin for an absent branch.
+        Used by Unpushed-revision recovery to compare the remote tip against
+        the recorded claim-time lease before pushing or preserving.
+        """
+
+        return self._remote_branch_revision(branch)
+
+    def push_branch_revision(
+        self,
+        branch: str,
+        revision: str,
+        *,
+        expected_revision: str | None,
+        issue_number: int | None = None,
+    ) -> str:
+        """Push an explicit ``revision`` to an attempt branch under one lease.
+
+        The single-shot push Unpushed-revision recovery retries: publish
+        ``revision`` as ``refs/heads/<branch>`` with
+        ``--force-with-lease=<branch>:<expected>`` (empty ``<expected>``
+        when ``expected_revision`` is ``None``, i.e. the lease says absent)
+        and verify the remote tip is ``revision`` afterwards. A push that
+        lands while the response is lost still returns ``revision``. A remote
+        that no longer stands at the lease raises
+        :class:`BranchMovedSinceClaimError`; any other failure raises
+        :class:`GitWorkspaceError`, and the caller keeps the revision as a
+        Preserved revision instead of retrying.
+        """
+
+        if (
+            not isinstance(revision, str)
+            or not revision.strip()
+            or any(character.isspace() for character in revision)
+        ):
+            raise GitWorkspaceError("Pushed revision must be a non-empty string")
+        expected = expected_revision or ""
+        try:
+            self._git(
+                "push",
+                f"--force-with-lease={branch}:{expected}",
+                "origin",
+                f"{revision}:refs/heads/{branch}",
+            )
+            if self._remote_branch_revision(branch) == revision:
+                return revision
+            raise GitWorkspaceError("Pushed branch does not match the given revision")
+        except BranchMovedSinceClaimError:
+            raise
+        except GitWorkspaceError as error:
+            try:
+                current = self._remote_branch_revision(branch)
+            except GitWorkspaceError:
+                current = "__unreadable__"
+            if current == revision:
+                return revision
+            if current != "__unreadable__" and current != expected_revision:
+                observed = "absent" if current is None else current
+                wanted = "absent" if expected_revision is None else expected_revision
+                raise BranchMovedSinceClaimError(
+                    f"branch moved since claim: remote {branch} is {observed}, "
+                    f"claim-time lease was {wanted}"
+                ) from error
+            raise
+
+    def preserve_revision(self, ref: str, revision: str) -> str:
+        """Keep ``revision`` under the local ``ref`` for an operator to decide on.
+
+        Used by Unpushed-revision recovery when the recorded revision cannot
+        be safely published: the Preserved revision stays reachable from
+        ``ref`` (a ``refs/agent/preserved/...`` reference, never a branch)
+        after attempt preparation restores the attempt branch from the
+        remote. Returns ``ref``.
+        """
+
+        if (
+            not isinstance(ref, str)
+            or not ref.strip()
+            or any(character.isspace() for character in ref)
+        ):
+            raise GitWorkspaceError("Preserved ref must be a non-empty string")
+        if (
+            not isinstance(revision, str)
+            or not revision.strip()
+            or any(character.isspace() for character in revision)
+        ):
+            raise GitWorkspaceError("Preserved revision must be a non-empty string")
+        try:
+            self._git("update-ref", ref, revision)
+        except GitWorkspaceError as error:
+            raise GitWorkspaceError(
+                f"Preserved revision could not be kept at {ref}"
+            ) from error
+        return ref
+
     def _push_retry_delay(
         self, attempt: int, deadline: float | None, error: GitWorkspaceError
     ) -> None:

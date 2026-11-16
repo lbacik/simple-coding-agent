@@ -36,6 +36,11 @@ from simple_coding_agent.recovery import (
     requeue_source_marker,
     worker_blocks,
 )
+from simple_coding_agent.unpushed_revision import (
+    UnpushedRevisionRecord,
+    UnpushedRevisionStore,
+    UnpushedRevisionStoreError,
+)
 
 
 _SUCCEEDED_BUT_UNPUBLISHED = "Implementation succeeded but publication failed."
@@ -178,6 +183,11 @@ class PublicationRequest:
     auto_merge_opt_in: bool = False
     reviews_performed: int = 0
     requeue_source: str = REQUEUE_SOURCE_HUMAN
+    #: One optional line about Unpushed-revision recovery performed at claim
+    #: time (a ``**Recovered unpushed revision**`` or ``**Preserved unpushed
+    #: revision**`` line), rendered after the unpushed-revision line. ``None``
+    #: renders nothing, keeping the comment byte-for-byte identical to today.
+    unpushed_recovery_line: str | None = None
     #: The automatic-continuation standing for the shared handoff record
     #: (the same ``used`` count the legacy handoff comment reports). ``None``
     #: means no shared record is requested, so handoff publication stays
@@ -349,6 +359,7 @@ class Publisher:
         merge_method: str = "merge",
         handoff_store: HandoffPublicationStore | MemoryHandoffPublicationStore | None = None,
         handoff_comment_mode: str = _DEFAULT_HANDOFF_COMMENT_MODE,
+        unpushed_store: UnpushedRevisionStore | None = None,
     ) -> None:
         self._workspace = workspace
         self._github = github
@@ -365,6 +376,7 @@ class Publisher:
         self._handoff_store = (
             handoff_store if handoff_store is not None else MemoryHandoffPublicationStore()
         )
+        self._unpushed_store = unpushed_store
 
     def publish(
         self, request: PublicationRequest, *, timeout: float | None = None
@@ -413,6 +425,7 @@ class Publisher:
                     level="ERROR",
                     issue_number=request.issue_number,
                 )
+                self._record_unpushed_revision(request, failed_push.local_revision)
                 outcome = AttemptOutcome.INFRASTRUCTURE_ERROR
                 comment_posted = self._post_result(
                     request, outcome, None, None, details, failed_push=failed_push
@@ -453,6 +466,7 @@ class Publisher:
                     level="ERROR",
                     issue_number=request.issue_number,
                 )
+                self._record_unpushed_revision(request, failed_push.local_revision)
                 if outcome is AttemptOutcome.INCOMPLETE and not request.decision.publication_eligible:
                     # A failed final authoritative check stays reported as
                     # incomplete; the push failure is secondary and must not
@@ -977,6 +991,66 @@ class Publisher:
         ):
             return None
         return revision
+
+    def _record_unpushed_revision(
+        self, request: PublicationRequest, local_revision: str | None
+    ) -> None:
+        """Durably record the Unpushed revision of a failed attempt-branch push.
+
+        Stores the local tip the push could not publish together with this
+        attempt's claim-time lease, so the next implementation claim of the
+        same issue on this Worker can publish it (or keep it as a Preserved
+        revision). A ``ClaimLeaseError`` never reaches here, because that
+        push itself landed. An unrecorded lease (checkpoints written before
+        the lease existed) writes no record instead of guessing. Never
+        raises: an unreadable revision, an unreadable lease, or an
+        unwritable store emits an ``unpushed_revision_record_failed`` ERROR
+        event and leaves the failed attempt's outcome, result comment, and
+        ``publication_failed`` event exactly as reported. A missing store
+        (callers without a data directory) records nothing.
+        """
+
+        if self._unpushed_store is None:
+            return
+        lease_revision, lease_known = self._claim_lease(request.issue_number)
+        if not lease_known:
+            return
+        if (
+            not isinstance(local_revision, str)
+            or not local_revision.strip()
+            or any(character.isspace() for character in local_revision)
+        ):
+            self._event_log(
+                "unpushed_revision_record_failed",
+                "the Unpushed revision could not be read from the local clone;"
+                " no Unpushed-revision record was stored",
+                level="ERROR",
+                issue_number=request.issue_number,
+            )
+            return
+        try:
+            self._unpushed_store.save(
+                UnpushedRevisionRecord(
+                    issue_number=request.issue_number,
+                    revision=local_revision,
+                    lease_revision=lease_revision,
+                    attempt_id=request.started_at,
+                )
+            )
+        except (UnpushedRevisionStoreError, OSError, ValueError) as error:
+            self._event_log(
+                "unpushed_revision_record_failed",
+                f"the Unpushed revision could not be recorded: {error}",
+                level="ERROR",
+                issue_number=request.issue_number,
+            )
+        except Exception as error:
+            self._event_log(
+                "unpushed_revision_record_failed",
+                f"the Unpushed revision could not be recorded: {error}",
+                level="ERROR",
+                issue_number=request.issue_number,
+            )
 
     def _push_branch(self, branch: str, *, deadline: float, issue_number: int) -> str:
         """Push using the recorded claim-time lease when one exists."""
@@ -1658,6 +1732,11 @@ def _result_comment(
         if failed_push is not None and failed_push.local_revision is not None
         else ""
     )
+    recovery_line = (
+        f"{request.unpushed_recovery_line}\n"
+        if request.unpushed_recovery_line
+        else ""
+    )
     merge_line = f"**Merge**: {merge_result}\n" if merge_result is not None else ""
     review_lines = "\n".join(_review_lines(request))
     source_marker = requeue_source_marker(request.requeue_source)
@@ -1669,6 +1748,7 @@ def _result_comment(
         f"{merge_line}"
         f"{commit_line}"
         f"{revision_line}"
+        f"{recovery_line}"
         f"{worker_block}\n"
         "### Evidence\n"
         f"{_request_check_line(request)}\n"

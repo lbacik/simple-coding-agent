@@ -175,6 +175,15 @@ class InMemoryWorkspace:
         self._resolve_after_model = resolve_after_model
         self._model_finished = False
         self.current_branch = self._branch
+        # Simulated remote attempt branches (branch -> tip revision) for
+        # Unpushed-revision recovery. ``remote_unavailable`` makes remote
+        # reads fail like an unreachable origin; ``recovery_push_error``
+        # makes the next recovery push fail without touching the remote.
+        self.remote_branches: dict[str, str] = {}
+        self.remote_unavailable = False
+        self.recovery_push_error: Exception | None = None
+        # Preserved revisions kept for the operator (ref -> revision).
+        self.preserved_refs: dict[str, str] = {}
         self.dirty: set[str] = set()
         # Artifacts ignored on the attempt branch but exposed as untracked on
         # the base branch (removed by cleanup, like the production sweep);
@@ -276,6 +285,49 @@ class InMemoryWorkspace:
         if self._commits:
             return self._commits[-1].revision
         return self._base_revision
+
+    def remote_branch_revision(self, branch: str) -> str | None:
+        """The simulated remote tip of an attempt branch (``None`` when absent)."""
+
+        if self.remote_unavailable:
+            raise GitWorkspaceError("origin is unreachable in the simulation")
+        return self.remote_branches.get(branch)
+
+    def push_branch_revision(
+        self,
+        branch: str,
+        revision: str,
+        *,
+        expected_revision: str | None,
+        issue_number: int | None = None,
+    ) -> str:
+        """Push an explicit revision under one lease against the simulated remote."""
+
+        from simple_coding_agent.git_workspace import BranchMovedSinceClaimError
+
+        if self.remote_unavailable:
+            raise GitWorkspaceError("origin is unreachable in the simulation")
+        if self.recovery_push_error is not None:
+            error, self.recovery_push_error = self.recovery_push_error, None
+            raise error
+        current = self.remote_branches.get(branch)
+        if current == revision:
+            return revision
+        if current != expected_revision:
+            observed = "absent" if current is None else current
+            wanted = "absent" if expected_revision is None else expected_revision
+            raise BranchMovedSinceClaimError(
+                f"branch moved since claim: remote {branch} is {observed}, "
+                f"claim-time lease was {wanted}"
+            )
+        self.remote_branches[branch] = revision
+        return revision
+
+    def preserve_revision(self, ref: str, revision: str) -> str:
+        """Keep a revision under a local ref in the simulation."""
+
+        self.preserved_refs[ref] = revision
+        return ref
 
     def files_changed(self, revision: str) -> tuple[str, ...]:
         """Repository-relative paths one recorded commit touched, if known."""
@@ -1389,6 +1441,7 @@ def build_lifecycle(
     contract_events=None,
     workspace_redactions: tuple[str, ...] = (),
     workspace_run=None,
+    unpushed_store=None,
 ):
     """Wire the real lifecycle against the shared fakes over a real git remote.
 
@@ -1456,6 +1509,8 @@ def build_lifecycle(
     publisher_kwargs: dict = {}
     if event_log is not None:
         publisher_kwargs["event_log"] = event_log
+    if unpushed_store is not None:
+        publisher_kwargs["unpushed_store"] = unpushed_store
     publisher = Publisher(
         workspace,
         github,
@@ -1473,6 +1528,9 @@ def build_lifecycle(
         lifecycle_kwargs["attempt_archive_factory"] = attempt_archive_factory
     if contract_events is not None:
         lifecycle_kwargs["contract_events"] = contract_events
+    lifecycle_kwargs = dict(lifecycle_kwargs)
+    if unpushed_store is not None:
+        lifecycle_kwargs["unpushed_store"] = unpushed_store
     return AgentLifecycle(
         tracker=tracker,
         attempt_state=attempt_state,

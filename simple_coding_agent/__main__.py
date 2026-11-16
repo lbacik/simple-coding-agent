@@ -48,6 +48,7 @@ from simple_coding_agent.finalization import AttemptCompletionStore
 from simple_coding_agent.git_workspace import GitWorkspace
 from simple_coding_agent.github_tracker import GitHubGraphQLTransport, GitHubTracker
 from simple_coding_agent.handoff_record import HandoffPublicationStore
+from simple_coding_agent.unpushed_revision import UnpushedRevisionStore
 from simple_coding_agent.halt import (
     HALT_CONTROL_ENDPOINT_UNAVAILABLE,
     HALT_PROVENANCE_FAILED,
@@ -220,6 +221,7 @@ def main() -> None:
         redactions=config.credential_redactions,
         extra_path=config.profile_extra_path,
     )
+    unpushed_store = UnpushedRevisionStore(config.data_dir)
     publisher = Publisher(
         workspace,
         github,
@@ -231,6 +233,7 @@ def main() -> None:
         attempt_state=attempt_state,
         handoff_store=HandoffPublicationStore(config.data_dir),
         handoff_comment_mode=config.handoff_comment_mode,
+        unpushed_store=unpushed_store,
         event_log=lambda event, detail="", level="INFO", issue_number=None, attempt_id=None: logger.emit(
             event, phase="publication", detail=detail, level=level, issue_number=issue_number, attempt_id=attempt_id
         ),
@@ -258,6 +261,7 @@ def main() -> None:
         ),
         attempt_archive_factory=archive_factory,
         completion_store=AttemptCompletionStore(config.data_dir),
+        unpushed_store=unpushed_store,
         control_store=control_store,
         contract_events=contract_events,
         repository=config.target_repo,
