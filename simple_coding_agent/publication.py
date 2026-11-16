@@ -22,6 +22,8 @@ from simple_coding_agent.handoff_record import (
     HandoffRecord,
     MemoryHandoffPublicationStore,
     build_handoff_record_body,
+    handoff_note_blob_url,
+    handoff_note_revision_blob_url,
     is_newer_attempt,
     parse_handoff_record,
     records_match,
@@ -36,6 +38,11 @@ from simple_coding_agent.recovery import (
     requeue_source_marker,
     worker_blocks,
 )
+from simple_coding_agent.unpushed_revision import (
+    UnpushedRevisionRecord,
+    UnpushedRevisionStore,
+    UnpushedRevisionStoreError,
+)
 
 
 _SUCCEEDED_BUT_UNPUBLISHED = "Implementation succeeded but publication failed."
@@ -49,6 +56,20 @@ class ClaimLeaseError(GitWorkspaceError):
     from a push failure so the event log and result comment name the
     bookkeeping that failed, not the push that already succeeded.
     """
+
+
+@dataclass(frozen=True)
+class _FailedPushInfo:
+    """How to report a push that published nothing new this attempt.
+
+    ``branch_url`` links the attempt branch already on the remote (``None``
+    when the claim-time lease says it was absent or is unknown, keeping
+    ``no branch created``); ``local_revision`` is the local tip that was not
+    pushed (``None`` when unreadable, so the failure is reported without it).
+    """
+
+    branch_url: str | None
+    local_revision: str | None = None
 
 
 #: The issue label opting one implementation into auto-merge when the
@@ -164,6 +185,11 @@ class PublicationRequest:
     auto_merge_opt_in: bool = False
     reviews_performed: int = 0
     requeue_source: str = REQUEUE_SOURCE_HUMAN
+    #: One optional line about Unpushed-revision recovery performed at claim
+    #: time (a ``**Recovered unpushed revision**`` or ``**Preserved unpushed
+    #: revision**`` line), rendered after the unpushed-revision line. ``None``
+    #: renders nothing, keeping the comment byte-for-byte identical to today.
+    unpushed_recovery_line: str | None = None
     #: The automatic-continuation standing for the shared handoff record
     #: (the same ``used`` count the legacy handoff comment reports). ``None``
     #: means no shared record is requested, so handoff publication stays
@@ -175,6 +201,17 @@ class PublicationRequest:
     #: a notified handoff still posts it (deduplicated) with the current
     #: standing; in ``verbose`` mode every handoff posts regardless.
     handoff_notify: bool = False
+    #: The automatic-continuation standing line for the handoff (the same
+    #: ``Automatic continuation k/N used; ...`` text
+    #: ``_handoff_publication_details`` appends to ``details``). Carried
+    #: separately so a confirmed ``link``-mode notification can render the
+    #: standing without the note body. ``None`` renders no standing line.
+    handoff_standing_line: str | None = None
+    #: The handoff note's ``reason`` field (for example
+    #: ``token_soft_threshold``). Carried separately so a confirmed
+    #: ``link``-mode notification can name the reason without the note
+    #: body. ``None`` (or blank) renders no reason line.
+    handoff_reason: str | None = None
     #: The profile check steps in run order. The comment reports only the
     #: outcome (plus the single failing step), never the joined script, so
     #: these exist to render the ``K/M`` position of a failure.
@@ -335,6 +372,7 @@ class Publisher:
         merge_method: str = "merge",
         handoff_store: HandoffPublicationStore | MemoryHandoffPublicationStore | None = None,
         handoff_comment_mode: str = _DEFAULT_HANDOFF_COMMENT_MODE,
+        unpushed_store: UnpushedRevisionStore | None = None,
     ) -> None:
         self._workspace = workspace
         self._github = github
@@ -351,6 +389,7 @@ class Publisher:
         self._handoff_store = (
             handoff_store if handoff_store is not None else MemoryHandoffPublicationStore()
         )
+        self._unpushed_store = unpushed_store
 
     def publish(
         self, request: PublicationRequest, *, timeout: float | None = None
@@ -385,19 +424,26 @@ class Publisher:
                     )
                     self._check_deadline(deadline)
                     self._mark_publishing()
-                branch_url = f"https://github.com/{self._repository}/tree/{request.branch}"
+                branch_url = self._branch_url(request.branch)
             except BranchMovedSinceClaimError as error:
                 push_failure = f"Partial branch push failed: {git_failure_summary(error)}"
+                failed_push = self._failed_push_display(request)
+                details = _with_unpushed_revision(push_failure, failed_push.local_revision)
                 self._event_log(
                     "publication_failed",
-                    f"Partial branch push failed: {git_failure_detail(error)}",
+                    _with_unpushed_revision(
+                        f"Partial branch push failed: {git_failure_detail(error)}",
+                        failed_push.local_revision,
+                    ),
                     level="ERROR",
                     issue_number=request.issue_number,
                 )
+                self._record_unpushed_revision(request, failed_push.local_revision)
                 outcome = AttemptOutcome.INFRASTRUCTURE_ERROR
-                details = push_failure
-                comment_posted = self._post_result(request, outcome, branch_url, None, details)
-                return PublicationResult(outcome, branch_url, None, comment_posted, details)
+                comment_posted = self._post_result(
+                    request, outcome, None, None, details, failed_push=failed_push
+                )
+                return PublicationResult(outcome, None, None, comment_posted, details)
             except ClaimLeaseError as error:
                 advance_failure = f"Claim lease advance failed: {git_failure_summary(error)}"
                 self._event_log(
@@ -406,6 +452,11 @@ class Publisher:
                     level="ERROR",
                     issue_number=request.issue_number,
                 )
+                # The push itself landed, so the branch line links it like a
+                # normal published branch; only the bookkeeping failed. The
+                # result keeps no branch URL so recovery still retains the
+                # local branch like every other unpublished outcome.
+                pushed_url = self._branch_url(request.branch)
                 if outcome is AttemptOutcome.INCOMPLETE and not request.decision.publication_eligible:
                     # Like a partial push failure, a failed final check stays
                     # reported as incomplete; the lease failure is secondary
@@ -414,26 +465,38 @@ class Publisher:
                 else:
                     outcome = AttemptOutcome.INFRASTRUCTURE_ERROR
                     details = advance_failure
-                comment_posted = self._post_result(request, outcome, branch_url, None, details)
-                return PublicationResult(outcome, branch_url, None, comment_posted, details)
+                comment_posted = self._post_result(request, outcome, pushed_url, None, details)
+                return PublicationResult(outcome, None, None, comment_posted, details)
             except (GitWorkspaceError, TimeoutError) as error:
                 push_failure = f"Partial branch push failed: {git_failure_summary(error)}"
+                failed_push = self._failed_push_display(request)
                 self._event_log(
                     "publication_failed",
-                    f"Partial branch push failed: {git_failure_detail(error)}",
+                    _with_unpushed_revision(
+                        f"Partial branch push failed: {git_failure_detail(error)}",
+                        failed_push.local_revision,
+                    ),
                     level="ERROR",
                     issue_number=request.issue_number,
                 )
+                self._record_unpushed_revision(request, failed_push.local_revision)
                 if outcome is AttemptOutcome.INCOMPLETE and not request.decision.publication_eligible:
                     # A failed final authoritative check stays reported as
                     # incomplete; the push failure is secondary and must not
                     # hide the evaluator's reason.
-                    details = "; ".join((*request.decision.reasons, push_failure))
+                    details = _with_unpushed_revision(
+                        "; ".join((*request.decision.reasons, push_failure)),
+                        failed_push.local_revision,
+                    )
                 else:
                     outcome = AttemptOutcome.INFRASTRUCTURE_ERROR
-                    details = _SUCCEEDED_BUT_UNPUBLISHED
-                comment_posted = self._post_result(request, outcome, branch_url, None, details)
-                return PublicationResult(outcome, branch_url, None, comment_posted, details)
+                    details = _with_unpushed_revision(
+                        _SUCCEEDED_BUT_UNPUBLISHED, failed_push.local_revision
+                    )
+                comment_posted = self._post_result(
+                    request, outcome, None, None, details, failed_push=failed_push
+                )
+                return PublicationResult(outcome, None, None, comment_posted, details)
 
         if request.decision.publication_eligible:
             try:
@@ -566,8 +629,20 @@ class Publisher:
             request.handoff_notify or not shared_requested or not handoff_posted
         )
         if needs_notification:
+            if request.handoff_notify and shared_requested and handoff_posted:
+                # A confirmed shared record already links the current note,
+                # so the notification carries only the standing: the reason,
+                # a revision-pinned link to the reported note, and a
+                # branch-following link to the current note. Nothing pasted
+                # here can go stale when a later handoff replaces the note.
+                # An unconfirmed or unrequested shared record keeps the full
+                # note body as the fallback: the link may not name a
+                # confirmed revision then.
+                comment_details = _handoff_notification_details(request, self._repository)
+            else:
+                comment_details = request.details
             comment_posted = self._post_result(
-                request, outcome, branch_url, pull_request, request.details, merge_result
+                request, outcome, branch_url, pull_request, comment_details, merge_result
             )
             if not shared_requested:
                 self._event_log(
@@ -681,7 +756,7 @@ class Publisher:
                     )
                     self._check_deadline(deadline)
                     self._mark_publishing()
-                branch_url = f"https://github.com/{self._repository}/tree/{request.branch}"
+                branch_url = self._branch_url(request.branch)
             except BranchMovedSinceClaimError as error:
                 push_failure = f"Rebased branch push failed: {git_failure_summary(error)}"
                 self._event_log(
@@ -896,6 +971,132 @@ class Publisher:
         except Exception as error:
             raise ClaimLeaseError(f"Claim lease could not be advanced: {error}") from error
 
+    def _branch_url(self, branch: str) -> str:
+        """The GitHub link for an attempt branch known to exist on the remote."""
+
+        return f"https://github.com/{self._repository}/tree/{branch}"
+
+    def _failed_push_display(self, request: PublicationRequest) -> _FailedPushInfo:
+        """How to report a push that published nothing new this attempt.
+
+        When the claim-time lease is recorded and names a revision, the
+        attempt branch already exists on the remote, so the result comment
+        links it and says this attempt's push failed instead of claiming
+        ``no branch created``. Otherwise (absent or unknown) the comment
+        keeps ``no branch created``. The local tip is attached whenever it
+        is readable so an operator can recover the unpushed work.
+        """
+
+        revision, known = self._claim_lease(request.issue_number)
+        branch_url = self._branch_url(request.branch) if known and revision else None
+        return _FailedPushInfo(
+            branch_url=branch_url,
+            local_revision=self._unpushed_local_revision(request.branch),
+        )
+
+    def _unpushed_local_revision(self, branch: str) -> str | None:
+        """The local tip a failed push did not publish, if readable.
+
+        Never raises: an unreadable revision reports the push failure
+        without the sha instead of crashing publication. Workspace doubles
+        without the reader also read as absent.
+        """
+
+        reader = getattr(self._workspace, "attempt_branch_revision", None)
+        if not callable(reader):
+            return None
+        try:
+            revision = reader(branch)
+        except Exception:
+            return None
+        if (
+            not isinstance(revision, str)
+            or not revision.strip()
+            or any(character.isspace() for character in revision)
+        ):
+            return None
+        return revision
+
+    def _record_unpushed_revision(
+        self, request: PublicationRequest, local_revision: str | None
+    ) -> None:
+        """Durably record the Unpushed revision of a failed attempt-branch push.
+
+        Stores the local tip the push could not publish together with this
+        attempt's claim-time lease, so the next implementation claim of the
+        same issue on this Worker can publish it (or keep it as a Preserved
+        revision). A ``ClaimLeaseError`` never reaches here, because that
+        push itself landed. An unrecorded lease (checkpoints written before
+        the lease existed) writes no record instead of guessing. Never
+        raises: an unreadable revision, an unreadable lease, or an
+        unwritable store emits an ``unpushed_revision_record_failed`` ERROR
+        event and leaves the failed attempt's outcome, result comment, and
+        ``publication_failed`` event exactly as reported. The lease is probed
+        directly from the attempt checkpoint (not through the push path's
+        ``_claim_lease`` fallback), so a checkpoint that cannot be read
+        records the ERROR instead of silently writing nothing, while a
+        genuinely unknown lease still writes nothing quietly. A missing store
+        (callers without a data directory) records nothing.
+        """
+
+        if self._unpushed_store is None:
+            return
+        try:
+            checkpoint = (
+                self._attempt_state.read() if self._attempt_state is not None else None
+            )
+            lease_known = checkpoint is not None and bool(
+                getattr(checkpoint, "claim_lease_recorded", False)
+            )
+            lease_revision = checkpoint.claim_branch_revision if lease_known else None
+        except Exception as error:
+            self._event_log(
+                "unpushed_revision_record_failed",
+                "the Unpushed revision could not be recorded:"
+                f" the claim-time lease could not be read: {error}",
+                level="ERROR",
+                issue_number=request.issue_number,
+            )
+            return
+        if not lease_known:
+            return
+        if (
+            not isinstance(local_revision, str)
+            or not local_revision.strip()
+            or any(character.isspace() for character in local_revision)
+        ):
+            self._event_log(
+                "unpushed_revision_record_failed",
+                "the Unpushed revision could not be read from the local clone;"
+                " no Unpushed-revision record was stored",
+                level="ERROR",
+                issue_number=request.issue_number,
+            )
+            return
+        try:
+            self._unpushed_store.save(
+                UnpushedRevisionRecord(
+                    issue_number=request.issue_number,
+                    revision=local_revision,
+                    lease_revision=lease_revision,
+                    attempt_id=request.started_at,
+                )
+            )
+        except (UnpushedRevisionStoreError, OSError, ValueError) as error:
+            self._event_log(
+                "unpushed_revision_record_failed",
+                f"the Unpushed revision could not be recorded: {error}",
+                level="ERROR",
+                issue_number=request.issue_number,
+            )
+        except Exception as error:
+            self._event_log(
+                "unpushed_revision_record_failed",
+                f"the Unpushed revision could not be recorded: {error}",
+                level="ERROR",
+                issue_number=request.issue_number,
+            )
+
     def _push_branch(self, branch: str, *, deadline: float, issue_number: int) -> str:
         """Push using the recorded claim-time lease when one exists."""
 
@@ -1040,6 +1241,8 @@ class Publisher:
         pull_request: PullRequest | None,
         details: str,
         merge_result: str | None = None,
+        *,
+        failed_push: _FailedPushInfo | None = None,
     ) -> bool:
         marker = f"<!-- agent-attempt: {request.started_at} -->"
         try:
@@ -1049,7 +1252,14 @@ class Publisher:
                 self._repository,
                 request.issue_number,
                 _result_comment(
-                    request, outcome, branch_url, pull_request, details, marker, merge_result
+                    request,
+                    outcome,
+                    branch_url,
+                    pull_request,
+                    details,
+                    marker,
+                    merge_result,
+                    failed_push=failed_push,
                 ),
             )
             return True
@@ -1528,6 +1738,51 @@ def _pull_request_body(request: PublicationRequest) -> str:
     )
 
 
+def _handoff_notification_details(request: PublicationRequest, repository: str) -> str:
+    """The short ``Details`` text for a confirmed ``link``-mode notification.
+
+    Names the handoff reason (when it can be read), links the reported note
+    revision (pinned to ``note_commit_sha`` so later handoffs cannot change
+    what this notification reports), and points at the current note through
+    the branch-following link the shared ``## Handoff note`` comment also
+    uses. The existing standing line is carried verbatim so the
+    automatic-continuation bookkeeping keeps matching. Only the ``Details``
+    text changes: the result header, branch/PR/note-commit lines, evidence,
+    and every marker stay exactly as the full-body comment renders them.
+    """
+
+    sections: list[str] = []
+    reason = (request.handoff_reason or "").strip()
+    if reason:
+        sections.append(f"Handoff reason: `{reason}`")
+    if request.note_commit_sha and request.note_commit_sha.strip():
+        pinned = handoff_note_revision_blob_url(
+            repository, request.note_commit_sha.strip(), request.issue_number
+        )
+        sections.append(
+            "Handoff note at the time of this notification:"
+            f" [`.agent/handoff/{request.issue_number}.md`]({pinned})"
+        )
+    current = handoff_note_blob_url(repository, request.branch, request.issue_number)
+    sections.append(
+        "Current Handoff note:"
+        f" [`.agent/handoff/{request.issue_number}.md`]({current})"
+        " (see also the shared `## Handoff note` comment)"
+    )
+    standing = (request.handoff_standing_line or "").strip()
+    if standing:
+        sections.append(standing)
+    return "\n\n".join(sections)
+
+
+def _with_unpushed_revision(text: str, local_revision: str | None) -> str:
+    """Append the unpushed revision to a push-failure message, when readable."""
+
+    if local_revision is None:
+        return text
+    return f"{text} Unpushed local revision: {local_revision}."
+
+
 def _result_comment(
     request: PublicationRequest,
     outcome: AttemptOutcome,
@@ -1536,14 +1791,34 @@ def _result_comment(
     details: str,
     marker: str,
     merge_result: str | None = None,
+    *,
+    failed_push: _FailedPushInfo | None = None,
 ) -> str:
-    branch = f"[{request.branch}]({branch_url})" if branch_url else "no branch created"
+    if branch_url is not None:
+        branch = f"[{request.branch}]({branch_url})"
+    elif failed_push is not None and failed_push.branch_url is not None:
+        branch = (
+            f"[{request.branch}]({failed_push.branch_url})"
+            " (exists on the remote; this attempt's push failed)"
+        )
+    else:
+        branch = "no branch created"
     pr = f"[#{pull_request.number}]({pull_request.url})" if pull_request else "none"
     commit_line = (
         f"**Handoff note commit**: `{request.note_commit_sha}`\n"
         if outcome is AttemptOutcome.HANDOFF and request.note_commit_sha
         else ""
     )
+    revision_line = (
+        f"**Unpushed local revision**: `{failed_push.local_revision}`\n"
+        if failed_push is not None and failed_push.local_revision is not None
+        else ""
+    )
+    # ``getattr`` like ``worker_id`` below: doubles and legacy callers may
+    # pass a request-shaped namespace without the recovery line, which then
+    # renders nothing, keeping the comment byte-for-byte identical to today.
+    recovery_text = getattr(request, "unpushed_recovery_line", None)
+    recovery_line = f"{recovery_text}\n" if recovery_text else ""
     merge_line = f"**Merge**: {merge_result}\n" if merge_result is not None else ""
     review_lines = "\n".join(_review_lines(request))
     source_marker = requeue_source_marker(request.requeue_source)
@@ -1554,6 +1829,8 @@ def _result_comment(
         f"**PR**: {pr}\n"
         f"{merge_line}"
         f"{commit_line}"
+        f"{revision_line}"
+        f"{recovery_line}"
         f"{worker_block}\n"
         "### Evidence\n"
         f"{_request_check_line(request)}\n"

@@ -21,6 +21,7 @@ import pytest
 from conformance_harness import harness as harness_module
 from conformance_harness.harness import (
     DAEMON_POLL_INTERVAL_SECONDS,
+    CHECKPOINT_REMOVAL_DELAY,
     HARNESS_VERSION,
     run_harness,
 )
@@ -771,6 +772,30 @@ def test_a_claimed_attempt_waits_for_finish_attempt(engine: _Engine) -> None:
     assert snapshot["last_finished"]["outcome"]["native"] == "infrastructure_error"
     # The outcome was consumed by that attempt, never left for the next one.
     assert not (engine.root / "flags" / "scripted_outcome.json").exists()
+
+
+def test_finish_attempt_waits_until_status_reports_the_finished_attempt(
+    engine: _Engine,
+) -> None:
+    # Issue #398: finalization removes the checkpoint before it seals the
+    # archive and records ``last_finished``. Widening that gap must not let
+    # ``finish-attempt`` answer while ``status`` still shows neither.
+    engine.call("set-issue", {"issue": 14, "eligible": True})
+    engine.call("release", {})
+    attempt_id = engine.status()["current_attempt"]["attempt_id"]
+    (engine.root / "flags" / CHECKPOINT_REMOVAL_DELAY).write_text(
+        json.dumps({"ms": 1000}), encoding="utf-8"
+    )
+
+    finished = engine.call("finish-attempt", {"native_outcome": "infrastructure_error"})
+
+    assert finished["attempt_id"] == attempt_id
+    snapshot = engine.status()
+    assert snapshot["current_attempt"] is None
+    assert snapshot["last_finished"] is not None
+    assert snapshot["last_finished"]["attempt_id"] == attempt_id
+    # The one-shot delay was consumed by that finalization.
+    assert not (engine.root / "flags" / CHECKPOINT_REMOVAL_DELAY).exists()
 
 
 def test_status_during_hold_lock_serves_the_prepared_snapshot(engine: _Engine) -> None:
