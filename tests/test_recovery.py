@@ -142,6 +142,32 @@ def test_status_reports_recovering_during_startup_reconciliation(tmp_path: Path)
     assert snapshot["recovery"]["attempt_id"] is not None
 
 
+def test_reconcile_startup_runs_once_without_reaching_a_claim_boundary(
+    tmp_path: Path,
+) -> None:
+    start_checkpoint(tmp_path)
+    lifecycle, tracker, _, _, _ = make_lifecycle(tmp_path)
+    tracker.next_claim = _claim(99)
+    recovered: list[int] = []
+    original = tracker.recover_claim
+
+    def recording_recover(issue_number: int):
+        recovered.append(issue_number)
+        return original(issue_number)
+
+    tracker.recover_claim = recording_recover  # type: ignore[method-assign]
+
+    lifecycle.reconcile_startup()
+
+    assert recovered == [24]
+    assert tracker.claimed == []  # reconciliation alone never claims new work
+
+    # The first engine cycle does not reconcile a second time.
+    assert lifecycle.reconcile_startup() is None
+    lifecycle.run_once()
+    assert recovered == [24]
+
+
 def test_retained_checkpoint_blocks_new_claims_until_recovery(tmp_path: Path) -> None:
     checkpoint = start_checkpoint(tmp_path)
     assert checkpoint is not None

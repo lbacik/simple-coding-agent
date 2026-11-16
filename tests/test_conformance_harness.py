@@ -19,7 +19,15 @@ from pathlib import Path
 import pytest
 
 from conformance_harness import harness as harness_module
-from conformance_harness.harness import HARNESS_VERSION, run_harness
+from conformance_harness.harness import (
+    DAEMON_POLL_INTERVAL_SECONDS,
+    HARNESS_VERSION,
+    run_harness,
+)
+
+#: Harness ``setup`` config for the engine-backed tests: an instant claim
+#: settle, so the time windows below are counted in daemon poll intervals.
+_FAST_ENGINE_CONFIG = {"native.startup_hold_ms": 100, "native.claim_settle_ms": 0}
 
 
 def invoke(*argv: str, state_dir: Path) -> tuple[int, dict]:
@@ -320,6 +328,96 @@ def test_start_container_after_a_crash_waits_for_the_new_engine(
     assert "did not serve the control endpoint" in reply["error"]["message"]
 
 
+def _release_against_a_stuck_engine(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, engine_state: str
+) -> tuple[int, dict]:
+    """Run ``release`` against a live engine that never settles anywhere.
+
+    The engine stays alive and keeps reporting ``engine_state`` with intake
+    open; it never writes ``startup_reconciled`` or answers the claim gate.
+    Every bounded ``release`` wait is shortened so it runs out quickly.
+    """
+
+    harness_module._save_state(
+        tmp_path,
+        {"repository": "octo/example", "engine_pid": 4242, "container_running": True},
+    )
+    (tmp_path / "flags").mkdir(exist_ok=True)
+    monkeypatch.setattr(harness_module, "_engine_alive", lambda root: True)
+    monkeypatch.setattr(
+        harness_module,
+        "_engine_status",
+        lambda root: {
+            "instance": {"state": engine_state},
+            "intake": {"state": "open"},
+            "current_attempt": None,
+        },
+    )
+    monkeypatch.setattr(harness_module, "_RELEASE_STARTUP_TIMEOUT_SECONDS", 0.2)
+    monkeypatch.setattr(harness_module, "_RELEASE_CLAIM_TIMEOUT_SECONDS", 0.2)
+    return invoke("release", request("release", {}), state_dir=tmp_path)
+
+
+def test_release_is_failed_when_the_engine_never_leaves_starting(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (tmp_path / "flags").mkdir(parents=True)
+    (tmp_path / "flags" / "startup_hold").write_text("armed", encoding="utf-8")
+
+    code, reply = _release_against_a_stuck_engine(tmp_path, monkeypatch, "starting")
+
+    assert code == 1, reply
+    assert reply["error"]["code"] == "failed"
+    assert "did not leave starting" in reply["error"]["message"]
+    assert not (tmp_path / "flags" / "startup_hold").exists()
+
+
+def test_release_is_failed_when_startup_reconciliation_never_finishes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (tmp_path / "flags").mkdir(parents=True)
+    (tmp_path / "flags" / "recovery_hold").write_text("armed", encoding="utf-8")
+
+    code, reply = _release_against_a_stuck_engine(tmp_path, monkeypatch, "recovering")
+
+    assert code == 1, reply
+    assert reply["error"]["code"] == "failed"
+    assert "reconciliation did not finish" in reply["error"]["message"]
+
+
+def test_release_is_failed_when_the_claim_it_lets_through_never_settles(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    code, reply = _release_against_a_stuck_engine(tmp_path, monkeypatch, "idle")
+
+    assert code == 1, reply
+    assert reply["error"]["code"] == "failed"
+    assert "did not settle the claim" in reply["error"]["message"]
+    # The gate is closed again even though the wait ran out.
+    assert not (tmp_path / "flags" / "claim_gate.json").exists()
+
+
+@pytest.mark.parametrize(
+    ("value", "message"),
+    [(-1, "native.claim_settle_ms must not be negative"), ("soon", "must be integers")],
+)
+def test_setup_rejects_a_bad_claim_settle_knob(
+    tmp_path: Path, value: object, message: str
+) -> None:
+    code, reply = invoke(
+        "setup",
+        request(
+            "setup",
+            {"repository": "octo/example", "config": {"native.claim_settle_ms": value}},
+        ),
+        state_dir=tmp_path,
+    )
+
+    assert code == 2, reply
+    assert reply["error"]["code"] == "usage"
+    assert message in reply["error"]["message"]
+
+
 def test_spawned_engine_has_a_commit_identity(tmp_path: Path, monkeypatch) -> None:
     """The harness container has no git identity; sealing attempt work commits."""
 
@@ -372,7 +470,7 @@ def _wait_for_state(socket: Path, wanted: str, timeout: float = 60.0) -> dict:
         last = _contract_status(socket)
         if last["instance"]["state"] == wanted:
             return last
-        time.sleep(0.2)
+        time.sleep(0.05)
     raise AssertionError(f"status never reached {wanted!r}; last={last!r}")
 
 
@@ -436,7 +534,8 @@ def test_harness_smoke_reaches_every_state(tmp_path: Path) -> None:
         "setup",
         {
             "repository": "octo/example",
-            "config": {"native.startup_hold_ms": 3000},
+            # Long enough to observe ``starting`` right after setup.
+            "config": {**_FAST_ENGINE_CONFIG, "native.startup_hold_ms": 400},
         },
     )
     assert result["repository"] == "octo/example"
@@ -583,10 +682,10 @@ def test_harness_smoke_reaches_every_state(tmp_path: Path) -> None:
 # Harness timing semantics the producer suite relies on (issue #376)
 # ---------------------------------------------------------------------------
 
-#: Many daemon poll intervals (0.2 s each), and longer than one whole claim
-#: including the tracker's assignment settle window, so a spontaneous claim
-#: would have produced an attempt checkpoint by the end of it.
-_NO_SPONTANEOUS_CLAIM_WINDOW_SECONDS = 3.5
+#: Several daemon poll intervals. With the claim settle delay configured to
+#: zero, one whole claim fits in a single engine iteration, so a spontaneous
+#: claim would have produced an attempt checkpoint by the end of it.
+_NO_SPONTANEOUS_CLAIM_WINDOW_SECONDS = 5 * DAEMON_POLL_INTERVAL_SECONDS
 
 
 class _Engine:
@@ -613,8 +712,7 @@ class _Engine:
 def engine(tmp_path: Path):
     harness = _Engine(tmp_path / "harness")
     harness.call(
-        "setup",
-        {"repository": "octo/example", "config": {"native.startup_hold_ms": 100}},
+        "setup", {"repository": "octo/example", "config": _FAST_ENGINE_CONFIG}
     )
     try:
         _wait_for_state(harness.socket, "idle")
@@ -676,14 +774,19 @@ def test_a_claimed_attempt_waits_for_finish_attempt(engine: _Engine) -> None:
 
 
 def test_status_during_hold_lock_serves_the_prepared_snapshot(engine: _Engine) -> None:
+    duration_ms = 1500
     before = engine.status()
     held: list[dict] = []
     holder = threading.Thread(
-        target=lambda: held.append(engine.call("hold-lock", {"duration_ms": 4000}))
+        target=lambda: held.append(engine.call("hold-lock", {"duration_ms": duration_ms}))
     )
     holder.start()
     try:
-        time.sleep(0.5)
+        # The engine confirms it holds its control lock before the hold runs.
+        deadline = time.monotonic() + 10.0
+        while not (engine.root / "flags" / "engine_lock.held").exists():
+            assert time.monotonic() < deadline, "the engine never took its lock"
+            time.sleep(0.01)
         started = time.monotonic()
         during = engine.status()
         elapsed = time.monotonic() - started
@@ -692,8 +795,8 @@ def test_status_during_hold_lock_serves_the_prepared_snapshot(engine: _Engine) -
         holder.join(timeout=30.0)
 
     assert still_held
-    assert elapsed < 3.0
-    assert held and held[0]["held_ms"] >= 4000
+    assert elapsed < duration_ms / 1000.0
+    assert held and held[0]["held_ms"] >= duration_ms
     for section in ("instance", "intake"):
         assert during[section]["observed_at"] <= before[section]["observed_at"]
 
@@ -719,8 +822,11 @@ def test_release_returns_promptly_with_intake_closed(engine: _Engine) -> None:
 
 
 def test_a_restart_holds_starting_and_release_honours_the_priority(
-    engine: _Engine,
+    engine: _Engine, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    # The startup wait must end on the engine leaving ``starting``, never on
+    # its bound: a shortened bound turns a missed wake-up into ``failed``.
+    monkeypatch.setattr(harness_module, "_RELEASE_STARTUP_TIMEOUT_SECONDS", 5.0)
     engine.call("hold", {"point": "before-claim", "scope": "next"})
     engine.call("set-issue", {"issue": 21, "eligible": True})
     engine.call("set-issue", {"issue": 22, "eligible": True})
@@ -733,7 +839,11 @@ def test_a_restart_holds_starting_and_release_honours_the_priority(
 
     engine.call("stop-container", {})
     engine.call("start-container", {})
-    time.sleep(1.0)  # well past native.startup_hold_ms: only release ends it
+    # Well past native.startup_hold_ms: only release ends ``starting``.
+    time.sleep(
+        _FAST_ENGINE_CONFIG["native.startup_hold_ms"] / 1000.0
+        + 3 * DAEMON_POLL_INTERVAL_SECONDS
+    )
     assert engine.status()["instance"]["state"] == "starting"
 
     assert engine.call("release", {}) == {"released": True}
@@ -901,7 +1011,7 @@ def _await_final_acknowledgement(
         record = reply["result"]["command"]
         if record["acknowledgement"] != "accepted" or time.monotonic() >= deadline:
             return record
-        time.sleep(0.2)
+        time.sleep(0.05)
 
 
 def test_handoff_now_completes_the_held_attempt_as_handoff(engine: _Engine) -> None:
@@ -942,7 +1052,7 @@ def test_an_interrupted_handoff_ends_not_fulfilled_after_recovery(
     deadline = time.monotonic() + 60.0
     while (engine.root / "flags" / "armed_crash.json").exists():
         assert time.monotonic() < deadline, "the armed crash never fired"
-        time.sleep(0.2)
+        time.sleep(0.05)
 
     engine.call("stop-container", {})
     engine.call("start-container", {})

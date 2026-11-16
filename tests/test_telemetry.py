@@ -116,7 +116,9 @@ class ScriptedSocketServer:
     def __init__(self, socket_path: Path, handler) -> None:
         self._socket_path = socket_path
         self._handler = handler
-        self._stopped = threading.Event()
+        #: Set by :meth:`stop`; a handler that must outlive its client
+        #: waits on it instead of sleeping, so stopping never waits it out.
+        self.stopped = threading.Event()
         self._listener: socket.socket | None = None
         self._thread: threading.Thread | None = None
 
@@ -137,7 +139,7 @@ class ScriptedSocketServer:
 
     def _serve(self) -> None:
         assert self._listener is not None
-        while not self._stopped.is_set():
+        while not self.stopped.is_set():
             try:
                 connection, _ = self._listener.accept()
             except socket.timeout:
@@ -152,7 +154,7 @@ class ScriptedSocketServer:
                 pass
 
     def stop(self) -> None:
-        self._stopped.set()
+        self.stopped.set()
         if self._listener is not None:
             try:
                 self._listener.close()
@@ -596,7 +598,8 @@ def test_agentctl_telemetry_times_out_after_three_seconds(
             if not chunk:
                 return
             data += chunk
-        time.sleep(30)
+        # Never answer; stopping the server ends the wait at once.
+        server.stopped.wait(timeout=30)
 
     socket_path = tmp_path / "state" / "blackhole.sock"
     server = ScriptedSocketServer(socket_path, black_hole)
@@ -611,7 +614,8 @@ def test_agentctl_telemetry_times_out_after_three_seconds(
     assert code == 2
     reply = json.loads(capsys.readouterr().out)
     assert reply["error"]["code"] == "agent_unreachable"
-    assert elapsed < 8
+    # The client gave up on its own 3 s timeout, not on a server hang-up.
+    assert 2.9 <= elapsed < 8
 
 
 def test_telemetry_serves_remembered_publication_while_status_stays_live(
