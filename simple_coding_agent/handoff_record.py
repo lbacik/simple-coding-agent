@@ -23,10 +23,11 @@ from pathlib import Path
 import tempfile
 
 from simple_coding_agent.recovery import (
-    _HANDOFF_NOTE_HEADING_TOP_RE,
     HANDOFF_RECORD_MARKER_PREFIX,
     HANDOFF_RECORD_VERSION,
     REQUEUE_SOURCES,
+    find_block_marker,
+    is_handoff_record,
 )
 
 
@@ -66,25 +67,26 @@ def handoff_record_marker(record: HandoffRecord) -> str:
 def parse_handoff_record(body: str) -> HandoffRecord | None:
     """Return the handoff record carried by a comment body, if any.
 
-    Structural: the body must start (after optional leading whitespace) with
-    the record heading or with the marker itself; quoted markers elsewhere
-    read as ``None``. Unknown keys are preserved for forward compatibility
-    by ignoring them; a body without a well-formed marker reads as ``None``.
+    Structural: the body must start (after up to three leading spaces) with
+    the record heading or with the marker itself, and a complete marker must
+    sit alone on its own line outside any fenced block; quoted markers
+    elsewhere read as ``None``. Unknown keys are preserved for forward
+    compatibility by ignoring them; a body without a well-formed marker
+    reads as ``None``.
     """
 
     text = body or ""
-    starts_heading = _HANDOFF_NOTE_HEADING_TOP_RE.search(text) is not None
-    starts_marker = text.lstrip().startswith(HANDOFF_RECORD_MARKER_PREFIX)
-    if not (starts_heading or starts_marker):
+    if not is_handoff_record(text):
         return None
-    start = text.find(HANDOFF_RECORD_MARKER_PREFIX)
-    if start < 0:
+    marker_text = find_block_marker(text, HANDOFF_RECORD_MARKER_PREFIX)
+    if marker_text is None:
         return None
-    end = text.find("-->", start)
+    start = marker_text.find(HANDOFF_RECORD_MARKER_PREFIX)
+    end = marker_text.find("-->", start)
     if end < 0:
         return None
     fields: dict[str, str] = {}
-    for token in text[start + len(HANDOFF_RECORD_MARKER_PREFIX) : end].split():
+    for token in marker_text[start + len(HANDOFF_RECORD_MARKER_PREFIX) : end].split():
         key, separator, value = token.partition("=")
         if separator and key and value:
             fields[key] = value

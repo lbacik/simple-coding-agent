@@ -12,6 +12,8 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
+import pytest
+
 from simple_coding_agent.completion import (
     AttemptOutcome,
     CompletionDecision,
@@ -45,7 +47,6 @@ from simple_coding_agent.recovery import (
     is_conflict_attempt,
     is_conflict_escalation,
     is_conflict_failure,
-    is_conflict_result_comment,
     is_generated_handoff_result,
     is_generated_result_comment,
     is_handoff_record,
@@ -304,21 +305,13 @@ def test_malformed_real_record_still_raises() -> None:
         "branch=agent/issue-393 branch_sha=" + "b" * 40 + " note_sha=" + "c" * 40 + " -->"
     )
     assert is_handoff_record(malformed) is True
-    try:
+    with pytest.raises(AmbiguousContinuationError):
         resolve_automatic_continuation_count((malformed,))
-    except AmbiguousContinuationError:
-        pass
-    else:
-        raise AssertionError("malformed record must raise")
 
 
 def test_two_real_records_still_raise() -> None:
-    try:
+    with pytest.raises(AmbiguousContinuationError):
         resolve_automatic_continuation_count((_shared(), _shared()))
-    except AmbiguousContinuationError:
-        pass
-    else:
-        raise AssertionError("duplicate records must raise")
 
 
 # ---------------------------------------------------------------------------
@@ -399,7 +392,6 @@ def test_conflict_result_recognised() -> None:
         None,
     )
     assert is_generated_result_comment(body) is True
-    assert is_conflict_result_comment(body) is True
     assert is_conflict_attempt(body) is True
     assert is_conflict_failure(body) is True
     assert is_conflict_escalation(body) is False
@@ -420,7 +412,7 @@ def test_conflict_escalation_recognised() -> None:
         None,
     )
     assert is_generated_result_comment(body) is True
-    assert is_conflict_result_comment(body) is True
+    assert is_conflict_attempt(body) is True
     assert is_conflict_escalation(body) is True
     assert is_conflict_failure(body) is False
 
@@ -447,3 +439,68 @@ def test_shared_record_body_recognised() -> None:
     assert parsed is not None
     assert parsed.issue_number == 393
     assert parsed.attempt_id == ATTEMPT
+
+
+# ---------------------------------------------------------------------------
+# markers must sit alone on their own line: header plus quoted marker is not
+# a result, and heading plus quoted marker is not a record
+# ---------------------------------------------------------------------------
+
+
+def test_header_at_top_with_only_quoted_marker_is_not_a_result() -> None:
+    quoted = attempt_marker("2026-01-02T00:00:00Z")
+    bodies = [
+        f"## Agent Attempt Result: handoff\n\nSee `{quoted}` for the format.",
+        f"## Agent Attempt Result: handoff\n\n- marker: `{quoted}`",
+        f"## Agent Attempt Result: handoff\n\n> {quoted}",
+        f"## Agent Attempt Result: handoff\n\n```\n{quoted}\n```",
+        f"## Agent Attempt Result: handoff\n\n    {quoted}",
+    ]
+    issue = _issue()
+    for body in bodies:
+        assert is_attempt_result_comment(body, kinds=("handoff", "incomplete")) is False
+        assert is_generated_result_comment(body) is True
+        assert _continuation_expected(issue, lambda unused, body=body: (body,)) is False
+
+
+def test_conflict_header_at_top_with_only_quoted_marker_is_not_a_result() -> None:
+    quoted = conflict_attempt_marker("rebase_conflict")
+    bodies = [
+        f"## Conflict Attempt Result: rebase_conflict\n\nSee `{quoted}`.",
+        f"## Conflict Attempt Result: rebase_conflict\n\n```\n{quoted}\n```",
+    ]
+    for body in bodies:
+        assert is_conflict_attempt(body) is False
+        assert count_conflict_failures((body,)) == 0
+
+
+def test_heading_at_top_with_only_quoted_record_marker_is_not_a_record() -> None:
+    marker = handoff_record_marker(_record())
+    bodies = [
+        f"## Handoff note\n\nSee `{marker}` for the format.",
+        f"## Handoff note\n\n```\n{marker}\n```",
+        f"## Handoff note\n\n> {marker}",
+    ]
+    for body in bodies:
+        assert is_handoff_record(body) is False
+        assert parse_handoff_record(body) is None
+    # Quoted after a real heading still resolves to "no record", never raises.
+    assert resolve_automatic_continuation_count((bodies[0], _shared())) == 2
+
+
+def test_indented_code_header_at_top_is_not_a_result() -> None:
+    body = (
+        f"    ## Agent Attempt Result: handoff\n\n    {attempt_marker(ATTEMPT)}\n"
+        f"    {requeue_source_marker(REQUEUE_SOURCE_AUTOMATIC)}"
+    )
+    assert is_attempt_result_comment(body) is False
+    assert is_generated_handoff_result(body) is False
+    assert _continuation_expected(_issue(), lambda unused: (body,)) is False
+
+
+def test_bare_marker_shorthand_still_counts() -> None:
+    marker = conflict_attempt_marker("rebase_conflict")
+    assert is_conflict_attempt(marker) is True
+    record_marker = handoff_record_marker(_record())
+    assert is_handoff_record(record_marker) is True
+    assert parse_handoff_record(record_marker) is not None
