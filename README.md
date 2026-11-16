@@ -227,9 +227,9 @@ are in [docs/agents/operator-onboarding.md](docs/agents/operator-onboarding.md).
 
 ## Operating limits and evidence
 
-Transient GitHub and push operations use `MAX_RETRIES` attempts with exponential
-backoff (2 seconds, capped at 30 seconds). GitHub `Retry-After` values are
-honoured up to five minutes. `PUBLISH_TIMEOUT` is a single deadline covering
+Transient GitHub, continuation-branch restoration, and push operations use
+`MAX_RETRIES` attempts with exponential backoff (2 seconds, capped at 30 seconds).
+GitHub `Retry-After` values are honoured up to five minutes. `PUBLISH_TIMEOUT` is a single deadline covering
 the push and pull-request path. Model implementation work is never replayed as
 a retry; an exhausted transient failure is an `infrastructure_error`.
 

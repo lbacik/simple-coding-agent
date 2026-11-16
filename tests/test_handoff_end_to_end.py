@@ -24,6 +24,8 @@ from __future__ import annotations
 from pathlib import Path
 import subprocess
 
+import pytest
+
 from simple_coding_agent.attempt_state import AttemptPhase, AttemptStateStore
 from simple_coding_agent.completion import AttemptOutcome
 from simple_coding_agent.config import RepositoryProfile
@@ -45,6 +47,7 @@ from tests.fakes import (
     remote_branch_subjects,
     remote_has_branch,
     repository_with_main,
+    run_command,
     running_lifecycle_server,
     write_and_commit,
     write_handoff_note,
@@ -301,6 +304,47 @@ def test_missing_continuation_branch_short_circuits_to_incomplete(tmp_path: Path
     assert "not found on origin" in comment.body
     assert "agent/issue-24" in comment.body
     assert not remote_has_branch(remote, "agent/issue-24")
+
+
+@pytest.mark.parametrize("operation", ["fetch", "ls-remote"])
+def test_unavailable_continuation_is_an_infrastructure_error_not_a_missing_branch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, operation: str,
+) -> None:
+    remote, _ = repository_with_main(tmp_path)
+    publish_attempt_branch(
+        tmp_path, remote, 24, {"published.txt": "retained work"}, "Published work"
+    )
+    github = FakeGitHub(
+        issue(24, body="Fix the thing.", labels=frozenset({"ready-for-agent", "round-finished"})),
+    )
+    executor = FakeModelExecutor()
+    events: list[tuple[str, str]] = []
+    lifecycle = build_lifecycle(
+        remote, tmp_path / "clone", tmp_path / "data", github, executor,
+        event_log=lambda event, detail="", **kwargs: events.append((event, detail)),
+    )
+    failures = 0
+
+    def unavailable(command: tuple[str, ...], cwd: Path | None, env: dict[str, str]) -> str:
+        nonlocal failures
+        if command[1] == operation and any(
+            argument.endswith("agent/issue-24") for argument in command
+        ):
+            failures += 1
+            raise subprocess.CalledProcessError(128, command, stderr="fatal: origin unavailable")
+        return run_command(command, cwd=cwd, env=env)
+
+    monkeypatch.setattr(lifecycle._workspace, "_run", unavailable)
+
+    result = lifecycle.run_once()
+
+    assert result.outcome is AttemptOutcome.INFRASTRUCTURE_ERROR
+    assert failures == 3
+    assert executor.calls == 0
+    assert not any(event == "continuation_branch_missing" for event, _ in events)
+    assert any("origin unavailable" in detail for event, detail in events if event == "attempt_exception")
+    assert all("not found on origin" not in comment.body for comment in github.comments)
+    assert remote_has_branch(remote, "agent/issue-24")
 
 
 # --- Scenario 7b: continuation with failing baseline check succeeds when fixed ---
