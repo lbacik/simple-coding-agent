@@ -61,6 +61,7 @@ from simple_coding_agent.github_tracker import (
 )
 from simple_coding_agent.recovery import (
     count_conflict_failures,
+    is_conflict_attempt,
     parse_conflict_attempt,
     pr_head_stale_marker,
     pr_head_stale_notice_body,
@@ -727,6 +728,8 @@ class FakeTracker:
         for author, body in reversed(self.comments.get(issue.number, [])):
             if not author or author not in allowed:
                 continue
+            if not is_conflict_attempt(body):
+                continue
             parsed = parse_conflict_attempt(body)
             if parsed is None:
                 continue
@@ -1314,7 +1317,12 @@ class FakeGitHub:
     def find_attempt_comment(
         self, repository: str, issue_number: int, marker: str
     ) -> bool:
-        return any(marker in comment.body for comment in self.comments)
+        from simple_coding_agent.recovery import is_generated_result_comment
+
+        return any(
+            is_generated_result_comment(comment.body) and marker in comment.body
+            for comment in self.comments
+        )
 
     def add_comment(self, repository: str, issue_number: int, body: str) -> None:
         self.comments.append(IssueComment(author_login="agent", body=body))

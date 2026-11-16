@@ -88,6 +88,10 @@ def attempt_marker(attempt_id: str) -> str:
 #: rendered, keeping the comment byte-for-byte identical to today. Existing
 #: marker parsers match their own literal markers only, so this marker is
 #: transparent to them by construction.
+#: Prefix of the durable per-attempt marker. Every published attempt-result
+#: comment carries it alone on its own line (see :func:`attempt_marker`).
+AGENT_ATTEMPT_MARKER_PREFIX = "<!-- agent-attempt:"
+
 AGENT_WORKER_MARKER_PREFIX = "<!-- agent-worker:"
 
 
@@ -198,13 +202,50 @@ HANDOFF_RECORD_VERSION = 1
 HANDOFF_RECORD_MARKER_PREFIX = "<!-- handoff-record:"
 
 
-def is_handoff_record(body: str) -> bool:
-    """Whether a comment body carries the shared handoff-record marker."""
+def find_block_marker(body: str, prefix: str) -> str | None:
+    """Return the first hidden marker sitting alone on its own line, if any.
 
-    start = body.find(HANDOFF_RECORD_MARKER_PREFIX)
-    if start < 0:
+    A marker counts only when a line outside fenced code blocks starts with
+    ``prefix`` with at most three leading spaces or tabs (mirroring the ATX
+    heading rule, so indented code blocks never match) and closes on the same
+    line, so prose, list items, blockquotes, and inline code spans that merely
+    quote a marker never match, and neither does a marker quoted inside a
+    fenced block. Returns the stripped marker line, or ``None``.
+    """
+
+    in_fence = False
+    for line in (body or "").splitlines():
+        stripped = line.strip()
+        leading = line[: len(line) - len(line.lstrip())]
+        if len(leading) > 3 or any(char not in " \t" for char in leading):
+            continue
+        if stripped.startswith("```") or stripped.startswith("~~~"):
+            in_fence = not in_fence
+            continue
+        if in_fence:
+            continue
+        if stripped.startswith(prefix) and "-->" in stripped:
+            return stripped
+    return None
+
+
+def is_handoff_record(body: str) -> bool:
+    """Whether a comment body is the shared handoff record.
+
+    Structural: the body must start (after up to three leading spaces) with
+    the record heading (``## Handoff note``) or with the hidden
+    ``handoff-record`` marker itself (bare-marker shorthand used in older
+    tests), and a complete hidden marker must sit alone on its own line
+    outside any fenced block. Human prose, lists, code spans, blockquotes,
+    or fenced blocks that merely quote the marker elsewhere never match.
+    """
+
+    text = body or ""
+    starts_heading = _HANDOFF_NOTE_HEADING_TOP_RE.search(text) is not None
+    starts_marker = text.lstrip().startswith(HANDOFF_RECORD_MARKER_PREFIX)
+    if not (starts_heading or starts_marker):
         return False
-    return body.find("-->", start) >= 0
+    return find_block_marker(text, HANDOFF_RECORD_MARKER_PREFIX) is not None
 
 
 class AmbiguousContinuationError(ValueError):
@@ -329,6 +370,11 @@ def resolve_automatic_continuation_count(
             continue
         if is_pr_head_stale_notice(body):
             continue
+        if not is_attempt_result_comment(body):
+            # Not a structural ordinary result (human prose, quoted markers,
+            # or legacy bodies without an attempt marker): ignore it so quoted
+            # markers never count or reset the standing.
+            continue
         attempt_id = parse_comment_attempt_id(body)
         if attempt_id is None:
             # Unmarked legacy results predate the shared-record era, which
@@ -370,6 +416,10 @@ def count_automatic_continuations(bodies_newest_first: tuple[str, ...] | list[st
             continue
         if is_pr_head_stale_notice(body):
             continue
+        if not is_attempt_result_comment(body):
+            # Human prose or quoted markers are not results: stop the row
+            # instead of counting a quoted automatic marker.
+            break
         if parse_requeue_source(body) != REQUEUE_SOURCE_AUTOMATIC:
             break
         count += 1
@@ -497,9 +547,48 @@ def parse_conflict_attempt(body: str) -> dict[str, str] | None:
 
 
 def is_conflict_attempt(body: str) -> bool:
-    """Whether a comment body carries a conflict-attempt marker."""
+    """Whether a comment body is a structural conflict-attempt result.
 
-    return parse_conflict_attempt(body) is not None
+    The body must start (after up to three leading spaces) with the
+    conflict-attempt header and carry the conflict marker alone on its own
+    line outside any fenced block, or be the bare marker itself (shorthand
+    used in older tests). Human prose quoting the marker elsewhere never
+    matches.
+    """
+
+    text = body or ""
+    if find_block_marker(text, _CONFLICT_MARKER_PREFIX) is None:
+        return False
+    if text.lstrip().startswith(_CONFLICT_MARKER_PREFIX):
+        return True
+    return _CONFLICT_HEADER_TOP_RE.search(text) is not None
+
+
+def is_attempt_result_comment(
+    body: str, kinds: tuple[str, ...] | list[str] | None = None
+) -> bool:
+    """Whether a comment body is a structural ordinary attempt-result comment.
+
+    The body must start (after up to three leading spaces) with the ordinary
+    result header (``## Agent Attempt Result: <kind>``) and carry a
+    well-formed ``agent-attempt`` marker with a non-empty id alone on its own
+    line outside any fenced block. When ``kinds`` is given the header kind
+    must be one of them (e.g. ``("handoff", "incomplete")`` for continuation
+    detection). Human prose quoting the header or the marker elsewhere never
+    matches.
+    """
+
+    text = body or ""
+    match = _ORDINARY_HEADER_TOP_RE.search(text)
+    if match is None:
+        return False
+    if kinds is not None and match.group(1) not in kinds:
+        return False
+    marker = find_block_marker(text, AGENT_ATTEMPT_MARKER_PREFIX)
+    if marker is None:
+        return False
+    parsed = _ATTEMPT_MARKER_RE.search(marker)
+    return parsed is not None and bool(parsed.group(1).strip())
 
 
 #: Hidden marker identifying the conflict-attempt result that escalated its
@@ -510,9 +599,17 @@ CONFLICT_ESCALATION_MARKER = "<!-- conflict-escalation -->"
 
 
 def is_conflict_escalation(body: str) -> bool:
-    """Whether a comment body is the escalation comment of its streak."""
+    """Whether a comment body is the escalation comment of its streak.
 
-    return CONFLICT_ESCALATION_MARKER in body
+    Structural: the body must start with the conflict-attempt header and
+    carry the escalation marker alone on its own line outside any fenced
+    block. Human prose quoting the marker elsewhere never matches.
+    """
+
+    text = body or ""
+    if find_block_marker(text, CONFLICT_ESCALATION_MARKER) is None:
+        return False
+    return _CONFLICT_HEADER_TOP_RE.search(text) is not None
 
 
 #: Hidden marker identifying a pull-request-head-out-of-sync notice. The
@@ -612,6 +709,8 @@ def is_conflict_failure(body: str) -> bool:
     """
 
     if is_conflict_escalation(body):
+        return False
+    if not is_conflict_attempt(body):
         return False
     parsed = parse_conflict_attempt(body)
     if parsed is None:
@@ -757,25 +856,23 @@ def describe_hold(
 
 
 #: Structural signal of a generated handoff attempt-result comment, modern or
-#: legacy: the result header with the ``handoff`` outcome. Markers
-#: (``agent-attempt``, ``requeue-source``) are not required, so comments
-#: posted before the markers existed are still recognized. Human prose is
-#: never matched: the header is only ever rendered by publication.
-_HANDOFF_RESULT_HEADER_RE = re.compile(
-    r"^#{1,6}\s*Agent Attempt Result:\s*handoff\b", re.MULTILINE
+#: legacy: the result header with the ``handoff`` outcome at the top of the
+#: body (after up to three leading spaces, so indented code blocks never
+#: match). Markers (``agent-attempt``,
+#: ``requeue-source``) are not required, so comments posted before the markers
+#: existed are still recognized. Human prose quoting the header anywhere else
+#: (prose, lists, code spans, blockquotes, fenced blocks) is never matched:
+#: the header is only ever rendered by publication at the top.
+_ORDINARY_HEADER_TOP_RE = re.compile(
+    r"\A[ \t]{0,3}#{1,6}\s*Agent Attempt Result:\s*([A-Za-z_]+)"
 )
 
-#: Structural signal of any generated attempt-result comment: the ordinary
-#: result header (whatever the outcome), the conflict-attempt header, or one
-#: of the hidden machine markers publication stamps onto its shared comment.
-_GENERATED_RESULT_HEADER_RE = re.compile(
-    r"^#{1,6}\s*(Agent Attempt Result:|Conflict Attempt Result\b)", re.MULTILINE
+_CONFLICT_HEADER_TOP_RE = re.compile(
+    r"\A[ \t]{0,3}#{1,6}\s*Conflict Attempt Result\b"
 )
-_GENERATED_RESULT_MARKER_RES = (
-    "<!-- agent-attempt:",
-    "<!-- conflict-attempt:",
-    "<!-- conflict-escalation -->",
-    "<!-- requeue-source:",
+
+_HANDOFF_NOTE_HEADING_TOP_RE = re.compile(
+    r"\A[ \t]{0,3}#{1,6}\s*Handoff note\b"
 )
 
 #: Machine bookkeeping lines publication renders onto its shared result
@@ -796,26 +893,31 @@ _HIDDEN_MARKER_RE = re.compile(r"<!--.*?-->")
 def is_generated_handoff_result(body: str) -> bool:
     """Whether a comment body is a generated handoff attempt-result.
 
-    Structural, never identity-based: the handoff result header identifies
-    the comment no matter who authored it, so a human note that happens to
-    share the agent's login is never mistaken for one (and vice versa).
+    Structural, never identity-based: the handoff result header at the top
+    identifies the comment no matter who authored it, so a human note that
+    happens to share the agent's login is never mistaken for one (and vice
+    versa). Legacy bodies starting with the header but predating markers
+    still match, so old handoffs stay excluded from prompts.
     """
 
-    return _HANDOFF_RESULT_HEADER_RE.search(body or "") is not None
+    text = body or ""
+    match = _ORDINARY_HEADER_TOP_RE.search(text)
+    return match is not None and match.group(1) == "handoff"
 
 
 def is_generated_result_comment(body: str) -> bool:
     """Whether a comment body is any generated attempt-result comment.
 
-    The ``agent-worker`` marker never identifies a result on its own: it is
-    transparent to detection and only ever rides along with a header or an
-    existing machine marker.
+    Structural: the ordinary or conflict header must start the body. Hidden
+    markers alone never identify a result (including the transparent
+    ``agent-worker`` marker), so human prose quoting a marker passes through
+    verbatim and is never bookkeeping-stripped.
     """
 
     text = body or ""
-    if _GENERATED_RESULT_HEADER_RE.search(text) is not None:
+    if _ORDINARY_HEADER_TOP_RE.search(text) is not None:
         return True
-    return any(marker in text for marker in _GENERATED_RESULT_MARKER_RES)
+    return _CONFLICT_HEADER_TOP_RE.search(text) is not None
 
 
 def strip_result_bookkeeping(body: str) -> str:

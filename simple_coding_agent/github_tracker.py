@@ -20,6 +20,7 @@ from simple_coding_agent.recovery import (
     AmbiguousContinuationError,
     count_conflict_failures,
     filter_prompt_comments,
+    is_conflict_attempt,
     is_handoff_record,
     parse_conflict_attempt,
     pr_head_stale_marker,
@@ -1248,6 +1249,8 @@ class GitHubTracker:
         for comment in reversed(comments):
             if not comment.author_login or comment.author_login not in allowed:
                 continue
+            if not is_conflict_attempt(comment.body):
+                continue
             parsed = parse_conflict_attempt(comment.body)
             if parsed is None:
                 continue
@@ -1664,7 +1667,8 @@ class GitHubGraphQLTransport:
         """Find a result only when it carries this attempt's durable marker.
 
         Both ordinary attempt results and conflict-attempt results carry the
-        attempt marker; the header distinguishes them.
+        attempt marker; the header must start the body, so prose quoting a
+        header elsewhere never matches.
         """
 
         owner, name = _repository_parts(repository)
@@ -1679,12 +1683,11 @@ class GitHubGraphQLTransport:
             {"owner": owner, "name": name, "number": issue_number},
         )
         try:
+            from simple_coding_agent.recovery import is_generated_result_comment
+
             comments = data["repository"]["issue"]["comments"]["nodes"]
             return any(
-                (
-                    "Agent Attempt Result" in comment["body"]
-                    or "Conflict Attempt Result" in comment["body"]
-                )
+                is_generated_result_comment(comment["body"])
                 and marker in comment["body"]
                 for comment in comments
             )

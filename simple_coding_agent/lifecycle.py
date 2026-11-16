@@ -8770,11 +8770,6 @@ def _build_starting_prompt(
     return "\n\n".join(parts)
 
 
-_HANDOFF_RESULT_MARKERS = (
-    "Agent Attempt Result: incomplete",
-    "Agent Attempt Result: handoff",
-)
-
 #: Result comments carrying this branch line never published a branch, so they
 #: are not handoffs and must not trigger the continuation path (issue #84).
 _NO_PUBLISHED_BRANCH_MARKER = "no branch created"
@@ -8792,19 +8787,23 @@ def _continuation_expected(
 
     The ``round-finished`` label is the current signal; a prior handoff or
     incomplete attempt-result comment is the historical one, but only when it
-    actually published a branch. Baseline/setup failures (and the
+    is a structural result (header at the top plus an ``agent-attempt``
+    marker) that actually published a branch. Baseline/setup failures (and the
     ``continuation_branch_missing`` short-circuit itself) post ``incomplete``
     with ``no branch created`` — none of them promises a remote branch, so
-    they must not trigger the continuation path. Checked in that order so a
-    present label never triggers a needless comment fetch, and so a real
-    handoff comment is still recognized once the label has been removed (e.g.
-    on claim) or the remote branch is missing.
+    they must not trigger the continuation path. Human prose quoting the
+    header elsewhere never triggers it. Checked in that order so a present
+    label never triggers a needless comment fetch, and so a real handoff
+    comment is still recognized once the label has been removed (e.g. on
+    claim) or the remote branch is missing.
     """
 
     if ROUND_FINISHED in issue.labels:
         return True
+    from simple_coding_agent.recovery import is_attempt_result_comment
+
     for comment in issue_comments(issue):
-        if not any(marker in comment for marker in _HANDOFF_RESULT_MARKERS):
+        if not is_attempt_result_comment(comment, kinds=("handoff", "incomplete")):
             continue
         if _CONTINUATION_MISSING_MARKER in comment:
             continue
