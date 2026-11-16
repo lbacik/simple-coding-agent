@@ -2892,6 +2892,9 @@ class AgentLifecycle:
                 f" {shared_hold} the hold remains. {hold_suffix}"
             )
         try:
+            handoff_standing, handoff_reason = self._handoff_notification_fields(
+                claim, checkpoint, details, decision.outcome
+            )
             published = self._publisher.publish(
                 PublicationRequest(
                     issue_number=claim.issue.number,
@@ -2921,6 +2924,8 @@ class AgentLifecycle:
                         decision.outcome is AttemptOutcome.HANDOFF
                         and self._handoff_needs_notification(claim, checkpoint)
                     ),
+                    handoff_standing_line=handoff_standing,
+                    handoff_reason=handoff_reason,
                 )
             )
         except Exception as error:
@@ -4092,6 +4097,34 @@ class AgentLifecycle:
             return details
         return f"{details}\n\n{line}" if details else line
 
+    def _handoff_notification_fields(
+        self,
+        claim: Claim,
+        checkpoint: AttemptCheckpoint | None,
+        note_text: str,
+        outcome: AttemptOutcome,
+    ) -> tuple[str | None, str | None]:
+        """The (standing, reason) a confirmed link-mode notification reports.
+
+        Only handoff outcomes carry either field; anything else publishes
+        the legacy details unchanged. The standing is the same line
+        ``_handoff_publication_details`` appends to the details, and the
+        reason is the note's ``reason`` field read from the raw note text
+        (never parsed back out of the joined details). An unreadable
+        reason reads as ``None`` so the notification simply omits its
+        reason line.
+        """
+
+        if outcome is not AttemptOutcome.HANDOFF:
+            return None, None
+        standing = self._auto_continuation_status_line(claim, checkpoint)
+        reason: str | None = None
+        if isinstance(note_text, str) and note_text:
+            candidate = _parse_handoff_note_fields(note_text).get("reason")
+            if isinstance(candidate, str) and candidate.strip():
+                reason = candidate.strip()
+        return standing, reason
+
     def _auto_continuation_status_line(
         self, claim: Claim, checkpoint: AttemptCheckpoint | None
     ) -> str | None:
@@ -5016,6 +5049,9 @@ class AgentLifecycle:
                     self._wire_attempt_telemetry_publisher()
                     evidence = self._attempt_runner(claim, profile, prepared)
                     publication_started_at = self._clock()
+                    handoff_standing, handoff_reason = self._handoff_notification_fields(
+                        claim, checkpoint, evidence.details, evidence.decision.outcome
+                    )
                     published = self._publish_bounded(
                         PublicationRequest(
                             issue_number=claim.issue.number,
@@ -5052,6 +5088,8 @@ class AgentLifecycle:
                                 evidence.decision.outcome is AttemptOutcome.HANDOFF
                                 and self._handoff_needs_notification(claim, checkpoint)
                             ),
+                            handoff_standing_line=handoff_standing,
+                            handoff_reason=handoff_reason,
                         )
                     )
                     outcome = published.outcome
@@ -6747,6 +6785,9 @@ class AgentLifecycle:
                     and outcome is AttemptOutcome.INFRASTRUCTURE_ERROR
                 )
             else:
+                handoff_standing, handoff_reason = self._handoff_notification_fields(
+                    claim, checkpoint, details, decision.outcome
+                )
                 published = self._publish_bounded(
                     PublicationRequest(
                         issue_number=claim.issue.number,
@@ -6776,6 +6817,8 @@ class AgentLifecycle:
                             decision.outcome is AttemptOutcome.HANDOFF
                             and self._handoff_needs_notification(claim, checkpoint)
                         ),
+                        handoff_standing_line=handoff_standing,
+                        handoff_reason=handoff_reason,
                     )
                 )
                 outcome = published.outcome

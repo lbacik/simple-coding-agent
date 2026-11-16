@@ -42,6 +42,7 @@ from tests.fakes import FakePublisher, FakeTracker, InMemoryWorkspace
 from test_handoff_publication import (
     ATTEMPT_ONE,
     ATTEMPT_TWO,
+    NOTE_ONE,
     NOTE_TWO,
     HandoffGitHub,
     handoff_request,
@@ -314,6 +315,9 @@ def test_link_notified_handoff_posts_with_the_current_standing(tmp_path: Path) -
         requeue_source=REQUEUE_SOURCE_AUTOMATIC,
         handoff_continuation_count=2,
         handoff_notify=True,
+        handoff_standing_line="Automatic continuation 2/2 used; the automatic"
+        " continuation budget is exhausted and the issue now needs a human requeue.",
+        handoff_reason="token_soft_threshold",
     )
 
     result = Publisher(workspace, github, "octo/example").publish(notified)
@@ -322,7 +326,12 @@ def test_link_notified_handoff_posts_with_the_current_standing(tmp_path: Path) -
     assert result.comment_suppressed is False
     assert result.comment_posted is True
     assert len(_result_bodies(github)) == 1
-    assert "Automatic continuation 2/2 used" in _result_bodies(github)[0]
+    body = _result_bodies(github)[0]
+    assert "Automatic continuation 2/2 used" in body
+    # A confirmed shared record means the notification carries the standing,
+    # not the note body.
+    assert "Halfway done." not in body
+    assert "Handoff reason: `token_soft_threshold`" in body
 
 
 def test_link_notification_is_deduplicated_on_retry(tmp_path: Path) -> None:
@@ -346,6 +355,9 @@ def test_link_notification_is_deduplicated_on_retry(tmp_path: Path) -> None:
         requeue_source=base.requeue_source,
         handoff_continuation_count=base.handoff_continuation_count,
         handoff_notify=True,
+        handoff_standing_line="Automatic continuation 2/2 used; the automatic"
+        " continuation budget is exhausted and the issue now needs a human requeue.",
+        handoff_reason="token_soft_threshold",
     )
 
     assert publisher.publish(notified).comment_posted is True
@@ -380,6 +392,212 @@ def test_link_legacy_only_handoff_still_posts_its_result(tmp_path: Path) -> None
     assert result.comment_posted is True
     assert len(_result_bodies(github)) == 1
     assert shared_bodies(github) == []
+
+
+def _notified_request(base: PublicationRequest, *, count: int | None = 2) -> PublicationRequest:
+    """A lifecycle-shaped notified handoff request: joined details plus separate fields."""
+
+    standing = (
+        "Automatic continuation 2/2 used; the automatic continuation budget is"
+        " exhausted and the issue now needs a human requeue."
+    )
+    return PublicationRequest(
+        issue_number=base.issue_number,
+        issue_title=base.issue_title,
+        branch=base.branch,
+        started_at=base.started_at,
+        decision=base.decision,
+        check_command=base.check_command,
+        check_exit_code=base.check_exit_code,
+        review_cycles=base.review_cycles,
+        review_findings=base.review_findings,
+        details=f"{base.details}\n\n{standing}",
+        base_branch=base.base_branch,
+        note_commit_sha=base.note_commit_sha,
+        requeue_source=REQUEUE_SOURCE_AUTOMATIC,
+        handoff_continuation_count=count,
+        handoff_notify=True,
+        handoff_standing_line=standing,
+        handoff_reason="token_soft_threshold",
+    )
+
+
+def test_link_notified_handoff_links_the_reported_note_revision(tmp_path: Path) -> None:
+    workspace, prepared = prepared_branch(tmp_path)
+    github = HandoffGitHub()
+
+    result = Publisher(workspace, github, "octo/example").publish(
+        _notified_request(handoff_request(prepared.branch, count=2))
+    )
+
+    assert result.handoff_posted is True
+    assert len(_result_bodies(github)) == 1
+    body = _result_bodies(github)[0]
+    pinned = f"https://github.com/octo/example/blob/{NOTE_ONE}/.agent/handoff/23.md"
+    current = "https://github.com/octo/example/blob/agent/issue-23/.agent/handoff/23.md"
+    assert pinned in body
+    assert current in body
+    assert pinned != current
+    assert "## Handoff note" in body
+    assert "Automatic continuation 2/2 used" in body
+    # Nothing the notification pastes can go stale: the note body is absent.
+    assert "Halfway done." not in body
+    # The local result still carries the full text; only the GitHub body is short.
+    assert "Halfway done." in result.details
+
+
+def test_link_notified_handoff_without_a_reason_omits_the_reason_line(
+    tmp_path: Path,
+) -> None:
+    workspace, prepared = prepared_branch(tmp_path)
+    github = HandoffGitHub()
+    base = _notified_request(handoff_request(prepared.branch, count=2))
+    unreasoned = PublicationRequest(
+        issue_number=base.issue_number,
+        issue_title=base.issue_title,
+        branch=base.branch,
+        started_at=base.started_at,
+        decision=base.decision,
+        check_command=base.check_command,
+        check_exit_code=base.check_exit_code,
+        review_cycles=base.review_cycles,
+        review_findings=base.review_findings,
+        details=base.details,
+        base_branch=base.base_branch,
+        note_commit_sha=base.note_commit_sha,
+        requeue_source=base.requeue_source,
+        handoff_continuation_count=base.handoff_continuation_count,
+        handoff_notify=True,
+        handoff_standing_line=base.handoff_standing_line,
+        handoff_reason=None,
+    )
+
+    result = Publisher(workspace, github, "octo/example").publish(unreasoned)
+
+    assert result.handoff_posted is True
+    body = _result_bodies(github)[0]
+    assert "Handoff reason:" not in body
+    assert "Halfway done." not in body
+    assert "Automatic continuation 2/2 used" in body
+
+
+def test_link_unconfirmed_shared_record_posts_the_full_note_body(tmp_path: Path) -> None:
+    workspace, prepared = prepared_branch(tmp_path)
+    github = HandoffGitHub(fail_create=True)
+
+    result = Publisher(workspace, github, "octo/example").publish(
+        _notified_request(handoff_request(prepared.branch, count=2))
+    )
+
+    assert result.handoff_posted is False
+    assert result.comment_suppressed is False
+    assert len(_result_bodies(github)) == 1
+    # The link may not name a confirmed revision, so the body is the fallback.
+    assert "Halfway done." in _result_bodies(github)[0]
+
+
+def test_link_unrequested_shared_record_posts_the_full_note_body(tmp_path: Path) -> None:
+    workspace, prepared = prepared_branch(tmp_path)
+    github = HandoffGitHub()
+    base = handoff_request(prepared.branch, count=None)
+    notified = _notified_request(base, count=None)
+
+    result = Publisher(workspace, github, "octo/example").publish(notified)
+
+    assert result.handoff_posted is True
+    assert result.comment_suppressed is False
+    assert len(_result_bodies(github)) == 1
+    assert shared_bodies(github) == []
+    assert "Halfway done." in _result_bodies(github)[0]
+
+
+def test_verbose_notified_handoff_posts_the_full_note_body(tmp_path: Path) -> None:
+    workspace, prepared = prepared_branch(tmp_path)
+    github = HandoffGitHub()
+
+    result = Publisher(
+        workspace, github, "octo/example", handoff_comment_mode="verbose"
+    ).publish(_notified_request(handoff_request(prepared.branch, count=2)))
+
+    assert result.handoff_posted is True
+    assert len(_result_bodies(github)) == 1
+    body = _result_bodies(github)[0]
+    assert "Halfway done." in body
+    assert "Automatic continuation 2/2 used" in body
+    assert "Handoff note at the time of this notification" not in body
+
+
+def test_link_notification_stays_readable_to_existing_readers(tmp_path: Path) -> None:
+    from simple_coding_agent.recovery import (
+        filter_prompt_comments,
+        is_generated_handoff_result,
+        resolve_automatic_continuation_count,
+        strip_result_bookkeeping,
+    )
+
+    workspace, prepared = prepared_branch(tmp_path)
+    github = HandoffGitHub()
+
+    result = Publisher(workspace, github, "octo/example").publish(
+        _notified_request(handoff_request(prepared.branch, count=2))
+    )
+
+    assert result.handoff_posted is True
+    bodies = [body for _, body in github.comments]
+    assert len(bodies) == 2
+    notification = _result_bodies(github)[0]
+    # Deduplication, model-facing filtering, and bookkeeping stripping
+    # key off the unchanged header, marker, and standing line.
+    assert f"<!-- agent-attempt: {ATTEMPT_ONE} -->" in notification
+    assert is_generated_handoff_result(notification) is True
+    # The notification is dropped from the starting prompt like every
+    # generated handoff result; the shared record is not a result comment
+    # and stays visible as the pointer to the current note.
+    assert filter_prompt_comments(bodies) == tuple(shared_bodies(github))
+    assert "Automatic continuation 2/2 used" not in strip_result_bookkeeping(notification)
+    # Continuation counting still resolves from the shared record: the
+    # notification names the same attempt, so it counts once.
+    assert (
+        resolve_automatic_continuation_count(
+            tuple(reversed(bodies)), issue_number=23, repository="octo/example"
+        )
+        == 2
+    )
+
+
+def test_link_notification_fields_come_from_the_note_and_standing(
+    tmp_path: Path,
+) -> None:
+    tracker = FakeTracker(issues={24: _issue()}, auto_counts={24: 0})
+    lifecycle = _lifecycle(tmp_path, tracker=tracker, max_auto_continuations=2)
+    checkpoint = SimpleNamespace(requeue_source=REQUEUE_SOURCE_AUTOMATIC)
+    note = (
+        "# Handoff note: issue #24\n\n"
+        "- issue: 24\n"
+        "- started_at: 2026-09-20T13:00:00Z\n"
+        "- reason: token_soft_threshold\n"
+        "- last_work_commit: abcdef\n\n"
+        "Halfway done.\n"
+    )
+
+    standing, reason = lifecycle._handoff_notification_fields(  # noqa: SLF001
+        _claim(), checkpoint, note, AttemptOutcome.HANDOFF
+    )
+
+    assert reason == "token_soft_threshold"
+    assert standing == (
+        "Automatic continuation 1/2 used; the agent will continue automatically."
+    )
+
+
+def test_link_notification_fields_are_absent_without_a_handoff(tmp_path: Path) -> None:
+    tracker = FakeTracker(issues={24: _issue()}, auto_counts={24: 0})
+    lifecycle = _lifecycle(tmp_path, tracker=tracker, max_auto_continuations=2)
+    checkpoint = SimpleNamespace(requeue_source=REQUEUE_SOURCE_AUTOMATIC)
+
+    assert lifecycle._handoff_notification_fields(  # noqa: SLF001
+        _claim(), checkpoint, "note", AttemptOutcome.COMPLETE
+    ) == (None, None)
 
 
 def test_link_normal_completion_reporting_is_unchanged(tmp_path: Path) -> None:

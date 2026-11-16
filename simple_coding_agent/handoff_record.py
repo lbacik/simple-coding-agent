@@ -132,6 +132,21 @@ def handoff_note_blob_url(repository: str, branch: str, issue_number: int) -> st
     )
 
 
+def handoff_note_revision_blob_url(repository: str, note_sha: str, issue_number: int) -> str:
+    """The revision-pinned URL of an issue's Handoff note file.
+
+    Unlike :func:`handoff_note_blob_url` (which follows the attempt branch
+    and therefore always shows the latest committed note), this URL names
+    the exact note revision a notification reports, so it never changes
+    when later handoffs replace the note.
+    """
+
+    return (
+        f"https://github.com/{repository}/blob/{note_sha}"
+        f"/.agent/handoff/{issue_number}.md"
+    )
+
+
 def build_handoff_record_body(record: HandoffRecord) -> str:
     """Build the short shared comment: one link plus the hidden marker.
 
