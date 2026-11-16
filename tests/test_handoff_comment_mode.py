@@ -600,6 +600,73 @@ def test_link_notification_fields_are_absent_without_a_handoff(tmp_path: Path) -
     ) == (None, None)
 
 
+def test_recovery_retry_of_a_notified_handoff_carries_the_short_fields(
+    tmp_path: Path,
+) -> None:
+    from simple_coding_agent.attempt_state import AttemptPhase
+    from simple_coding_agent.lifecycle import CommandAcknowledgement
+    from simple_coding_agent.publication import _handoff_notification_details
+
+    state = AttemptStateStore(tmp_path / "state")
+    state.start(
+        issue_number=24,
+        branch="agent/issue-24",
+        requeue_source=REQUEUE_SOURCE_AUTOMATIC,
+    )
+    for phase in (
+        AttemptPhase.SETUP,
+        AttemptPhase.MODEL_RUNNING,
+        AttemptPhase.PUSHING,
+        AttemptPhase.PUBLISHING,
+    ):
+        state.transition(phase)
+    checkpoint = state.read()
+    assert checkpoint is not None
+    workspace = InMemoryWorkspace(tmp_path / "workspace", issue_number=24)
+    workspace.commit_handoff_note(
+        24,
+        "# Handoff note: issue #24\n\n"
+        "- issue: 24\n"
+        f"- started_at: {checkpoint.started_at}\n"
+        "- reason: token_soft_threshold\n"
+        "- last_work_commit: base-revision-0\n\n"
+        "Half done.\n",
+    )
+    publisher = FakePublisher(outcome=AttemptOutcome.HANDOFF)
+    lifecycle = AgentLifecycle(
+        tracker=FakeTracker(issues={24: _issue()}, auto_counts={24: 1}),
+        attempt_state=AttemptStateStore(tmp_path / "state"),
+        workspace=workspace,
+        profile_loader=lambda _: SimpleNamespace(base_branch="main"),
+        publisher=publisher,
+        attempt_runner=lambda c, p, pr: (_ for _ in ()).throw(
+            AssertionError("recovery must not invoke the model")
+        ),
+        control_store=ControlStore(tmp_path),
+        completion_store=AttemptCompletionStore(tmp_path),
+        sleeper=lambda seconds: None,
+        repository="octo/example",
+        max_auto_continuations=2,
+    )
+
+    record = lifecycle.submit_recovery_retry("req-notify", checkpoint.started_at)
+
+    assert record.acknowledgement is CommandAcknowledgement.COMPLETED
+    request = publisher.requests[-1]
+    assert request.handoff_notify is True
+    assert request.handoff_reason == "token_soft_threshold"
+    # The standing travels separately and matches the line appended to the
+    # joined details, so the short body reports the same standing as the
+    # first publication would.
+    assert request.handoff_standing_line is not None
+    assert request.handoff_standing_line.startswith("Automatic continuation 2/2 used")
+    assert request.details.endswith(request.handoff_standing_line)
+    short = _handoff_notification_details(request, "octo/example")
+    assert "Half done." not in short
+    assert "Handoff reason: `token_soft_threshold`" in short
+    assert short.endswith(request.handoff_standing_line)
+
+
 def test_link_normal_completion_reporting_is_unchanged(tmp_path: Path) -> None:
     workspace, prepared = prepared_branch(tmp_path)
     github = HandoffGitHub()
