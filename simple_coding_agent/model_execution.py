@@ -784,6 +784,8 @@ class ModelExecutor:
         self._token_handoff_snapshot: str | None = None
         self._running_subagents: set[str] = set()
         self._stopped_subagent_ids: list[str] = []
+        self._task_tool_links: dict[str, str] = {}
+        self._agent_to_tool: dict[str, str] = {}
         self._usage_shape_logged = False
         self._operator_handoff_provider: OperatorHandoffProvider | None = None
         self._operator_handoff_reporter: OperatorHandoffReporter | None = None
@@ -835,6 +837,8 @@ class ModelExecutor:
         self._compaction_last: dict[str, Any] | None = None
         self._subagent_info: dict[str, dict[str, Any]] = {}
         self._subagent_order: list[str] = []
+        self._task_tool_links = {}
+        self._agent_to_tool = {}
 
     def set_operator_handoff_provider(
         self, provider: OperatorHandoffProvider | None
@@ -1313,6 +1317,38 @@ class ModelExecutor:
             "in-flight subagent tools are denied after the token soft-threshold crossing "
             "and only handoff-related main-thread commands stay allowed.",
         )
+        for agent_id in stopped:
+            tool_use_id = self._agent_to_tool.get(agent_id)
+            if tool_use_id is not None:
+                self._finish_subagent(tool_use_id)
+        for tool_use_id, info in self._subagent_info.items():
+            if info.get("running"):
+                self._finish_subagent(tool_use_id)
+
+    def _finish_subagent(self, tool_use_id: str) -> None:
+        """Mark one subagent entry finished and settle its ledger thread."""
+
+        info = self._subagent_info.get(tool_use_id)
+        if info is not None:
+            info["running"] = False
+        if self._ledger.has_thread(tool_use_id):
+            self._settle_thread_and_log(tool_use_id)
+
+    def _finish_subagent_for_task(self, task_id: str | None) -> None:
+        """Finish the subagent entry linked to a background task id, if any."""
+
+        if not isinstance(task_id, str) or not task_id:
+            return
+        tool_use_id = self._task_tool_links.get(task_id)
+        if tool_use_id is None:
+            return
+        self._finish_subagent(tool_use_id)
+
+    def _mark_all_subagents_finished(self) -> None:
+        """Mark every tracked subagent finished at the end of the run."""
+
+        for tool_use_id in list(self._subagent_info.keys()):
+            self._finish_subagent(tool_use_id)
 
     def _archive_evidence(self, kind: str, content: str, *, extension: str) -> str | None:
         """Write full evidence to the attempt archive; return a reference or None.
@@ -1989,6 +2025,7 @@ class ModelExecutor:
                         sorted(background_pending),
                         "result is terminal; background tasks still running",
                     )
+                    self._mark_all_subagents_finished()
                     return deferred_result, tuple(observed_models)
                 wait = self._operator_stream_wait()
                 if grace_started is not None and self._deferring_task_ids(background_pending):
@@ -2083,6 +2120,7 @@ class ModelExecutor:
                         sorted(background_pending),
                         "result is terminal; background tasks still running",
                     )
+                    self._mark_all_subagents_finished()
                     return message, tuple(observed_models)
                 elif isinstance(message, AssistantMessage):
                     if deferred_results:
@@ -2100,6 +2138,7 @@ class ModelExecutor:
                     await client.interrupt()
                     drained = await self._drain(client)
                     self._settle_all_threads_and_log()
+                    self._mark_all_subagents_finished()
                     return drained, tuple(observed_models)
                 model = getattr(message, "model", None)
                 if isinstance(model, str):
@@ -2151,6 +2190,8 @@ class ModelExecutor:
             "background_tasks_stopped",
             f"task_ids={','.join(stopped)}{waited_detail}; reason={reason}",
         )
+        for task_id in task_ids:
+            self._finish_subagent_for_task(task_id)
 
     def _observe_background_task(
         self,
@@ -2170,6 +2211,9 @@ class ModelExecutor:
         if isinstance(message, TaskStartedMessage):
             if message.task_id:
                 pending.setdefault(message.task_id, {"task_type": message.task_type})
+                tool_use_id = getattr(message, "tool_use_id", None)
+                if isinstance(tool_use_id, str) and tool_use_id:
+                    self._task_tool_links[message.task_id] = tool_use_id
             return True
         if isinstance(message, TaskNotificationMessage):
             if message.status in TERMINAL_TASK_STATUSES:
@@ -2177,6 +2221,17 @@ class ModelExecutor:
                     finished, message.task_id, message.summary, message.output_file
                 )
                 pending.pop(message.task_id, None)
+                tool_use_id = getattr(message, "tool_use_id", None)
+                if (
+                    isinstance(message.task_id, str)
+                    and message.task_id
+                    and isinstance(tool_use_id, str)
+                    and tool_use_id
+                ):
+                    self._task_tool_links[message.task_id] = tool_use_id
+                    self._finish_subagent(tool_use_id)
+                else:
+                    self._finish_subagent_for_task(message.task_id)
             return True
         if isinstance(message, TaskUpdatedMessage):
             status = message.status
@@ -2188,6 +2243,7 @@ class ModelExecutor:
             if status is not None and status in TERMINAL_TASK_STATUSES:
                 self._record_background_finished(finished, message.task_id, None, None)
                 pending.pop(message.task_id, None)
+                self._finish_subagent_for_task(message.task_id)
             return True
         return False
 
@@ -2348,7 +2404,19 @@ class ModelExecutor:
 
         thread_id = getattr(message, "parent_tool_use_id", None) or "main"
         self._ensure_ledger_thread(thread_id)
-        for tool_use_id in _tool_result_ids(getattr(message, "content", "")):
+        for tool_use_id, raw_content in _tool_results(getattr(message, "content", "")):
+            is_async, agent_id = _parse_async_ack(raw_content)
+            if is_async:
+                # A background launch acknowledgement is not the subagent's
+                # final answer: keep it running and leave its ledger thread
+                # open so later streaming keeps updating its reading.
+                info = self._subagent_info.get(tool_use_id)
+                if info is not None:
+                    info["running"] = True
+                    if agent_id is not None:
+                        info["agent_id"] = agent_id
+                        self._agent_to_tool[agent_id] = tool_use_id
+                continue
             # A Task tool result ends its subagent thread: settle the
             # subagent's final response before the main-thread event is
             # applied, so its entry carries the subagent thread (not main)
@@ -3537,6 +3605,85 @@ def _tool_result_ids(content: object) -> tuple[str, ...]:
             if isinstance(candidate, str) and candidate:
                 ids.append(candidate)
     return tuple(ids)
+
+
+def _tool_result_content(item: object) -> Any:
+    """The raw payload of one tool-result block, if any."""
+
+    if isinstance(item, Mapping):
+        if "content" in item:
+            return item.get("content")
+        return None
+    return getattr(item, "content", None)
+
+
+def _tool_results(content: object) -> tuple[tuple[str, Any], ...]:
+    """Tool-use ids with their raw payloads for one streamed message.
+
+    Mirrors :func:`_tool_result_ids` but keeps each block's ``content`` so the
+    caller can tell a background launch acknowledgement apart from a final
+    subagent result. Both ``ToolResultBlock`` objects and plain mappings are
+    read; anything else completes no thread.
+    """
+
+    results: list[tuple[str, Any]] = []
+    stack: list[object] = [content]
+    while stack:
+        item = stack.pop()
+        if isinstance(item, Mapping):
+            candidate = item.get("tool_use_id", item.get("toolUseId"))
+            if isinstance(candidate, str) and candidate:
+                results.append((candidate, _tool_result_content(item)))
+        elif isinstance(item, (list, tuple)):
+            stack.extend(item)
+        elif isinstance(item, str):
+            continue
+        else:
+            candidate = getattr(item, "tool_use_id", None)
+            if isinstance(candidate, str) and candidate:
+                results.append((candidate, _tool_result_content(item)))
+    return tuple(results)
+
+
+def _parse_async_ack(raw_content: Any) -> tuple[bool, str | None]:
+    """Whether a tool-result payload is a background launch acknowledgement.
+
+    Returns ``(is_async, agent_id)``. A launch acknowledgement is a JSON
+    object (or JSON string) with ``isAsync: true``; ``agent_id`` is the
+    ``agentId`` string when present. Anything unparsable, or without
+    ``isAsync: true``, reads as a final subagent result.
+    """
+
+    payloads: list[Any] = [raw_content]
+    if isinstance(raw_content, list):
+        payloads = list(raw_content)
+    for payload in payloads:
+        if isinstance(payload, str):
+            try:
+                parsed = json.loads(payload)
+            except (ValueError, TypeError):
+                continue
+            payload = parsed
+        if isinstance(payload, Mapping):
+            text = payload.get("text")
+            if isinstance(text, str):
+                try:
+                    parsed = json.loads(text)
+                except (ValueError, TypeError):
+                    pass
+                else:
+                    if isinstance(parsed, Mapping):
+                        payload = parsed
+            is_async = payload.get("isAsync", payload.get("is_async"))
+            if is_async is True:
+                agent_id = payload.get("agentId", payload.get("agent_id"))
+                return True, agent_id if isinstance(agent_id, str) and agent_id else None
+    if isinstance(raw_content, Mapping):
+        is_async = raw_content.get("isAsync", raw_content.get("is_async"))
+        if is_async is True:
+            agent_id = raw_content.get("agentId", raw_content.get("agent_id"))
+            return True, agent_id if isinstance(agent_id, str) and agent_id else None
+    return False, None
 
 
 def _deny(reason: str) -> dict[str, Any]:
