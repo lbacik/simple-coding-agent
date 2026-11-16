@@ -1006,13 +1006,33 @@ class Publisher:
         raises: an unreadable revision, an unreadable lease, or an
         unwritable store emits an ``unpushed_revision_record_failed`` ERROR
         event and leaves the failed attempt's outcome, result comment, and
-        ``publication_failed`` event exactly as reported. A missing store
+        ``publication_failed`` event exactly as reported. The lease is probed
+        directly from the attempt checkpoint (not through the push path's
+        ``_claim_lease`` fallback), so a checkpoint that cannot be read
+        records the ERROR instead of silently writing nothing, while a
+        genuinely unknown lease still writes nothing quietly. A missing store
         (callers without a data directory) records nothing.
         """
 
         if self._unpushed_store is None:
             return
-        lease_revision, lease_known = self._claim_lease(request.issue_number)
+        try:
+            checkpoint = (
+                self._attempt_state.read() if self._attempt_state is not None else None
+            )
+            lease_known = checkpoint is not None and bool(
+                getattr(checkpoint, "claim_lease_recorded", False)
+            )
+            lease_revision = checkpoint.claim_branch_revision if lease_known else None
+        except Exception as error:
+            self._event_log(
+                "unpushed_revision_record_failed",
+                "the Unpushed revision could not be recorded:"
+                f" the claim-time lease could not be read: {error}",
+                level="ERROR",
+                issue_number=request.issue_number,
+            )
+            return
         if not lease_known:
             return
         if (

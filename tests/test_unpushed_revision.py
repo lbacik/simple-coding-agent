@@ -19,6 +19,8 @@ import pytest
 
 from simple_coding_agent.attempt_state import AttemptPhase, AttemptStateError, AttemptStateStore
 from simple_coding_agent.completion import AttemptOutcome, CompletionDecision, PublicationPath
+from simple_coding_agent.control import ControlStore
+from simple_coding_agent.finalization import AttemptCompletionStore
 from simple_coding_agent.git_workspace import (
     BranchMovedSinceClaimError,
     GitWorkspace,
@@ -527,6 +529,51 @@ def test_unreadable_revision_emits_error_and_writes_no_record(tmp_path: Path) ->
     assert failures[0][3] == 23
 
 
+def test_unreadable_lease_emits_error_and_writes_no_record(tmp_path: Path) -> None:
+    class FlakyLeaseState:
+        """A checkpoint store failing only at the Unpushed-record probe.
+
+        The publish flow reads the checkpoint twice before recording (the
+        pre-push phase check and the failure report's lease lookup); the
+        third read -- the record probe -- hits the transient I/O failure.
+        """
+
+        def __init__(self, inner: AttemptStateStore) -> None:
+            self._inner = inner
+            self._reads = 0
+
+        def read(self):  # type: ignore[no-untyped-def]
+            self._reads += 1
+            if self._reads >= 3:
+                raise AttemptStateError("checkpoint is gone")
+            return self._inner.read()
+
+    events: list = []
+    inner = publishing_state(tmp_path)
+    inner.record_claim_lease(REMOTE_SHA)
+    store = UnpushedRevisionStore(tmp_path / "data")
+    publisher, github = recording_publisher(
+        PushFailingWorkspace(), events, FlakyLeaseState(inner), store
+    )
+
+    result = publisher.publish(publishing_request())
+
+    assert result.outcome is AttemptOutcome.INFRASTRUCTURE_ERROR
+    assert store.read(23) is None
+    failures = [event for event in events if event[0] == "publication_failed"]
+    assert len(failures) == 1
+    assert LOCAL_SHA in failures[0][1]
+    record_failures = [
+        event for event in events if event[0] == "unpushed_revision_record_failed"
+    ]
+    assert len(record_failures) == 1
+    assert record_failures[0][2] == "ERROR"
+    assert record_failures[0][3] == 23
+    assert "could not be read" in record_failures[0][1]
+    (comment,) = [body for _, body in github.comments]
+    assert "**Unpushed local revision**: `" + LOCAL_SHA + "`" in comment
+
+
 def test_unwritable_store_emits_error_and_keeps_outcome(tmp_path: Path) -> None:
     events: list = []
     state = publishing_state(tmp_path)
@@ -846,7 +893,7 @@ def test_recovery_preserves_when_remote_moved(tmp_path: Path) -> None:
     assert recovery is not None
     assert recovery.outcome == RECOVERY_PRESERVED
     assert recovery.ref == preserved_ref_for_issue_attempt(24, "attempt-1")
-    assert "moved" in (recovery.reason or "")
+    assert recovery.reason == "remote moved"
     assert git(remote, "rev-parse", "refs/heads/agent/issue-24") == moved
     assert git(clone, "rev-parse", recovery.ref) == revision
     assert store.read(24) is None
@@ -881,7 +928,7 @@ def test_recovery_preserves_when_remote_branch_was_deleted(tmp_path: Path) -> No
 
     assert recovery is not None
     assert recovery.outcome == RECOVERY_PRESERVED
-    assert "deleted" in (recovery.reason or "")
+    assert recovery.reason == "remote deleted"
     assert git(clone, "rev-parse", recovery.ref) == revision
     assert store.read(24) is None
 
@@ -915,10 +962,18 @@ def test_recovery_preserves_when_the_recovery_push_is_refused(tmp_path: Path) ->
 
     assert recovery is not None
     assert recovery.outcome == RECOVERY_PRESERVED
-    assert "recovery push failed" in (recovery.reason or "")
+    assert recovery.reason == "recovery push refused"
+    assert "GitCommandError" not in (recovery.reason or "")
     assert git(remote, "rev-parse", "refs/heads/agent/issue-24") == lease
     assert git(clone, "rev-parse", recovery.ref) == revision
     assert store.read(24) is None
+    preserved = [event for event in events if event[0] == "unpushed_revision_preserved"]
+    assert len(preserved) == 1
+    assert preserved[0][2] == "WARNING"
+    assert "reason=recovery push refused" in preserved[0][1]
+    # The refusal's exception type rides along as event context, not in the
+    # reason: the workspace surfaces the hook refusal as a GitCommandError.
+    assert "GitCommandError" in preserved[0][1]
 
 
 def test_recovery_leaves_record_untouched_when_remote_is_unreadable(
@@ -1044,7 +1099,7 @@ def test_live_claim_threads_preserved_line_into_result_comment(tmp_path: Path) -
     assert outcome["workspace"].preserved_refs == {ref: LOCAL_SHA}
     (request,) = outcome["publisher"].requests
     assert request.unpushed_recovery_line == preserved_comment_line(
-        LOCAL_SHA, "attempt-1", ref, "remote branch moved since the failure"
+        LOCAL_SHA, "attempt-1", ref, "remote moved"
     )
     preserved = [
         event for event in outcome["events"] if event[0] == "unpushed_revision_preserved"
@@ -1330,3 +1385,108 @@ def test_recovery_reports_already_published_end_to_end(
     assert [event for event, _, _ in events if event == "unpushed_revision_recovered"]
     bodies = [comment.body for comment in github.comments]
     assert any("(already published)" in body and revision in body for body in bodies)
+
+
+# ---------------------------------------------------------------------------
+# recovery retry / release and startup reconciliation never recover
+# ---------------------------------------------------------------------------
+
+
+class RecoveryCallSpyWorkspace(InMemoryWorkspace):
+    """An InMemoryWorkspace counting Unpushed-recovery calls (expect none)."""
+
+    def __init__(self, *args: object, **kwargs: object) -> None:
+        super().__init__(*args, **kwargs)  # type: ignore[arg-type]
+        self.recovery_calls: list = []
+
+    def remote_branch_revision(self, branch: str) -> str | None:
+        self.recovery_calls.append(("remote_branch_revision", branch))
+        return super().remote_branch_revision(branch)
+
+    def push_branch_revision(
+        self,
+        branch: str,
+        revision: str,
+        *,
+        expected_revision: str | None,
+        issue_number: int | None = None,
+    ) -> str:
+        self.recovery_calls.append(("push_branch_revision", branch, revision))
+        return super().push_branch_revision(
+            branch, revision, expected_revision=expected_revision, issue_number=issue_number
+        )
+
+    def preserve_revision(self, ref: str, revision: str) -> str:
+        self.recovery_calls.append(("preserve_revision", ref))
+        return super().preserve_revision(ref, revision)
+
+
+def _retained_lifecycle(
+    tmp_path: Path,
+    workspace: RecoveryCallSpyWorkspace,
+    store: UnpushedRevisionStore,
+    events: list,
+) -> tuple[AgentLifecycle, object]:
+    """A lifecycle holding a retained PUSHING attempt plus a seeded record."""
+
+    state = AttemptStateStore(tmp_path / "state")
+    started = state.start(issue_number=24, branch="agent/issue-24")
+    for phase in (AttemptPhase.SETUP, AttemptPhase.MODEL_RUNNING, AttemptPhase.PUSHING):
+        state.transition(phase)
+    lifecycle = AgentLifecycle(
+        sleeper=lambda _: None,
+        tracker=FakeTracker(issues={24: live_issue(24)}),
+        attempt_state=state,
+        workspace=workspace,  # type: ignore[arg-type]
+        profile_loader=lambda _: live_profile(),
+        publisher=FakePublisher(),
+        control_store=ControlStore(tmp_path),
+        completion_store=AttemptCompletionStore(tmp_path),
+        unpushed_store=store,
+        event_log=lambda event, detail="", level="INFO", issue_number=None: events.append(
+            (event, detail, level, issue_number)
+        ),
+    )
+    return lifecycle, started
+
+
+def test_recovery_retry_leaves_record_untouched(tmp_path: Path) -> None:
+    workspace = RecoveryCallSpyWorkspace(tmp_path / "repo", issue_number=24)
+    store = UnpushedRevisionStore(tmp_path / "data")
+    seeded = UnpushedRevisionRecord(
+        issue_number=24,
+        revision=LOCAL_SHA,
+        lease_revision=REMOTE_SHA,
+        attempt_id="attempt-1",
+    )
+    store.save(seeded)
+    events: list = []
+    lifecycle, started = _retained_lifecycle(tmp_path, workspace, store, events)
+
+    lifecycle.submit_recovery_retry("req-retry", started.started_at)
+
+    assert store.read(24) == seeded
+    assert workspace.recovery_calls == []
+    assert workspace.preserved_refs == {}
+    assert [event for event in events if event[0].startswith("unpushed_revision_")] == []
+
+
+def test_recovery_release_leaves_record_untouched(tmp_path: Path) -> None:
+    workspace = RecoveryCallSpyWorkspace(tmp_path / "repo", issue_number=24)
+    store = UnpushedRevisionStore(tmp_path / "data")
+    seeded = UnpushedRevisionRecord(
+        issue_number=24,
+        revision=LOCAL_SHA,
+        lease_revision=REMOTE_SHA,
+        attempt_id="attempt-1",
+    )
+    store.save(seeded)
+    events: list = []
+    lifecycle, started = _retained_lifecycle(tmp_path, workspace, store, events)
+
+    lifecycle.submit_recovery_release("req-release", started.started_at, "/tmp/secured-work")
+
+    assert store.read(24) == seeded
+    assert workspace.recovery_calls == []
+    assert workspace.preserved_refs == {}
+    assert [event for event in events if event[0].startswith("unpushed_revision_")] == []

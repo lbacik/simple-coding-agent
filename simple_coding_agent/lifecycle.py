@@ -2688,7 +2688,7 @@ class AgentLifecycle:
                 )
             except Exception as error:
                 return self._preserve_unpushed_revision(
-                    record, f"recovery push failed ({type(error).__name__})"
+                    record, "recovery push refused", error=error
                 )
             self._clear_unpushed_record(issue_number)
             self._event_log(
@@ -2706,18 +2706,22 @@ class AgentLifecycle:
                 ),
             )
         if remote_tip is None:
-            reason = "remote branch deleted since the failure"
+            reason = "remote deleted"
         else:
-            reason = "remote branch moved since the failure"
+            reason = "remote moved"
         return self._preserve_unpushed_revision(record, reason)
 
     def _preserve_unpushed_revision(
-        self, record: UnpushedRevisionRecord, reason: str
+        self, record: UnpushedRevisionRecord, reason: str, *, error: Exception | None = None
     ) -> UnpushedRecovery | None:
         """Keep an unpublishable Unpushed revision under its Preserved ref.
 
-        Clears the record in every case so there is at most one recovery try
-        per record and never a loop. Never raises.
+        ``reason`` is a short machine-readable code (``"remote moved"``,
+        ``"remote deleted"``, or ``"recovery push refused"``) rendered in the
+        event and the result-comment line; a refused push's exception rides
+        along as extra event context, never inside the reason. Clears the
+        record in every case so there is at most one recovery try per record
+        and never a loop. Never raises.
         """
 
         issue_number = record.issue_number
@@ -2745,10 +2749,15 @@ class AgentLifecycle:
             self._clear_unpushed_record(issue_number)
             return None
         self._clear_unpushed_record(issue_number)
+        detail = (
+            f"revision={record.revision}; source_attempt={record.attempt_id};"
+            f" ref={ref}; reason={reason}"
+        )
+        if error is not None:
+            detail += f"; error={type(error).__name__}: {error}"
         self._event_log(
             "unpushed_revision_preserved",
-            f"revision={record.revision}; source_attempt={record.attempt_id};"
-            f" ref={ref}; reason={reason}",
+            detail,
             level="WARNING",
             issue_number=issue_number,
         )
