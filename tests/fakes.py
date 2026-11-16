@@ -1380,6 +1380,8 @@ def build_lifecycle(
     event_log=None,
     attempt_archive_factory=None,
     contract_events=None,
+    workspace_redactions: tuple[str, ...] = (),
+    workspace_run=None,
 ):
     """Wire the real lifecycle against the shared fakes over a real git remote.
 
@@ -1391,7 +1393,9 @@ def build_lifecycle(
     threaded into the tracker, runner, publisher, and lifecycle only when
     given, so existing callers keep the default silent behavior.
     ``contract_events`` is threaded into the lifecycle only when given (it
-    feeds ``status.recent_events``).
+    feeds ``status.recent_events``). ``workspace_redactions`` is the
+    credential set the ``GitWorkspace`` redacts from git output, and
+    ``workspace_run`` replaces its git runner (for example to fail a push).
     """
 
     from simple_coding_agent.attempt_state import AttemptStateStore
@@ -1416,7 +1420,12 @@ def build_lifecycle(
 
     attempt_state = AttemptStateStore(data_dir)
     workspace = GitWorkspace(
-        clone_dir, str(remote), token_provider=lambda: "token", sleeper=lambda _: None
+        clone_dir,
+        str(remote),
+        token_provider=lambda: "token",
+        sleeper=lambda _: None,
+        redactions=workspace_redactions,
+        run=workspace_run,
     )
     tracker_kwargs: dict = {}
     if event_log is not None:

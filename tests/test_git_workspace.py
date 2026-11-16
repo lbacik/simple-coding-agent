@@ -12,6 +12,7 @@ from simple_coding_agent.git_workspace import (
     GitWorkspace,
     GitWorkspaceError,
     GitWorkspaceRecoveryError,
+    find_git_command_error,
 )
 from simple_coding_agent.model_execution import ModelExecutionStatus
 from tests.fakes import git, repository_with_main, run_command, write_and_commit
@@ -130,7 +131,12 @@ def test_unavailable_origin_is_not_reported_as_an_absent_branch(
     assert all("exit code 128" in detail and "[REDACTED]" in detail for detail in events)
     assert secret not in str(raised.value)
     assert all(secret not in detail for detail in events)
-    assert "[REDACTED]" in str(raised.value)
+    assert "exit code 128" in str(raised.value)
+    assert "origin rejected" not in str(raised.value)
+    command = find_git_command_error(raised.value)
+    assert command is not None
+    assert (command.operation, command.exit_code) == (operation, 128)
+    assert "[REDACTED]" in command.output
     assert git(tmp_path / "clone", "branch", "--show-current") == "main"
     with pytest.raises(subprocess.CalledProcessError):
         git(tmp_path / "clone", "show-ref", "--verify", "refs/heads/agent/issue-19")

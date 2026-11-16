@@ -253,6 +253,13 @@ outcome metadata and separate setup, baseline-check, and final-check output.
 Available SDK skill provenance and token metadata are archived too; any SDK
 dollar estimate is explicitly non-authoritative.
 
+A failed git command keeps its credential-redacted, bounded output for the
+WARNING/ERROR event that reports it. Issue comments only get a short summary:
+the git operation, its exit code, and at most the last output line (about 200
+characters) in an inline code span, with `@`, backticks and HTML comment
+delimiters neutralised. Every comment body the agent writes is also passed
+through the credential redactor before it is sent.
+
 ## Model execution
 
 The execution boundary dispatches `/implement` with the issue body as its

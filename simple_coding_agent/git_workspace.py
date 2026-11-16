@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from datetime import datetime
 import os
@@ -15,10 +15,39 @@ import time
 from urllib.parse import urlsplit
 
 from simple_coding_agent.model_execution import ModelExecutionStatus
+from simple_coding_agent.observability import Redactor
+
+# Bound on the redacted diagnostic output one failed git command keeps.
+GIT_OUTPUT_LIMIT = 2000
+# Bound on the single git output line an issue comment may quote.
+COMMENT_OUTPUT_LIMIT = 200
 
 
 class GitWorkspaceError(RuntimeError):
     """Raised when the persistent git workspace cannot be used safely."""
+
+
+class GitCommandError(GitWorkspaceError):
+    """Raised when one git command fails or cannot start.
+
+    The failure is carried as structured data: the git ``operation``, its
+    ``exit_code`` (``None`` when git could not start) and its ``output``,
+    already redacted with the full credential set and bounded to
+    ``GIT_OUTPUT_LIMIT`` characters. ``str()`` is only the short form, so
+    raw git output never reaches text built from the message; events quote
+    the output through ``git_failure_detail`` and issue comments through
+    ``git_failure_summary``.
+    """
+
+    def __init__(self, operation: str, exit_code: int | None, output: str = "") -> None:
+        if exit_code is None:
+            message = f"Git {operation} could not start"
+        else:
+            message = f"Git {operation} failed (exit code {exit_code})"
+        super().__init__(message)
+        self.operation = operation
+        self.exit_code = exit_code
+        self.output = output
 
 
 class GitWorkspaceRecoveryError(GitWorkspaceError):
@@ -166,6 +195,7 @@ class GitWorkspace:
         sleeper: Callable[[float], None] | None = None,
         max_retries: int = 3,
         event_log: Callable[..., None] | None = None,
+        redactions: Iterable[str] = (),
     ) -> None:
         if max_retries <= 0:
             raise GitWorkspaceError("Branch restoration retry count must be positive")
@@ -174,6 +204,7 @@ class GitWorkspace:
         self._clone_dir = clone_dir
         self._repository_url = repository_url
         self._token_provider = token_provider
+        self._redactions = tuple(redactions)
         self._run = run or _run_git
         self._sleeper = sleeper if sleeper is not None else _default_sleeper
 
@@ -337,7 +368,8 @@ class GitWorkspace:
                 last_error = error
                 self._event_log(
                     "attempt_branch_restore_failed",
-                    f"branch={branch}; attempt={attempt + 1}/{self._max_retries}; {error}",
+                    f"branch={branch}; attempt={attempt + 1}/{self._max_retries};"
+                    f" {git_failure_detail(error)}",
                     level="WARNING",
                     issue_number=issue_number,
                 )
@@ -1086,22 +1118,110 @@ class GitWorkspace:
         github_token = self._token_provider()
         if not isinstance(github_token, str) or not github_token:
             raise GitWorkspaceError("GITHUB_TOKEN is unavailable")
+        redactor = Redactor((*self._redactions, github_token))
         with _askpass_environment(github_token) as environment:
             try:
                 return self._run(("git", *arguments), working_directory, environment)
-            except (OSError, subprocess.CalledProcessError) as error:
-                detail = f"Git {arguments[0]} failed"
-                if isinstance(error, subprocess.CalledProcessError):
-                    detail += f" (exit code {error.returncode})"
-                    output = error.stderr or error.stdout
-                    if isinstance(output, bytes):
-                        output = output.decode("utf-8", errors="replace")
-                    if output:
-                        detail += f": {output.strip()}"
-                else:
-                    detail += f": {error}"
-                detail = detail.replace(github_token, "[REDACTED]")
-                raise GitWorkspaceError(detail[:2000]) from error
+            except subprocess.CalledProcessError as error:
+                failure = GitCommandError(
+                    arguments[0],
+                    error.returncode,
+                    _bounded_output(redactor, error.stderr or error.stdout),
+                )
+            except OSError as error:
+                failure = GitCommandError(arguments[0], None, _bounded_output(redactor, str(error)))
+        # Raised outside the handlers so the raw, unredacted subprocess error
+        # is neither the cause nor the context of the structured failure.
+        raise failure
+
+
+def find_git_command_error(error: BaseException) -> GitCommandError | None:
+    """Return the failed git command behind ``error``, following its chain."""
+
+    seen: set[int] = set()
+    current: BaseException | None = error
+    while current is not None and id(current) not in seen:
+        if isinstance(current, GitCommandError):
+            return current
+        seen.add(id(current))
+        current = current.__cause__ or current.__context__
+    return None
+
+
+def git_failure_detail(error: BaseException) -> str:
+    """Event-log text for a failure: its short form plus the redacted git output.
+
+    Meant for WARNING/ERROR events and archives only; issue comments use
+    ``git_failure_summary`` instead.
+    """
+
+    detail = f"{type(error).__name__}: {error}"
+    command = find_git_command_error(error)
+    if command is None:
+        return detail
+    if command is not error:
+        detail += f"; {command}"
+    if command.output:
+        detail += f"; output: {command.output}"
+    return detail
+
+
+def git_failure_summary(error: BaseException) -> str:
+    """Comment-safe text for a failure: the single builder for issue comments.
+
+    Gives the failure's short form, the git operation and exit code, and at
+    most the last non-empty output line, cut to ``COMMENT_OUTPUT_LIMIT``
+    characters inside an inline code span. The quoted line is neutralised
+    so it cannot close the code span, ping anyone, or contain an agent
+    comment marker (``<!--`` / ``-->``) that substring matching would find.
+    """
+
+    summary = f"{type(error).__name__}: {error}"
+    command = find_git_command_error(error)
+    if command is None:
+        return summary
+    if command is not error:
+        summary += f"; {command}"
+    line = _last_output_line(command.output)
+    if line:
+        summary += f": `{_neutralise_for_comment(line)}`"
+    return summary
+
+
+def _bounded_output(redactor: Redactor, output: object) -> str:
+    """Redact git output with the full credential set, then bound it.
+
+    The tail is kept: git reports the decisive ``fatal:``/``error:`` line last.
+    """
+
+    if isinstance(output, bytes):
+        output = output.decode("utf-8", errors="replace")
+    if not isinstance(output, str):
+        return ""
+    return str(redactor.redact(output.strip()))[-GIT_OUTPUT_LIMIT:]
+
+
+def _last_output_line(output: str) -> str:
+    """The last non-empty output line, cut to ``COMMENT_OUTPUT_LIMIT`` characters."""
+
+    lines = [line.strip() for line in output.splitlines() if line.strip()]
+    if not lines:
+        return ""
+    line = lines[-1]
+    if len(line) > COMMENT_OUTPUT_LIMIT:
+        line = line[: COMMENT_OUTPUT_LIMIT - 1] + "…"
+    return line
+
+
+def _neutralise_for_comment(text: str) -> str:
+    """Make one line inert inside an inline code span of a GitHub comment."""
+
+    return (
+        text.replace("`", "'")
+        .replace("@", "＠")
+        .replace("<", "‹")
+        .replace(">", "›")
+    )
 
 
 def _porcelain_path(line: str) -> str:

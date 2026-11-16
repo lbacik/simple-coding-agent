@@ -9,7 +9,12 @@ from typing import Callable, Protocol
 from simple_coding_agent.completion import AttemptOutcome, CompletionDecision, PublicationPath
 from simple_coding_agent.attempt_state import AttemptPhase, AttemptStateStore
 from simple_coding_agent.attempt_workspace import BranchPusher
-from simple_coding_agent.git_workspace import BranchMovedSinceClaimError, GitWorkspaceError
+from simple_coding_agent.git_workspace import (
+    BranchMovedSinceClaimError,
+    GitWorkspaceError,
+    git_failure_detail,
+    git_failure_summary,
+)
 from simple_coding_agent.handoff_record import (
     HANDOFF_RECORD_VERSION,
     HandoffPublicationStore,
@@ -382,10 +387,10 @@ class Publisher:
                     self._mark_publishing()
                 branch_url = f"https://github.com/{self._repository}/tree/{request.branch}"
             except BranchMovedSinceClaimError as error:
-                push_failure = f"Partial branch push failed: {type(error).__name__}: {error}"
+                push_failure = f"Partial branch push failed: {git_failure_summary(error)}"
                 self._event_log(
                     "publication_failed",
-                    push_failure,
+                    f"Partial branch push failed: {git_failure_detail(error)}",
                     level="ERROR",
                     issue_number=request.issue_number,
                 )
@@ -394,10 +399,10 @@ class Publisher:
                 comment_posted = self._post_result(request, outcome, branch_url, None, details)
                 return PublicationResult(outcome, branch_url, None, comment_posted, details)
             except ClaimLeaseError as error:
-                advance_failure = f"Claim lease advance failed: {type(error).__name__}: {error}"
+                advance_failure = f"Claim lease advance failed: {git_failure_summary(error)}"
                 self._event_log(
                     "publication_failed",
-                    advance_failure,
+                    f"Claim lease advance failed: {git_failure_detail(error)}",
                     level="ERROR",
                     issue_number=request.issue_number,
                 )
@@ -412,10 +417,10 @@ class Publisher:
                 comment_posted = self._post_result(request, outcome, branch_url, None, details)
                 return PublicationResult(outcome, branch_url, None, comment_posted, details)
             except (GitWorkspaceError, TimeoutError) as error:
-                push_failure = f"Partial branch push failed: {type(error).__name__}: {error}"
+                push_failure = f"Partial branch push failed: {git_failure_summary(error)}"
                 self._event_log(
                     "publication_failed",
-                    push_failure,
+                    f"Partial branch push failed: {git_failure_detail(error)}",
                     level="ERROR",
                     issue_number=request.issue_number,
                 )
@@ -502,10 +507,10 @@ class Publisher:
         never retained for recovery, never retried.
         """
 
-        move_failure = f"Shared handoff branch push failed: {type(error).__name__}: {error}"
+        move_failure = f"Shared handoff branch push failed: {git_failure_summary(error)}"
         self._event_log(
             "publication_failed",
-            move_failure,
+            f"Shared handoff branch push failed: {git_failure_detail(error)}",
             level="ERROR",
             issue_number=request.issue_number,
         )
@@ -678,10 +683,10 @@ class Publisher:
                     self._mark_publishing()
                 branch_url = f"https://github.com/{self._repository}/tree/{request.branch}"
             except BranchMovedSinceClaimError as error:
-                push_failure = f"Rebased branch push failed: {type(error).__name__}: {error}"
+                push_failure = f"Rebased branch push failed: {git_failure_summary(error)}"
                 self._event_log(
                     "publication_failed",
-                    push_failure,
+                    f"Rebased branch push failed: {git_failure_detail(error)}",
                     level="ERROR",
                     issue_number=request.issue_number,
                 )
@@ -716,10 +721,10 @@ class Publisher:
                 # keep the ``push_failed`` marker (publication did not
                 # complete) while naming the advance, not the push, in the
                 # details and the event log.
-                advance_failure = f"Claim lease advance failed: {type(error).__name__}: {error}"
+                advance_failure = f"Claim lease advance failed: {git_failure_summary(error)}"
                 self._event_log(
                     "publication_failed",
-                    advance_failure,
+                    f"Claim lease advance failed: {git_failure_detail(error)}",
                     level="ERROR",
                     issue_number=request.issue_number,
                 )
@@ -754,10 +759,10 @@ class Publisher:
                     escalate,
                 )
             except (GitWorkspaceError, TimeoutError) as error:
-                push_failure = f"Rebased branch push failed: {type(error).__name__}: {error}"
+                push_failure = f"Rebased branch push failed: {git_failure_summary(error)}"
                 self._event_log(
                     "publication_failed",
-                    push_failure,
+                    f"Rebased branch push failed: {git_failure_detail(error)}",
                     level="ERROR",
                     issue_number=request.issue_number,
                 )
@@ -1156,7 +1161,7 @@ class Publisher:
         except (GitWorkspaceError, TimeoutError) as error:
             self._event_log(
                 "publication_failed",
-                f"Shared handoff branch push failed: {type(error).__name__}: {error}",
+                f"Shared handoff branch push failed: {git_failure_detail(error)}",
                 level="ERROR",
                 issue_number=request.issue_number,
             )
