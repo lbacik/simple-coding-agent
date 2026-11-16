@@ -66,7 +66,6 @@ from simple_coding_agent.unpushed_revision import (
     UnpushedRecovery,
     UnpushedRevisionRecord,
     UnpushedRevisionStore,
-    UnpushedRevisionStoreError,
     preserved_comment_line,
     preserved_ref_for_issue_attempt,
     recovered_comment_line,
