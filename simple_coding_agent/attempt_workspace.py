@@ -132,6 +132,44 @@ class AttemptWorkspace(Protocol):
         """
         ...
 
+    def remote_branch_revision(self, branch: str) -> str | None:
+        """The remote tip revision of an attempt branch (``None`` when absent).
+
+        Raises when the remote cannot be read, so callers never mistake an
+        unreachable origin for an absent branch. Used by Unpushed-revision
+        recovery to compare the remote tip against the recorded claim-time
+        lease before pushing or preserving.
+        """
+        ...
+
+    def push_branch_revision(
+        self,
+        branch: str,
+        revision: str,
+        *,
+        expected_revision: str | None,
+        issue_number: int | None = None,
+    ) -> str:
+        """Push an explicit ``revision`` to an attempt branch under one lease.
+
+        The single-shot push Unpushed-revision recovery retries: publishes
+        ``revision`` with a ``force-with-lease`` at ``expected_revision``
+        (``None`` when the lease says the branch was absent) and verifies
+        the remote tip afterwards. A remote that no longer stands at the
+        lease raises, and any other failure raises, so the caller keeps the
+        revision as a Preserved revision instead of retrying.
+        """
+        ...
+
+    def preserve_revision(self, ref: str, revision: str) -> str:
+        """Keep ``revision`` under the local ``ref`` for an operator to decide on.
+
+        The Preserved revision stays reachable from ``ref`` (a dedicated,
+        non-branch namespace) after attempt preparation restores the attempt
+        branch from the remote. Returns ``ref``.
+        """
+        ...
+
     def cleanup(
         self, *, base_branch: str, prepared: PreparedAttempt, retain_branch: bool
     ) -> None:
