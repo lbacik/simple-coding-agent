@@ -85,7 +85,10 @@ between two harness verbs:
 - **Attempts wait for `finish-attempt`.** A claimed attempt blocks in the
   fake model execution until `finish-attempt` scripts its outcome. The
   outcome names its attempt and that attempt consumes it, so no stale
-  outcome can finish a later attempt.
+  outcome can finish a later attempt. On a normal finish, `finish-attempt`
+  returns once `status` shows the attempt in `last_finished`, not merely
+  once its checkpoint is gone: finalization removes the checkpoint before
+  it seals the archive and records `last_finished`.
 - **`after-outcome` pauses finalization with the outcome recorded.** The
   hold takes effect right after the engine emits `outcome_recorded`, which
   it does as soon as publication decides the verdict (ADR 0010): the

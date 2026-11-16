@@ -42,6 +42,7 @@ from conformance_harness.harness import (
     DAEMON_POLL_INTERVAL_SECONDS,
     ENGINE_LOCK_HELD,
     FAILED_FINALIZATION,
+    CHECKPOINT_REMOVAL_DELAY,
     RECOVERY_HOLD,
     STARTUP_HOLD,
     STARTUP_RECONCILED,
@@ -643,6 +644,35 @@ class FinalizationFailingTransport:
         return getattr(self.__dict__["_inner"], name)
 
 
+class CheckpointRemovalDelayingStore:
+    """Attempt state store whose next checkpoint removal can pause afterwards.
+
+    Test-only seam. Finalization removes the checkpoint, then seals the
+    archive and records ``last_finished`` (the engine's durable completion
+    boundary). The armed one-shot (``{"ms": N}``) makes the next ``delete``,
+    whichever path calls it, sleep N ms after the removal. On a normal
+    finalization ``status`` then shows neither a ``current_attempt`` nor
+    the attempt in ``last_finished`` for that long. Every other call is
+    delegated unchanged.
+    """
+
+    def __init__(self, inner: object, flags: Path) -> None:
+        self._inner = inner
+        self._flags = flags
+
+    def delete(self) -> None:
+        self._inner.delete()
+        armed = _take_json(self._flags / CHECKPOINT_REMOVAL_DELAY)
+        if armed is None:
+            return
+        delay_ms = armed.get("ms")
+        if isinstance(delay_ms, int) and delay_ms > 0:
+            time.sleep(delay_ms / 1000)
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self.__dict__["_inner"], name)
+
+
 class GateProxy:
     """Serialize control mutations with the harness engine lock and crash gate.
 
@@ -940,7 +970,7 @@ def _build_engine(
     )
     lifecycle = AgentLifecycle(
         tracker=tracker,
-        attempt_state=attempt_state,
+        attempt_state=CheckpointRemovalDelayingStore(attempt_state, flags),
         workspace=workspace,
         profile_loader=lambda _: default_profile(),
         publisher=publisher,
