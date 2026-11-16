@@ -1732,11 +1732,11 @@ def _result_comment(
         if failed_push is not None and failed_push.local_revision is not None
         else ""
     )
-    recovery_line = (
-        f"{request.unpushed_recovery_line}\n"
-        if request.unpushed_recovery_line
-        else ""
-    )
+    # ``getattr`` like ``worker_id`` below: doubles and legacy callers may
+    # pass a request-shaped namespace without the recovery line, which then
+    # renders nothing, keeping the comment byte-for-byte identical to today.
+    recovery_text = getattr(request, "unpushed_recovery_line", None)
+    recovery_line = f"{recovery_text}\n" if recovery_text else ""
     merge_line = f"**Merge**: {merge_result}\n" if merge_result is not None else ""
     review_lines = "\n".join(_review_lines(request))
     source_marker = requeue_source_marker(request.requeue_source)
