@@ -89,6 +89,14 @@ Turning every uncommitted change in the attempt workspace into a commit attribut
 Sealing is distinct from the operator contract's **Sealed** (a complete, immutable Attempt Archive, defined in the [contract glossary](https://github.com/lbacik/agent-operator-contract/blob/v1.0.0/CONTEXT.md#attempts-and-archives)): sealing commits workspace changes during an attempt, while Sealed marks an archive whose evidence set is final and may be cached.
 _Avoid_: Preserving dirty work, safety-net commit, checkpoint (the attempt checkpoint is a different thing)
 
+**Unpushed revision**:
+The local attempt-branch tip that an implementation attempt's failed push could not publish, recorded on the failing Worker together with that attempt's claim-time lease. It exists only in that Worker's clone; the next implementation claim of the same issue on that Worker publishes it if the remote branch still stands at the recorded lease, and otherwise keeps it as a Preserved revision. Recovering it never changes the failed attempt's Recorded verdict.
+_Avoid_: Orphaned commits, lost work, local handoff
+
+**Preserved revision**:
+An Unpushed revision that could not be safely published at the next claim (the remote branch moved, or the push was refused), kept under a local reference on the Worker for an operator to decide on instead of being discarded when the attempt branch is restored from the remote.
+_Avoid_: Backup branch, stash
+
 **Token budget**:
 The limit on the total tokens one implementation attempt may process and generate, counting every token category unweighted and including the tokens spent by its subagents. It measures the amount of work in the attempt, not its price; a USD limit exists only as a looser backstop.
 _Avoid_: Cost budget, spend limit
