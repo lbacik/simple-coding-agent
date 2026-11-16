@@ -9,6 +9,7 @@ from simple_coding_agent.completion import AttemptOutcome, CompletionDecision, P
 from simple_coding_agent.attempt_state import AttemptPhase, AttemptStateError, AttemptStateStore
 from simple_coding_agent.git_workspace import (
     BranchMovedSinceClaimError,
+    GitCommandError,
     GitWorkspace,
     GitWorkspaceError,
 )
@@ -354,6 +355,7 @@ class PushFailingWorkspace:
         deadline: float | None = None,
         expected_revision: str | None = None,
         lease_known: bool = False,
+        issue_number: int | None = None,
     ) -> str:
         raise GitWorkspaceError("remote hung up unexpectedly")
 
@@ -881,6 +883,7 @@ class BranchMovedWorkspace:
         deadline: float | None = None,
         expected_revision: str | None = None,
         lease_known: bool = False,
+        issue_number: int | None = None,
     ) -> str:
         self.calls.append((expected_revision, lease_known))
         raise BranchMovedSinceClaimError(
@@ -904,6 +907,7 @@ class RecordingWorkspace:
         deadline: float | None = None,
         expected_revision: str | None = None,
         lease_known: bool = False,
+        issue_number: int | None = None,
     ) -> str:
         self.calls.append((expected_revision, lease_known))
         return self.sha
@@ -995,3 +999,373 @@ def test_claim_lease_advance_failure_is_not_reported_as_a_push_failure(
     assert "Claim lease advance failed" in events[0][1]
     assert inner.read() is not None
     assert inner.read().claim_branch_revision == "old-sha"
+
+
+class ChainedPushFailingWorkspace:
+    """A pusher double failing like an exhausted retry loop, cause chained.
+
+    Mirrors the production raise (``GitWorkspaceError ... from <git error>``)
+    with already-redacted output, as ``GitCommandError`` carries it.
+    """
+
+    def __init__(self) -> None:
+        self.issue_numbers: list[int | None] = []
+
+    def push_attempt_branch(
+        self,
+        branch: str,
+        *,
+        max_retries: int,
+        deadline: float | None = None,
+        expected_revision: str | None = None,
+        lease_known: bool = False,
+        issue_number: int | None = None,
+    ) -> str:
+        self.issue_numbers.append(issue_number)
+        try:
+            raise GitCommandError(
+                "push", 128, "fatal: could not read from remote: [REDACTED]"
+            )
+        except GitCommandError as cause:
+            raise GitWorkspaceError(
+                "Attempt branch could not be pushed safely"
+            ) from cause
+
+
+def test_partial_push_failure_carries_the_issue_number_and_names_the_git_cause(
+    tmp_path: Path,
+) -> None:
+    workspace = ChainedPushFailingWorkspace()
+    github = FakeGitHub()
+    events: list[tuple[str, str, str, int | None]] = []
+
+    result = Publisher(
+        workspace,
+        github,
+        "octo/example",
+        event_log=lambda event, detail="", level="INFO", issue_number=None: events.append(
+            (event, detail, level, issue_number)
+        ),
+    ).publish(
+        request(
+            CompletionDecision(
+                AttemptOutcome.INCOMPLETE,
+                False,
+                PublicationPath.PARTIAL,
+                ("Final authoritative check did not succeed.",),
+            ),
+            "agent/issue-23",
+        )
+    )
+
+    assert workspace.issue_numbers == [23]
+    assert result.outcome is AttemptOutcome.INCOMPLETE
+    assert "Partial branch push failed" in result.details
+    assert "Git push failed (exit code 128)" in result.details
+    failures = [event for event in events if event[0] == "publication_failed"]
+    assert len(failures) == 1
+    assert failures[0][2] == "ERROR"
+    assert failures[0][3] == 23
+    assert "could not read from remote" in failures[0][1]
+    assert "Git push failed (exit code 128)" in failures[0][1]
+
+
+REMOTE_SHA = "b" * 40
+LOCAL_SHA = "a" * 40
+
+
+class RevisablePushFailingWorkspace:
+    """A pusher double whose push fails while the local tip stays readable."""
+
+    def __init__(self, local_revision: str = LOCAL_SHA) -> None:
+        self.local_revision = local_revision
+
+    def push_attempt_branch(
+        self,
+        branch: str,
+        *,
+        max_retries: int,
+        deadline: float | None = None,
+        expected_revision: str | None = None,
+        lease_known: bool = False,
+        issue_number: int | None = None,
+    ) -> str:
+        raise GitWorkspaceError("remote hung up unexpectedly")
+
+    def attempt_branch_revision(self, branch: str) -> str:
+        return self.local_revision
+
+
+class UnreadableTipWorkspace(RevisablePushFailingWorkspace):
+    """A pusher double whose push fails and whose local tip cannot be read."""
+
+    def attempt_branch_revision(self, branch: str) -> str:
+        raise GitWorkspaceError("Attempt branch revision is unavailable in the local clone")
+
+
+class RevisableBranchMovedWorkspace:
+    """A lease-rejection double whose local tip stays readable."""
+
+    def push_attempt_branch(
+        self,
+        branch: str,
+        *,
+        max_retries: int,
+        deadline: float | None = None,
+        expected_revision: str | None = None,
+        lease_known: bool = False,
+        issue_number: int | None = None,
+    ) -> str:
+        raise BranchMovedSinceClaimError(
+            f"branch moved since claim: remote {branch} is rival-sha,"
+            " claim-time lease was absent"
+        )
+
+    def attempt_branch_revision(self, branch: str) -> str:
+        return LOCAL_SHA
+
+
+def failed_push_publisher(
+    workspace: object,
+    github: FakeGitHub,
+    events: list[tuple[str, str, str, int | None]],
+    state: AttemptStateStore | None = None,
+) -> Publisher:
+    return Publisher(
+        workspace,  # type: ignore[arg-type]
+        github,
+        "octo/example",
+        attempt_state=state,
+        event_log=lambda event, detail="", level="INFO", issue_number=None: events.append(
+            (event, detail, level, issue_number)
+        ),
+    )
+
+
+def test_failed_push_to_existing_branch_links_branch_and_reports_unpushed_revision(
+    tmp_path: Path,
+) -> None:
+    workspace = RevisablePushFailingWorkspace()
+    github = FakeGitHub()
+    events: list[tuple[str, str, str, int | None]] = []
+    state = publishing_state(tmp_path)
+    state.record_claim_lease(REMOTE_SHA)
+
+    result = failed_push_publisher(workspace, github, events, state).publish(
+        request(CompletionDecision(None, True, PublicationPath.COMPLETE, ("ready",)), "agent/issue-23")
+    )
+
+    assert result.outcome is AttemptOutcome.INFRASTRUCTURE_ERROR
+    assert result.branch_url is None
+    (comment,) = [body for _, body in github.comments]
+    assert (
+        "**Branch**: [agent/issue-23](https://github.com/octo/example/tree/agent/issue-23)"
+        in comment
+    )
+    assert "push failed" in comment
+    assert "no branch created" not in comment
+    assert "**Unpushed local revision**: `" + LOCAL_SHA + "`" in comment
+    assert LOCAL_SHA in comment
+    assert LOCAL_SHA in result.details
+    assert len(events) == 1
+    assert events[0][0] == "publication_failed"
+    assert LOCAL_SHA in events[0][1]
+    assert events[0][2] == "ERROR"
+    assert events[0][3] == 23
+
+
+def test_branch_moved_failure_links_the_existing_branch(tmp_path: Path) -> None:
+    workspace = RevisableBranchMovedWorkspace()
+    github = FakeGitHub()
+    events: list[tuple[str, str, str, int | None]] = []
+    state = publishing_state(tmp_path)
+    state.record_claim_lease(REMOTE_SHA)
+
+    result = failed_push_publisher(workspace, github, events, state).publish(
+        request(CompletionDecision(None, True, PublicationPath.COMPLETE, ("ready",)), "agent/issue-23")
+    )
+
+    assert result.outcome is AttemptOutcome.INFRASTRUCTURE_ERROR
+    assert result.branch_url is None
+    (comment,) = [body for _, body in github.comments]
+    assert (
+        "**Branch**: [agent/issue-23](https://github.com/octo/example/tree/agent/issue-23)"
+        in comment
+    )
+    assert "push failed" in comment
+    assert "no branch created" not in comment
+    assert "branch moved since claim" in comment
+    assert LOCAL_SHA in comment
+    assert LOCAL_SHA in result.details
+    assert len(events) == 1
+    assert events[0][0] == "publication_failed"
+    assert "branch moved since claim" in events[0][1]
+    assert LOCAL_SHA in events[0][1]
+
+
+def test_failed_push_with_absent_lease_still_reads_no_branch_created(
+    tmp_path: Path,
+) -> None:
+    workspace = RevisablePushFailingWorkspace()
+    github = FakeGitHub()
+    events: list[tuple[str, str, str, int | None]] = []
+    state = publishing_state(tmp_path)
+    state.record_claim_lease(None)
+
+    result = failed_push_publisher(workspace, github, events, state).publish(
+        request(CompletionDecision(None, True, PublicationPath.COMPLETE, ("ready",)), "agent/issue-23")
+    )
+
+    assert result.outcome is AttemptOutcome.INFRASTRUCTURE_ERROR
+    assert result.branch_url is None
+    (comment,) = [body for _, body in github.comments]
+    assert "**Branch**: no branch created" in comment
+    assert LOCAL_SHA in comment
+    assert LOCAL_SHA in result.details
+    assert len(events) == 1
+    assert LOCAL_SHA in events[0][1]
+
+
+def test_failed_push_with_unknown_lease_still_reads_no_branch_created(
+    tmp_path: Path,
+) -> None:
+    workspace = RevisablePushFailingWorkspace()
+    github = FakeGitHub()
+    events: list[tuple[str, str, str, int | None]] = []
+
+    result = failed_push_publisher(workspace, github, events).publish(
+        request(CompletionDecision(None, True, PublicationPath.COMPLETE, ("ready",)), "agent/issue-23")
+    )
+
+    assert result.outcome is AttemptOutcome.INFRASTRUCTURE_ERROR
+    assert result.branch_url is None
+    (comment,) = [body for _, body in github.comments]
+    assert "**Branch**: no branch created" in comment
+    assert LOCAL_SHA in comment
+    assert LOCAL_SHA in result.details
+    assert len(events) == 1
+    assert LOCAL_SHA in events[0][1]
+
+
+def test_claim_lease_advance_failure_links_the_pushed_branch(tmp_path: Path) -> None:
+    class AdvanceFailingStore(AttemptStateStore):
+        def advance_claim_lease(self, revision: str | None):  # type: ignore[override]
+            raise AttemptStateError("disk is gone")
+
+    workspace = RecordingWorkspace(sha="new-sha")
+    github = FakeGitHub()
+    events: list[tuple[str, str, str, int | None]] = []
+    inner = publishing_state(tmp_path)
+    inner.record_claim_lease("old-sha")
+    state = AdvanceFailingStore(tmp_path)
+
+    result = failed_push_publisher(workspace, github, events, state).publish(
+        request(CompletionDecision(None, True, PublicationPath.COMPLETE, ("ready",)), "agent/issue-23")
+    )
+
+    assert result.outcome is AttemptOutcome.INFRASTRUCTURE_ERROR
+    assert result.branch_url is None
+    (comment,) = [body for _, body in github.comments]
+    assert (
+        "**Branch**: [agent/issue-23](https://github.com/octo/example/tree/agent/issue-23)\n"
+        in comment
+    )
+    assert "no branch created" not in comment
+    assert "Claim lease advance failed" in comment
+    assert len(events) == 1
+    assert "Claim lease advance failed" in events[0][1]
+
+
+def test_failed_push_with_unreadable_revision_publishes_without_sha(
+    tmp_path: Path,
+) -> None:
+    workspace = UnreadableTipWorkspace()
+    github = FakeGitHub()
+    events: list[tuple[str, str, str, int | None]] = []
+    state = publishing_state(tmp_path)
+    state.record_claim_lease(REMOTE_SHA)
+
+    result = failed_push_publisher(workspace, github, events, state).publish(
+        request(CompletionDecision(None, True, PublicationPath.COMPLETE, ("ready",)), "agent/issue-23")
+    )
+
+    assert result.outcome is AttemptOutcome.INFRASTRUCTURE_ERROR
+    assert result.branch_url is None
+    assert len(github.comments) == 1
+    (comment,) = [body for _, body in github.comments]
+    assert (
+        "**Branch**: [agent/issue-23](https://github.com/octo/example/tree/agent/issue-23)"
+        in comment
+    )
+    assert "no branch created" not in comment
+    assert "Unpushed local revision" not in comment
+    assert "Implementation succeeded but publication failed." in comment
+    assert len(events) == 1
+    assert events[0][0] == "publication_failed"
+    assert "Partial branch push failed" in events[0][1]
+    assert "Unpushed local revision" not in events[0][1]
+
+
+def test_failed_push_comments_feed_continuation_detection(tmp_path: Path) -> None:
+    from datetime import UTC, datetime
+
+    from simple_coding_agent.github_tracker import TrackerIssue
+    from simple_coding_agent.lifecycle import _continuation_expected
+
+    def issue() -> TrackerIssue:
+        return TrackerIssue(
+            id="issue-23",
+            number=23,
+            title="Implement publication",
+            body="Connect boundaries.",
+            created_at=datetime(2026, 9, 20, tzinfo=UTC),
+            state="OPEN",
+            labels=frozenset(),
+            assignee_logins=(),
+            blocked_by=0,
+            author_login="reporter",
+        )
+
+    existing_workspace = RevisablePushFailingWorkspace()
+    existing_github = FakeGitHub()
+    existing_state = publishing_state(tmp_path / "existing")
+    existing_state.record_claim_lease(REMOTE_SHA)
+    failed_push_publisher(existing_workspace, existing_github, [], existing_state).publish(
+        request(
+            CompletionDecision(
+                AttemptOutcome.INCOMPLETE, False, PublicationPath.PARTIAL, ("check failed",)
+            ),
+            "agent/issue-23",
+        )
+    )
+    (existing_comment,) = [body for _, body in existing_github.comments]
+    assert "no branch created" not in existing_comment
+    assert _continuation_expected(issue(), lambda unused: (existing_comment,)) is True
+
+    missing_workspace = RevisablePushFailingWorkspace()
+    missing_github = FakeGitHub()
+    missing_state = publishing_state(tmp_path / "missing")
+    missing_state.record_claim_lease(None)
+    failed_push_publisher(missing_workspace, missing_github, [], missing_state).publish(
+        request(
+            CompletionDecision(
+                AttemptOutcome.INCOMPLETE, False, PublicationPath.PARTIAL, ("check failed",)
+            ),
+            "agent/issue-23",
+        )
+    )
+    (missing_comment,) = [body for _, body in missing_github.comments]
+    assert "no branch created" in missing_comment
+    assert _continuation_expected(issue(), lambda unused: (missing_comment,)) is False
+
+
+def test_attempt_branch_revision_reads_the_local_tip(tmp_path: Path) -> None:
+    remote, _ = repository_with_main(tmp_path)
+    workspace = GitWorkspace(tmp_path / "clone", str(remote), token_provider=lambda: "token")
+    prepared = workspace.prepare_attempt(base_branch="main", issue_number=23)
+    write_and_commit(tmp_path / "clone", "feature.txt", "done", "Implement publication")
+
+    revision = workspace.attempt_branch_revision(prepared.branch)
+
+    assert revision == git(tmp_path / "clone", "rev-parse", "--verify", prepared.branch)
+    assert len(revision) == 40

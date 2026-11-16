@@ -59,6 +59,17 @@ from simple_coding_agent.completion import (
 )
 from simple_coding_agent.config import RepositoryProfile
 from simple_coding_agent.finalization import AttemptCompletionStore, CompletionStoreError
+from simple_coding_agent.unpushed_revision import (
+    RECOVERY_ALREADY_PUBLISHED,
+    RECOVERY_PRESERVED,
+    RECOVERY_RECOVERED,
+    UnpushedRecovery,
+    UnpushedRevisionRecord,
+    UnpushedRevisionStore,
+    preserved_comment_line,
+    preserved_ref_for_issue_attempt,
+    recovered_comment_line,
+)
 from simple_coding_agent.git_workspace import (
     AttemptCommit,
     DirtyWorkspaceError,
@@ -1372,6 +1383,7 @@ class AgentLifecycle:
         ),
         attempt_archive_factory: Callable[[int, str], AttemptArchive] | None = None,
         completion_store: AttemptCompletionStore | None = None,
+        unpushed_store: UnpushedRevisionStore | None = None,
         control_store: ControlStore | None = None,
         repository: str = "",
         clock: Callable[[], datetime] | None = None,
@@ -1417,6 +1429,7 @@ class AgentLifecycle:
         self._event_log = event_log
         self._attempt_archive_factory = attempt_archive_factory
         self._completion_store = completion_store
+        self._unpushed_store = unpushed_store
         self._control_store = control_store
         self._repository = repository
         self._mode = mode
@@ -2603,6 +2616,181 @@ class AgentLifecycle:
             level="INFO",
             issue_number=issue_number,
         )
+
+    def _recover_unpushed_revision(self, issue_number: int) -> UnpushedRecovery | None:
+        """Publish or preserve the issue's recorded Unpushed revision, if any.
+
+        Runs once per live implementation claim, after the claim and before
+        attempt preparation. The remote attempt-branch tip decides:
+
+        * equal to the recorded claim-time lease (including "absent" when
+          the branch is still absent): push the Unpushed revision with that
+          lease, i.e. the push that failed earlier;
+        * equal to the Unpushed revision: someone already published it,
+          nothing to push;
+        * anything else (moved, or deleted after being present): keep it as
+          a Preserved revision under a local ref instead of pushing;
+        * a refused or failed recovery push: the same Preserved fallback.
+
+        The record is cleared after each of the push, already-published,
+        and preserved outcomes, so a second claim of the same issue does
+        nothing. When the remote tip cannot be read the record is left
+        untouched and preparation (which already handles an unreachable
+        origin) decides. Never raises: reading or clearing the store, or a
+        failed preserve, emits an ERROR event and the attempt continues
+        from the remote.
+        """
+
+        store = self._unpushed_store
+        if store is None:
+            return None
+        try:
+            record = store.read(issue_number)
+        except Exception as error:
+            self._event_log(
+                "unpushed_revision_read_failed",
+                f"the Unpushed-revision record could not be read: {error}",
+                level="ERROR",
+                issue_number=issue_number,
+            )
+            return None
+        if record is None:
+            return None
+        branch = f"agent/issue-{issue_number}"
+        try:
+            remote_tip = self._workspace.remote_branch_revision(branch)
+        except Exception:
+            return None
+        if remote_tip == record.revision:
+            self._clear_unpushed_record(issue_number)
+            self._event_log(
+                "unpushed_revision_recovered",
+                f"revision={record.revision}; source_attempt={record.attempt_id};"
+                " already published on the remote",
+                level="INFO",
+                issue_number=issue_number,
+            )
+            return UnpushedRecovery(
+                outcome=RECOVERY_ALREADY_PUBLISHED,
+                revision=record.revision,
+                source_attempt_id=record.attempt_id,
+                comment_line=recovered_comment_line(
+                    record.revision, record.attempt_id, already_published=True
+                ),
+            )
+        if remote_tip == record.lease_revision:
+            try:
+                self._workspace.push_branch_revision(
+                    branch,
+                    record.revision,
+                    expected_revision=record.lease_revision,
+                    issue_number=issue_number,
+                )
+            except Exception as error:
+                return self._preserve_unpushed_revision(
+                    record, "recovery push refused", error=error
+                )
+            self._clear_unpushed_record(issue_number)
+            self._event_log(
+                "unpushed_revision_recovered",
+                f"revision={record.revision}; source_attempt={record.attempt_id}",
+                level="INFO",
+                issue_number=issue_number,
+            )
+            return UnpushedRecovery(
+                outcome=RECOVERY_RECOVERED,
+                revision=record.revision,
+                source_attempt_id=record.attempt_id,
+                comment_line=recovered_comment_line(
+                    record.revision, record.attempt_id
+                ),
+            )
+        if remote_tip is None:
+            reason = "remote deleted"
+        else:
+            reason = "remote moved"
+        return self._preserve_unpushed_revision(record, reason)
+
+    def _preserve_unpushed_revision(
+        self, record: UnpushedRevisionRecord, reason: str, *, error: Exception | None = None
+    ) -> UnpushedRecovery | None:
+        """Keep an unpublishable Unpushed revision under its Preserved ref.
+
+        ``reason`` is a short machine-readable code (``"remote moved"``,
+        ``"remote deleted"``, or ``"recovery push refused"``) rendered in the
+        event and the result-comment line; a refused push's exception rides
+        along as extra event context, never inside the reason. Clears the
+        record in every case so there is at most one recovery try per record
+        and never a loop. Never raises.
+        """
+
+        issue_number = record.issue_number
+        try:
+            ref = preserved_ref_for_issue_attempt(issue_number, record.attempt_id)
+        except ValueError as error:
+            self._event_log(
+                "unpushed_revision_preserve_failed",
+                f"the Preserved ref could not be named: {error}",
+                level="ERROR",
+                issue_number=issue_number,
+            )
+            self._clear_unpushed_record(issue_number)
+            return None
+        try:
+            self._workspace.preserve_revision(ref, record.revision)
+        except Exception as error:
+            self._event_log(
+                "unpushed_revision_preserve_failed",
+                f"revision={record.revision}; source_attempt={record.attempt_id};"
+                f" ref={ref}; {error}",
+                level="ERROR",
+                issue_number=issue_number,
+            )
+            self._clear_unpushed_record(issue_number)
+            return None
+        self._clear_unpushed_record(issue_number)
+        detail = (
+            f"revision={record.revision}; source_attempt={record.attempt_id};"
+            f" ref={ref}; reason={reason}"
+        )
+        if error is not None:
+            detail += f"; error={type(error).__name__}: {error}"
+        self._event_log(
+            "unpushed_revision_preserved",
+            detail,
+            level="WARNING",
+            issue_number=issue_number,
+        )
+        return UnpushedRecovery(
+            outcome=RECOVERY_PRESERVED,
+            revision=record.revision,
+            source_attempt_id=record.attempt_id,
+            ref=ref,
+            reason=reason,
+            comment_line=preserved_comment_line(
+                record.revision, record.attempt_id, ref, reason
+            ),
+        )
+
+    def _clear_unpushed_record(self, issue_number: int) -> None:
+        """Drop the issue's Unpushed-revision record after one recovery try.
+
+        Never raises: a store that cannot be cleared emits an ERROR event,
+        and the next claim simply tries the same record again.
+        """
+
+        store = self._unpushed_store
+        if store is None:
+            return
+        try:
+            store.clear(issue_number)
+        except Exception as error:
+            self._event_log(
+                "unpushed_revision_clear_failed",
+                f"the Unpushed-revision record could not be cleared: {error}",
+                level="ERROR",
+                issue_number=issue_number,
+            )
 
     def _remember_workspace_dirty(self, attempt_id: str, dirty: bool) -> None:
         """Remember the workspace-dirty state for telemetry (never raises)."""
@@ -4973,6 +5161,10 @@ class AgentLifecycle:
         retain_branch = False
         comment_posted = True
         publication_started_at: datetime | None = None
+        # The Unpushed-revision recovery line for this attempt's result
+        # comment (``None`` when no record applied: no record, a conflict
+        # claim, or a claim that failed before recovery ran).
+        unpushed_recovery_line: str | None = None
         # A conflict requeue routes to the conflict path (a fast path plus at
         # most one narrow model resolution session) instead of the ordinary
         # model-driven path; both share the except/finally boundary that
@@ -5011,6 +5203,16 @@ class AgentLifecycle:
                     level="INFO",
                     issue_number=claim.issue.number,
                 )
+                # Unpushed-revision recovery runs after the claim and before
+                # attempt preparation, and never on the conflict-attempt path:
+                # publish the previous failed push when the remote still
+                # stands at its lease, or keep it as a Preserved revision, so
+                # preparation restoring from the remote cannot orphan it.
+                unpushed_recovery = self._recover_unpushed_revision(
+                    claim.issue.number
+                )
+                if unpushed_recovery is not None:
+                    unpushed_recovery_line = unpushed_recovery.comment_line
                 prepared = self._workspace.prepare_attempt(
                     base_branch=profile.base_branch, issue_number=claim.issue.number
                 )
@@ -5042,6 +5244,7 @@ class AgentLifecycle:
                         timeout=self._handoff_publish_budget(),
                         auto_merge_opt_in=_claim_time_opt_in(claim, checkpoint),
                         requeue_source=_claim_time_requeue_source(claim, checkpoint),
+                        unpushed_recovery_line=unpushed_recovery_line,
                     )
                     comment_posted = getattr(published, "comment_posted", True)
                 else:
@@ -5079,6 +5282,7 @@ class AgentLifecycle:
                             auto_merge_opt_in=_claim_time_opt_in(claim, checkpoint),
                             requeue_source=_claim_time_requeue_source(claim, checkpoint),
                             worker_id=self._request_worker_id(),
+                            unpushed_recovery_line=unpushed_recovery_line,
                             handoff_continuation_count=(
                                 self._handoff_continuation_used(claim, checkpoint)
                                 if evidence.decision.outcome is AttemptOutcome.HANDOFF
@@ -5161,6 +5365,7 @@ class AgentLifecycle:
                     timeout=self._handoff_publish_budget(),
                     auto_merge_opt_in=_claim_time_opt_in(claim, checkpoint),
                     requeue_source=_claim_time_requeue_source(claim, checkpoint),
+                    unpushed_recovery_line=unpushed_recovery_line,
                 )
                 outcome = AttemptOutcome.INFRASTRUCTURE_ERROR
             comment_posted = getattr(published, "comment_posted", True)
@@ -5183,6 +5388,7 @@ class AgentLifecycle:
                     timeout=self._handoff_publish_budget(),
                     auto_merge_opt_in=_claim_time_opt_in(claim, checkpoint),
                     requeue_source=_claim_time_requeue_source(claim, checkpoint),
+                    unpushed_recovery_line=unpushed_recovery_line,
                 )
             comment_posted = getattr(published, "comment_posted", True)
         except BaseException as error:
@@ -5209,6 +5415,7 @@ class AgentLifecycle:
                         timeout=self._handoff_publish_budget(),
                         auto_merge_opt_in=_claim_time_opt_in(claim, checkpoint),
                         requeue_source=_claim_time_requeue_source(claim, checkpoint),
+                        unpushed_recovery_line=unpushed_recovery_line,
                     )
                 comment_posted = getattr(published, "comment_posted", True)
             except Exception:
@@ -7919,6 +8126,7 @@ class AgentLifecycle:
         timeout: float | None = None,
         auto_merge_opt_in: bool = False,
         requeue_source: str = "human",
+        unpushed_recovery_line: str | None = None,
     ):
         branch = prepared.branch if prepared is not None else f"agent/issue-{claim.issue.number}"
         base_branch = profile.base_branch if profile is not None else "main"
@@ -7937,6 +8145,7 @@ class AgentLifecycle:
             auto_merge_opt_in=auto_merge_opt_in,
             requeue_source=requeue_source,
             worker_id=self._request_worker_id(),
+            unpushed_recovery_line=unpushed_recovery_line,
         )
         if timeout is None:
             published = self._publisher.publish(request)
@@ -7955,6 +8164,7 @@ class AgentLifecycle:
         timeout: float | None = None,
         auto_merge_opt_in: bool = False,
         requeue_source: str = "human",
+        unpushed_recovery_line: str | None = None,
     ):
         """Report an unresolvable rebase conflict as the terminal infrastructure error.
 
@@ -7986,6 +8196,7 @@ class AgentLifecycle:
             timeout=timeout,
             auto_merge_opt_in=auto_merge_opt_in,
             requeue_source=requeue_source,
+            unpushed_recovery_line=unpushed_recovery_line,
         )
 
     def _record_terminal_outcome(

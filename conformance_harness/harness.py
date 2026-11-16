@@ -113,6 +113,11 @@ FAILED_FINALIZATION = "failed_finalization"
 #: Written by the daemon while finalization waits in an ``after-outcome``
 #: hold; names the held attempt for ``finish-attempt`` and ``release``.
 AFTER_OUTCOME_HELD = "after_outcome_held.json"
+#: Test-only one-shot (``{"ms": N}``): the engine's next attempt checkpoint
+#: removal, whichever path removes it, sleeps N ms afterwards. On a normal
+#: finalization that widens the gap before the archive is sealed and
+#: ``last_finished`` recorded, which ``finish-attempt`` must wait across.
+CHECKPOINT_REMOVAL_DELAY = "checkpoint_removal_delay.json"
 
 #: How long ``setup``/``start-container`` wait for the engine to serve.
 _DAEMON_READY_TIMEOUT_SECONDS = 30.0
@@ -977,8 +982,14 @@ def _verb_finish_attempt(root: Path, params: dict) -> tuple[int, dict]:
         # A one-shot crash armed for finalization, or the deferred
         # publication, ends the engine with the attempt still recorded:
         # the outcome is in, and the restart recovers the rest.
-        if _active_attempt_id(root) is None or not _engine_alive(root):
+        if not _engine_alive(root):
             return True
+        # Finalization removes the checkpoint before it seals the archive
+        # and records ``last_finished`` (its durable completion boundary):
+        # a running engine has finished the attempt only once ``status``
+        # reports it there, never as soon as the checkpoint is gone.
+        if _active_attempt_id(root) is None:
+            return _finalized(root, attempt_id)
         if after_outcome and _held_after_outcome(root) == attempt_id:
             return True
         # A failed finalization keeps the attempt as a Retained Attempt
