@@ -14,6 +14,7 @@ from typing import Any, Literal, Protocol
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
+from simple_coding_agent.observability import Redactor
 from simple_coding_agent.publication import HandoffRecordRef, PullRequest
 from simple_coding_agent.recovery import (
     AmbiguousContinuationError,
@@ -1264,9 +1265,13 @@ class GitHubGraphQLTransport:
         *,
         max_retries: int = 3,
         peer_logins: Iterable[str] | None = None,
+        redactions: Iterable[str] = (),
     ) -> None:
         self._token = token
         self._max_retries = max_retries
+        # Final guard on every comment body the agent writes: whatever text
+        # reached it, no configured credential leaves in an issue comment.
+        self._comment_redactor = Redactor((*redactions, token))
         # Explicit peer logins win; when absent the ``PEER_LOGINS``
         # environment setting is read at lookup time, like the tracker.
         self._explicit_peer_logins = (
@@ -1703,7 +1708,7 @@ class GitHubGraphQLTransport:
               addComment(input: {subjectId: $subjectId, body: $body}) { commentEdge { node { id } } }
             }
             """,
-            {"subjectId": issue_id, "body": body},
+            {"subjectId": issue_id, "body": self._redact_comment(body)},
         )
 
     def find_handoff_record(
@@ -1769,7 +1774,7 @@ class GitHubGraphQLTransport:
               addComment(input: {subjectId: $subjectId, body: $body}) { commentEdge { node { id } } }
             }
             """,
-            {"subjectId": issue_id, "body": body},
+            {"subjectId": issue_id, "body": self._redact_comment(body)},
         )
         try:
             return data["addComment"]["commentEdge"]["node"]["id"]
@@ -1790,8 +1795,11 @@ class GitHubGraphQLTransport:
               updateIssueComment(input: {id: $commentId, body: $body}) { issueComment { id } }
             }
             """,
-            {"commentId": comment_id, "body": body},
+            {"commentId": comment_id, "body": self._redact_comment(body)},
         )
+
+    def _redact_comment(self, body: str) -> str:
+        return str(self._comment_redactor.redact(body))
 
     def _repository_id(self, owner: str, name: str) -> str:
         data = self._execute(

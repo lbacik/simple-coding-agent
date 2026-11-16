@@ -66,6 +66,8 @@ from simple_coding_agent.git_workspace import (
     GitWorkspaceRecoveryError,
     PreparedAttempt,
     RebaseConflictError,
+    git_failure_detail,
+    git_failure_summary,
     handoff_note_relpath,
 )
 from simple_coding_agent.conflict_attempt import (
@@ -640,7 +642,7 @@ class ModelAttemptRunner:
             except Exception as seal_error:
                 self._event_log(
                     "seal_attempt_work_failed",
-                    _exception_detail(seal_error),
+                    git_failure_detail(seal_error),
                     level="ERROR",
                     issue_number=claim.issue.number,
                 )
@@ -711,13 +713,17 @@ class ModelAttemptRunner:
                 status=execution.status,
             )
         except GitWorkspaceError as error:
+            reason = (
+                "Failed to seal attempt work after model execution:"
+                f" {git_failure_summary(error)}"
+            )
             decision = CompletionDecision(
                 outcome=AttemptOutcome.INFRASTRUCTURE_ERROR,
                 publication_eligible=False,
                 publication_path=PublicationPath.NONE,
-                reasons=(f"Failed to seal attempt work after model execution: {error}",),
+                reasons=(reason,),
             )
-            return _attempt_evidence(decision, profile, None, 0, "not run", str(error))
+            return _attempt_evidence(decision, profile, None, 0, "not run", reason)
         if setup_deferred:
             # Setup was skipped before the model so it would not parse a
             # half-rebased tree; run it now that the model had its chance to
@@ -884,7 +890,7 @@ class ModelAttemptRunner:
                 except Exception as seal_error:
                     self._event_log(
                         "seal_attempt_work_failed",
-                        _exception_detail(seal_error),
+                        git_failure_detail(seal_error),
                         level="ERROR",
                         issue_number=claim.issue.number,
                     )
@@ -1134,7 +1140,7 @@ class ModelAttemptRunner:
         except Exception as error:
             self._event_log(
                 "transcripts_copy_failed",
-                f"reason={_exception_detail(error)}",
+                f"reason={git_failure_detail(error)}",
                 level="WARNING",
                 issue_number=issue_number,
             )
@@ -5063,7 +5069,7 @@ class AgentLifecycle:
         except GitWorkspaceRecoveryError as error:
             self._event_log(
                 "git_workspace_unrecoverable",
-                _exception_detail(error),
+                git_failure_detail(error),
                 level="ERROR",
                 issue_number=claim.issue.number,
             )
@@ -5084,7 +5090,7 @@ class AgentLifecycle:
                     except Exception as abort_error:
                         self._event_log(
                             "conflict_abort_failed",
-                            _exception_detail(abort_error),
+                            git_failure_detail(abort_error),
                             level="WARNING",
                             issue_number=claim.issue.number,
                         )
@@ -5106,13 +5112,13 @@ class AgentLifecycle:
             comment_posted = getattr(published, "comment_posted", True)
         except Exception as error:
             self._event_log(
-                "attempt_exception", _exception_detail(error), level="ERROR", issue_number=claim.issue.number
+                "attempt_exception", git_failure_detail(error), level="ERROR", issue_number=claim.issue.number
             )
             publication_started_at = self._clock()
             if is_conflict_claim:
                 published = self._publish_conflict_bounded(
                     self._conflict_error_request(
-                        claim, checkpoint, prepared, profile, _exception_detail(error)
+                        claim, checkpoint, prepared, profile, git_failure_summary(error)
                     ),
                     claim,
                 )
@@ -5131,14 +5137,14 @@ class AgentLifecycle:
             # with no terminal event or comment. The original is always
             # re-raised after best-effort reporting.
             self._event_log(
-                "attempt_exception", _exception_detail(error), level="ERROR", issue_number=claim.issue.number
+                "attempt_exception", git_failure_detail(error), level="ERROR", issue_number=claim.issue.number
             )
             try:
                 publication_started_at = self._clock()
                 if is_conflict_claim:
                     published = self._publish_conflict_bounded(
                         self._conflict_error_request(
-                            claim, checkpoint, prepared, profile, _exception_detail(error)
+                            claim, checkpoint, prepared, profile, git_failure_summary(error)
                         ),
                         claim,
                     )
@@ -6810,7 +6816,7 @@ class AgentLifecycle:
         except GitWorkspaceRecoveryError as error:
             self._event_log(
                 "git_workspace_unrecoverable",
-                _exception_detail(error),
+                git_failure_detail(error),
                 level="ERROR",
                 issue_number=claim.issue.number,
             )
@@ -6844,7 +6850,7 @@ class AgentLifecycle:
             comment_posted = getattr(published, "comment_posted", True)
         except Exception as error:
             self._event_log(
-                "attempt_exception", _exception_detail(error), level="ERROR", issue_number=claim.issue.number
+                "attempt_exception", git_failure_detail(error), level="ERROR", issue_number=claim.issue.number
             )
             publication_started_at = self._clock()
             if _is_conflict_attempt(checkpoint):
@@ -6854,7 +6860,7 @@ class AgentLifecycle:
                         checkpoint,
                         prepared,
                         profile,
-                        _exception_detail(error),
+                        git_failure_summary(error),
                         requeue_source=REQUEUE_SOURCE_CONFLICT,
                     ),
                     claim,
@@ -6870,7 +6876,7 @@ class AgentLifecycle:
             comment_posted = getattr(published, "comment_posted", True)
         except BaseException as error:
             self._event_log(
-                "attempt_exception", _exception_detail(error), level="ERROR", issue_number=claim.issue.number
+                "attempt_exception", git_failure_detail(error), level="ERROR", issue_number=claim.issue.number
             )
             try:
                 publication_started_at = self._clock()
@@ -6881,7 +6887,7 @@ class AgentLifecycle:
                             checkpoint,
                             prepared,
                             profile,
-                            _exception_detail(error),
+                            git_failure_summary(error),
                             requeue_source=REQUEUE_SOURCE_CONFLICT,
                         ),
                         claim,
@@ -7294,7 +7300,7 @@ class AgentLifecycle:
                 prepared,
                 profile,
                 "Could not read the pull request's commits before model resolution: "
-                f"{_exception_detail(error)}",
+                f"{git_failure_summary(error)}",
             )
         executor = self._conflict_model_executor
         if executor is None:
@@ -7467,7 +7473,7 @@ class AgentLifecycle:
                 prepared,
                 profile,
                 "Failed to seal conflict resolution work: "
-                f"{_exception_detail(error)}",
+                f"{git_failure_summary(error)}",
             )
         try:
             after_commits = tuple(self._workspace.commits_added(prepared))
@@ -7478,7 +7484,7 @@ class AgentLifecycle:
                 prepared,
                 profile,
                 "Could not read the pull request's commits after model resolution: "
-                f"{_exception_detail(error)}",
+                f"{git_failure_summary(error)}",
             )
         after_subjects = tuple(commit.subject for commit in reversed(after_commits))
         fix_count = _conflict_fix_commit_count(before_subjects, after_subjects)
@@ -7621,7 +7627,7 @@ class AgentLifecycle:
         except Exception as error:
             self._event_log(
                 "conflict_abort_failed",
-                f"reason={_exception_detail(error)}",
+                f"reason={git_failure_detail(error)}",
                 level="WARNING",
                 issue_number=issue_number,
             )
@@ -7631,7 +7637,7 @@ class AgentLifecycle:
         except Exception as error:
             self._event_log(
                 "conflict_abort_failed",
-                f"reason={_exception_detail(error)}",
+                f"reason={git_failure_detail(error)}",
                 level="WARNING",
                 issue_number=issue_number,
             )
@@ -7679,7 +7685,7 @@ class AgentLifecycle:
             except Exception as error:
                 self._event_log(
                     "conflict_archive_failed",
-                    f"reason={_exception_detail(error)}",
+                    f"reason={git_failure_detail(error)}",
                     level="WARNING",
                     issue_number=issue_number,
                 )
@@ -7694,7 +7700,7 @@ class AgentLifecycle:
             except Exception as error:
                 self._event_log(
                     "transcripts_copy_failed",
-                    f"reason={_exception_detail(error)}",
+                    f"reason={git_failure_detail(error)}",
                     level="WARNING",
                     issue_number=issue_number,
                 )
@@ -7903,7 +7909,7 @@ class AgentLifecycle:
 
         self._event_log(
             "rebase_conflict",
-            _exception_detail(error),
+            git_failure_detail(error),
             level="ERROR",
             issue_number=claim.issue.number,
         )
