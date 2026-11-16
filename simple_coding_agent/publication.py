@@ -51,6 +51,20 @@ class ClaimLeaseError(GitWorkspaceError):
     """
 
 
+@dataclass(frozen=True)
+class _FailedPushInfo:
+    """How to report a push that published nothing new this attempt.
+
+    ``branch_url`` links the attempt branch already on the remote (``None``
+    when the claim-time lease says it was absent or is unknown, keeping
+    ``no branch created``); ``local_revision`` is the local tip that was not
+    pushed (``None`` when unreadable, so the failure is reported without it).
+    """
+
+    branch_url: str | None
+    local_revision: str | None = None
+
+
 #: The issue label opting one implementation into auto-merge when the
 #: operator runs with ``PR_AUTO_MERGE=label``. Like ``ready-for-agent`` it
 #: sits on the collaborator trust boundary: only writers can apply it. It is
@@ -385,19 +399,25 @@ class Publisher:
                     )
                     self._check_deadline(deadline)
                     self._mark_publishing()
-                branch_url = f"https://github.com/{self._repository}/tree/{request.branch}"
+                branch_url = self._branch_url(request.branch)
             except BranchMovedSinceClaimError as error:
                 push_failure = f"Partial branch push failed: {git_failure_summary(error)}"
+                failed_push = self._failed_push_display(request)
+                details = _with_unpushed_revision(push_failure, failed_push.local_revision)
                 self._event_log(
                     "publication_failed",
-                    f"Partial branch push failed: {git_failure_detail(error)}",
+                    _with_unpushed_revision(
+                        f"Partial branch push failed: {git_failure_detail(error)}",
+                        failed_push.local_revision,
+                    ),
                     level="ERROR",
                     issue_number=request.issue_number,
                 )
                 outcome = AttemptOutcome.INFRASTRUCTURE_ERROR
-                details = push_failure
-                comment_posted = self._post_result(request, outcome, branch_url, None, details)
-                return PublicationResult(outcome, branch_url, None, comment_posted, details)
+                comment_posted = self._post_result(
+                    request, outcome, None, None, details, failed_push=failed_push
+                )
+                return PublicationResult(outcome, None, None, comment_posted, details)
             except ClaimLeaseError as error:
                 advance_failure = f"Claim lease advance failed: {git_failure_summary(error)}"
                 self._event_log(
@@ -406,6 +426,11 @@ class Publisher:
                     level="ERROR",
                     issue_number=request.issue_number,
                 )
+                # The push itself landed, so the branch line links it like a
+                # normal published branch; only the bookkeeping failed. The
+                # result keeps no branch URL so recovery still retains the
+                # local branch like every other unpublished outcome.
+                pushed_url = self._branch_url(request.branch)
                 if outcome is AttemptOutcome.INCOMPLETE and not request.decision.publication_eligible:
                     # Like a partial push failure, a failed final check stays
                     # reported as incomplete; the lease failure is secondary
@@ -414,13 +439,17 @@ class Publisher:
                 else:
                     outcome = AttemptOutcome.INFRASTRUCTURE_ERROR
                     details = advance_failure
-                comment_posted = self._post_result(request, outcome, branch_url, None, details)
-                return PublicationResult(outcome, branch_url, None, comment_posted, details)
+                comment_posted = self._post_result(request, outcome, pushed_url, None, details)
+                return PublicationResult(outcome, None, None, comment_posted, details)
             except (GitWorkspaceError, TimeoutError) as error:
                 push_failure = f"Partial branch push failed: {git_failure_summary(error)}"
+                failed_push = self._failed_push_display(request)
                 self._event_log(
                     "publication_failed",
-                    f"Partial branch push failed: {git_failure_detail(error)}",
+                    _with_unpushed_revision(
+                        f"Partial branch push failed: {git_failure_detail(error)}",
+                        failed_push.local_revision,
+                    ),
                     level="ERROR",
                     issue_number=request.issue_number,
                 )
@@ -428,12 +457,19 @@ class Publisher:
                     # A failed final authoritative check stays reported as
                     # incomplete; the push failure is secondary and must not
                     # hide the evaluator's reason.
-                    details = "; ".join((*request.decision.reasons, push_failure))
+                    details = _with_unpushed_revision(
+                        "; ".join((*request.decision.reasons, push_failure)),
+                        failed_push.local_revision,
+                    )
                 else:
                     outcome = AttemptOutcome.INFRASTRUCTURE_ERROR
-                    details = _SUCCEEDED_BUT_UNPUBLISHED
-                comment_posted = self._post_result(request, outcome, branch_url, None, details)
-                return PublicationResult(outcome, branch_url, None, comment_posted, details)
+                    details = _with_unpushed_revision(
+                        _SUCCEEDED_BUT_UNPUBLISHED, failed_push.local_revision
+                    )
+                comment_posted = self._post_result(
+                    request, outcome, None, None, details, failed_push=failed_push
+                )
+                return PublicationResult(outcome, None, None, comment_posted, details)
 
         if request.decision.publication_eligible:
             try:
@@ -681,7 +717,7 @@ class Publisher:
                     )
                     self._check_deadline(deadline)
                     self._mark_publishing()
-                branch_url = f"https://github.com/{self._repository}/tree/{request.branch}"
+                branch_url = self._branch_url(request.branch)
             except BranchMovedSinceClaimError as error:
                 push_failure = f"Rebased branch push failed: {git_failure_summary(error)}"
                 self._event_log(
@@ -896,6 +932,52 @@ class Publisher:
         except Exception as error:
             raise ClaimLeaseError(f"Claim lease could not be advanced: {error}") from error
 
+    def _branch_url(self, branch: str) -> str:
+        """The GitHub link for an attempt branch known to exist on the remote."""
+
+        return f"https://github.com/{self._repository}/tree/{branch}"
+
+    def _failed_push_display(self, request: PublicationRequest) -> _FailedPushInfo:
+        """How to report a push that published nothing new this attempt.
+
+        When the claim-time lease is recorded and names a revision, the
+        attempt branch already exists on the remote, so the result comment
+        links it and says this attempt's push failed instead of claiming
+        ``no branch created``. Otherwise (absent or unknown) the comment
+        keeps ``no branch created``. The local tip is attached whenever it
+        is readable so an operator can recover the unpushed work.
+        """
+
+        revision, known = self._claim_lease(request.issue_number)
+        branch_url = self._branch_url(request.branch) if known and revision else None
+        return _FailedPushInfo(
+            branch_url=branch_url,
+            local_revision=self._unpushed_local_revision(request.branch),
+        )
+
+    def _unpushed_local_revision(self, branch: str) -> str | None:
+        """The local tip a failed push did not publish, if readable.
+
+        Never raises: an unreadable revision reports the push failure
+        without the sha instead of crashing publication. Workspace doubles
+        without the reader also read as absent.
+        """
+
+        reader = getattr(self._workspace, "attempt_branch_revision", None)
+        if not callable(reader):
+            return None
+        try:
+            revision = reader(branch)
+        except Exception:
+            return None
+        if (
+            not isinstance(revision, str)
+            or not revision.strip()
+            or any(character.isspace() for character in revision)
+        ):
+            return None
+        return revision
+
     def _push_branch(self, branch: str, *, deadline: float, issue_number: int) -> str:
         """Push using the recorded claim-time lease when one exists."""
 
@@ -1040,6 +1122,8 @@ class Publisher:
         pull_request: PullRequest | None,
         details: str,
         merge_result: str | None = None,
+        *,
+        failed_push: _FailedPushInfo | None = None,
     ) -> bool:
         marker = f"<!-- agent-attempt: {request.started_at} -->"
         try:
@@ -1049,7 +1133,14 @@ class Publisher:
                 self._repository,
                 request.issue_number,
                 _result_comment(
-                    request, outcome, branch_url, pull_request, details, marker, merge_result
+                    request,
+                    outcome,
+                    branch_url,
+                    pull_request,
+                    details,
+                    marker,
+                    merge_result,
+                    failed_push=failed_push,
                 ),
             )
             return True
@@ -1528,6 +1619,14 @@ def _pull_request_body(request: PublicationRequest) -> str:
     )
 
 
+def _with_unpushed_revision(text: str, local_revision: str | None) -> str:
+    """Append the unpushed revision to a push-failure message, when readable."""
+
+    if local_revision is None:
+        return text
+    return f"{text} Unpushed local revision: {local_revision}."
+
+
 def _result_comment(
     request: PublicationRequest,
     outcome: AttemptOutcome,
@@ -1536,12 +1635,27 @@ def _result_comment(
     details: str,
     marker: str,
     merge_result: str | None = None,
+    *,
+    failed_push: _FailedPushInfo | None = None,
 ) -> str:
-    branch = f"[{request.branch}]({branch_url})" if branch_url else "no branch created"
+    if branch_url is not None:
+        branch = f"[{request.branch}]({branch_url})"
+    elif failed_push is not None and failed_push.branch_url is not None:
+        branch = (
+            f"[{request.branch}]({failed_push.branch_url})"
+            " (exists on the remote; this attempt's push failed)"
+        )
+    else:
+        branch = "no branch created"
     pr = f"[#{pull_request.number}]({pull_request.url})" if pull_request else "none"
     commit_line = (
         f"**Handoff note commit**: `{request.note_commit_sha}`\n"
         if outcome is AttemptOutcome.HANDOFF and request.note_commit_sha
+        else ""
+    )
+    revision_line = (
+        f"**Unpushed local revision**: `{failed_push.local_revision}`\n"
+        if failed_push is not None and failed_push.local_revision is not None
         else ""
     )
     merge_line = f"**Merge**: {merge_result}\n" if merge_result is not None else ""
@@ -1554,6 +1668,7 @@ def _result_comment(
         f"**PR**: {pr}\n"
         f"{merge_line}"
         f"{commit_line}"
+        f"{revision_line}"
         f"{worker_block}\n"
         "### Evidence\n"
         f"{_request_check_line(request)}\n"

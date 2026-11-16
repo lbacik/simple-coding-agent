@@ -167,3 +167,11 @@ class BranchPusher(Protocol):
         lease_known: bool = False,
         issue_number: int | None = None,
     ) -> str: ...
+
+    def attempt_branch_revision(self, branch: str) -> str:
+        """The local tip revision of an attempt branch (what a push publishes).
+
+        Used on the push-failure path so the result comment and the failure
+        event can name the unpushed revision for operator recovery.
+        """
+        ...

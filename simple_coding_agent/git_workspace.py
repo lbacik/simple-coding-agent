@@ -759,6 +759,20 @@ class GitWorkspace:
                     self._push_retry_delay(attempt, deadline, error)
         raise GitWorkspaceError("Attempt branch could not be pushed safely") from last_error
 
+    def attempt_branch_revision(self, branch: str) -> str:
+        """The local tip revision of an attempt branch (what a push publishes).
+
+        Read on the push-failure path so the result comment and the failure
+        event can name the unpushed revision for operator recovery.
+        """
+
+        try:
+            return self._git("rev-parse", "--verify", branch)
+        except GitWorkspaceError as error:
+            raise GitWorkspaceError(
+                "Attempt branch revision is unavailable in the local clone"
+            ) from error
+
     def _push_retry_delay(
         self, attempt: int, deadline: float | None, error: GitWorkspaceError
     ) -> None:

@@ -270,6 +270,13 @@ class InMemoryWorkspace:
             for record in reversed(self._commits)
         )
 
+    def attempt_branch_revision(self, branch: str) -> str:
+        """The newest local commit revision, or the base when nothing is committed."""
+
+        if self._commits:
+            return self._commits[-1].revision
+        return self._base_revision
+
     def files_changed(self, revision: str) -> tuple[str, ...]:
         """Repository-relative paths one recorded commit touched, if known."""
 
