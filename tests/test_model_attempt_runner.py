@@ -219,6 +219,36 @@ def test_continuation_missing_comment_does_not_trigger_another_continuation_miss
     assert executor.captured_prompt is not None
 
 
+def test_quoted_handoff_header_in_a_brief_runs_the_model_normally(tmp_path: Path) -> None:
+    """A comment quoting the result header is not a prior handoff (issue #402).
+
+    The #393 shape: a never-attempted issue whose only trusted comment quotes
+    the handoff header inside an inline code span must reach model execution
+    instead of short-circuiting with ``continuation_branch_missing``.
+    """
+
+    executor = FakeModelExecutor()
+    comments = (
+        "## Agent Brief\n\n"
+        "`_result_comment` / `_post_result`: the header "
+        "(`## Agent Attempt Result: handoff`), published with the branch link.",
+    )
+    events: list[tuple[str, str]] = []
+    runner = build_runner(
+        tmp_path,
+        model_executor=executor,
+        issue_comments=lambda issue: comments,
+        event_log=lambda event, detail="", level="INFO", issue_number=None: events.append(
+            (event, level)
+        ),
+    )
+
+    runner(claim(issue_number=24), profile(), FakePrepared(restored_from_remote=False))
+
+    assert executor.captured_prompt is not None
+    assert not any(event == "continuation_branch_missing" for event, _ in events)
+
+
 def test_restored_continuation_branch_runs_the_model_normally(tmp_path: Path) -> None:
     executor = FakeModelExecutor()
     runner = build_runner(tmp_path, model_executor=executor)
