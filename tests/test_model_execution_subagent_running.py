@@ -50,8 +50,8 @@ def _executor(tmp_path: Path) -> tuple[ModelExecutor, list[tuple[str, str]]]:
 
 
 def _launch(executor: ModelExecutor, tool_use_id: str) -> None:
-    executor._ensure_ledger_thread("main", prompt_chars=10)  # noqa: SLF001
-    executor._start_launch_thread(  # noqa: SLF001
+    executor._ensure_ledger_thread("main", prompt_chars=10)
+    executor._start_launch_thread(
         {"tool_name": "Agent", "tool_input": {"prompt": "do work", "subagent_type": "Explore"}},
         tool_use_id,
     )
@@ -86,15 +86,15 @@ def _limits_for(events: list[tuple[str, str]], thread_id: str) -> list[str]:
 def test_foreground_result_marks_finished_and_settles_thread(tmp_path: Path) -> None:
     executor, events = _executor(tmp_path)
     _launch(executor, "toolu-fg")
-    assert executor._subagent_info["toolu-fg"]["running"] is True  # noqa: SLF001
+    assert executor._subagent_info["toolu-fg"]["running"] is True
 
-    executor._observe_assistant_message(_sub_response("toolu-fg", "s1", "sub work"))  # noqa: SLF001
-    executor._observe_assistant_message(_sub_response("toolu-fg", "s2", "sub done"))  # noqa: SLF001
-    executor._observe_user_message(  # noqa: SLF001
+    executor._observe_assistant_message(_sub_response("toolu-fg", "s1", "sub work"))
+    executor._observe_assistant_message(_sub_response("toolu-fg", "s2", "sub done"))
+    executor._observe_user_message(
         UserMessage(content=[ToolResultBlock(tool_use_id="toolu-fg", content="done")])
     )
 
-    assert executor._subagent_info["toolu-fg"]["running"] is False  # noqa: SLF001
+    assert executor._subagent_info["toolu-fg"]["running"] is False
     sub_entries = _limits_for(events, "toolu-fg")
     assert len(sub_entries) == executor._ledger.response_count("toolu-fg") == 2
 
@@ -102,27 +102,27 @@ def test_foreground_result_marks_finished_and_settles_thread(tmp_path: Path) -> 
 def test_background_ack_keeps_running_and_settles_later(tmp_path: Path) -> None:
     executor, events = _executor(tmp_path)
     _launch(executor, "toolu-bg")
-    executor._observe_assistant_message(_sub_response("toolu-bg", "s1", "partial"))  # noqa: SLF001
+    executor._observe_assistant_message(_sub_response("toolu-bg", "s1", "partial"))
     assert _limits_for(events, "toolu-bg") == []
 
-    executor._observe_user_message(_ack("toolu-bg", "agent-1"))  # noqa: SLF001
+    executor._observe_user_message(_ack("toolu-bg", "agent-1"))
 
-    assert executor._subagent_info["toolu-bg"]["running"] is True  # noqa: SLF001
+    assert executor._subagent_info["toolu-bg"]["running"] is True
     # The acknowledgement does not settle the in-flight subagent response.
     assert _limits_for(events, "toolu-bg") == []
-    view = executor._live_attempt_view()  # noqa: SLF001
+    view = executor._live_attempt_view()
     by_id = {entry["id"]: entry for entry in view["subagents"]}
     assert by_id["toolu-bg"]["running"] is True
 
     # A response streaming afterwards settles the first one normally.
-    executor._observe_assistant_message(_sub_response("toolu-bg", "s2", "more"))  # noqa: SLF001
+    executor._observe_assistant_message(_sub_response("toolu-bg", "s2", "more"))
     assert len(_limits_for(events, "toolu-bg")) == 1
 
     # The terminal task notification settles the last response: exactly one
     # entry per settled response, no duplicates.
     pending: dict = {}
     finished: list = []
-    executor._observe_background_task(  # noqa: SLF001
+    executor._observe_background_task(
         TaskStartedMessage(
             task_type="local_agent",
             subtype="task_started",
@@ -136,7 +136,7 @@ def test_background_ack_keeps_running_and_settles_later(tmp_path: Path) -> None:
         pending,
         finished,
     )
-    executor._observe_background_task(  # noqa: SLF001
+    executor._observe_background_task(
         TaskNotificationMessage(
             subtype="task_notification",
             data={},
@@ -152,7 +152,7 @@ def test_background_ack_keeps_running_and_settles_later(tmp_path: Path) -> None:
         finished,
     )
 
-    assert executor._subagent_info["toolu-bg"]["running"] is False  # noqa: SLF001
+    assert executor._subagent_info["toolu-bg"]["running"] is False
     sub_entries = _limits_for(events, "toolu-bg")
     assert len(sub_entries) == executor._ledger.response_count("toolu-bg") == 2
 
@@ -160,12 +160,12 @@ def test_background_ack_keeps_running_and_settles_later(tmp_path: Path) -> None:
 def test_background_completes_on_updated_with_only_task_id(tmp_path: Path) -> None:
     executor, _ = _executor(tmp_path)
     _launch(executor, "toolu-bg2")
-    executor._observe_user_message(_ack("toolu-bg2", "agent-2"))  # noqa: SLF001
-    assert executor._subagent_info["toolu-bg2"]["running"] is True  # noqa: SLF001
+    executor._observe_user_message(_ack("toolu-bg2", "agent-2"))
+    assert executor._subagent_info["toolu-bg2"]["running"] is True
 
     pending: dict = {}
     finished: list = []
-    executor._observe_background_task(  # noqa: SLF001
+    executor._observe_background_task(
         TaskStartedMessage(
             task_type="local_agent",
             subtype="task_started",
@@ -179,8 +179,8 @@ def test_background_completes_on_updated_with_only_task_id(tmp_path: Path) -> No
         pending,
         finished,
     )
-    assert executor._subagent_info["toolu-bg2"]["running"] is True  # noqa: SLF001
-    executor._observe_background_task(  # noqa: SLF001
+    assert executor._subagent_info["toolu-bg2"]["running"] is True
+    executor._observe_background_task(
         TaskUpdatedMessage(
             subtype="task_updated",
             data={},
@@ -192,24 +192,24 @@ def test_background_completes_on_updated_with_only_task_id(tmp_path: Path) -> No
         finished,
     )
 
-    assert executor._subagent_info["toolu-bg2"]["running"] is False  # noqa: SLF001
+    assert executor._subagent_info["toolu-bg2"]["running"] is False
     assert pending == {}
 
 
 def test_background_stopped_at_soft_threshold(tmp_path: Path) -> None:
     executor, events = _executor(tmp_path)
     _launch(executor, "toolu-bg3")
-    executor._observe_user_message(_ack("toolu-bg3", "agent-3"))  # noqa: SLF001
-    assert executor._subagent_info["toolu-bg3"]["running"] is True  # noqa: SLF001
+    executor._observe_user_message(_ack("toolu-bg3", "agent-3"))
+    assert executor._subagent_info["toolu-bg3"]["running"] is True
 
     # The soft-threshold path tracks hook agent ids; the ack links agent-3
     # back to the launch tool_use_id.
-    executor._track_subagent_seen({"tool_name": "Read", "agent_id": "agent-3"})  # noqa: SLF001
-    executor._stop_running_subagents()  # noqa: SLF001
+    executor._track_subagent_seen({"tool_name": "Read", "agent_id": "agent-3"})
+    executor._stop_running_subagents()
 
-    assert executor._subagent_info["toolu-bg3"]["running"] is False  # noqa: SLF001
+    assert executor._subagent_info["toolu-bg3"]["running"] is False
     assert any(name == "token_soft_threshold_subagents_stopped" for name, _ in events)
-    view = executor._live_attempt_view()  # noqa: SLF001
+    view = executor._live_attempt_view()
     by_id = {entry["id"]: entry for entry in view["subagents"]}
     assert by_id["toolu-bg3"]["running"] is False
 
@@ -217,9 +217,9 @@ def test_background_stopped_at_soft_threshold(tmp_path: Path) -> None:
 def test_background_stopped_by_executor_at_terminal(tmp_path: Path) -> None:
     executor, _ = _executor(tmp_path)
     _launch(executor, "toolu-bg4")
-    executor._observe_user_message(_ack("toolu-bg4", "agent-4"))  # noqa: SLF001
+    executor._observe_user_message(_ack("toolu-bg4", "agent-4"))
 
-    executor._task_tool_links["task-4"] = "toolu-bg4"  # noqa: SLF001
+    executor._task_tool_links["task-4"] = "toolu-bg4"
 
     class _Client:
         def __init__(self) -> None:
@@ -229,7 +229,23 @@ def test_background_stopped_by_executor_at_terminal(tmp_path: Path) -> None:
             self.stopped.append(task_id)
 
     client = _Client()
-    asyncio.run(executor._stop_background_tasks(client, ["task-4"], "result is terminal"))  # noqa: SLF001
+    asyncio.run(executor._stop_background_tasks(client, ["task-4"], "result is terminal"))
 
     assert client.stopped == ["task-4"]
-    assert executor._subagent_info["toolu-bg4"]["running"] is False  # noqa: SLF001
+    assert executor._subagent_info["toolu-bg4"]["running"] is False
+
+
+def test_background_failed_stop_keeps_running(tmp_path: Path) -> None:
+    executor, _ = _executor(tmp_path)
+    _launch(executor, "toolu-bg5")
+    executor._observe_user_message(_ack("toolu-bg5", "agent-5"))
+
+    executor._task_tool_links["task-5"] = "toolu-bg5"
+
+    class _FailingClient:
+        async def stop_task(self, task_id: str) -> None:
+            raise RuntimeError(f"cannot stop {task_id}")
+
+    asyncio.run(executor._stop_background_tasks(_FailingClient(), ["task-5"], "result is terminal"))
+
+    assert executor._subagent_info["toolu-bg5"]["running"] is True

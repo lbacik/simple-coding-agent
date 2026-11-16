@@ -1345,7 +1345,12 @@ class ModelExecutor:
         self._finish_subagent(tool_use_id)
 
     def _mark_all_subagents_finished(self) -> None:
-        """Mark every tracked subagent finished at the end of the run."""
+        """Mark every tracked subagent finished at the end of the run.
+
+        Each entry's ledger thread is settled too, so the final telemetry
+        view reports no running subagents and every thread has its closing
+        ``limits_checked`` entry.
+        """
 
         for tool_use_id in list(self._subagent_info.keys()):
             self._finish_subagent(tool_use_id)
@@ -1990,6 +1995,7 @@ class ModelExecutor:
                         f"deadline_seconds={_OPERATOR_HANDOFF_MODEL_DEADLINE_SECONDS}; "
                         f"{self._operator_step_trail()}",
                     )
+                    self._mark_all_subagents_finished()
                     return None, tuple(observed_models)
                 if (
                     grace_started is not None
@@ -2051,6 +2057,7 @@ class ModelExecutor:
                             background_followup_sent,
                         )
                         if resumed is None:
+                            self._mark_all_subagents_finished()
                             return None, tuple(observed_models)
                         stream = resumed
                         background_followup_sent = True
@@ -2074,6 +2081,7 @@ class ModelExecutor:
                             background_followup_sent,
                         )
                         if resumed is None:
+                            self._mark_all_subagents_finished()
                             return None, tuple(observed_models)
                         stream = resumed
                         background_followup_sent = True
@@ -2190,7 +2198,7 @@ class ModelExecutor:
             "background_tasks_stopped",
             f"task_ids={','.join(stopped)}{waited_detail}; reason={reason}",
         )
-        for task_id in task_ids:
+        for task_id in stopped:
             self._finish_subagent_for_task(task_id)
 
     def _observe_background_task(
@@ -3588,23 +3596,7 @@ def _tool_result_ids(content: object) -> tuple[str, ...]:
     else (plain user text, unknown blocks) completes no thread.
     """
 
-    ids: list[str] = []
-    stack: list[object] = [content]
-    while stack:
-        item = stack.pop()
-        if isinstance(item, Mapping):
-            candidate = item.get("tool_use_id", item.get("toolUseId"))
-            if isinstance(candidate, str) and candidate:
-                ids.append(candidate)
-        elif isinstance(item, (list, tuple)):
-            stack.extend(item)
-        elif isinstance(item, str):
-            continue
-        else:
-            candidate = getattr(item, "tool_use_id", None)
-            if isinstance(candidate, str) and candidate:
-                ids.append(candidate)
-    return tuple(ids)
+    return tuple(tool_use_id for tool_use_id, _ in _tool_results(content))
 
 
 def _tool_result_content(item: object) -> Any:
@@ -3620,10 +3612,10 @@ def _tool_result_content(item: object) -> Any:
 def _tool_results(content: object) -> tuple[tuple[str, Any], ...]:
     """Tool-use ids with their raw payloads for one streamed message.
 
-    Mirrors :func:`_tool_result_ids` but keeps each block's ``content`` so the
-    caller can tell a background launch acknowledgement apart from a final
-    subagent result. Both ``ToolResultBlock`` objects and plain mappings are
-    read; anything else completes no thread.
+    Keeps each block's ``content`` so the caller can tell a background launch
+    acknowledgement apart from a final subagent result. Both
+    ``ToolResultBlock`` objects and plain mappings are read; anything else
+    (plain user text, unknown blocks) completes no thread.
     """
 
     results: list[tuple[str, Any]] = []
@@ -3674,16 +3666,21 @@ def _parse_async_ack(raw_content: Any) -> tuple[bool, str | None]:
                 else:
                     if isinstance(parsed, Mapping):
                         payload = parsed
-            is_async = payload.get("isAsync", payload.get("is_async"))
-            if is_async is True:
-                agent_id = payload.get("agentId", payload.get("agent_id"))
-                return True, agent_id if isinstance(agent_id, str) and agent_id else None
-    if isinstance(raw_content, Mapping):
-        is_async = raw_content.get("isAsync", raw_content.get("is_async"))
-        if is_async is True:
-            agent_id = raw_content.get("agentId", raw_content.get("agent_id"))
-            return True, agent_id if isinstance(agent_id, str) and agent_id else None
+            is_async, agent_id = _async_ack_ids(payload)
+            if is_async:
+                return True, agent_id
     return False, None
+
+
+def _async_ack_ids(payload: Mapping[Any, Any]) -> tuple[bool, str | None]:
+    """Whether one decoded payload is a background launch acknowledgement."""
+
+    if payload.get("isAsync", payload.get("is_async")) is not True:
+        return False, None
+    agent_id = payload.get("agentId", payload.get("agent_id"))
+    if isinstance(agent_id, str) and agent_id:
+        return True, agent_id
+    return True, None
 
 
 def _deny(reason: str) -> dict[str, Any]:
