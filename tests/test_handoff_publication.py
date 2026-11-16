@@ -401,6 +401,7 @@ class PushFailingWorkspace:
         deadline: float | None = None,
         expected_revision: str | None = None,
         lease_known: bool = False,
+        issue_number: int | None = None,
     ) -> str:
         raise GitWorkspaceError("remote hung up unexpectedly")
 
@@ -534,6 +535,7 @@ class BranchMovedWorkspace:
         deadline: float | None = None,
         expected_revision: str | None = None,
         lease_known: bool = False,
+        issue_number: int | None = None,
     ) -> str:
         self.calls += 1
         raise BranchMovedSinceClaimError(
