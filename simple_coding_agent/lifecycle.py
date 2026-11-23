@@ -8981,6 +8981,11 @@ def _gate_section(
         "model finishes. They run in sequence and the first failure fails "
         "the gate.",
         "",
+        "Run long gates (such as the full test suite) in the foreground with "
+        "an explicit Bash `timeout` large enough for the command to finish, "
+        "and never end your turn waiting for a background shell: background "
+        "shells do not report back and will not wake you up.",
+        "",
     ]
     if include_review_instruction:
         lines += [
