@@ -85,7 +85,7 @@ The working tree in which one implementation attempt makes its changes, prepared
 _Avoid_: Repo, checkout, sandbox
 
 **Sealing**:
-Turning every uncommitted change in the attempt workspace into a commit attributed to that attempt (issue, attempt ID, and the reason the model stopped). An attempt is sealed after every model execution, whatever its status, so no work the model wrote is ever lost or leaks onto the base. A workspace mid-way through an unresolved rebase or merge is never sealed: its conflicts are aborted instead.
+Turning every uncommitted change in the attempt workspace into a commit attributed to that attempt (issue, attempt ID, and the reason the model stopped). An attempt is sealed after every model execution, whatever its status, so no work the model wrote is ever lost or leaks onto the base. A workspace with a paused rebase is never sealed with conflict markers in it. Its work is first kept as a Preserved revision. If no conflicts remain, the rebase is then finished, with the attempt's remaining changes sealed inside it. Otherwise the rebase is aborted and the Preserved revision keeps the work.
 Sealing is distinct from the operator contract's **Sealed** (a complete, immutable Attempt Archive, defined in the [contract glossary](https://github.com/lbacik/agent-operator-contract/blob/v1.0.0/CONTEXT.md#attempts-and-archives)): sealing commits workspace changes during an attempt, while Sealed marks an archive whose evidence set is final and may be cached.
 _Avoid_: Preserving dirty work, safety-net commit, checkpoint (the attempt checkpoint is a different thing)
 
@@ -94,7 +94,7 @@ The local attempt-branch tip that an implementation attempt's failed push could 
 _Avoid_: Orphaned commits, lost work, local handoff
 
 **Preserved revision**:
-An Unpushed revision that could not be safely published at the next claim (the remote branch moved, or the push was refused), kept under a local reference on the Worker for an operator to decide on instead of being discarded when the attempt branch is restored from the remote.
+Attempt work kept under a local reference on the Worker for an operator to decide on, instead of being discarded when the attempt branch is restored. It has two sources: an Unpushed revision that could not be safely published at the next claim (the remote branch moved, or the push was refused), and the work of an attempt whose paused rebase had to be aborted (staged, unstaged and untracked changes, captured before the abort).
 _Avoid_: Backup branch, stash
 
 **Token budget**:
