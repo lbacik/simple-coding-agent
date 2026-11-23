@@ -155,7 +155,7 @@ from simple_coding_agent.github_tracker import (
     claim_marker_labels,
     ineligibility_reason,
 )
-from simple_coding_agent.model_execution import ModelExecutionStatus, ModelExecutor, OperatorHandoff, ToolCallRecord, expected_handoff_last_work_commit
+from simple_coding_agent.model_execution import ModelExecution, ModelExecutionStatus, ModelExecutor, OperatorHandoff, ToolCallRecord, expected_handoff_last_work_commit
 from simple_coding_agent.contract_events import (
     ContractEventsBuffer,
     command_accepted_detail,
@@ -757,6 +757,51 @@ class ModelAttemptRunner:
                 level="INFO",
                 issue_number=claim.issue.number,
             )
+        # A requested handoff without a committed note still preserves the
+        # model's own assessment when the final response carries it: commit
+        # the recovered note before sealing so the branch order matches an
+        # ordinary handoff (note commit, then the seal commit on top). The
+        # recovered block must name the work preserved beneath it, like a
+        # model-committed note; anything unusable falls through to the
+        # emergency note after sealing, leaving no invalid note behind.
+        recovered_note_committed = False
+        if execution.status is ModelExecutionStatus.HANDOFF_REQUESTED:
+            existing_note_commit = self._workspace.handoff_note_commit(
+                prepared, claim.issue.number, attempt_id=attempt_id
+            )
+            if existing_note_commit is None:
+                recovered_block = _extract_recovered_handoff_note(
+                    execution.last_assistant_text,
+                    claim.issue.number,
+                    attempt_id,
+                )
+                if recovered_block is not None:
+                    pre_note_commits = self._workspace.commits_added(prepared)
+                    expected_work_commit = (
+                        pre_note_commits[0].revision
+                        if pre_note_commits
+                        else prepared.base_revision
+                    )
+                    if _recovered_note_names_expected_work(
+                        recovered_block,
+                        expected_work_commit,
+                        self._workspace.working_directory,
+                    ):
+                        recovered_content = (
+                            f"{recovered_block.rstrip()}\n\n"
+                            f"{_RECOVERED_NOTE_PROVENANCE}\n"
+                        )
+                        self._workspace.commit_handoff_note(
+                            claim.issue.number, recovered_content
+                        )
+                        self._event_log(
+                            "handoff_note_recovered",
+                            f"issue #{claim.issue.number}: committed the handoff"
+                            " note recovered from the model's final response.",
+                            level="WARNING",
+                            issue_number=claim.issue.number,
+                        )
+                        recovered_note_committed = True
         # Seal the attempt's work unconditionally: every normal exit from
         # model execution leaves dirty and untracked changes in one commit
         # attributed to this attempt, whatever the execution status. A new
@@ -807,52 +852,46 @@ class ModelAttemptRunner:
                 prepared, claim.issue.number, attempt_id=attempt_id
             )
             if note_commit is None:
-                reason = _classify_handoff_reason(execution)
-                note_content = _build_emergency_handoff_note(
-                    issue_number=claim.issue.number,
-                    started_at=attempt_id,
-                    reason=reason,
-                    last_work_commit=commits[0].revision if commits else prepared.base_revision,
-                    explanation=execution.explanation,
-                    diff_stat=_git_diff_stat(
-                        self._workspace.working_directory,
-                        prepared.base_revision,
-                        seal_commit.revision if seal_commit is not None else prepared.branch,
-                    ),
-                    attempt_commits=tuple(
-                        f"{commit.revision[:7]} {commit.subject}" for commit in commits
-                    ),
-                    sealed_files=(
-                        tuple(pre_seal_dirty)
-                        if seal_commit is not None and pre_seal_dirty is not None
-                        else None
-                    ),
-                    edited_files=tuple(execution.edited_files),
-                    last_assistant_text=execution.last_assistant_text,
-                    handoff_skill_invoked=_main_thread_handoff_invoked(
-                        execution.skill_events
-                    ),
-                    tool_calls=tuple(execution.tool_calls),
-                    last_check_call=_last_check_call(
-                        tuple(execution.bash_calls), profile.check
-                    ),
-                    baseline_result=(
-                        preparation.baseline if preparation is not None else None
-                    ),
-                    token_budget=execution.token_budget,
-                    archive_dir=(
-                        str(archive.directory) if archive is not None else None
-                    ),
-                    session_id=getattr(
-                        self._model_executor, "cli_session_id", None
-                    ),
-                    previous_note=_previous_complete_note(
-                        self._workspace, prepared, claim.issue.number
-                    ),
+                commits = self._commit_emergency_handoff_note(
+                    claim,
+                    prepared,
+                    attempt_id=attempt_id,
+                    execution=execution,
+                    commits=commits,
+                    seal_commit=seal_commit,
+                    pre_seal_dirty=pre_seal_dirty,
+                    preparation=preparation,
+                    archive=archive,
+                    profile=profile,
+                    reason=_classify_handoff_reason(execution),
                 )
-                self._workspace.commit_handoff_note(claim.issue.number, note_content)
-                commits = self._workspace.commits_added(prepared)
             execution = replace(execution, status=ModelExecutionStatus.HANDOFF_REQUESTED)
+        elif (
+            execution.status is ModelExecutionStatus.HANDOFF_REQUESTED
+            and not recovered_note_committed
+        ):
+            # A requested handoff that left no note commit ends as a handoff
+            # all the same: the runtime writes the emergency note itself
+            # (recovery above already ran when the final response held one).
+            # A note the model did commit but that fails validation never
+            # reaches this fallback: it stays a rejection below.
+            note_commit = self._workspace.handoff_note_commit(
+                prepared, claim.issue.number, attempt_id=attempt_id
+            )
+            if note_commit is None:
+                commits = self._commit_emergency_handoff_note(
+                    claim,
+                    prepared,
+                    attempt_id=attempt_id,
+                    execution=execution,
+                    commits=commits,
+                    seal_commit=seal_commit,
+                    pre_seal_dirty=pre_seal_dirty,
+                    preparation=preparation,
+                    archive=archive,
+                    profile=profile,
+                    reason="token_soft_threshold",
+                )
         commit_count = len(commits)
         # A red deferred baseline means the same gate the final check runs
         # already failed on this tree after conflict resolution, with no new
@@ -1353,6 +1392,80 @@ class ModelAttemptRunner:
         if not isinstance(text, str) or not text:
             return None
         return _parse_handoff_note_fields(text).get("reason")
+
+    def _commit_emergency_handoff_note(
+        self,
+        claim: Claim,
+        prepared: PreparedAttempt,
+        *,
+        attempt_id: str,
+        execution: ModelExecution,
+        commits: tuple[AttemptCommit, ...],
+        seal_commit: AttemptCommit | None,
+        pre_seal_dirty: tuple[str, ...] | None,
+        preparation: PreparationEvidence | None,
+        archive: AttemptArchive | None,
+        profile: RepositoryProfile,
+        reason: str,
+    ) -> tuple[AttemptCommit, ...]:
+        """Build, commit, and announce the runtime-written emergency note.
+
+        The model's work is already sealed; the note commit stages only the
+        note file on top of it. Returns the refreshed attempt commits so the
+        caller validates and publishes the note it just wrote.
+        """
+
+        note_content = _build_emergency_handoff_note(
+            issue_number=claim.issue.number,
+            started_at=attempt_id,
+            reason=reason,
+            last_work_commit=commits[0].revision if commits else prepared.base_revision,
+            explanation=execution.explanation,
+            diff_stat=_git_diff_stat(
+                self._workspace.working_directory,
+                prepared.base_revision,
+                seal_commit.revision if seal_commit is not None else prepared.branch,
+            ),
+            attempt_commits=tuple(
+                f"{commit.revision[:7]} {commit.subject}" for commit in commits
+            ),
+            sealed_files=(
+                tuple(pre_seal_dirty)
+                if seal_commit is not None and pre_seal_dirty is not None
+                else None
+            ),
+            edited_files=tuple(execution.edited_files),
+            last_assistant_text=execution.last_assistant_text,
+            handoff_skill_invoked=_main_thread_handoff_invoked(
+                execution.skill_events
+            ),
+            tool_calls=tuple(execution.tool_calls),
+            last_check_call=_last_check_call(
+                tuple(execution.bash_calls), profile.check
+            ),
+            baseline_result=(
+                preparation.baseline if preparation is not None else None
+            ),
+            token_budget=execution.token_budget,
+            archive_dir=(
+                str(archive.directory) if archive is not None else None
+            ),
+            session_id=getattr(
+                self._model_executor, "cli_session_id", None
+            ),
+            previous_note=_previous_complete_note(
+                self._workspace, prepared, claim.issue.number
+            ),
+        )
+        self._workspace.commit_handoff_note(claim.issue.number, note_content)
+        self._event_log(
+            "handoff_note_emergency_written",
+            f"issue #{claim.issue.number}: the model did not commit a handoff"
+            f" note, so the runtime wrote an emergency one (reason={reason}).",
+            level="WARNING",
+            issue_number=claim.issue.number,
+        )
+        return self._workspace.commits_added(prepared)
 
     def _run_preparation(
         self,
@@ -9193,6 +9306,75 @@ _PREVIOUS_NOTE_ATTEMPT_ID = "previous-rounds"
 #: Marker the runtime stamps into every note it writes itself, distinguishing
 #: emergency notes (runtime evidence only) from complete ones.
 _RUNTIME_WRITTEN_MARKER = "written by the runtime"
+
+#: Provenance line appended to a note recovered from the model's final
+#: response. It must not contain ``_RUNTIME_WRITTEN_MARKER``: a recovered
+#: note carries the model's own assessment and still counts as a complete
+#: note for later rounds' previous-note lookup.
+_RECOVERED_NOTE_PROVENANCE = (
+    "Recovered by the runtime from the model's final response: the model "
+    "wrote this note but did not commit it."
+)
+
+#: Fenced code blocks in free model text; the language tag after the opening
+#: fence is optional and the closing fence must be present.
+_FENCED_BLOCK_PATTERN = re.compile(r"```[^\n]*\n?(.*?)```", re.DOTALL)
+
+
+def _extract_recovered_handoff_note(
+    last_assistant_text: object, issue_number: int, attempt_id: str
+) -> str | None:
+    """The first fenced block reading as this attempt's handoff note, if any.
+
+    A block qualifies when it parses with the matching title and ``issue``
+    field for this issue, ``started_at`` equal to the attempt id, and an
+    allowed ``reason``. Anything else (another issue's note, a stale attempt
+    id, prose) is ignored so the caller falls back to the emergency note.
+    """
+
+    if not isinstance(last_assistant_text, str) or not last_assistant_text:
+        return None
+    want = str(issue_number)
+    for match in _FENCED_BLOCK_PATTERN.finditer(last_assistant_text):
+        block = match.group(1).strip()
+        if not block:
+            continue
+        fields = _parse_handoff_note_fields(block)
+        if fields.get("title_issue") != want:
+            continue
+        if fields.get("issue") != want:
+            continue
+        if fields.get("started_at", "") != attempt_id:
+            continue
+        if fields.get("reason") not in _ALLOWED_HANDOFF_REASONS:
+            continue
+        return block
+    return None
+
+
+def _recovered_note_names_expected_work(
+    block: str, expected_revision: str, working_directory: Path
+) -> bool:
+    """Whether ``block`` names the preserved work beneath the note commit.
+
+    Mirrors the ``last_work_commit`` half of ``_validate_handoff_note`` (which
+    stays unchanged): an exact prefix of at least 7 characters, or a
+    transcription slip within two edits that names no real commit. A stale
+    value naming a real (older) commit stays rejected, so the caller falls
+    back to the emergency note instead of committing a note that could never
+    validate.
+    """
+
+    last_work_commit = _parse_handoff_note_fields(block).get("last_work_commit", "")
+    if expected_revision.startswith(last_work_commit) and len(last_work_commit) >= 7:
+        return True
+    return (
+        len(last_work_commit) >= 7
+        and _is_hex(last_work_commit)
+        and not _resolves_to_commit(working_directory, last_work_commit)
+        and _last_work_commit_typo_distance(last_work_commit, expected_revision, 2)
+        <= 2
+    )
 
 
 def _is_complete_handoff_note(content: str, issue_number: int) -> bool:
