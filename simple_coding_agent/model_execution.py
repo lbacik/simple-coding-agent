@@ -2030,6 +2030,7 @@ class ModelExecutor:
         deferred_results = 0
         model_turn_after_defer = False
         background_followup_sent = False
+        shell_followup_sent = False
         deferred_result: Any = None
         grace_started: float | None = None
         # One pending ``__anext__()`` shared across loop iterations: waiting
@@ -2188,6 +2189,18 @@ class ModelExecutor:
                         )
                         continue
                     self._settle_all_threads_and_log()
+                    resumed = await self._maybe_background_shell_followup(
+                        client,
+                        background_pending,
+                        message,
+                        tuple(observed_models),
+                        shell_followup_sent,
+                        background_followup_sent,
+                    )
+                    if resumed is not None:
+                        stream = resumed
+                        shell_followup_sent = True
+                        continue
                     await self._stop_background_tasks(
                         client,
                         sorted(background_pending),
@@ -2293,7 +2306,11 @@ class ModelExecutor:
 
         if isinstance(message, TaskStartedMessage):
             if message.task_id:
-                pending.setdefault(message.task_id, {"task_type": message.task_type})
+                detail: dict[str, str | None] = {"task_type": message.task_type}
+                description = getattr(message, "description", None)
+                if isinstance(description, str) and description:
+                    detail["description"] = description
+                pending.setdefault(message.task_id, detail)
                 tool_use_id = getattr(message, "tool_use_id", None)
                 if isinstance(tool_use_id, str) and tool_use_id:
                     self._task_tool_links[message.task_id] = tool_use_id
@@ -2379,6 +2396,67 @@ class ModelExecutor:
             f"task_ids={','.join(sorted(entry['task_id'] for entry in finished if entry['task_id']))}; "
             "no new model turn followed the settled background tasks, so a "
             "single wake-up prompt is issued",
+        )
+        await client.query(prompt)
+        return _message_stream(client)
+
+    async def _maybe_background_shell_followup(
+        self,
+        client: SDKClient,
+        pending: dict[str, dict[str, str | None]],
+        terminal: Any,
+        observed_models: tuple[str, ...],
+        shell_followup_sent: bool,
+        deferring_followup_sent: bool,
+    ) -> Any | None:
+        """Send the single wake-up follow-up for still-running background shells.
+
+        Shells and monitors (anything outside ``DEFERRING_TASK_TYPES``) never
+        defer a terminal result, so without this the execution would stop them
+        at once and the model — which expects a wake-up notification that never
+        comes — would leave review and the final gates undone. The follow-up
+        names the pending tasks and tells the model plainly that they will not
+        report back, so it must wait for them in the foreground and then finish
+        the workflow. Returns a fresh message stream when issued (the caller
+        keeps reading from it), else ``None`` to end the execution as today.
+        Fires at most once per receive loop.
+        """
+
+        if shell_followup_sent or deferring_followup_sent:
+            return None
+        non_deferring = sorted(
+            task_id
+            for task_id, detail in pending.items()
+            if detail.get("task_type") not in DEFERRING_TASK_TYPES
+        )
+        if not non_deferring:
+            return None
+        if sorted(pending) != non_deferring:
+            return None
+        if self._review_count > 0:
+            return None
+        if self._handoff_note_committed:
+            return None
+        if self._soft_threshold_crossed:
+            return None
+        if self._hard_token_limit_reached():
+            return None
+        if (
+            self._operator_handoff is not None
+            or self._operator_begun
+            or self._operator_context_delivered
+        ):
+            return None
+        if self._is_model_limit(terminal, observed_models):
+            return None
+        prompt = _background_shells_followup_prompt(
+            {task_id: pending[task_id] for task_id in non_deferring}
+        )
+        self._log(
+            "background_shells_followup",
+            f"task_ids={','.join(non_deferring)}; "
+            "a terminal result arrived while only non-deferring background "
+            "tasks were still running, so a single wake-up prompt is issued",
         )
         await client.query(prompt)
         return _message_stream(client)
@@ -4144,6 +4222,28 @@ def _background_tasks_followup_prompt(
         + "\n".join(lines)
         + "\nRead their output, incorporate the results into the implementation, "
         "and finish the work that depended on them instead of waiting."
+    )
+
+
+def _background_shells_followup_prompt(
+    pending: dict[str, dict[str, str | None]],
+) -> str:
+    """Wake the model when it ends its turn with only background shells running."""
+
+    lines = []
+    for task_id in sorted(pending):
+        detail = pending[task_id]
+        description = detail.get("description") or detail.get("task_type") or "background task"
+        lines.append(f"- {task_id}: {description}")
+    return (
+        "Your background shell task(s) are still running, and they will not "
+        "report back or wake you up — no notification will arrive:\n"
+        + "\n".join(lines)
+        + "\nDo not end your turn waiting for them. Wait for them in the "
+        "foreground (run the same command with an explicit Bash `timeout` "
+        "large enough for it to finish) or read their output, then finish "
+        "the workflow: commit your changes, invoke the `code-review` skill, "
+        "and run the final gates."
     )
 
 

@@ -559,14 +559,183 @@ class HangingRaisingStopClient(RaisingStopClient, HangingBackgroundClient):
 
 def test_non_deferring_task_does_not_defer_and_is_stopped_on_exit(tmp_path: Path) -> None:
     client = BackgroundFakeClient(
-        None, [started("B", "local_bash"), result(input_tokens=12)]
+        None,
+        [started("B", "local_bash"), result(input_tokens=12)],
+        followup_messages=[result(input_tokens=34)],
     )
     execution, events, client = run_executor(tmp_path, client)
 
     assert not any(name == "background_result_deferred" for name, _ in events)
+    # One wake-up follow-up names the pending shell instead of ending at once.
+    assert len(client.queried_prompts) == 1
+    assert "B" in client.queried_prompts[0]
+    assert any(name == "background_shells_followup" for name, _ in events)
+    # The model ends its turn again, so the still-pending shell is stopped.
     assert client.stopped_tasks == ["B"]
     stopped = [detail for name, detail in events if name == "background_tasks_stopped"]
     assert len(stopped) == 1 and "B" in stopped[0]
+    # The terminal evidence comes from the second result, not the first.
+    assert execution.model_usage == {MODEL: {"input_tokens": 34}}
+
+
+def test_shell_followup_prompt_names_task_and_says_no_wakeup(tmp_path: Path) -> None:
+    client = BackgroundFakeClient(
+        None,
+        [started("B", "local_bash"), result(input_tokens=12)],
+        followup_messages=[result(input_tokens=34)],
+    )
+    _, events, client = run_executor(tmp_path, client)
+
+    assert len(client.queried_prompts) == 1
+    prompt = client.queried_prompts[0]
+    assert "B" in prompt
+    assert "will not report back or wake you up" in prompt
+    assert "code-review" in prompt
+    followups = [detail for name, detail in events if name == "background_shells_followup"]
+    assert len(followups) == 1 and "B" in followups[0]
+    assert client.stopped_tasks == ["B"]
+
+
+def test_second_terminal_result_ends_execution_without_a_second_followup(
+    tmp_path: Path,
+) -> None:
+    client = BackgroundFakeClient(
+        None,
+        [started("B", "local_bash"), result(input_tokens=12)],
+        followup_messages=[result(input_tokens=34)],
+    )
+    execution, events, client = run_executor(tmp_path, client)
+
+    assert execution.status is ModelExecutionStatus.SUCCEEDED
+    assert len(client.queried_prompts) == 1
+    assert client.stopped_tasks == ["B"]
+    assert any(name == "background_tasks_stopped" for name, _ in events)
+
+
+class MutatingBackgroundClient(BackgroundFakeClient):
+    """Invoke a state mutation just before the first terminal result is served."""
+
+    def __init__(self, options: object, messages: list[object], mutate: object) -> None:
+        super().__init__(options, messages)
+        self._mutate = mutate
+        self._mutated = False
+
+    async def receive_messages(self):  # type: ignore[override]
+        if self.queried_prompts:
+            for message in self._followup_messages:
+                yield message
+            return
+        for message in self._messages:
+            if not self._mutated and not isinstance(message, TaskStartedMessage):
+                self._mutated = True
+                self._mutate()
+            yield message
+
+
+def run_shell_skip_case(
+    tmp_path: Path, mutate: Any
+) -> tuple[ModelExecution, list[tuple[str, str]], MutatingBackgroundClient]:
+    """Run a shell-pending stream with ``mutate`` applied before the result lands."""
+
+    events: list[tuple[str, str]] = []
+    clients: list[MutatingBackgroundClient] = []
+    holder: dict[str, ModelExecutor] = {}
+
+    def factory(options: object) -> MutatingBackgroundClient:
+        client = MutatingBackgroundClient(
+            options,
+            [started("B", "local_bash"), result(input_tokens=12)],
+            lambda: mutate(holder["executor"]),
+        )
+        clients.append(client)
+        return client
+
+    executor = ModelExecutor(
+        runtime_config(tmp_path),
+        client_factory=factory,
+        event_log=lambda event, detail="", level="INFO", issue_number=None: events.append(
+            (event, detail)
+        ),
+    )
+    holder["executor"] = executor
+    execution = asyncio.run(
+        executor.execute(issue_body="Fix it.", working_directory=tmp_path)
+    )
+    return execution, events, clients[0]
+
+
+def test_shell_followup_skipped_after_code_review(tmp_path: Path) -> None:
+    execution, events, client = run_shell_skip_case(
+        tmp_path, lambda executor: setattr(executor, "_review_count", 1)
+    )
+
+    assert client.queried_prompts == []
+    assert not any(name == "background_shells_followup" for name, _ in events)
+    assert client.stopped_tasks == ["B"]
+    assert execution.status is ModelExecutionStatus.SUCCEEDED
+
+
+def test_shell_followup_skipped_after_handoff_note_commit(tmp_path: Path) -> None:
+    execution, events, client = run_shell_skip_case(
+        tmp_path, lambda executor: setattr(executor, "_handoff_note_committed", True)
+    )
+
+    assert client.queried_prompts == []
+    assert not any(name == "background_shells_followup" for name, _ in events)
+    assert client.stopped_tasks == ["B"]
+    assert execution.status is ModelExecutionStatus.SUCCEEDED
+
+
+def test_shell_followup_skipped_after_soft_threshold_crossed(tmp_path: Path) -> None:
+    execution, events, client = run_shell_skip_case(
+        tmp_path, lambda executor: setattr(executor, "_soft_threshold_crossed", True)
+    )
+
+    # The token handoff path owns the rest of the run: no shell wake-up is
+    # sent (any follow-up query is the handoff instruction, not the wake).
+    assert not any(name == "background_shells_followup" for name, _ in events)
+    assert all("wake you up" not in prompt for prompt in client.queried_prompts)
+    assert client.stopped_tasks == ["B"]
+
+
+def test_shell_followup_skipped_when_operator_handoff_in_progress(
+    tmp_path: Path,
+) -> None:
+    execution, events, client = run_shell_skip_case(
+        tmp_path, lambda executor: setattr(executor, "_operator_begun", True)
+    )
+
+    assert client.queried_prompts == []
+    assert not any(name == "background_shells_followup" for name, _ in events)
+    assert client.stopped_tasks == ["B"]
+    assert execution.status is ModelExecutionStatus.SUCCEEDED
+
+
+def test_shell_followup_skipped_at_hard_ceiling(tmp_path: Path) -> None:
+    execution, events, client = run_shell_skip_case(
+        tmp_path, lambda executor: setattr(executor, "_token_hard_ceiling_reached", True)
+    )
+
+    assert client.queried_prompts == []
+    assert not any(name == "background_shells_followup" for name, _ in events)
+    assert client.stopped_tasks == ["B"]
+
+
+def test_completion_gate_tells_model_to_run_long_gates_in_foreground() -> None:
+    from simple_coding_agent.lifecycle import _gate_section
+
+    section = _gate_section(
+        RepositoryProfile(
+            setup=(), check=("pytest",), base_branch="main", timeout=60,
+            setup_timeout=60, env={},
+        ),
+        (),
+    )
+
+    assert "## Completion gate" in section
+    assert "foreground" in section
+    assert "explicit Bash `timeout`" in section
+    assert "will not wake you up" in section
 
 
 def test_grace_expiry_stops_deferring_tasks_and_uses_deferred_result(
