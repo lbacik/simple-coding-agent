@@ -36,7 +36,6 @@ from tests.fakes import (
     write_and_commit,
 )
 from tests.test_model_attempt_runner import (
-    FakeModelExecutor as RunnerFakeExecutor,
     FakePrepared,
     build_runner,
     claim,
@@ -122,7 +121,7 @@ class _HandoffExecutor:
         )
 
 
-def _capture_capture_events():
+def _capture_events():
     captured: list[tuple] = []
     return captured, lambda event, detail="", level="INFO", issue_number=None: captured.append(
         (event, detail, level, issue_number)
@@ -179,7 +178,7 @@ def test_limit_stop_emergency_note_now_announces_itself(tmp_path: Path) -> None:
     events, event_log = _capture_events()
     runner = build_runner(
         tmp_path,
-        model_executor=RunnerFakeExecutor(status=ModelExecutionStatus.MODEL_LIMIT_REACHED),
+        model_executor=_HandoffExecutor(None, status=ModelExecutionStatus.MODEL_LIMIT_REACHED),
         workspace=workspace,
         event_log=event_log,
     )
