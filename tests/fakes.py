@@ -428,8 +428,6 @@ class InMemoryWorkspace:
         attempt_id: str,
         status: object,
     ) -> PausedRebaseFinish:
-        from simple_coding_agent.git_workspace import PausedRebaseFinish
-
         self.finish_calls.append((issue_number, attempt_id))
         if not self._conflict.in_progress:
             return PausedRebaseFinish(completed=True)

@@ -553,7 +553,15 @@ class PrepareDirtyWorkspace(InMemoryWorkspace):
 
 
 class CleanupFailingWorkspace(InMemoryWorkspace):
-    def cleanup(self, *, base_branch: str, prepared: PreparedAttempt, retain_branch: bool) -> None:
+    def cleanup(
+        self,
+        *,
+        base_branch: str,
+        prepared: PreparedAttempt,
+        retain_branch: bool,
+        issue_number: int | None = None,
+        attempt_id: str | None = None,
+    ) -> None:
         raise OSError("cleanup unavailable")
 
 

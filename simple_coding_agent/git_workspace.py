@@ -1483,18 +1483,21 @@ class GitWorkspace:
     def _worktree_needs_stash(self) -> bool:
         """Whether unstaged or untracked changes would block ``rebase --continue``."""
 
+        # ``git status --porcelain`` cannot be parsed from the stripped
+        # ``_git`` output: a leading-space ``XY`` code (unstaged-only change)
+        # loses its first column to ``_run_git``'s ``strip()``, so `` M foo``
+        # reads back as ``M foo`` and looks staged. Detect the two blocking
+        # classes directly instead: ``git diff --quiet`` reports unstaged
+        # modifications, ``ls-files --others`` reports untracked files.
         try:
-            output = self._git("status", "--porcelain")
+            self._git("diff", "--quiet")
         except GitWorkspaceError:
             return True
-        for line in output.splitlines():
-            if not line.strip():
-                continue
-            if len(line) < 2:
-                continue
-            if line[1] != " ":
-                return True
-        return False
+        try:
+            untracked = self._git("ls-files", "--others", "--exclude-standard")
+        except GitWorkspaceError:
+            return True
+        return bool(untracked.strip())
 
     def _index_holds_staged_changes(self) -> bool:
         """Whether the index differs from HEAD (a pick resolution to complete)."""
