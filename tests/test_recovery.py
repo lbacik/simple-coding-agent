@@ -982,7 +982,8 @@ def test_release_lost_claim_with_untracked_work_stays_not_fulfilled(tmp_path: Pa
         tmp_path, issues={24: _issue(24)}
     )
     archive = _seed_unsealed_archive(tmp_path, checkpoint)
-    workspace.make_dirty("docs/adr/0031-follow-up.md")
+    dirty_path = workspace.make_dirty("docs/adr/0031-follow-up.md")
+    branch_before = workspace.current_branch
 
     record = lifecycle.submit_recovery_release(
         "req-dirty", checkpoint.started_at, "s3://bucket/work"
@@ -997,6 +998,9 @@ def test_release_lost_claim_with_untracked_work_stays_not_fulfilled(tmp_path: Pa
     assert tracker.removed_labels == []
     assert "claim_lost" not in [event for event, _ in _lost_claim_events(events)]
     assert read_sealing_record(archive.directory) is None
+    assert workspace.current_branch == branch_before
+    assert dirty_path.exists()
+    assert "docs/adr/0031-follow-up.md" in workspace.dirty_paths()
 
 
 def test_release_lost_claim_with_a_tracked_modification_stays_not_fulfilled(
@@ -1144,6 +1148,14 @@ def test_startup_reconciliation_with_lost_claim_and_dirty_workspace_retains_atte
         if event == "intake_held_for_recovery"
     ]
     assert held, "the next poll must hold on the retained attempt"
+    assert "working_tree_dirty" not in [event for event, _ in _lost_claim_events(events)]
+    lifecycle.run_once()
+    assert "working_tree_dirty" not in [event for event, _ in _lost_claim_events(events)]
+    still_held = [
+        detail for event, level, detail in events
+        if event == "intake_held_for_recovery"
+    ]
+    assert len(still_held) >= 2, "intake must keep holding on the retained attempt"
     snapshot = lifecycle.control_status("owner/repo")
     assert snapshot["recovery"] is not None
     assert snapshot["recovery"]["attempt_id"] == checkpoint.started_at
