@@ -337,8 +337,16 @@ def test_two_consecutive_failures_escalate_exactly_once(tmp_path: Path) -> None:
         fifo=[7],
         comments={7: [("agent", fail_body("check_failed"))]},
     )
+    workspace = failing_workspace(tmp_path)
+    # The runtime finishes a merely-staged rebase itself now; force the
+    # fallback so this test still covers the abort-and-report path.
+    workspace.finish_unresolvable = (
+        "unmerged paths: a.txt",
+        "refs/agent/preserved/issue-7/finish",
+        "preserved-finish",
+    )
     result, tracker, publisher, _, _, events = run_budget(
-        tmp_path, tracker, tmp_path / "store1"
+        tmp_path, tracker, tmp_path / "store1", workspace=workspace
     )
 
     assert result.outcome is AttemptOutcome.INCOMPLETE

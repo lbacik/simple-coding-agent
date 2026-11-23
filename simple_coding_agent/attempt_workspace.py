@@ -22,6 +22,8 @@ from typing import Protocol
 from simple_coding_agent.git_workspace import (
     AttemptCommit,
     ConflictState,
+    PausedRebaseFinish,
+    PausedRebasePreserved,
     PreparedAttempt,
     handoff_note_relpath,
 )
@@ -59,7 +61,40 @@ class AttemptWorkspace(Protocol):
         self, prepared: PreparedAttempt | None = None
     ) -> ConflictState: ...
 
-    def abort_unresolved_rebase(self, prepared: PreparedAttempt) -> None: ...
+    def abort_unresolved_rebase(
+        self, prepared: PreparedAttempt, *, issue_number: int, attempt_id: str
+    ) -> PausedRebasePreserved | None:
+        """Abort a paused rebase after keeping the workspace as a Preserved revision.
+
+        Returns the kept Preserved revision, or ``None`` when there was
+        nothing to keep.
+        """
+        ...
+
+    def preserve_paused_rebase(
+        self, *, issue_number: int, attempt_id: str
+    ) -> PausedRebasePreserved | None:
+        """Snapshot a paused rebase's workspace under the Preserved ref.
+
+        Returns the kept Preserved revision, or ``None`` when no rebase is
+        in progress.
+        """
+        ...
+
+    def finish_paused_rebase(
+        self,
+        prepared: PreparedAttempt,
+        *,
+        issue_number: int,
+        attempt_id: str,
+        status: ModelExecutionStatus,
+    ) -> PausedRebaseFinish:
+        """Finish a model-paused rebase, or report why it could not finish."""
+        ...
+
+    def clean_untracked(self) -> None:
+        """Remove untracked, non-ignored files from the working tree."""
+        ...
 
     def seal(
         self,
@@ -171,7 +206,13 @@ class AttemptWorkspace(Protocol):
         ...
 
     def cleanup(
-        self, *, base_branch: str, prepared: PreparedAttempt, retain_branch: bool
+        self,
+        *,
+        base_branch: str,
+        prepared: PreparedAttempt,
+        retain_branch: bool,
+        issue_number: int | None = None,
+        attempt_id: str | None = None,
     ) -> None:
         """Best-effort abort of an unresolved rebase and switch to base_branch.
 

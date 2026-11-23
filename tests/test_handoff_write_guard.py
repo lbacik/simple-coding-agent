@@ -304,3 +304,30 @@ def test_handoff_skill_names_the_write_tool() -> None:
     assert "Bash cannot" in skill
     assert "git add" in skill
     assert "git commit" in skill
+
+
+def test_paused_rebase_continue_stays_allowed_after_the_threshold() -> None:
+    """ADR 0011: the model can finish a paused rebase before the handoff note."""
+
+    assert _is_handoff_command("git rebase --continue") is True
+    assert _is_handoff_command("git -c core.editor=true rebase --continue") is True
+    assert _is_handoff_command("git rebase --skip") is False
+    assert _is_handoff_command("git rebase --abort") is False
+    assert _is_handoff_command("git rebase --quit") is False
+    assert _is_handoff_command("git rebase -i") is False
+    assert _is_handoff_command("git rebase") is False
+
+
+def test_soft_threshold_handoff_steps_finish_the_paused_rebase_first() -> None:
+    """The handoff instruction orders `rebase --continue` before the note commit."""
+
+    from simple_coding_agent.model_execution import (
+        _COST_ALLOWED_COMMANDS,
+        _cost_handoff_followup_prompt,
+    )
+
+    steps = _token_handoff_steps(287)
+    assert "git rebase --continue" in steps
+    assert steps.index("git rebase --continue") < steps.index("git commit")
+    assert "git rebase --continue" in _COST_ALLOWED_COMMANDS
+    assert "git rebase --continue" in _cost_handoff_followup_prompt(287, "attempt-1")

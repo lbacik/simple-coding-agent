@@ -75,6 +75,7 @@ from simple_coding_agent.git_workspace import (
     DirtyWorkspaceError,
     GitWorkspaceError,
     GitWorkspaceRecoveryError,
+    PausedRebasePreserved,
     PreparedAttempt,
     RebaseConflictError,
     git_failure_detail,
@@ -662,32 +663,80 @@ class ModelAttemptRunner:
             # The model had its chance to resolve the conflicts left in
             # place by preparation. Setup must never run against a
             # half-merged tree, so the resolution is verified
-            # deterministically first: any remaining rebase/merge state,
-            # unmerged path, conflict marker, or whitespace error falls
-            # back to the pre-rebase branch state and the attempt reports
-            # a rebase_conflict infrastructure error, exactly as if the
+            # deterministically first. A rebase the model resolved and
+            # staged but never continued is finished by the runtime itself
+            # (ADR 0011) instead of aborted: the workspace is preserved
+            # first, so the fallback below never discards the attempt's
+            # work. Any remaining rebase/merge state, unmerged path,
+            # conflict marker, or whitespace error otherwise falls back to
+            # the pre-rebase branch state and the attempt reports a
+            # rebase_conflict infrastructure error, exactly as if the
             # rebase had been aborted up front.
             post_state = self._workspace.conflict_state(prepared)
+            if post_state.in_progress:
+                try:
+                    finished = self._workspace.finish_paused_rebase(
+                        prepared,
+                        issue_number=claim.issue.number,
+                        attempt_id=attempt_id,
+                        status=execution.status,
+                    )
+                except GitWorkspaceError as error:
+                    self._event_log(
+                        "rebase_finished_by_runtime_failed",
+                        git_failure_detail(error),
+                        level="WARNING",
+                        issue_number=claim.issue.number,
+                    )
+                    finished = None
+                if finished is not None and finished.completed:
+                    self._event_log(
+                        "rebase_finished_by_runtime",
+                        "The model left the rebase paused with its resolution staged;"
+                        " the runtime completed it.",
+                        level="INFO",
+                        issue_number=claim.issue.number,
+                    )
+                    post_state = self._workspace.conflict_state(prepared)
+                else:
+                    if finished is None:
+                        preserved_ref: str | None = None
+                        preserved_revision: str | None = None
+                    else:
+                        preserved_ref = finished.preserved_ref
+                        preserved_revision = finished.preserved_revision
+                    remaining = _remaining_conflicts(post_state, prepared)
+                    branch = prepared.branch
+                    preserved_ref, preserved_revision = self._abort_paused_rebase_best_effort(
+                        claim,
+                        prepared,
+                        post_state,
+                        attempt_id,
+                        preserved_ref=preserved_ref,
+                        preserved_revision=preserved_revision,
+                    )
+                    files = f" Conflicting files: {', '.join(remaining)}." if remaining else ""
+                    problems_text = " ".join(post_state.resolution_problems)
+                    raise RebaseConflictError(
+                        f"Rebase of {branch} onto {profile.base_branch} hit conflicts"
+                        f" (rebase_conflict).{files} {problems_text}"
+                        " The rebase was aborted and setup was not started.",
+                        branch=branch,
+                        base_branch=profile.base_branch,
+                        conflicted_files=remaining,
+                        preserved_ref=preserved_ref,
+                        preserved_revision=preserved_revision,
+                    )
             if post_state.resolution_problems:
                 remaining = _remaining_conflicts(post_state, prepared)
                 branch = prepared.branch
-                try:
-                    self._workspace.abort_unresolved_rebase(prepared)
-                except GitWorkspaceError:
-                    self._event_log(
-                        "rebase_resolution_failed",
-                        f"{' '.join(post_state.resolution_problems)} The branch could not be restored.",
-                        level="ERROR",
-                        issue_number=claim.issue.number,
-                    )
-                    raise
-                self._event_log(
-                    "rebase_resolution_failed",
-                    f"{' '.join(post_state.resolution_problems)}"
-                    " The rebase was aborted and the branch restored to its"
-                    " pre-rebase state.",
-                    level="ERROR",
-                    issue_number=claim.issue.number,
+                preserved_ref, preserved_revision = self._abort_paused_rebase_best_effort(
+                    claim,
+                    prepared,
+                    post_state,
+                    attempt_id,
+                    preserved_ref=None,
+                    preserved_revision=None,
                 )
                 files = f" Conflicting files: {', '.join(remaining)}." if remaining else ""
                 problems_text = " ".join(post_state.resolution_problems)
@@ -698,6 +747,8 @@ class ModelAttemptRunner:
                     branch=branch,
                     base_branch=profile.base_branch,
                     conflicted_files=remaining,
+                    preserved_ref=preserved_ref,
+                    preserved_revision=preserved_revision,
                 )
             self._event_log(
                 "rebase_resolution_succeeded",
@@ -1058,6 +1109,62 @@ class ModelAttemptRunner:
             note_commit_sha,
             reviews_performed=review_count,
         )
+
+    def _abort_paused_rebase_best_effort(
+        self,
+        claim: Claim,
+        prepared: PreparedAttempt,
+        post_state: ConflictState,
+        attempt_id: str,
+        *,
+        preserved_ref: str | None,
+        preserved_revision: str | None,
+    ) -> tuple[str | None, str | None]:
+        """Abort a paused rebase after keeping the work as a Preserved revision.
+
+        The abort itself preserves first (so the caller's finish snapshot, or
+        the abort's own when the caller has none, holds the attempt's work),
+        restores the pre-rebase branch, and cleans untracked leftovers so the
+        workspace is not held: the work is reachable from the returned
+        Preserved ref. Re-raises the abort's own error when the branch cannot
+        be restored.
+        """
+
+        try:
+            kept = self._workspace.abort_unresolved_rebase(
+                prepared,
+                issue_number=claim.issue.number,
+                attempt_id=attempt_id,
+            )
+        except GitWorkspaceError:
+            self._event_log(
+                "rebase_resolution_failed",
+                f"{' '.join(post_state.resolution_problems)} The branch could not be restored.",
+                level="ERROR",
+                issue_number=claim.issue.number,
+            )
+            raise
+        if kept is not None:
+            preserved_ref = kept.ref
+            preserved_revision = kept.revision
+        try:
+            self._workspace.clean_untracked()
+        except GitWorkspaceError as error:
+            self._event_log(
+                "rebase_cleanup_failed",
+                git_failure_detail(error),
+                level="WARNING",
+                issue_number=claim.issue.number,
+            )
+        self._event_log(
+            "rebase_resolution_failed",
+            f"{' '.join(post_state.resolution_problems)}"
+            " The rebase was aborted and the branch restored to its"
+            " pre-rebase state.",
+            level="ERROR",
+            issue_number=claim.issue.number,
+        )
+        return preserved_ref, preserved_revision
 
     def _wire_review_gate(self, prepared: object, initial_commits: Sequence[object]) -> None:
         """Let the model execution nudge the model toward ``code-review``.
@@ -3182,6 +3289,8 @@ class AgentLifecycle:
                 # comment_posted is True here (the unconfirmed path returned
                 # above), so only genuinely unpublished work retains.
                 retain_branch=bool(retain_branch),
+                issue_number=claim.issue.number,
+                attempt_id=attempt_id,
             )
             self._observe_and_remember_workspace_dirty(attempt_id)
         except DirtyWorkspaceError as error:
@@ -3374,6 +3483,8 @@ class AgentLifecycle:
                 base_branch=profile.base_branch,
                 prepared=prepared,
                 retain_branch=True,
+                issue_number=claim.issue.number,
+                attempt_id=attempt_id,
             )
         except Exception as error:
             return False, (
@@ -5338,6 +5449,15 @@ class AgentLifecycle:
             raise
         except RebaseConflictError as error:
             publication_started_at = self._clock()
+            preserved_line = _preserved_comment_line_for_conflict(
+                error.preserved_ref, error.preserved_revision, checkpoint.started_at
+            )
+            if preserved_line is not None:
+                unpushed_recovery_line = (
+                    f"{unpushed_recovery_line}\n{preserved_line}"
+                    if unpushed_recovery_line
+                    else preserved_line
+                )
             if is_conflict_claim:
                 # The model already had its single resolution session, so a
                 # rebase left in progress reaches here only defensively:
@@ -5345,7 +5465,11 @@ class AgentLifecycle:
                 # without pushing.
                 if prepared is not None:
                     try:
-                        self._workspace.abort_unresolved_rebase(prepared)
+                        self._workspace.abort_unresolved_rebase(
+                            prepared,
+                            issue_number=claim.issue.number,
+                            attempt_id=checkpoint.started_at,
+                        )
                     except Exception as abort_error:
                         self._event_log(
                             "conflict_abort_failed",
@@ -5458,6 +5582,8 @@ class AgentLifecycle:
                             base_branch=profile.base_branch if profile is not None else "main",
                             prepared=prepared,
                             retain_branch=retain_branch or not comment_posted,
+                            issue_number=claim.issue.number,
+                            attempt_id=checkpoint.started_at,
                         )
                         cleanup_ok = True
                         self._observe_and_remember_workspace_dirty(
@@ -7259,6 +7385,8 @@ class AgentLifecycle:
                             base_branch=profile.base_branch if profile is not None else "main",
                             prepared=prepared,
                             retain_branch=retain_branch or not comment_posted,
+                            issue_number=claim.issue.number,
+                            attempt_id=checkpoint.started_at,
                         )
                         cleanup_ok = True
                         self._observe_and_remember_workspace_dirty(
@@ -7701,7 +7829,7 @@ class AgentLifecycle:
             self._event_log(
                 "conflict_model_failed", detail, level="ERROR", issue_number=issue_number
             )
-            self._abort_conflict_best_effort(prepared, issue_number)
+            self._abort_conflict_best_effort(prepared, issue_number, attempt_id)
             self._seal_conflict_best_effort(
                 issue_number, attempt_id, ModelExecutionStatus.INFRASTRUCTURE_ERROR
             )
@@ -7726,7 +7854,7 @@ class AgentLifecycle:
             issue_number=issue_number,
         )
         if status is ModelExecutionStatus.MODEL_LIMIT_REACHED:
-            self._abort_conflict_best_effort(prepared, issue_number)
+            self._abort_conflict_best_effort(prepared, issue_number, attempt_id)
             self._seal_conflict_best_effort(issue_number, attempt_id, status)
             return self._build_conflict_request(
                 claim,
@@ -7741,7 +7869,7 @@ class AgentLifecycle:
                 conflicted_files=tuple(conflicted),
             )
         if status is not ModelExecutionStatus.SUCCEEDED:
-            self._abort_conflict_best_effort(prepared, issue_number)
+            self._abort_conflict_best_effort(prepared, issue_number, attempt_id)
             self._seal_conflict_best_effort(issue_number, attempt_id, status)
             detail = (
                 f"the model session ended with status `{status}` instead of "
@@ -7760,6 +7888,86 @@ class AgentLifecycle:
                 conflicted_files=tuple(conflicted),
             )
         post_state = self._workspace.conflict_state(prepared)
+        if post_state.in_progress:
+            # The model staged the resolution but never continued: the
+            # runtime finishes the paused rebase itself (ADR 0011) instead
+            # of aborting the attempt's work, and the attempt then proceeds
+            # to its normal check and push path.
+            try:
+                finished = self._workspace.finish_paused_rebase(
+                    prepared,
+                    issue_number=issue_number,
+                    attempt_id=attempt_id,
+                    status=status,
+                )
+            except GitWorkspaceError as error:
+                self._event_log(
+                    "rebase_finished_by_runtime_failed",
+                    git_failure_detail(error),
+                    level="WARNING",
+                    issue_number=issue_number,
+                )
+                finished = None
+            if finished is not None and finished.completed:
+                self._event_log(
+                    "rebase_finished_by_runtime",
+                    "The model left the rebase paused with its resolution staged;"
+                    " the runtime completed it.",
+                    level="INFO",
+                    issue_number=issue_number,
+                )
+                post_state = self._workspace.conflict_state(prepared)
+            else:
+                if finished is None:
+                    preserved_ref: str | None = None
+                    preserved_revision: str | None = None
+                else:
+                    preserved_ref = finished.preserved_ref
+                    preserved_revision = finished.preserved_revision
+                remaining = tuple(post_state.conflicted_files) or tuple(conflicted)
+                self._event_log(
+                    "conflict_model_unresolved",
+                    "; ".join(post_state.resolution_problems),
+                    level="WARNING",
+                    issue_number=issue_number,
+                )
+                kept = self._abort_conflict_best_effort(prepared, issue_number, attempt_id)
+                if kept is not None:
+                    preserved_ref = kept.ref
+                    preserved_revision = kept.revision
+                try:
+                    self._workspace.clean_untracked()
+                except GitWorkspaceError as error:
+                    self._event_log(
+                        "conflict_cleanup_failed",
+                        git_failure_detail(error),
+                        level="WARNING",
+                        issue_number=issue_number,
+                    )
+                self._seal_conflict_best_effort(issue_number, attempt_id, status)
+                details = _conflict_model_unresolved_details(
+                    branch,
+                    base_branch,
+                    remaining,
+                    after_check=check_output is not None,
+                )
+                preserved_line = _preserved_comment_line_for_conflict(
+                    preserved_ref, preserved_revision, attempt_id
+                )
+                if preserved_line is not None:
+                    details = f"{details} {preserved_line}"
+                return self._build_conflict_request(
+                    claim,
+                    checkpoint,
+                    branch,
+                    base_branch,
+                    pull_request,
+                    CONFLICT_OUTCOME_REBASE_CONFLICT,
+                    "",
+                    details,
+                    push_branch=False,
+                    conflicted_files=tuple(remaining),
+                )
         if post_state.resolution_problems:
             remaining = tuple(post_state.conflicted_files) or tuple(conflicted)
             self._event_log(
@@ -7768,7 +7976,7 @@ class AgentLifecycle:
                 level="WARNING",
                 issue_number=issue_number,
             )
-            self._abort_conflict_best_effort(prepared, issue_number)
+            self._abort_conflict_best_effort(prepared, issue_number, attempt_id)
             self._seal_conflict_best_effort(issue_number, attempt_id, status)
             return self._build_conflict_request(
                 claim,
@@ -7942,13 +8150,19 @@ class AgentLifecycle:
         )
 
     def _abort_conflict_best_effort(
-        self, prepared: PreparedAttempt, issue_number: int
-    ) -> None:
-        """Abort an in-progress rebase without changing the attempt's outcome."""
+        self, prepared: PreparedAttempt, issue_number: int, attempt_id: str
+    ) -> PausedRebasePreserved | None:
+        """Abort an in-progress rebase without changing the attempt's outcome.
+
+        The abort preserves the workspace first, so the attempt's work stays
+        reachable from the returned Preserved revision. Returns the kept
+        revision, or ``None`` when there was nothing to keep or the abort
+        failed.
+        """
 
         try:
             if not self._workspace.conflict_state(prepared).in_progress:
-                return
+                return None
         except Exception as error:
             self._event_log(
                 "conflict_abort_failed",
@@ -7956,9 +8170,13 @@ class AgentLifecycle:
                 level="WARNING",
                 issue_number=issue_number,
             )
-            return
+            return None
         try:
-            self._workspace.abort_unresolved_rebase(prepared)
+            return self._workspace.abort_unresolved_rebase(
+                prepared,
+                issue_number=issue_number,
+                attempt_id=attempt_id,
+            )
         except Exception as error:
             self._event_log(
                 "conflict_abort_failed",
@@ -7966,6 +8184,7 @@ class AgentLifecycle:
                 level="WARNING",
                 issue_number=issue_number,
             )
+            return None
 
     def _seal_conflict_best_effort(
         self,
@@ -8374,6 +8593,22 @@ def _format_conflicted_files(files: tuple[str, ...]) -> str:
     if not files:
         return ""
     return f" Conflicting files: {', '.join(files)}."
+
+
+def _preserved_comment_line_for_conflict(
+    preserved_ref: str | None, preserved_revision: str | None, attempt_id: str
+) -> str | None:
+    """The result-comment line for work kept from an aborted paused rebase.
+
+    ``None`` when the fallback kept nothing (a clean tree holds no work to
+    keep), so callers only name a Preserved revision that actually exists.
+    """
+
+    if preserved_ref is None or preserved_revision is None:
+        return None
+    return preserved_comment_line(
+        preserved_revision, attempt_id, preserved_ref, "rebase_conflict"
+    )
 
 
 def _utc_timestamp() -> str:

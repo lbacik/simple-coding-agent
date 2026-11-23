@@ -665,6 +665,13 @@ def test_conflicting_rebase_runs_one_session_and_reports_unresolved(
 ) -> None:
     workspace = InMemoryWorkspace(tmp_path / "repo", resolve_after_model=False)
     workspace.prepare_conflicts = ("a.txt", "b.txt")
+    # The runtime finishes a merely-staged rebase itself now; force the
+    # fallback so this test still covers the abort-and-report path.
+    workspace.finish_unresolvable = (
+        "unmerged paths: a.txt, b.txt",
+        "refs/agent/preserved/issue-7/finish",
+        "preserved-finish",
+    )
     calls: list[str] = []
     executor = FakeConflictExecutor(calls=calls)
     executor.after_execute = workspace.note_model_finished
@@ -690,6 +697,8 @@ def test_conflicting_rebase_runs_one_session_and_reports_unresolved(
     )
     # The unresolved rebase was aborted; setup and the check never ran.
     assert active.abort_calls != []
+    assert active.finish_calls != []
+    assert "refs/agent/preserved/issue-7/" in request.details
     assert runner.calls == []
     assert tracker.cleanup == [(7, "merge-conflict", "agent-id")]
 

@@ -356,6 +356,13 @@ def test_changed_commit_count_pushes_nothing(tmp_path: Path) -> None:
 def test_unresolved_conflict_aborts_and_pushes_nothing(tmp_path: Path) -> None:
     workspace = InMemoryWorkspace(tmp_path / "repo", resolve_after_model=False)
     workspace.prepare_conflicts = ("a.txt",)
+    # The runtime finishes a merely-staged rebase itself now; force the
+    # fallback so this test still covers the abort-and-report path.
+    workspace.finish_unresolvable = (
+        "unmerged paths: a.txt",
+        "refs/agent/preserved/issue-7/finish",
+        "preserved-finish",
+    )
     calls: list[str] = []
     executor = FakeConflictExecutor(calls=calls)
     executor.after_execute = workspace.note_model_finished
@@ -372,6 +379,8 @@ def test_unresolved_conflict_aborts_and_pushes_nothing(tmp_path: Path) -> None:
     assert request.push_branch is False
     assert request.conflicted_files == ("a.txt",)
     assert active.abort_calls != []
+    assert active.finish_calls != []
+    assert "refs/agent/preserved/issue-7/" in request.details
     assert runner.calls == []
 
 

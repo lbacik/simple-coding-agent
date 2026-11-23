@@ -371,7 +371,7 @@ def test_abort_unresolved_rebase_restores_the_pre_rebase_branch_state(
 
     prepared = workspace.prepare_attempt(base_branch="main", issue_number=19)
 
-    workspace.abort_unresolved_rebase(prepared)
+    workspace.abort_unresolved_rebase(prepared, issue_number=19, attempt_id="2026-11-20T15:15:00.359514Z")
 
     assert "<<<<<<<" not in (clone / "README.md").read_text()
     assert git(clone, "status", "--porcelain") == ""
@@ -401,7 +401,7 @@ def test_abort_unresolved_rebase_restores_after_rebase_quit(tmp_path: Path) -> N
 
     assert workspace.has_unresolved_conflicts() is True
 
-    workspace.abort_unresolved_rebase(prepared)
+    workspace.abort_unresolved_rebase(prepared, issue_number=19, attempt_id="2026-11-20T15:15:00.359514Z")
 
     assert workspace.has_unresolved_conflicts() is False
     assert git(clone, "rev-parse", "agent/issue-19") == pre_rebase_revision
@@ -1072,7 +1072,7 @@ def test_scoped_marker_scan_still_flags_the_conflicted_file(tmp_path: Path) -> N
     problems = workspace.rebase_resolution_problems(prepared)
     assert any("README.md" in problem for problem in problems)
 
-    workspace.abort_unresolved_rebase(prepared)
+    workspace.abort_unresolved_rebase(prepared, issue_number=19, attempt_id="2026-11-20T15:15:00.359514Z")
     assert (clone / "README.md").read_text() == "branch change"
     assert workspace.has_unresolved_conflicts() is False
 
@@ -1324,3 +1324,206 @@ def test_push_reported_failed_but_landed_emits_no_warning(
 
     assert pushed == git(tmp_path / "clone", "rev-parse", "HEAD")
     assert [event for event in events if event[0] == "attempt_branch_push_failed"] == []
+
+
+def _paused_rebase_with_two_picks(
+    tmp_path: Path, *, issue_number: int = 19
+) -> tuple[GitWorkspace, Path, object, str]:
+    """Prepare an attempt branch with two picks and pause its rebase on the first.
+
+    Returns the workspace, the clone directory, the ``PreparedAttempt``, and
+    the pre-rebase branch revision. The caller simulates the model on top.
+    """
+
+    remote, seed = repository_with_main(tmp_path)
+    clone = tmp_path / "clone"
+    workspace = GitWorkspace(clone, str(remote), token_provider=lambda: "secret-token")
+    workspace.prepare_attempt(base_branch="main", issue_number=issue_number)
+    git(clone, "config", "user.name", "Test User")
+    git(clone, "config", "user.email", "test@example.com")
+    write_and_commit(clone, "README.md", "branch change", "Branch pick one")
+    write_and_commit(clone, "feature.txt", "feature work", "Branch pick two")
+    pre_rebase_revision = git(clone, "rev-parse", f"agent/issue-{issue_number}")
+
+    write_and_commit(seed, "README.md", "upstream fix", "Upstream commit")
+    git(seed, "push", "origin", "main")
+
+    prepared = workspace.prepare_attempt(base_branch="main", issue_number=issue_number)
+
+    assert workspace.has_unresolved_conflicts() is True
+    assert prepared.rebase_conflicts == ("README.md",)
+    assert prepared.pre_rebase_revision == pre_rebase_revision
+    return workspace, clone, prepared, pre_rebase_revision
+
+
+def test_finish_paused_rebase_completes_the_pick_and_seals_the_rest(
+    tmp_path: Path,
+) -> None:
+    """A staged resolution plus extra work finishes the rebase via the runtime.
+
+    The staged index completes the paused pick under its original message,
+    the unstaged edit and the untracked file land in one inserted seal commit
+    carrying the ``Attempt-Id`` trailer, the remaining picks still apply, and
+    no Preserved-revision ref is left behind.
+    """
+
+    workspace, clone, prepared, _ = _paused_rebase_with_two_picks(tmp_path)
+    (clone / "README.md").write_text("resolved content\n")
+    git(clone, "add", "README.md")
+    (clone / ".gitignore").write_text(".venv/\n.env\n")
+    (clone / "notes.txt").write_text("new notes\n")
+
+    finished = workspace.finish_paused_rebase(
+        prepared,
+        issue_number=19,
+        attempt_id="attempt-finish-1",
+        status=ModelExecutionStatus.SUCCEEDED,
+    )
+
+    assert finished.completed is True
+    assert workspace.has_unresolved_conflicts() is False
+    assert git(clone, "branch", "--show-current") == "agent/issue-19"
+    subjects = git(clone, "log", "--format=%s", "agent/issue-19").splitlines()
+    assert subjects[:3] == [
+        "Branch pick two",
+        "Seal attempt work for #19 (succeeded)",
+        "Branch pick one",
+    ]
+    seal = git(clone, "log", "--format=%H", "--grep=Seal attempt work", "agent/issue-19")
+    body = git(clone, "log", "--format=%B", "-1", seal)
+    assert "Attempt-Id: attempt-finish-1" in body
+    sealed_files = git(clone, "show", "--format=", "--name-only", seal).splitlines()
+    assert sorted(sealed_files) == [".gitignore", "notes.txt"]
+    assert (clone / "README.md").read_text() == "resolved content\n"
+    assert (clone / ".gitignore").read_text() == ".venv/\n.env\n"
+    assert (clone / "notes.txt").read_text() == "new notes\n"
+    assert (clone / "feature.txt").read_text() == "feature work"
+    assert git(clone, "for-each-ref", "refs/agent/preserved") == ""
+
+
+def test_finish_paused_rebase_keeps_a_mid_rebase_note_commit_reachable(
+    tmp_path: Path,
+) -> None:
+    """A handoff-note commit the model made mid-rebase stays on the branch.
+
+    The incident behind this change committed the note on the detached HEAD
+    and lost it in the abort; finishing the rebase instead keeps that commit
+    reachable from the attempt branch.
+    """
+
+    workspace, clone, prepared, _ = _paused_rebase_with_two_picks(tmp_path)
+    (clone / "README.md").write_text("resolved content\n")
+    git(clone, "add", "README.md")
+    (clone / ".agent").mkdir(exist_ok=True)
+    (clone / ".agent" / "handoff").mkdir(exist_ok=True)
+    (clone / ".agent" / "handoff" / "19.md").write_text("# Handoff note\n")
+    git(clone, "add", ".agent/handoff/19.md")
+    git(clone, "commit", "-m", "Handoff note: issue #19")
+    note = git(clone, "rev-parse", "HEAD")
+    (clone / ".gitignore").write_text(".venv/\n.env\n")
+
+    finished = workspace.finish_paused_rebase(
+        prepared,
+        issue_number=19,
+        attempt_id="attempt-finish-2",
+        status=ModelExecutionStatus.HANDOFF_REQUESTED,
+    )
+
+    assert finished.completed is True
+    assert workspace.has_unresolved_conflicts() is False
+    assert git(clone, "merge-base", "--is-ancestor", note, "agent/issue-19") == ""
+    subjects = git(clone, "log", "--format=%s", "agent/issue-19").splitlines()
+    assert "Handoff note: issue #19" in subjects
+    assert (clone / "README.md").read_text() == "resolved content\n"
+
+
+def test_finish_paused_rebase_refuses_markers_and_abort_keeps_everything(
+    tmp_path: Path,
+) -> None:
+    """Leftover conflict markers take the preserve/abort/clean fallback.
+
+    The runtime refuses to finish, so no commit may contain the markers. The
+    abort restores the pre-rebase branch and the workspace is cleaned --
+    including untracked files -- because the whole workspace (staged,
+    unstaged, and untracked changes) is kept under the Preserved ref.
+    """
+
+    workspace, clone, prepared, pre_rebase_revision = _paused_rebase_with_two_picks(
+        tmp_path
+    )
+    # The model staged nothing: the markers are still in the worktree.
+    assert "<<<<<<<" in (clone / "README.md").read_text()
+    (clone / "notes.txt").write_text("new notes\n")
+
+    finished = workspace.finish_paused_rebase(
+        prepared,
+        issue_number=19,
+        attempt_id="attempt-fallback-1",
+        status=ModelExecutionStatus.SUCCEEDED,
+    )
+
+    assert finished.completed is False
+    assert finished.preserved_ref == "refs/agent/preserved/issue-19/attempt-fallback-1"
+    assert finished.preserved_revision is not None
+    kept = workspace.abort_unresolved_rebase(
+        prepared, issue_number=19, attempt_id="attempt-fallback-1"
+    )
+    workspace.clean_untracked()
+
+    assert kept is not None
+    assert kept.ref == finished.preserved_ref
+    assert workspace.has_unresolved_conflicts() is False
+    assert git(clone, "rev-parse", "agent/issue-19") == pre_rebase_revision
+    assert git(clone, "status", "--porcelain") == ""
+    assert not (clone / "notes.txt").exists()
+    assert (
+        git(clone, "show", f"{kept.revision}:README.md").find("<<<<<<<") != -1
+    )
+    assert git(clone, "show", f"{kept.revision}:notes.txt") == "new notes"
+    for revision in git(clone, "log", "--format=%H", "agent/issue-19").splitlines():
+        assert "<<<<<<<" not in git(clone, "show", f"{revision}:README.md")
+
+
+def test_finish_paused_rebase_falls_back_when_a_later_pick_conflicts(
+    tmp_path: Path,
+) -> None:
+    """A later pick conflicting with the inserted seal takes the fallback too."""
+
+    remote, seed = repository_with_main(tmp_path)
+    clone = tmp_path / "clone"
+    workspace = GitWorkspace(clone, str(remote), token_provider=lambda: "secret-token")
+    workspace.prepare_attempt(base_branch="main", issue_number=19)
+    git(clone, "config", "user.name", "Test User")
+    git(clone, "config", "user.email", "test@example.com")
+    write_and_commit(clone, "README.md", "branch change", "Branch pick one")
+    # The second pick touches the same file the model's unstaged edit seals.
+    write_and_commit(clone, ".gitignore", ".venv/\nnode_modules/\n", "Branch pick two")
+
+    write_and_commit(seed, "README.md", "upstream fix", "Upstream commit")
+    git(seed, "push", "origin", "main")
+
+    prepared = workspace.prepare_attempt(base_branch="main", issue_number=19)
+    assert workspace.has_unresolved_conflicts() is True
+
+    (clone / "README.md").write_text("resolved content\n")
+    git(clone, "add", "README.md")
+    (clone / ".gitignore").write_text(".venv/\n.env\n")
+
+    finished = workspace.finish_paused_rebase(
+        prepared,
+        issue_number=19,
+        attempt_id="attempt-fallback-2",
+        status=ModelExecutionStatus.SUCCEEDED,
+    )
+
+    assert finished.completed is False
+    assert "later pick" in (finished.reason or "")
+    assert finished.preserved_ref == "refs/agent/preserved/issue-19/attempt-fallback-2"
+    kept = workspace.abort_unresolved_rebase(
+        prepared, issue_number=19, attempt_id="attempt-fallback-2"
+    )
+    workspace.clean_untracked()
+
+    assert kept is not None
+    assert git(clone, "rev-parse", "agent/issue-19") == prepared.pre_rebase_revision
+    assert git(clone, "status", "--porcelain") == ""
