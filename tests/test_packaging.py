@@ -843,7 +843,7 @@ class TestDockerSmoke:
         )
         envelope = json.loads(lines[-1])
         assert envelope.get("contract") == "1.2", (
-            f"Contract envelope must carry contract 1.0; got: {envelope!r}"
+            f"Contract envelope must carry contract 1.2; got: {envelope!r}"
         )
         # No engine runs in this one-shot container, so identity answers
         # agent_unreachable through the contract envelope (exit 6) instead

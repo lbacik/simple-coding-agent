@@ -2194,13 +2194,9 @@ class ModelExecutor:
                 elif isinstance(message, AssistantMessage):
                     if deferred_results:
                         model_turn_after_defer = True
-                    thread_id = getattr(message, "parent_tool_use_id", None) or "main"
-                    if thread_id == "main":
-                        response_origin = "main"
-                        response_conversation = "main"
-                    else:
-                        response_origin = "subagent"
-                        response_conversation = f"subagent:{thread_id}"
+                    response_origin, response_conversation = self._invocation_thread(
+                        getattr(message, "parent_tool_use_id", None)
+                    )
                     for block in message.content:
                         if isinstance(block, TextBlock) and block.text.strip():
                             self._log(
@@ -3470,7 +3466,7 @@ class ModelExecutor:
     def _invocation_thread(agent_id: str | None) -> tuple[str, str]:
         """The (origin, conversation) of one tool invocation (contract 1.2)."""
 
-        if agent_id is not None:
+        if agent_id:
             return "subagent", f"subagent:{agent_id}"
         return "main", "main"
 

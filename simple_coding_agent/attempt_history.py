@@ -199,6 +199,12 @@ _LINKED_KINDS = ("tool_call", "tool_result", "model_output")
 _CALL_RESULT_FIELDS = ("call_id", "tool")
 
 
+def _non_empty_str(value: object) -> bool:
+    """Whether ``value`` is a usable link-field string (never a bool)."""
+
+    return isinstance(value, str) and bool(value) and not isinstance(value, bool)
+
+
 def _scan_entries(run_dir: Path) -> list[dict[str, Any]]:
     """Hash every public evidence file of one archive directory, sorted by path."""
 
@@ -253,41 +259,62 @@ def _overlay_evidence_metadata(
         if not isinstance(metadata, dict):
             continue
         at = metadata.get("at")
-        if isinstance(at, str) and at and _is_manifest_timestamp(at):
+        if isinstance(at, str) and _is_manifest_timestamp(at):
             entry["at"] = at
         for field in ("origin", "conversation"):
             value = metadata.get(field)
-            if isinstance(value, str) and value and not isinstance(value, bool):
+            if _non_empty_str(value):
                 entry[field] = value
         if entry.get("kind") != "model_output":
             for field in _CALL_RESULT_FIELDS:
                 value = metadata.get(field)
-                if isinstance(value, str) and value and not isinstance(value, bool):
+                if _non_empty_str(value):
                     entry[field] = value
     if sealed:
-        calls = {
-            str(entry["call_id"])
-            for entry in entries
-            if entry.get("kind") == "tool_call"
-            and isinstance(entry.get("call_id"), str)
-            and entry["call_id"]
-        }
-        for entry in entries:
-            if entry.get("kind") != "tool_result":
-                continue
-            call_id = entry.get("call_id")
-            if (
-                isinstance(call_id, str)
-                and call_id
-                and not isinstance(call_id, bool)
-                and call_id not in calls
-            ):
-                del entry["call_id"]
+        _prune_sealed_call_ids(entries)
+
+
+def _prune_sealed_call_ids(entries: list[dict[str, Any]]) -> None:
+    """Enforce the sealed cross-entry rules (spec section 7.6), in place.
+
+    Entries arrive in path order, so the first entry of a kind keeps a
+    duplicated ``call_id`` and later duplicates lose it. A ``tool_result``
+    then keeps its ``call_id`` only when a ``tool_call`` with the same
+    ``call_id`` is archived in the same Attempt.
+    """
+
+    seen: dict[str, set[str]] = {"tool_call": set(), "tool_result": set()}
+    for entry in entries:
+        kind = entry.get("kind")
+        if kind not in ("tool_call", "tool_result"):
+            continue
+        call_id = entry.get("call_id")
+        if not _non_empty_str(call_id):
+            continue
+        assert isinstance(call_id, str)
+        if call_id in seen[kind]:
+            del entry["call_id"]
+        else:
+            seen[kind].add(call_id)
+    calls = seen["tool_call"]
+    for entry in entries:
+        if entry.get("kind") != "tool_result":
+            continue
+        call_id = entry.get("call_id")
+        if _non_empty_str(call_id) and call_id not in calls:
+            del entry["call_id"]
 
 
 def _is_manifest_timestamp(value: str) -> bool:
-    """Whether ``value`` is shaped like a contract timestamp (spec section 7)."""
+    """Whether ``value`` is shaped like a contract timestamp (spec section 7).
 
+    Contract timestamps are ISO-8601 UTC with the ``Z`` suffix; a missing
+    suffix or a non-UTC offset never counts, even when ``fromisoformat``
+    could parse it.
+    """
+
+    if not isinstance(value, str) or not value.endswith("Z"):
+        return False
     try:
         parsed = datetime.fromisoformat(value.removesuffix("Z") + "+00:00")
     except (ValueError, AttributeError):

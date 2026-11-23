@@ -397,3 +397,83 @@ def test_native_tool_event_text_is_unchanged(tmp_path: Path) -> None:
     )
     assert sub_call.startswith("Read [subagent:sub-1] -> ")
     assert "call_id" not in call_event
+
+
+def test_sealed_manifest_keeps_first_call_id_per_kind(tmp_path: Path) -> None:
+    archive = _archive(tmp_path)
+    for name in (
+        "0001_tool_call.json",
+        "0002_tool_call.json",
+        "0003_tool_result.json",
+        "0004_tool_result.json",
+    ):
+        archive.write_text(name, '{"payload": true}')
+    for name in ("0001_tool_call.json", "0002_tool_call.json"):
+        archive.record_evidence_metadata(
+            name,
+            {
+                "at": "2026-11-23T12:00:00Z",
+                "call_id": "toolu-dup",
+                "tool": "Bash",
+                "origin": "main",
+                "conversation": "main",
+            },
+        )
+    for name in ("0003_tool_result.json", "0004_tool_result.json"):
+        archive.record_evidence_metadata(
+            name,
+            {
+                "at": "2026-11-23T12:00:00Z",
+                "call_id": "toolu-dup",
+                "tool": "Bash",
+                "origin": "main",
+                "conversation": "main",
+            },
+        )
+
+    sealed = seal_archive(archive.directory)
+    assert sealed is not None
+    by_path = {entry["path"]: entry for entry in sealed["manifest"]}
+    assert by_path["0001_tool_call.json"]["call_id"] == "toolu-dup"
+    assert "call_id" not in by_path["0002_tool_call.json"]
+    assert by_path["0003_tool_result.json"]["call_id"] == "toolu-dup"
+    assert "call_id" not in by_path["0004_tool_result.json"]
+    assert documents.validate_attempts_show(show_attempt(tmp_path, ATTEMPT_ID)) == []
+
+
+def test_non_utc_at_values_are_dropped_but_entries_stay(tmp_path: Path) -> None:
+    archive = _archive(tmp_path)
+    archive.write_text("0001_tool_call.json", '{"command": "ls"}')
+    archive.record_evidence_metadata(
+        "0001_tool_call.json",
+        {
+            "at": "2026-11-23T12:00:00+02:00",
+            "call_id": "toolu-offset",
+            "tool": "Bash",
+            "origin": "main",
+            "conversation": "main",
+        },
+    )
+    archive.write_text("0002_tool_result.json", '{"stdout": "ok"}')
+    archive.record_evidence_metadata(
+        "0002_tool_result.json",
+        {
+            "at": "2026-11-23T12:00:00",
+            "call_id": "toolu-naive",
+            "tool": "Bash",
+            "origin": "main",
+            "conversation": "main",
+        },
+    )
+
+    shown = show_attempt(tmp_path, ATTEMPT_ID)
+    by_path = {entry["path"]: entry for entry in shown["manifest"]}
+    assert "at" not in by_path["0001_tool_call.json"]
+    assert by_path["0001_tool_call.json"]["call_id"] == "toolu-offset"
+    assert "at" not in by_path["0002_tool_result.json"]
+    assert documents.validate_attempts_show(shown) == []
+    sealed = seal_archive(archive.directory)
+    assert sealed is not None
+    sealed_by_path = {entry["path"]: entry for entry in sealed["manifest"]}
+    assert "at" not in sealed_by_path["0001_tool_call.json"]
+    assert "at" not in sealed_by_path["0002_tool_result.json"]
