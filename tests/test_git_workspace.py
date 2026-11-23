@@ -371,7 +371,7 @@ def test_abort_unresolved_rebase_restores_the_pre_rebase_branch_state(
 
     prepared = workspace.prepare_attempt(base_branch="main", issue_number=19)
 
-    workspace.abort_unresolved_rebase(prepared)
+    workspace.abort_unresolved_rebase(prepared, issue_number=19, attempt_id="2026-11-20T15:15:00.359514Z")
 
     assert "<<<<<<<" not in (clone / "README.md").read_text()
     assert git(clone, "status", "--porcelain") == ""
@@ -401,7 +401,7 @@ def test_abort_unresolved_rebase_restores_after_rebase_quit(tmp_path: Path) -> N
 
     assert workspace.has_unresolved_conflicts() is True
 
-    workspace.abort_unresolved_rebase(prepared)
+    workspace.abort_unresolved_rebase(prepared, issue_number=19, attempt_id="2026-11-20T15:15:00.359514Z")
 
     assert workspace.has_unresolved_conflicts() is False
     assert git(clone, "rev-parse", "agent/issue-19") == pre_rebase_revision
@@ -1072,7 +1072,7 @@ def test_scoped_marker_scan_still_flags_the_conflicted_file(tmp_path: Path) -> N
     problems = workspace.rebase_resolution_problems(prepared)
     assert any("README.md" in problem for problem in problems)
 
-    workspace.abort_unresolved_rebase(prepared)
+    workspace.abort_unresolved_rebase(prepared, issue_number=19, attempt_id="2026-11-20T15:15:00.359514Z")
     assert (clone / "README.md").read_text() == "branch change"
     assert workspace.has_unresolved_conflicts() is False
 

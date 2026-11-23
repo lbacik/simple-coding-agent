@@ -39,9 +39,12 @@ from simple_coding_agent.git_workspace import (
     AttemptCommit,
     DirtyWorkspaceError,
     GitWorkspaceError,
+    PausedRebaseFinish,
+    PausedRebasePreserved,
     PreparedAttempt,
     attempt_start_epoch,
 )
+from simple_coding_agent.unpushed_revision import preserved_ref_for_issue_attempt
 from simple_coding_agent.github_tracker import (
     CLAIM_MARKER_PREFIX,
     MERGE_CONFLICT,
@@ -199,6 +202,9 @@ class InMemoryWorkspace:
         # progress) to simulate a conflicting rebase for conflict attempts.
         self.prepare_conflicts: tuple[str, ...] = ()
         self.abort_calls: list[object] = []
+        self.preserve_calls: list[tuple[int, str]] = []
+        self.finish_calls: list[tuple[int, str]] = []
+        self.finish_unresolvable: tuple[str, str, str] | None = None
         self.cleanup_calls: list[tuple[str, bool]] = []
         self.seal_calls: list[tuple[int, str, ModelExecutionStatus]] = []
         self.note_calls: list[tuple[int, str]] = []
@@ -390,9 +396,60 @@ class InMemoryWorkspace:
         if self._resolve_after_model:
             self.resolve_conflict()
 
-    def abort_unresolved_rebase(self, prepared: PreparedAttempt) -> None:
+    def abort_unresolved_rebase(
+        self, prepared: PreparedAttempt, *, issue_number: int, attempt_id: str
+    ) -> PausedRebasePreserved | None:
         self.abort_calls.append(prepared)
+        preserved: PausedRebasePreserved | None = None
+        if self._conflict.in_progress or self.dirty:
+            ref = preserved_ref_for_issue_attempt(issue_number, attempt_id)
+            revision = f"preserved-{self._sequence + 1:04d}"
+            self.preserved_refs[ref] = revision
+            preserved = PausedRebasePreserved(ref=ref, revision=revision)
         self._conflict = ConflictState(in_progress=False)
+        return preserved
+
+    def preserve_paused_rebase(
+        self, *, issue_number: int, attempt_id: str
+    ) -> PausedRebasePreserved | None:
+        if not self._conflict.in_progress:
+            return None
+        ref = preserved_ref_for_issue_attempt(issue_number, attempt_id)
+        revision = f"preserved-{self._sequence + 1:04d}"
+        self.preserved_refs[ref] = revision
+        self.preserve_calls.append((issue_number, attempt_id))
+        return PausedRebasePreserved(ref=ref, revision=revision)
+
+    def finish_paused_rebase(
+        self,
+        prepared: PreparedAttempt,
+        *,
+        issue_number: int,
+        attempt_id: str,
+        status: object,
+    ) -> PausedRebaseFinish:
+        from simple_coding_agent.git_workspace import PausedRebaseFinish
+
+        self.finish_calls.append((issue_number, attempt_id))
+        if not self._conflict.in_progress:
+            return PausedRebaseFinish(completed=True)
+        if self.finish_unresolvable is not None:
+            reason, ref, revision = self.finish_unresolvable
+            self.preserved_refs[ref] = revision
+            return PausedRebaseFinish(
+                completed=False,
+                reason=reason,
+                preserved_ref=ref,
+                preserved_revision=revision,
+            )
+        ref = preserved_ref_for_issue_attempt(issue_number, attempt_id)
+        revision = f"preserved-{self._sequence + 1:04d}"
+        self.preserved_refs[ref] = revision
+        self._conflict = ConflictState(in_progress=False)
+        return PausedRebaseFinish(completed=True)
+
+    def clean_untracked(self) -> None:
+        self.dirty -= {name for name in self.dirty if name not in self.ignored}
 
     def seal(
         self,
@@ -478,9 +535,22 @@ class InMemoryWorkspace:
         return touches_other_files and relpath not in record.existing
 
     def cleanup(
-        self, *, base_branch: str, prepared: PreparedAttempt, retain_branch: bool
+        self,
+        *,
+        base_branch: str,
+        prepared: PreparedAttempt,
+        retain_branch: bool,
+        issue_number: int | None = None,
+        attempt_id: str | None = None,
     ) -> None:
         self.cleanup_calls.append((base_branch, retain_branch))
+        if (
+            issue_number is not None
+            and attempt_id is not None
+            and self._conflict.in_progress
+        ):
+            ref = preserved_ref_for_issue_attempt(issue_number, attempt_id)
+            self.preserved_refs[ref] = f"preserved-{self._sequence + 1:04d}"
         self._conflict = ConflictState(in_progress=False)
         if self.dirty - self.ignored - self.base_ignored:
             raise DirtyWorkspaceError(

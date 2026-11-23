@@ -16,6 +16,7 @@ from urllib.parse import urlsplit
 
 from simple_coding_agent.model_execution import ModelExecutionStatus
 from simple_coding_agent.observability import Redactor
+from simple_coding_agent.unpushed_revision import preserved_ref_for_issue_attempt
 
 # Bound on the redacted diagnostic output one failed git command keeps.
 GIT_OUTPUT_LIMIT = 2000
@@ -84,11 +85,15 @@ class RebaseConflictError(GitWorkspaceError):
         branch: str,
         base_branch: str,
         conflicted_files: tuple[str, ...] = (),
+        preserved_ref: str | None = None,
+        preserved_revision: str | None = None,
     ) -> None:
         super().__init__(message)
         self.branch = branch
         self.base_branch = base_branch
         self.conflicted_files = conflicted_files
+        self.preserved_ref = preserved_ref
+        self.preserved_revision = preserved_revision
 
 
 class BranchMovedSinceClaimError(GitWorkspaceError):
@@ -144,6 +149,35 @@ class ConflictState:
     in_progress: bool
     conflicted_files: tuple[str, ...] = ()
     resolution_problems: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class PausedRebasePreserved:
+    """The Preserved revision keeping a paused rebase's workspace.
+
+    ``ref`` is the deterministic ``refs/agent/preserved/...`` reference and
+    ``revision`` the snapshot commit capturing the whole workspace (staged,
+    unstaged and untracked changes) on top of the paused HEAD.
+    """
+
+    ref: str
+    revision: str
+
+
+@dataclass(frozen=True)
+class PausedRebaseFinish:
+    """The outcome of the runtime finishing a paused rebase itself.
+
+    ``completed`` reports whether the rebase now completes on the attempt
+    branch. On success the Preserved snapshot is deleted and both reference
+    fields are ``None``. Otherwise they name the kept work and ``reason``
+    says why the rebase could not finish.
+    """
+
+    completed: bool
+    reason: str | None = None
+    preserved_ref: str | None = None
+    preserved_revision: str | None = None
 
 
 def handoff_note_relpath(issue_number: int) -> str:
@@ -581,7 +615,13 @@ class GitWorkspace:
         return False
 
     def cleanup(
-        self, *, base_branch: str, prepared: PreparedAttempt, retain_branch: bool = True
+        self,
+        *,
+        base_branch: str,
+        prepared: PreparedAttempt,
+        retain_branch: bool = True,
+        issue_number: int | None = None,
+        attempt_id: str | None = None,
     ) -> None:
         """Best-effort abort of an unresolved rebase and switch to base_branch.
 
@@ -589,6 +629,11 @@ class GitWorkspace:
         tree is dirty: the workspace stays on the attempt branch and raises
         ``DirtyWorkspaceError`` so the caller can hold intake for operator
         inspection instead of carrying uncommitted work onto the base.
+
+        When ``issue_number`` and ``attempt_id`` are given and a rebase is
+        still in progress, the workspace is first kept as a Preserved
+        revision (best-effort: a preserve failure is logged and the abort
+        still runs), so the abort never silently discards the attempt's work.
 
         The one deliberate file deletion is scoped to reproducible artifacts:
         files ignored on the attempt branch survive ``git checkout`` and read
@@ -603,6 +648,22 @@ class GitWorkspace:
         work is preserved for operator inspection as before.
         """
 
+        if (
+            issue_number is not None
+            and attempt_id is not None
+            and self.has_unresolved_conflicts()
+        ):
+            try:
+                self.preserve_paused_rebase(
+                    issue_number=issue_number, attempt_id=attempt_id
+                )
+            except GitWorkspaceError as error:
+                self._event_log(
+                    "rebase_paused_work_preserve_failed",
+                    git_failure_detail(error),
+                    level="ERROR",
+                    issue_number=issue_number,
+                )
         try:
             self._git("rebase", "--abort")
         except GitWorkspaceError:
@@ -1180,25 +1241,312 @@ class GitWorkspace:
             problems.append("`git diff --check` reports whitespace errors.")
         return tuple(problems)
 
-    def abort_unresolved_rebase(self, prepared: PreparedAttempt) -> None:
-        """Abort a model-unresolved rebase and restore the pre-rebase branch state.
+    def preserve_paused_rebase(
+        self, *, issue_number: int, attempt_id: str
+    ) -> PausedRebasePreserved | None:
+        """Snapshot a paused rebase's whole workspace under the Preserved ref.
 
-        The abort alone restores the branch when the rebase is still in
-        progress; the hard reset to the recorded pre-rebase revision also
-        covers states the model left behind without rebase metadata (for
-        example after ``git rebase --quit``). Untracked files are preserved
-        as-is, matching the cleanup path. Raises
-        ``GitWorkspaceRecoveryError`` when the branch cannot be restored and
-        needs human cleanup.
+        Captures staged, unstaged and untracked changes as one commit on top
+        of the paused HEAD, without disturbing the index or the worktree, and
+        stores it under ``refs/agent/preserved/issue-<n>/<attempt-id>`` via
+        :meth:`preserve_revision`. Returns ``None`` when no rebase is in
+        progress (nothing needs keeping). The snapshot is built through a
+        throwaway index, so it also works with unmerged paths whose worktree
+        content (including any conflict markers) is what gets kept.
         """
 
+        if not self.has_unresolved_conflicts():
+            return None
+        ref = preserved_ref_for_issue_attempt(issue_number, attempt_id)
+        head = self._git("rev-parse", "HEAD")
+        descriptor, index_path = tempfile.mkstemp(prefix="paused-rebase-index-")
+        os.close(descriptor)
+        try:
+            extra_env = {"GIT_INDEX_FILE": index_path}
+            self._git_with_env("read-tree", head, extra_env=extra_env)
+            self._git_with_env("add", "-A", extra_env=extra_env)
+            tree = self._git_with_env("write-tree", extra_env=extra_env)
+            subject = f"Preserve paused-rebase work for #{issue_number}"
+            revision = self._git_with_env(
+                "commit-tree",
+                tree,
+                "-p",
+                head,
+                "-m",
+                f"{subject}\n\nAttempt-Id: {attempt_id}\n",
+                extra_env=extra_env,
+            )
+        finally:
+            try:
+                Path(index_path).unlink(missing_ok=True)
+            except OSError:
+                pass
+        self.preserve_revision(ref, revision)
+        self._event_log(
+            "rebase_paused_work_preserved",
+            f"ref={ref}; revision={revision}",
+            level="WARNING",
+            issue_number=issue_number,
+        )
+        return PausedRebasePreserved(ref=ref, revision=revision)
+
+    def _snapshot_workspace_for_abort(
+        self, *, issue_number: int, attempt_id: str
+    ) -> PausedRebasePreserved | None:
+        """Snapshot the workspace before an abort that restores the branch.
+
+        Unlike :meth:`preserve_paused_rebase` this also covers states without
+        rebase metadata (``git rebase --quit``) or with a completed rebase
+        whose post-resolution checks failed: the abort below resets the
+        branch, so anything not yet committed would be lost. Returns ``None``
+        when the tree holds nothing beyond the current HEAD.
+        """
+
+        if not self.has_unresolved_conflicts() and not self.dirty_status().strip():
+            return None
+        ref = preserved_ref_for_issue_attempt(issue_number, attempt_id)
+        head = self._git("rev-parse", "HEAD")
+        descriptor, index_path = tempfile.mkstemp(prefix="paused-rebase-index-")
+        os.close(descriptor)
+        try:
+            extra_env = {"GIT_INDEX_FILE": index_path}
+            self._git_with_env("read-tree", head, extra_env=extra_env)
+            self._git_with_env("add", "-A", extra_env=extra_env)
+            tree = self._git_with_env("write-tree", extra_env=extra_env)
+            if tree == self._git("rev-parse", f"{head}^{{tree}}"):
+                return None
+            subject = f"Preserve paused-rebase work for #{issue_number}"
+            revision = self._git_with_env(
+                "commit-tree",
+                tree,
+                "-p",
+                head,
+                "-m",
+                f"{subject}\n\nAttempt-Id: {attempt_id}\n",
+                extra_env=extra_env,
+            )
+        finally:
+            try:
+                Path(index_path).unlink(missing_ok=True)
+            except OSError:
+                pass
+        self.preserve_revision(ref, revision)
+        self._event_log(
+            "rebase_paused_work_preserved",
+            f"ref={ref}; revision={revision}",
+            level="WARNING",
+            issue_number=issue_number,
+        )
+        return PausedRebasePreserved(ref=ref, revision=revision)
+
+    def finish_paused_rebase(
+        self,
+        prepared: PreparedAttempt,
+        *,
+        issue_number: int,
+        attempt_id: str,
+        status: ModelExecutionStatus,
+    ) -> PausedRebaseFinish:
+        """Finish a model-paused rebase on behalf of the attempt.
+
+        Preserves the whole workspace first, then completes the paused pick
+        from the staged index (keeping its original message), seals any
+        remaining unstaged and untracked changes as an inserted commit, and
+        repeats ``git -c core.editor=true rebase --continue`` until the
+        rebase completes. On success the Preserved snapshot is deleted.
+        Returns the reason instead of finishing when unmerged paths or
+        conflict markers remain, or when a later pick hits a new conflict:
+        the caller then aborts, cleans, and reports ``rebase_conflict`` with
+        the kept work.
+        """
+
+        if not self.has_unresolved_conflicts():
+            return PausedRebaseFinish(completed=True)
+        preserved = self.preserve_paused_rebase(
+            issue_number=issue_number, attempt_id=attempt_id
+        )
+        assert preserved is not None
+        unmerged = self.conflicted_files()
+        marked = self.conflict_marker_files(
+            base_revision=prepared.base_revision,
+            original_conflicted=tuple(prepared.rebase_conflicts or ()),
+        )
+        if unmerged or marked:
+            detail = "; ".join(
+                [
+                    f"unmerged paths: {', '.join(unmerged)}" if unmerged else "",
+                    f"conflict markers remain in: {', '.join(marked)}" if marked else "",
+                ]
+            ).strip("; ")
+            return PausedRebaseFinish(
+                completed=False,
+                reason=detail,
+                preserved_ref=preserved.ref,
+                preserved_revision=preserved.revision,
+            )
+        stashed = False
+        if self._worktree_needs_stash():
+            try:
+                self._git(
+                    "stash",
+                    "push",
+                    "--keep-index",
+                    "-u",
+                    "-m",
+                    f"paused-rebase work for #{issue_number}",
+                )
+                stashed = True
+            except GitWorkspaceError as error:
+                if "No local changes" not in (error.output or ""):
+                    return PausedRebaseFinish(
+                        completed=False,
+                        reason=f"could not stash remaining changes: {error}",
+                        preserved_ref=preserved.ref,
+                        preserved_revision=preserved.revision,
+                    )
+        try:
+            if self._index_holds_staged_changes():
+                rebase_head = self._git("rev-parse", "--verify", "REBASE_HEAD")
+                self._git("commit", "--quiet", "-C", rebase_head)
+        except GitWorkspaceError as error:
+            if stashed:
+                try:
+                    self._git("stash", "pop")
+                except GitWorkspaceError:
+                    pass
+            return PausedRebaseFinish(
+                completed=False,
+                reason=f"could not complete the paused pick: {error}",
+                preserved_ref=preserved.ref,
+                preserved_revision=preserved.revision,
+            )
+        if stashed:
+            try:
+                self._git("stash", "pop")
+            except GitWorkspaceError as error:
+                try:
+                    self._git("stash", "drop")
+                except GitWorkspaceError:
+                    pass
+                return PausedRebaseFinish(
+                    completed=False,
+                    reason=f"remaining changes conflict with the resolution: {error}",
+                    preserved_ref=preserved.ref,
+                    preserved_revision=preserved.revision,
+                )
+            if not self.is_clean():
+                subject = f"Seal attempt work for #{issue_number} ({status})"
+                try:
+                    self._git("add", "-A")
+                    self._git(
+                        "commit", "--message", f"{subject}\n\nAttempt-Id: {attempt_id}\n"
+                    )
+                except GitWorkspaceError as error:
+                    return PausedRebaseFinish(
+                        completed=False,
+                        reason=f"could not seal remaining changes: {error}",
+                        preserved_ref=preserved.ref,
+                        preserved_revision=preserved.revision,
+                    )
+        for _ in range(20):
+            if not self.has_unresolved_conflicts():
+                break
+            try:
+                self._git("-c", "core.editor=true", "rebase", "--continue")
+            except GitWorkspaceError as error:
+                return PausedRebaseFinish(
+                    completed=False,
+                    reason=f"a later pick hit a new conflict: {error}",
+                    preserved_ref=preserved.ref,
+                    preserved_revision=preserved.revision,
+                )
+        else:
+            return PausedRebaseFinish(
+                completed=False,
+                reason="the rebase did not complete after 20 continue attempts",
+                preserved_ref=preserved.ref,
+                preserved_revision=preserved.revision,
+            )
+        if self.has_unresolved_conflicts():
+            return PausedRebaseFinish(
+                completed=False,
+                reason="the rebase is still in progress after continuing",
+                preserved_ref=preserved.ref,
+                preserved_revision=preserved.revision,
+            )
+        try:
+            self._git("update-ref", "-d", preserved.ref)
+        except GitWorkspaceError:
+            pass
+        return PausedRebaseFinish(completed=True)
+
+    def _worktree_needs_stash(self) -> bool:
+        """Whether unstaged or untracked changes would block ``rebase --continue``."""
+
+        try:
+            output = self._git("status", "--porcelain")
+        except GitWorkspaceError:
+            return True
+        for line in output.splitlines():
+            if not line.strip():
+                continue
+            if len(line) < 2:
+                continue
+            if line[1] != " ":
+                return True
+        return False
+
+    def _index_holds_staged_changes(self) -> bool:
+        """Whether the index differs from HEAD (a pick resolution to complete)."""
+
+        try:
+            self._git("diff", "--cached", "--quiet")
+        except GitWorkspaceError:
+            return True
+        return False
+
+    def clean_untracked(self) -> None:
+        """Remove untracked, non-ignored files from the working tree.
+
+        Used after a preserved abort of a paused rebase: the work is kept
+        under the Preserved revision, so leftovers must not hold the
+        workspace dirty.
+        """
+
+        self._git("clean", "-fd")
+
+    def abort_unresolved_rebase(
+        self,
+        prepared: PreparedAttempt,
+        *,
+        issue_number: int,
+        attempt_id: str,
+    ) -> PausedRebasePreserved | None:
+        """Abort a model-unresolved rebase and restore the pre-rebase branch state.
+
+        Keeps the workspace as a Preserved revision before touching anything,
+        so the abort never discards the attempt's work. The abort alone
+        restores the branch when the rebase is still in progress; the hard
+        reset to the recorded pre-rebase revision also covers states the
+        model left behind without rebase metadata (for example after
+        ``git rebase --quit``). Untracked files are preserved as-is, matching
+        the cleanup path. Raises ``GitWorkspaceRecoveryError`` when the
+        branch cannot be restored and needs human cleanup. Returns the kept
+        Preserved revision, or ``None`` when there was nothing to keep.
+        """
+
+        preserved: PausedRebasePreserved | None = None
+        if prepared.pre_rebase_revision is not None:
+            preserved = self._snapshot_workspace_for_abort(
+                issue_number=issue_number, attempt_id=attempt_id
+            )
         try:
             self._git("rebase", "--abort")
         except GitWorkspaceError:
             pass
         pre_rebase_revision = prepared.pre_rebase_revision
         if pre_rebase_revision is None:
-            return
+            return preserved
         try:
             self._git("reset", "--hard", pre_rebase_revision)
             self._git("checkout", prepared.branch)
@@ -1212,6 +1560,7 @@ class GitWorkspace:
                 f"Rebase of {prepared.branch} still holds unresolved conflicts "
                 "after abort; human cleanup is required"
             )
+        return preserved
 
     def _rebase_in_progress(self) -> bool:
         """Return True if git still reports an unresolved rebase state."""
@@ -1247,12 +1596,18 @@ class GitWorkspace:
         return True
 
     def _git(self, *arguments: str, cwd: Path | None = None) -> str:
+        return self._git_with_env(*arguments, cwd=cwd, extra_env={})
+
+    def _git_with_env(
+        self, *arguments: str, cwd: Path | None = None, extra_env: dict[str, str] | None = None
+    ) -> str:
         working_directory = self._clone_dir if cwd is None and arguments[0] != "clone" else cwd
         github_token = self._token_provider()
         if not isinstance(github_token, str) or not github_token:
             raise GitWorkspaceError("GITHUB_TOKEN is unavailable")
         redactor = Redactor((*self._redactions, github_token))
         with _askpass_environment(github_token) as environment:
+            environment.update(extra_env or {})
             try:
                 return self._run(("git", *arguments), working_directory, environment)
             except subprocess.CalledProcessError as error:
