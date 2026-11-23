@@ -734,6 +734,28 @@ def test_release_lost_claim_reports_a_missing_issue_as_gone() -> None:
     assert tracker.release_lost_claim(2) is None
 
 
+def test_classify_lost_claim_is_read_only() -> None:
+    transport = SharedTransport(issue(1))
+    tracker = worker_tracker(transport, "worker-a")
+    transport.current = issue(
+        1, labels=frozenset({"ready-for-agent", "claimed-by:worker-a"})
+    )
+
+    assert tracker.classify_lost_claim(1) == "unassigned"
+    assert transport.removed_labels == []
+    assert transport.current.labels == frozenset({"ready-for-agent", "claimed-by:worker-a"})
+
+    transport.current = issue(
+        1,
+        labels=frozenset({"ready-for-agent", "claimed-by:worker-b"}),
+        assignee_logins=("agent",),
+    )
+    assert tracker.classify_lost_claim(1) == "claimed_by_another"
+    assert transport.removed_labels == []
+
+    assert tracker.classify_lost_claim(2) is None
+
+
 def _restart_with_checkpoint(
     tmp_path: Path, tracker: FakeTracker
 ) -> tuple[AgentLifecycle, list[tuple[str, str, str]]]:

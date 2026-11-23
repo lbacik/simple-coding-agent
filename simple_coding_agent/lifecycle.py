@@ -418,6 +418,10 @@ class AttemptTracker(Protocol):
 
     def recover_claim(self, issue_number: int) -> Claim | None: ...
 
+    def classify_lost_claim(
+        self, issue_number: int
+    ) -> Literal["unassigned", "claimed_by_another"] | None: ...
+
     def release_lost_claim(
         self, issue_number: int
     ) -> Literal["unassigned", "claimed_by_another"] | None: ...
@@ -3492,6 +3496,39 @@ class AgentLifecycle:
                 " was discarded."
             )
         if claim is None:
+            try:
+                lost_reason = self._tracker.classify_lost_claim(issue_number)
+            except Exception as error:
+                return False, (
+                    f"recovery release for attempt {attempt_id} not fulfilled:"
+                    f" issue #{issue_number} is unavailable for recovery"
+                    f" ({_exception_detail(error)}); the hold remains and no"
+                    " work was discarded."
+                )
+            if lost_reason is None:
+                return False, (
+                    f"recovery release for attempt {attempt_id} not fulfilled:"
+                    f" issue #{issue_number} is unavailable for recovery;"
+                    " the hold remains and no work was discarded."
+                )
+            if self._workspace_is_dirty():
+                # The claim is lost but the attempt workspace still holds
+                # uncommitted work (or cannot be read): dropping the attempt
+                # would strand that work without an identity, and the next
+                # claim would hold on an unattributed dirty tree. The
+                # attempt stays retained with everything preserved — the
+                # tracker (including this Worker's own marker), the
+                # checkpoint, the branch, the working tree, and the archive
+                # are all left untouched.
+                self._remember_workspace_dirty(attempt_id, True)
+                return False, (
+                    f"recovery release for attempt {attempt_id} not fulfilled:"
+                    f" issue #{issue_number} is no longer claimed by this Worker"
+                    f" ({lost_reason}), but the attempt workspace still holds"
+                    " uncommitted work"
+                    f"{self._dirty_paths_suffix() or '.'}"
+                    " The hold remains and no work was discarded."
+                )
             try:
                 lost_reason = self._tracker.release_lost_claim(issue_number)
             except Exception as error:
@@ -6897,7 +6934,11 @@ class AgentLifecycle:
     def _abandon_lost_claim(self, checkpoint: AttemptCheckpoint, reason: str) -> None:
         """Drop a retained attempt whose claim is no longer this Worker's.
 
-        The tracker already removed only this Worker's own marker. Nothing
+        Callers classify the lost claim first and check the attempt
+        workspace before mutating the tracker: this must never run while
+        the tree is dirty (or unreadable), when the attempt stays retained
+        instead so its uncommitted work keeps its identity. The tracker
+        already removed only this Worker's own marker. Nothing
         is published, pushed, or taken over, and no terminal outcome is
         recorded, so nothing counts against the issue's budgets or the
         completion ledger. The outcome passed to the control accounting
@@ -7099,8 +7140,35 @@ class AgentLifecycle:
             # With ``WORKER_ID`` the issue can exist while this Worker's
             # claim does not (unassigned meanwhile, or only another
             # Worker's marker): that is a lost claim, not a missing issue.
-            lost_reason = self._tracker.release_lost_claim(checkpoint.issue_number)
+            lost_reason = self._tracker.classify_lost_claim(checkpoint.issue_number)
             if lost_reason is not None:
+                if self._workspace_is_dirty():
+                    # The claim is lost but the attempt workspace still
+                    # holds uncommitted work (or cannot be read): dropping
+                    # the attempt would strand that work without an
+                    # identity, and the next poll would hold on an
+                    # unattributed dirty tree. The attempt stays retained
+                    # with everything preserved — the tracker (including
+                    # this Worker's own marker), the checkpoint, the branch,
+                    # the working tree, and the archive are all left
+                    # untouched — and intake holds on the retained attempt
+                    # until the operator repairs the workspace.
+                    self._remember_workspace_dirty(checkpoint.started_at, True)
+                    self._event_log(
+                        "lost_claim_workspace_dirty",
+                        f"issue #{checkpoint.issue_number} is no longer claimed"
+                        f" by this Worker ({lost_reason}), but the workspace"
+                        f" for retained attempt {checkpoint.started_at} still"
+                        " holds uncommitted work"
+                        f"{self._dirty_paths_suffix() or '.'}"
+                        " The attempt is retained for recovery; no work was"
+                        " discarded.",
+                        level="WARNING",
+                        issue_number=checkpoint.issue_number,
+                    )
+                    self._active_issue_number = None
+                    return None
+                self._tracker.release_lost_claim(checkpoint.issue_number)
                 self._abandon_lost_claim(checkpoint, lost_reason)
                 return None
             # Recorded decision for #219: a retained checkpoint whose issue
