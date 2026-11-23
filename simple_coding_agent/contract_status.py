@@ -36,8 +36,10 @@ commands) with ``truncated: true``.
 from __future__ import annotations
 
 import json
+from collections.abc import Container
 
 from simple_coding_agent import telemetry as telemetry_module
+from simple_coding_agent.attempt_history import requires_attention
 from simple_coding_agent.control import CommandAcknowledgement, IntakeState
 
 
@@ -404,8 +406,17 @@ def project_current_attempt(
 # ---------------------------------------------------------------------------
 
 
-def project_last_finished(summary: dict | None) -> dict | None:
-    """Project the telemetry last-finished summary onto an AttemptSummary."""
+def project_last_finished(
+    summary: dict | None, *, held: Container[str] = frozenset()
+) -> dict | None:
+    """Project the telemetry last-finished summary onto an AttemptSummary.
+
+    ``attention_required`` comes from the shared Attempt-history helper
+    (retained or held work needs attention); the finished Attempt's
+    outcome plays no part, so a Handoff sets nothing by itself. ``held``
+    is the set of Attempt IDs currently held for recovery (empty for a
+    finished Attempt, whose checkpoint is gone).
+    """
 
     if summary is None:
         return None
@@ -449,7 +460,11 @@ def project_last_finished(summary: dict | None) -> dict | None:
             "label": _OUTCOME_LABELS.get(outcome, outcome),
         },
         "delivery": delivery,
-        "attention_required": outcome == "handoff",
+        "attention_required": (
+            requires_attention(attempt_id, held)
+            if isinstance(attempt_id, str)
+            else False
+        ),
         "sealed": True,
         "sealed_at": finished_at if isinstance(finished_at, str) else None,
     }
@@ -568,6 +583,7 @@ def build_status_snapshot(
     startup_check: str | None = None,
     last_halt: dict | None = None,
     recent_events: list | None = None,
+    held: Container[str] = frozenset(),
 ) -> dict:
     """Assemble one contract Status Snapshot from prepared state.
 
@@ -576,6 +592,9 @@ def build_status_snapshot(
     held). ``recovering`` covers startup reconciliation and intake held
     for recovery. ``last_halt`` is the durable halt from the previous
     engine-decided exit, if any; a successful start never erases it.
+    ``held`` is the set of Attempt IDs currently held for recovery,
+    feeding ``last_finished``'s ``attention_required`` through the
+    shared Attempt-history helper.
     """
 
     attempt_active = attempt is not None
@@ -606,7 +625,7 @@ def build_status_snapshot(
             usd_ceiling=usd_ceiling,
             observed_at=observed_at,
         ),
-        "last_finished": project_last_finished(last_finished),
+        "last_finished": project_last_finished(last_finished, held=held),
         "recent_commands": [
             project_command(record, payload, repository=repository)
             for record, payload in command_details

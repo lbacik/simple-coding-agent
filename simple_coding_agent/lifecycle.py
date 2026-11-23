@@ -4885,6 +4885,7 @@ class AgentLifecycle:
                 if self._contract_events is not None
                 else []
             ),
+            held=self._held_attempt_ids_locked(checkpoint),
         )
 
     def _recovery_hold_network_free(
@@ -6663,6 +6664,12 @@ class AgentLifecycle:
         completion ledger. The outcome passed to the control accounting
         only releases a stop plan waiting on this attempt. The checkpoint
         is removed and the archive sealed; intake then continues.
+
+        Like the regular release path, the dropped attempt still
+        finalizes: its archive record carries ``lifecycle_state``
+        ``released`` and telemetry's ``last_finished`` names it, with the
+        outcome publication already recorded in the archive record
+        (ADR 0010) or ``infrastructure_error`` when there is none.
         """
 
         attempt_id = checkpoint.started_at
@@ -6674,14 +6681,66 @@ class AgentLifecycle:
             level="WARNING",
             issue_number=checkpoint.issue_number,
         )
+        archive = self._archive_for(checkpoint.issue_number, attempt_id)
+        outcome = AttemptOutcome.INFRASTRUCTURE_ERROR
+        completed_at: str | None = None
+        if archive is not None:
+            try:
+                record = archive.read_attempt()
+            except Exception:
+                record = {}
+            if not isinstance(record, dict):
+                record = {}
+            raw = record.get("outcome")
+            if hasattr(raw, "value"):
+                raw = raw.value  # type: ignore[union-attr]
+            if isinstance(raw, str) and raw:
+                try:
+                    outcome = AttemptOutcome(raw)
+                except ValueError:
+                    outcome = AttemptOutcome.INFRASTRUCTURE_ERROR
+            existing = record.get("completed_at")
+            if isinstance(existing, str) and existing:
+                completed_at = existing
+        write_completed_at = completed_at is None
+        if completed_at is None:
+            completed_at = datetime.now(UTC).isoformat().replace("+00:00", "Z")
+        if archive is not None:
+            # A release without a Terminal Outcome still finalizes: the
+            # lifecycle state rides the archive record (its last write)
+            # into the telemetry and history projections. A completion
+            # timestamp rides along when the record has none yet, so the
+            # finalized attempt reads as finished everywhere (including
+            # the telemetry seed after a restart); the recorded outcome
+            # itself is never rewritten here.
+            try:
+                stamp: dict[str, object] = {"lifecycle_state": "released"}
+                if write_completed_at:
+                    stamp["completed_at"] = completed_at
+                archive.write_attempt(stamp)
+            except Exception:
+                pass
         self._record_control_finalization(attempt_id, AttemptOutcome.INFRASTRUCTURE_ERROR)
         self._attempt_state.delete()
         self._seal_archive_and_emit(
-            self._archive_for(checkpoint.issue_number, attempt_id),
+            archive,
             attempt_id,
             issue_number=checkpoint.issue_number,
         )
-        self._telemetry_finish()
+        issue_title = getattr(checkpoint, "issue_title", None)
+        if not isinstance(issue_title, str) or not issue_title:
+            issue_title = None
+        self._telemetry_finish(
+            self._last_finished_summary(
+                attempt_id,
+                checkpoint.issue_number,
+                issue_title,
+                outcome,
+                completed_at,
+                archive,
+                lifecycle_state="released",
+            )
+        )
         self._active_issue_number = None
 
     def _reconcile_startup(self) -> AttemptOutcome | None:

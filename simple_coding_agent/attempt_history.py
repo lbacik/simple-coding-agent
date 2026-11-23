@@ -401,6 +401,20 @@ def _archived_summary(
     )
 
 
+def requires_attention(attempt_id: str, held: Container[str]) -> bool:
+    """Whether one Attempt needs operator attention.
+
+    An Attempt needs attention exactly when its work is retained or held
+    for recovery. The Attempt's outcome plays no part: a finished Handoff
+    (automatic or operator) sets nothing by itself. This is the single
+    shared helper behind ``attention_required`` in both the Attempt
+    history and the Status Snapshot's ``last_finished``, so the two
+    projections can never disagree.
+    """
+
+    return attempt_id in held
+
+
 def _summary(
     *,
     attempt_id: str,
@@ -418,7 +432,7 @@ def _summary(
 
     return {
         "attempt_id": attempt_id,
-        "attention_required": attempt_id in held,
+        "attention_required": requires_attention(attempt_id, held),
         "delivery": _delivery(record),
         "finished_at": finished_at,
         "issue": {"number": issue_number, "title": issue_title},
