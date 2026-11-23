@@ -352,6 +352,13 @@ def test_unresolved_conflicts_after_the_model_abort_restore_and_raise(
     workspace = InMemoryWorkspace(tmp_path / "repo", resolve_after_model=False)
     workspace.model_commit("Retained work", files=("Retained work",))
     workspace.leave_conflict(files=("SubscriptionController.php",))
+    # The runtime finishes a merely-staged rebase itself now; force the
+    # fallback so this test still covers the abort-and-report path.
+    workspace.finish_unresolvable = (
+        "unmerged paths: SubscriptionController.php",
+        "refs/agent/preserved/issue-24/finish",
+        "preserved-finish",
+    )
     executor.after_execute = workspace.note_model_finished
     verifier = FakeVerifier(calls=calls)
     events: list[tuple[str, str, str]] = []
@@ -370,6 +377,7 @@ def test_unresolved_conflicts_after_the_model_abort_restore_and_raise(
         runner(claim(issue_number=24, issue_body="Fix the parser."), profile(), prepared)
 
     assert calls == ["execute"]
+    assert len(workspace.finish_calls) == 1
     assert len(workspace.abort_calls) == 1
     assert workspace.abort_calls[0] is prepared
     assert any(event == "rebase_resolution_started" for event, _, _ in events)
@@ -383,6 +391,12 @@ def test_unresolved_conflicts_after_the_model_abort_restore_and_raise(
     assert caught.value.branch == "agent/issue-24"
     assert caught.value.base_branch == "main"
     assert caught.value.conflicted_files == ("SubscriptionController.php",)
+    assert caught.value.preserved_ref is not None
+    assert caught.value.preserved_ref in workspace.preserved_refs
+    assert (
+        caught.value.preserved_revision
+        == workspace.preserved_refs[caught.value.preserved_ref]
+    )
 
 
 def test_failed_resolution_reports_the_detected_problem_not_unresolved_claim(
@@ -442,6 +456,11 @@ def test_fallback_falls_back_to_the_prepare_snapshot_for_the_file_list(
     executor = FakeModelExecutor(status=ModelExecutionStatus.SUCCEEDED)
     workspace = seeded_workspace(tmp_path / "repo", "Retained work")
     workspace.leave_conflict(files=())
+    workspace.finish_unresolvable = (
+        "unmerged paths: SubscriptionController.php",
+        "refs/agent/preserved/issue-24/finish",
+        "preserved-finish",
+    )
     events: list[tuple[str, str, str]] = []
     runner = build_runner(
         tmp_path,
@@ -457,6 +476,7 @@ def test_fallback_falls_back_to_the_prepare_snapshot_for_the_file_list(
         runner(claim(issue_number=24, issue_body="Fix the parser."), profile(), prepared)
 
     assert caught.value.conflicted_files == ("SubscriptionController.php",)
+    assert caught.value.preserved_ref in workspace.preserved_refs
     started = [detail for event, detail, _ in events if event == "rebase_resolution_started"]
     assert len(started) == 1
     assert "SubscriptionController.php" in started[0]
@@ -480,6 +500,11 @@ def test_unreadable_verification_state_fails_safe_without_running_setup(
     workspace.leave_conflict(
         files=(),
         problems=("Conflict-resolution verification failed; treating the tree as conflicted.",),
+    )
+    workspace.finish_unresolvable = (
+        "verification failed",
+        "refs/agent/preserved/issue-24/finish",
+        "preserved-finish",
     )
     verifier = FakeVerifier(calls=calls)
     events: list[tuple[str, str, str]] = []

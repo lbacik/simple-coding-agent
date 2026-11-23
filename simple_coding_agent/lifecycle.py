@@ -3289,6 +3289,8 @@ class AgentLifecycle:
                 # comment_posted is True here (the unconfirmed path returned
                 # above), so only genuinely unpublished work retains.
                 retain_branch=bool(retain_branch),
+                issue_number=claim.issue.number,
+                attempt_id=attempt_id,
             )
             self._observe_and_remember_workspace_dirty(attempt_id)
         except DirtyWorkspaceError as error:
@@ -3481,6 +3483,8 @@ class AgentLifecycle:
                 base_branch=profile.base_branch,
                 prepared=prepared,
                 retain_branch=True,
+                issue_number=claim.issue.number,
+                attempt_id=attempt_id,
             )
         except Exception as error:
             return False, (
@@ -5577,6 +5581,8 @@ class AgentLifecycle:
                             base_branch=profile.base_branch if profile is not None else "main",
                             prepared=prepared,
                             retain_branch=retain_branch or not comment_posted,
+                            issue_number=claim.issue.number,
+                            attempt_id=checkpoint.started_at,
                         )
                         cleanup_ok = True
                         self._observe_and_remember_workspace_dirty(
@@ -7320,6 +7326,8 @@ class AgentLifecycle:
                             base_branch=profile.base_branch if profile is not None else "main",
                             prepared=prepared,
                             retain_branch=retain_branch or not comment_posted,
+                            issue_number=claim.issue.number,
+                            attempt_id=checkpoint.started_at,
                         )
                         cleanup_ok = True
                         self._observe_and_remember_workspace_dirty(

@@ -464,7 +464,9 @@ def _token_handoff_steps(issue_number: int | None) -> str:
         " using the pre-filled header above verbatim, and fill in Summary,"
         " Remaining work and Evidence. Bash cannot create or modify files"
         " while the handoff is pending.\n"
-        f"4. In one `Bash` call, run `git add .agent/handoff/{note_label}.md"
+        f"4. If a rebase is in progress, finish the paused rebase first with"
+        " `git rebase --continue` (repeat until it completes), then in one"
+        f" `Bash` call, run `git add .agent/handoff/{note_label}.md"
         f" && git commit -m \"Handoff note: issue #{note_label}\"`.\n"
         "5. Stop."
     )
@@ -496,7 +498,9 @@ def _cost_handoff_followup_prompt(
     base = (
         "This attempt crossed its token soft threshold and must now end by handing off. "
         "Invoke the `handoff` skill now to preserve your progress: commit any outstanding "
-        "work, then write and commit the handoff note. Do not attempt further implementation "
+        "work, then write and commit the handoff note. If a rebase is in progress, "
+        "finish the paused rebase with `git rebase --continue` before committing "
+        "the handoff note. Do not attempt further implementation "
         f"work. {_HANDOFF_SKILL_TOOL_HINT} {_handoff_target(issue_number)}"
         f"{_attempt_id_sentence(attempt_id)} {_HANDOFF_NOTE_TOOL_HINT}"
     )
@@ -506,6 +510,8 @@ def _cost_handoff_followup_prompt(
         "This attempt crossed its token soft threshold and must now end by handing off. "
         "Invoke the `handoff` skill now and use the current branch state below: "
         "write and commit the handoff note, leaving any uncommitted work alone. "
+        "If a rebase is in progress, finish the paused rebase with "
+        "`git rebase --continue` before committing the handoff note. "
         "Do not attempt further implementation "
         f"work. {_HANDOFF_SKILL_TOOL_HINT} {_handoff_target(issue_number)}"
         f"{_attempt_id_sentence(attempt_id)} {_HANDOFF_NOTE_TOOL_HINT}"
@@ -557,9 +563,13 @@ def _operator_handoff_followup_prompt(
 #: Appended to every soft-threshold denial so the model knows what stays allowed.
 _COST_ALLOWED_COMMANDS = (
     "Still allowed: `git status`, `git diff`, `git add`, `git commit`, `git log`,"
-    " `git rev-parse`, `git rev-list`, `git branch --show-current`, and committing"
+    " `git rev-parse`, `git rev-list`, `git branch --show-current`,"
+    " `git rebase --continue` (run as `git -c core.editor=true rebase --continue`"
+    " so no editor opens) to finish a paused rebase before committing the handoff"
+    " note, and committing"
     " a handoff note created with the `Write` (or `Edit`) tool under"
-    " `.agent/handoff/`. Bash cannot create or modify files after the threshold:"
+    " `.agent/handoff/`. `git rebase --skip`, `--abort`, `--quit`, `-i`, and any"
+    " other `rebase` form stay denied. Bash cannot create or modify files after the threshold:"
     " write the note with the `Write`/`Edit` tool, then run `git add` +"
     " `git commit`. A compound command (`&&`, `;`, `|`) is"
     " denied as a whole if any part of it is not allowed, so split it up."
@@ -4314,6 +4324,13 @@ def _is_handoff_command(command: str) -> bool:
             subcommand = _git_subcommand(arguments)
             if subcommand in ("status", "diff", "add", "commit", "log", "rev-parse", "rev-list"):
                 continue
+            if subcommand == "rebase" and _git_subcommand_arguments(arguments) == ["--continue"]:
+                # A paused rebase must be finishable after the soft threshold
+                # so the model can complete it before committing the handoff
+                # note (ADR 0011). Only the plain continue form stays
+                # allowed: --skip/--abort/--quit/-i and bare rebase are still
+                # denied below.
+                continue
             if subcommand == "branch" and _git_subcommand_arguments(arguments) in (
                 [],
                 ["--show-current"],
@@ -4332,7 +4349,7 @@ def _git_subcommand(arguments: list[str]) -> str | None:
     index = 0
     while index < len(arguments):
         argument = arguments[index]
-        if argument == "-C" and index + 1 < len(arguments):
+        if argument in ("-C", "-c") and index + 1 < len(arguments):
             index += 2
         elif argument.startswith("-"):
             index += 1
@@ -4347,7 +4364,7 @@ def _git_subcommand_arguments(arguments: list[str]) -> list[str] | None:
     index = 0
     while index < len(arguments):
         argument = arguments[index]
-        if argument == "-C" and index + 1 < len(arguments):
+        if argument in ("-C", "-c") and index + 1 < len(arguments):
             index += 2
         elif argument.startswith("-"):
             index += 1
