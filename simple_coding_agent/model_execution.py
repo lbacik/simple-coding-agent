@@ -579,6 +579,75 @@ _COST_ALLOWED_COMMANDS = (
     " denied as a whole if any part of it is not allowed, so split it up."
 )
 
+#: Observability event for the first paused-rebase reminder of a run.
+_REBASE_PAUSED_REMINDER_EVENT = "rebase_paused_reminder"
+
+
+def _read_rebase_pick_number(path: Path) -> int | None:
+    """One git rebase counter file as an int, or ``None`` when unreadable."""
+
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    try:
+        value = int(text.strip().split()[0])
+    except (ValueError, IndexError):
+        return None
+    return value if value >= 1 else None
+
+
+def _paused_rebase_state(working_directory: Path | None) -> tuple[bool, int | None, int | None]:
+    """Whether a rebase is paused in ``working_directory``, with pick counts.
+
+    Mirrors the rebase part of ``GitWorkspace.has_unresolved_conflicts`` /
+    ``GitWorkspace._rebase_in_progress`` (``.git/rebase-merge`` or
+    ``.git/rebase-apply`` exists). A direct ``GitWorkspace`` import would be
+    circular (that module imports ``ModelExecutionStatus`` from here), so the
+    directory check stays filesystem-local and git-specific state (unmerged
+    paths, ``MERGE_HEAD``) is out of scope. Returns ``(paused, remaining,
+    total)``; the counts are ``None`` when git does not expose them. Never
+    raises: an unreadable workspace reports ``(False, None, None)`` so the
+    hook falls back to today's behaviour.
+    """
+
+    try:
+        if working_directory is None:
+            return (False, None, None)
+        git_dir = Path(working_directory) / ".git"
+        if not git_dir.is_dir():
+            return (False, None, None)
+        if (git_dir / "rebase-merge").is_dir():
+            state_dir = git_dir / "rebase-merge"
+        elif (git_dir / "rebase-apply").is_dir():
+            state_dir = git_dir / "rebase-apply"
+        else:
+            return (False, None, None)
+    except Exception:
+        return (False, None, None)
+    for current_name, total_name in (("msgnum", "end"), ("next", "last")):
+        current = _read_rebase_pick_number(state_dir / current_name)
+        total = _read_rebase_pick_number(state_dir / total_name)
+        if current is not None and total is not None and current <= total:
+            return (True, total - current + 1, total)
+    return (True, None, None)
+
+
+def _paused_rebase_reminder(remaining: int | None, total: int | None = None) -> str:
+    """The steering text sent while a rebase is paused."""
+
+    if remaining is not None and total is not None:
+        count_sentence = f" {remaining} of {total} picks remaining."
+    else:
+        count_sentence = ""
+    return (
+        "A git rebase is still paused in this workspace."
+        f"{count_sentence} Finish it now before any issue work: resolve the"
+        " conflicts, stage the resolutions with `git add`, and run"
+        " `git rebase --continue` until the rebase completes."
+        " Do not start or continue issue work until the rebase has completed."
+    )
+
 
 class ModelExecutionStatus(StrEnum):
     """Status of the SDK stream; the evaluator maps it to an attempt outcome."""
@@ -820,6 +889,7 @@ class ModelExecutor:
         self._operator_begun = False
         self._operator_deadline_expired = False
         self._cli_session_id: str | None = None
+        self._rebase_paused_reminder_logged = False
         self._token_hard_ceiling_reached = False
         self._last_assistant_text: str | None = None
         self._edited_files: list[str] = []
@@ -1479,6 +1549,7 @@ class ModelExecutor:
         self._ensure_ledger_thread("main", prompt_chars=len(issue_body))
         self._operator_handoff = None
         self._operator_context_delivered = False
+        self._rebase_paused_reminder_logged = False
         self._operator_delivery_via = None
         self._operator_fallback_used = False
         self._operator_fallback_was_blocked = False
@@ -1830,6 +1901,37 @@ class ModelExecutor:
             else "operator_handoff_note_committed",
             f"revision={revision}; note={self._handoff_note_relpath()}",
         )
+
+    def _maybe_rebase_paused_context(self) -> str | None:
+        """The paused-rebase reminder, or ``None`` when no reminder is due.
+
+        Sent after every tool call (main thread and subagents) while the
+        attempt workspace holds a paused rebase, so a model that staged its
+        resolution cannot drift into issue work with the rebase still paused.
+        Suppressed once the soft threshold has crossed or an Operator Handoff
+        context was delivered: those gates' handoff allowlist does not permit
+        ``git rebase``, so the reminder would contradict them, and finishing
+        the rebase is then the runtime's job (ADR 0011). The first reminder
+        of a run emits one observability event; later ones are silent. Never
+        raises: a workspace state that cannot be read falls back to no
+        reminder.
+        """
+
+        if self._soft_threshold_crossed or self._operator_context_delivered:
+            return None
+        paused, remaining, total = _paused_rebase_state(self._working_directory)
+        if not paused:
+            return None
+        if not self._rebase_paused_reminder_logged:
+            self._rebase_paused_reminder_logged = True
+            if remaining is not None:
+                detail = f"remaining_picks={remaining}"
+                if total is not None:
+                    detail += f"; total_picks={total}"
+            else:
+                detail = "remaining_picks=unknown"
+            self._log(_REBASE_PAUSED_REMINDER_EVENT, detail)
+        return _paused_rebase_reminder(remaining, total)
 
     def _build_token_snapshot(self) -> str:
         """Collect the branch state for the two-call token handoff, now."""
@@ -3488,6 +3590,9 @@ class ModelExecutor:
                 " pending, so the handoff instruction is repeated here. "
                 + _operator_handoff_instruction(self._issue_number, self._attempt_id)
             )
+        rebase_context = self._maybe_rebase_paused_context()
+        if rebase_context is not None:
+            contexts.append(rebase_context)
         if contexts:
             return {
                 "hookSpecificOutput": {
