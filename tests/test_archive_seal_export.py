@@ -286,7 +286,7 @@ def test_export_streams_pax_tar_with_manifest_first(tmp_path: Path) -> None:
         extracted = tar.extractfile(first)
         assert extracted is not None
         manifest = json.loads(extracted.read().decode("utf-8"))
-    assert manifest["contract"] == "1.0"
+    assert manifest["contract"] == "1.2"
     assert manifest["attempt"]["attempt_id"] == ATTEMPT_ID
     assert manifest["attempt"]["sealed"] is True
     assert [entry["path"] for entry in manifest["files"]] == [
@@ -627,7 +627,7 @@ def test_contract_export_path_filter_and_unknown_path(
         control_identity=lambda: {
             "backend": "simple-coding-agent",
             "agent_version": "0.0-test",
-            "contract": {"major": 1, "minor": 0},
+            "contract": {"major": 1, "minor": 2},
             "repository": REPOSITORY,
             "mode": "online",
             "process_started_at": "2026-11-06T08:00:00Z",
@@ -685,7 +685,7 @@ def test_contract_export_unknown_attempt_has_no_tar_bytes(
     assert err == ""
     assert code == 5
     envelope = json.loads(payload.decode("utf-8"))
-    assert envelope["contract"] == "1.0"
+    assert envelope["contract"] == "1.2"
     assert envelope["ok"] is False
     assert envelope["error"]["code"] == "not_found"
     assert envelope["error"]["retryable"] is False

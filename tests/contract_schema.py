@@ -5,7 +5,7 @@ Every contract ``_run`` helper routes its parsed envelope through
 tar bytes through :func:`validate_export_stream`, and Contract Event tests
 route single events through :func:`validate_contract_event`, so the in-repo
 suite fails on any drift between our projections and agent-operator-contract
-``v1.0.0`` --- not just on the local assertions.
+``v1.2.0`` --- not just on the local assertions.
 
 The checks layer the shared validators from the pinned library
 (:mod:`agent_operator_contract.documents`) under strict ``jsonschema``

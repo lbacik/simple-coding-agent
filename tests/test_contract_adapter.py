@@ -68,7 +68,7 @@ class _ContractControl:
         return {
             "backend": "simple-coding-agent",
             "agent_version": agent_version(),
-            "contract": {"major": 1, "minor": 0},
+            "contract": {"major": 1, "minor": 2},
             "repository": self._repository,
             "mode": "online",
             "process_started_at": "2026-11-06T08:00:00Z",
@@ -149,7 +149,7 @@ def test_contract_mismatch_before_anything_executes(
     code, envelope, _, err = _run(["--contract", "2", "status"])
     assert code == 4
     assert envelope == {
-        "contract": "1.0",
+        "contract": "1.2",
         "error": {
             "code": "contract_mismatch",
             "details": {"supported": [1]},
@@ -172,7 +172,7 @@ def test_contract_mismatch_with_garbage_operation() -> None:
 def test_missing_major_is_usage() -> None:
     code, envelope, _, err = _run(["--contract"])
     assert code == 2
-    assert envelope["contract"] == "1.0"
+    assert envelope["contract"] == "1.2"
     assert envelope["ok"] is False
     assert envelope["error"]["code"] == "usage"
     assert envelope["error"]["retryable"] is False
@@ -237,7 +237,7 @@ def test_offline_without_operation_is_usage() -> None:
 def test_malformed_argv_is_usage(argv: list[str]) -> None:
     code, envelope, _, err = _run(argv)
     assert code == 2, argv
-    assert envelope["contract"] == "1.0", argv
+    assert envelope["contract"] == "1.2", argv
     assert envelope["ok"] is False, argv
     assert envelope["error"]["code"] == "usage", argv
     assert envelope["error"]["retryable"] is False, argv
@@ -264,7 +264,7 @@ def test_identity_reports_backend_version_contract_repository_and_mode(
     code, envelope, _, err = _run(["--contract", "1", "identity"])
     assert code == 0
     assert envelope == {
-        "contract": "1.0",
+        "contract": "1.2",
         "ok": True,
         "result": {
             "backend": "simple-coding-agent",
@@ -277,7 +277,7 @@ def test_identity_reports_backend_version_contract_repository_and_mode(
                 "recovery-retry",
                 "stop-after",
             ],
-            "contract": {"major": 1, "minor": 0},
+            "contract": {"major": 1, "minor": 2},
             "mode": "online",
             "process_started_at": "2026-11-06T08:00:00Z",
             "repository": REPOSITORY,
@@ -333,7 +333,7 @@ def test_identity_matches_lifecycle_control_identity(
     result = envelope["result"]
     assert result["backend"] == "simple-coding-agent"
     assert result["agent_version"] == agent_version()
-    assert result["contract"] == {"major": 1, "minor": 0}
+    assert result["contract"] == {"major": 1, "minor": 2}
     assert result["repository"] == REPOSITORY
     assert result["mode"] == "online"
     assert isinstance(result["process_started_at"], str)
@@ -351,7 +351,7 @@ def test_unreachable_engine_answers_agent_unreachable(
     monkeypatch.setenv("AGENTCTL_SOCKET", str(tmp_path / "missing.sock"))
     code, envelope, _, err = _run(["--contract", "1", "identity"])
     assert code == 6
-    assert envelope["contract"] == "1.0"
+    assert envelope["contract"] == "1.2"
     assert envelope["ok"] is False
     assert envelope["error"]["code"] == "agent_unreachable"
     assert envelope["error"]["retryable"] is True
@@ -410,7 +410,7 @@ def test_unadvertised_capability_is_unsupported(contract_server) -> None:
     )
     assert code == 3
     assert envelope == {
-        "contract": "1.0",
+        "contract": "1.2",
         "error": {
             "code": "unsupported",
             "details": {"capability": "operator-handoff"},

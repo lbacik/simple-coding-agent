@@ -148,7 +148,7 @@ def _run(argv: list[str]) -> tuple[int, dict, str, str]:
 
 
 def _result(envelope: dict) -> dict:
-    assert envelope["contract"] == "1.0"
+    assert envelope["contract"] == "1.2"
     assert envelope["ok"] is True
     return envelope["result"]
 
@@ -435,7 +435,7 @@ def test_show_unknown_attempt_is_not_found(attempts_server) -> None:
 
     assert err == ""
     assert code == 5
-    assert envelope["contract"] == "1.0"
+    assert envelope["contract"] == "1.2"
     assert envelope["ok"] is False
     assert envelope["error"]["code"] == "not_found"
     assert envelope["error"]["retryable"] is False

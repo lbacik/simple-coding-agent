@@ -216,13 +216,13 @@ def _mutation(
 
 
 def _result(envelope: dict) -> dict:
-    assert envelope["contract"] == "1.0"
+    assert envelope["contract"] == "1.2"
     assert envelope["ok"] is True
     return envelope["result"]
 
 
 def _error(envelope: dict) -> dict:
-    assert envelope["contract"] == "1.0"
+    assert envelope["contract"] == "1.2"
     assert envelope["ok"] is False
     return envelope["error"]
 

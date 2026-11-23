@@ -17,7 +17,7 @@ tickets implement are parsed and gated here but answer ``unsupported``
 until their projection exists; an unreachable engine answers
 ``agent_unreachable`` and an engine-side failure answers ``internal``.
 
-The normative source is agent-operator-contract ``v1.0.0``. The
+The normative source is agent-operator-contract ``v1.2.0``. The
 contract-side rendering (DTOs, envelope, exit codes, CLI grammar and
 capability checks) uses the shared part of that library
 (:mod:`agent_operator_contract.shared`), pinned to the same tag; the
