@@ -914,3 +914,279 @@ def test_stale_notice_is_transparent_to_the_continuation_count() -> None:
     )
 
     assert count_automatic_continuations([automatic, _stale_notice(), automatic]) == 2
+
+
+# ---------------------------------------------------------------------------
+# acceptance: a lost claim with a dirty attempt workspace keeps the attempt
+# ---------------------------------------------------------------------------
+
+
+def _make_lost_claim_lifecycle(tmp_path: Path, *, issues):
+    """Wire a Worker lifecycle whose retained claim is lost, capturing events."""
+
+    from simple_coding_agent.lifecycle import AgentLifecycle
+
+    events: list[tuple[str, str, str]] = []
+    tracker = FakeTracker(issues=issues, worker_id="worker-a")
+    workspace = InMemoryWorkspace(tmp_path / "workspace", issue_number=24)
+    lifecycle = AgentLifecycle(
+        tracker=tracker,
+        attempt_state=AttemptStateStore(tmp_path),
+        workspace=workspace,
+        profile_loader=lambda _: type("Profile", (), {"base_branch": "main"})(),
+        publisher=FakePublisher(),
+        attempt_runner=lambda claim, profile, prepared: None,
+        control_store=ControlStore(tmp_path),
+        completion_store=AttemptCompletionStore(tmp_path),
+        sleeper=lambda seconds: None,
+        repository="owner/repo",
+        event_log=lambda event, detail="", level="INFO", issue_number=None: events.append(
+            (event, level, detail)
+        ),
+        attempt_archive_factory=lambda issue_number, started_at: (
+            __import__(
+                "simple_coding_agent.observability", fromlist=["AttemptArchive"]
+            ).AttemptArchive(tmp_path, issue_number=issue_number, started_at=started_at)
+        ),
+    )
+    return lifecycle, tracker, workspace, events
+
+
+def _seed_unsealed_archive(tmp_path: Path, checkpoint):
+    from simple_coding_agent.observability import AttemptArchive
+
+    archive = AttemptArchive(
+        tmp_path, issue_number=checkpoint.issue_number, started_at=checkpoint.started_at
+    )
+    archive.write_attempt(
+        {
+            "started_at": checkpoint.started_at,
+            "issue_number": checkpoint.issue_number,
+            "issue_title": "Implement recovery",
+            "outcome": "infrastructure_error",
+        }
+    )
+    return archive
+
+
+def _lost_claim_events(events):
+    return [(event, level) for event, level, _ in events]
+
+
+def test_release_lost_claim_with_untracked_work_stays_not_fulfilled(tmp_path: Path) -> None:
+    from simple_coding_agent.attempt_history import read_sealing_record
+
+    checkpoint = start_checkpoint(tmp_path)
+    assert checkpoint is not None
+    lifecycle, tracker, workspace, events = _make_lost_claim_lifecycle(
+        tmp_path, issues={24: _issue(24)}
+    )
+    archive = _seed_unsealed_archive(tmp_path, checkpoint)
+    workspace.make_dirty("docs/adr/0031-follow-up.md")
+
+    record = lifecycle.submit_recovery_release(
+        "req-dirty", checkpoint.started_at, "s3://bucket/work"
+    )
+
+    assert record.acknowledgement is CommandAcknowledgement.NOT_FULFILLED
+    assert "no longer claimed" in record.detail
+    assert "docs/adr/0031-follow-up.md" in record.detail
+    assert "hold remains" in record.detail
+    assert "no work was discarded" in record.detail
+    assert AttemptStateStore(tmp_path).read() is not None
+    assert tracker.removed_labels == []
+    assert "claim_lost" not in [event for event, _ in _lost_claim_events(events)]
+    assert read_sealing_record(archive.directory) is None
+
+
+def test_release_lost_claim_with_a_tracked_modification_stays_not_fulfilled(
+    tmp_path: Path,
+) -> None:
+    checkpoint = start_checkpoint(tmp_path)
+    assert checkpoint is not None
+    lifecycle, tracker, workspace, events = _make_lost_claim_lifecycle(
+        tmp_path, issues={24: _issue(24)}
+    )
+    workspace.make_dirty("src/main.py")
+
+    record = lifecycle.submit_recovery_release(
+        "req-dirty-tracked", checkpoint.started_at, "s3://bucket/work"
+    )
+
+    assert record.acknowledgement is CommandAcknowledgement.NOT_FULFILLED
+    assert "no longer claimed" in record.detail
+    assert "src/main.py" in record.detail
+    assert "hold remains" in record.detail
+    assert AttemptStateStore(tmp_path).read() is not None
+    assert tracker.removed_labels == []
+    assert "claim_lost" not in [event for event, _ in _lost_claim_events(events)]
+
+
+def test_release_lost_claim_with_a_clean_workspace_still_completes(tmp_path: Path) -> None:
+    from dataclasses import replace
+
+    checkpoint = start_checkpoint(tmp_path)
+    assert checkpoint is not None
+    owned = replace(
+        _issue(24),
+        labels=frozenset({"ready-for-agent", "claimed-by:worker-a"}),
+    )
+    lifecycle, tracker, _, events = _make_lost_claim_lifecycle(
+        tmp_path, issues={24: owned}
+    )
+
+    record = lifecycle.submit_recovery_release(
+        "req-clean", checkpoint.started_at, "s3://bucket/work"
+    )
+
+    assert record.acknowledgement is CommandAcknowledgement.COMPLETED
+    assert "the hold is cleared" in record.detail
+    assert AttemptStateStore(tmp_path).read() is None
+    assert ("issue-24", "claimed-by:worker-a") in tracker.removed_labels
+    assert ("claim_lost", "WARNING") in _lost_claim_events(events)
+
+
+def test_release_lost_claim_completes_after_the_tree_is_cleaned(tmp_path: Path) -> None:
+    checkpoint = start_checkpoint(tmp_path)
+    assert checkpoint is not None
+    lifecycle, tracker, workspace, _ = _make_lost_claim_lifecycle(
+        tmp_path, issues={24: _issue(24)}
+    )
+    workspace.make_dirty("docs/adr/0031-follow-up.md")
+
+    first = lifecycle.submit_recovery_release(
+        "req-dirty-first", checkpoint.started_at, "s3://bucket/work"
+    )
+    assert first.acknowledgement is CommandAcknowledgement.NOT_FULFILLED
+
+    workspace.dirty.clear()
+
+    second = lifecycle.submit_recovery_release(
+        "req-clean-second", checkpoint.started_at, "s3://bucket/work"
+    )
+    assert second.acknowledgement is CommandAcknowledgement.COMPLETED
+    assert "the hold is cleared" in second.detail
+    assert AttemptStateStore(tmp_path).read() is None
+
+
+def test_release_missing_issue_with_a_dirty_workspace_stays_unavailable(
+    tmp_path: Path,
+) -> None:
+    checkpoint = start_checkpoint(tmp_path)
+    assert checkpoint is not None
+    lifecycle, tracker, workspace, events = _make_lost_claim_lifecycle(
+        tmp_path, issues={}
+    )
+    workspace.make_dirty("docs/adr/0031-follow-up.md")
+
+    record = lifecycle.submit_recovery_release(
+        "req-gone", checkpoint.started_at, "s3://bucket/work"
+    )
+
+    assert record.acknowledgement is CommandAcknowledgement.NOT_FULFILLED
+    assert "unavailable for recovery" in record.detail
+    assert AttemptStateStore(tmp_path).read() is not None
+    assert "claim_lost" not in [event for event, _ in _lost_claim_events(events)]
+
+
+def test_release_lost_claim_with_an_unreadable_workspace_fails_closed(
+    tmp_path: Path,
+) -> None:
+    checkpoint = start_checkpoint(tmp_path)
+    assert checkpoint is not None
+    lifecycle, tracker, workspace, events = _make_lost_claim_lifecycle(
+        tmp_path, issues={24: _issue(24)}
+    )
+
+    def _unreadable():
+        raise OSError("working tree unreadable")
+
+    workspace.is_clean = _unreadable  # type: ignore[method-assign]
+    workspace.dirty_paths = _unreadable  # type: ignore[method-assign]
+
+    record = lifecycle.submit_recovery_release(
+        "req-unreadable", checkpoint.started_at, "s3://bucket/work"
+    )
+
+    assert record.acknowledgement is CommandAcknowledgement.NOT_FULFILLED
+    assert "no longer claimed" in record.detail
+    assert "hold remains" in record.detail
+    assert AttemptStateStore(tmp_path).read() is not None
+    assert tracker.removed_labels == []
+    assert "claim_lost" not in [event for event, _ in _lost_claim_events(events)]
+
+
+def test_startup_reconciliation_with_lost_claim_and_dirty_workspace_retains_attempt(
+    tmp_path: Path,
+) -> None:
+    checkpoint = start_checkpoint(tmp_path)
+    assert checkpoint is not None
+    lifecycle, tracker, workspace, events = _make_lost_claim_lifecycle(
+        tmp_path, issues={24: _issue(24)}
+    )
+    workspace.make_dirty("docs/adr/0031-follow-up.md")
+
+    lifecycle.run_once()
+
+    assert AttemptStateStore(tmp_path).read() is not None
+    assert tracker.removed_labels == []
+    assert "claim_lost" not in [event for event, _ in _lost_claim_events(events)]
+    dirty_warnings = [
+        detail for event, level, detail in events
+        if event == "lost_claim_workspace_dirty" and level == "WARNING"
+    ]
+    assert len(dirty_warnings) == 1
+    assert checkpoint.started_at in dirty_warnings[0]
+    assert "no longer claimed" in dirty_warnings[0]
+    assert "docs/adr/0031-follow-up.md" in dirty_warnings[0]
+    held = [
+        detail for event, level, detail in events
+        if event == "intake_held_for_recovery"
+    ]
+    assert held, "the next poll must hold on the retained attempt"
+    snapshot = lifecycle.control_status("owner/repo")
+    assert snapshot["recovery"] is not None
+    assert snapshot["recovery"]["attempt_id"] == checkpoint.started_at
+    assert snapshot["recovery"]["issue_number"] == 24
+    assert checkpoint.started_at in snapshot["recovery"]["hold_reason"]
+    assert "docs/adr/0031-follow-up.md" in snapshot["recovery"]["hold_reason"]
+
+
+def test_startup_reconciliation_with_lost_claim_and_unreadable_workspace_retains_attempt(
+    tmp_path: Path,
+) -> None:
+    checkpoint = start_checkpoint(tmp_path)
+    assert checkpoint is not None
+    lifecycle, tracker, workspace, events = _make_lost_claim_lifecycle(
+        tmp_path, issues={24: _issue(24)}
+    )
+
+    def _unreadable():
+        raise OSError("working tree unreadable")
+
+    workspace.is_clean = _unreadable  # type: ignore[method-assign]
+    workspace.dirty_paths = _unreadable  # type: ignore[method-assign]
+
+    lifecycle.run_once()
+
+    assert AttemptStateStore(tmp_path).read() is not None
+    assert tracker.removed_labels == []
+    assert "claim_lost" not in [event for event, _ in _lost_claim_events(events)]
+    assert any(
+        event == "lost_claim_workspace_dirty" and level == "WARNING"
+        for event, level, _ in events
+    )
+
+
+def test_startup_reconciliation_with_a_missing_issue_stays_fatal_despite_dirt(
+    tmp_path: Path,
+) -> None:
+    checkpoint = start_checkpoint(tmp_path)
+    assert checkpoint is not None
+    lifecycle, _, workspace, _ = _make_lost_claim_lifecycle(tmp_path, issues={})
+    workspace.make_dirty("docs/adr/0031-follow-up.md")
+
+    with pytest.raises(RuntimeError, match="unavailable for recovery"):
+        lifecycle.run_once()
+
+    assert AttemptStateStore(tmp_path).read() is not None

@@ -1022,6 +1022,39 @@ class GitHubTracker:
                 return None
         return Claim(current, Assignment(issue_id=current.id, assignee_id=identity.id))
 
+    def classify_lost_claim(
+        self, issue_number: int
+    ) -> Literal["unassigned", "claimed_by_another"] | None:
+        """Classify a lost claim without changing any remote state.
+
+        Called only after :meth:`recover_claim` returned ``None``. Returns
+        ``None`` when the issue is gone entirely (the fatal #219 case, which
+        the caller keeps fatal). Otherwise the issue exists but this
+        Worker's claim does not: the login is no longer assigned
+        (``"unassigned"``) or only another Worker's marker holds the shared
+        login (``"claimed_by_another"``). Purely read-only, so callers can
+        inspect the attempt workspace before deciding whether the attempt
+        may be dropped: a dirty tree must keep the attempt retained, and
+        retaining requires the own marker to stay put.
+        """
+
+        current = self._transport.get_issue(self._target_repo, issue_number)
+        if current is None:
+            return None
+        return self._classify_lost_claim(current)
+
+    def _classify_lost_claim(
+        self, current: TrackerIssue
+    ) -> Literal["unassigned", "claimed_by_another"]:
+        """Classify a re-read issue whose claim is no longer this Worker's."""
+
+        if self._other_markers(current.labels):
+            return "claimed_by_another"
+        identity = self._transport.viewer()
+        if identity.login not in current.assignee_logins:
+            return "unassigned"
+        return "claimed_by_another"
+
     def release_lost_claim(
         self, issue_number: int
     ) -> Literal["unassigned", "claimed_by_another"] | None:
@@ -1037,6 +1070,9 @@ class GitHubTracker:
         fresh re-read; another Worker's marker, the assignment, and every
         queue label are never touched. Without ``WORKER_ID`` there is no
         lost-claim state, so the issue is reported as gone only when it is.
+        Callers with a dirty attempt workspace must call
+        :meth:`classify_lost_claim` first and never reach this mutation: a
+        dirty tree keeps the attempt (and its marker) retained.
         """
 
         current = self._transport.get_issue(self._target_repo, issue_number)
@@ -1045,12 +1081,7 @@ class GitHubTracker:
         own = self._own_marker
         if own is not None and own in current.labels:
             self._transport.remove_label(current.id, own)
-        if self._other_markers(current.labels):
-            return "claimed_by_another"
-        identity = self._transport.viewer()
-        if identity.login not in current.assignee_logins:
-            return "unassigned"
-        return "claimed_by_another"
+        return self._classify_lost_claim(current)
 
     def release_attempt(self, issue_number: int, label: str, assignee_id: str) -> None:
         """Idempotently release only this agent's assignment and queue label.
