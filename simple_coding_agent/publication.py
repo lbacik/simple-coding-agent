@@ -994,6 +994,21 @@ class Publisher:
             local_revision=self._unpushed_local_revision(request.branch),
         )
 
+    def _existing_branch_url(self, request: PublicationRequest) -> str | None:
+        """The attempt-branch link when this attempt pushed nothing.
+
+        When the claim-time lease is recorded and names a revision, the
+        attempt branch already exists on the remote, so the result comment
+        links it instead of claiming ``no branch created``. Otherwise
+        (absent or unknown) there is no promised remote branch. Display-only:
+        callers keep ``PublicationResult.branch_url`` as ``None``.
+        """
+
+        revision, known = self._claim_lease(request.issue_number)
+        if known and revision:
+            return self._branch_url(request.branch)
+        return None
+
     def _unpushed_local_revision(self, branch: str) -> str | None:
         """The local tip a failed push did not publish, if readable.
 
@@ -1248,6 +1263,9 @@ class Publisher:
         try:
             if self._github.find_attempt_comment(self._repository, request.issue_number, marker):
                 return True
+            existing_branch_url: str | None = None
+            if branch_url is None and failed_push is None:
+                existing_branch_url = self._existing_branch_url(request)
             self._github.add_comment(
                 self._repository,
                 request.issue_number,
@@ -1260,6 +1278,7 @@ class Publisher:
                     marker,
                     merge_result,
                     failed_push=failed_push,
+                    existing_branch_url=existing_branch_url,
                 ),
             )
             return True
@@ -1793,6 +1812,7 @@ def _result_comment(
     merge_result: str | None = None,
     *,
     failed_push: _FailedPushInfo | None = None,
+    existing_branch_url: str | None = None,
 ) -> str:
     if branch_url is not None:
         branch = f"[{request.branch}]({branch_url})"
@@ -1800,6 +1820,11 @@ def _result_comment(
         branch = (
             f"[{request.branch}]({failed_push.branch_url})"
             " (exists on the remote; this attempt's push failed)"
+        )
+    elif existing_branch_url is not None:
+        branch = (
+            f"[{request.branch}]({existing_branch_url})"
+            " (exists on the remote; this attempt pushed nothing)"
         )
     else:
         branch = "no branch created"
