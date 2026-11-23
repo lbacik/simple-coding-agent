@@ -73,7 +73,7 @@ The durable record of a `handoff` outcome: a committed file at a fixed per-issue
 _Avoid_: Progress note, status update, summary
 
 **Emergency handoff note**:
-A Handoff note written by the runtime, not the model, when the model reaches a limit without having written one. It states its own provenance and carries only what the runtime can reconstruct (changes, activity, budget facts); it never claims to know what work remains. When an earlier round left a complete note, it preserves that note at its immutable revision as older context, clearly distinguished from the current runtime evidence; a missing or unreadable previous note is said explicitly.
+A Handoff note written by the runtime, not the model, when an attempt ends without a committed model note: the model reached a limit without having written one, or it requested a handoff without committing one. It states its own provenance and carries only what the runtime can reconstruct (changes, activity, budget facts); it never claims to know what work remains. When the model's final response itself contains the complete note in a fenced block, the runtime commits that recovered note (marked as recovered from the final response) instead, and only writes the emergency reconstruction when no usable block exists. When an earlier round left a complete note, the emergency note preserves that note at its immutable revision as older context, clearly distinguished from the current runtime evidence; a missing or unreadable previous note is said explicitly.
 _Avoid_: Fallback note, synthetic note
 
 **Operator Handoff**:

@@ -130,7 +130,8 @@ _HANDOFF_SKILL_TOOL_HINT = (
 _HANDOFF_NOTE_TOOL_HINT = (
     "Create or edit the handoff note with the `Write` (or `Edit`) tool, then"
     " commit it with `git add` + `git commit` in Bash. Bash cannot create or"
-    " modify files while the handoff is pending."
+    " modify files while the handoff is pending. The `Write` tool is always"
+    " loaded: call it directly and never look it up with `ToolSearch`."
 )
 
 
@@ -463,7 +464,8 @@ def _token_handoff_steps(issue_number: int | None) -> str:
         f" `.agent/handoff/{note_label}.md` with the `Write` (or `Edit`) tool,"
         " using the pre-filled header above verbatim, and fill in Summary,"
         " Remaining work and Evidence. Bash cannot create or modify files"
-        " while the handoff is pending.\n"
+        " while the handoff is pending. The `Write` tool is always loaded:"
+        " call it directly and never look it up with `ToolSearch`.\n"
         f"4. If a rebase is in progress, finish the paused rebase first with"
         " `git rebase --continue` (repeat until it completes), then in one"
         f" `Bash` call, run `git add .agent/handoff/{note_label}.md"
@@ -568,8 +570,10 @@ _COST_ALLOWED_COMMANDS = (
     " so no editor opens) to finish a paused rebase before committing the handoff"
     " note, and committing"
     " a handoff note created with the `Write` (or `Edit`) tool under"
-    " `.agent/handoff/`. `git rebase --skip`, `--abort`, `--quit`, `-i`, and any"
-    " other `rebase` form stay denied. Bash cannot create or modify files after the threshold:"
+    " `.agent/handoff/`. The `Write` tool is always loaded: call it directly"
+    " and never look it up with `ToolSearch`. `git rebase --skip`, `--abort`,"
+    " `--quit`, `-i`, and any other `rebase` form stay denied. Bash cannot"
+    " create or modify files after the threshold:"
     " write the note with the `Write`/`Edit` tool, then run `git add` +"
     " `git commit`. A compound command (`&&`, `;`, `|`) is"
     " denied as a whole if any part of it is not allowed, so split it up."

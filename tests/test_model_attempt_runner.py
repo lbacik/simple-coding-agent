@@ -635,6 +635,7 @@ def test_logs_setup_baseline_and_model_dispatch_stages(tmp_path: Path) -> None:
         "baseline_check_succeeded",
         "attempt_phase_transitioned",
         "model_dispatch_starting",
+        "handoff_note_emergency_written",
         "completion_decided",
     ]
     assert all(issue_number == 24 for _, issue_number in events)
@@ -663,6 +664,7 @@ def test_baseline_failure_tolerated_on_continuation_and_logs_warning(tmp_path: P
         ("baseline_check_failed", "WARNING"),
         ("attempt_phase_transitioned", "INFO"),
         ("model_dispatch_starting", "INFO"),
+        ("handoff_note_emergency_written", "WARNING"),
         ("completion_decided", "WARNING"),
     ]
     assert executor.captured_prompt is not None

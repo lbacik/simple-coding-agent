@@ -620,7 +620,7 @@ def test_valid_handoff_survives_locally_when_push_retries_are_exhausted(
 # incomplete progress --------------------------------------------------------
 
 
-def test_handoff_without_a_committed_note_publishes_as_ordinary_incomplete(tmp_path: Path) -> None:
+def test_handoff_without_a_committed_note_writes_an_emergency_note(tmp_path: Path) -> None:
     remote, _ = repository_with_main(tmp_path)
     github = FakeGitHub(issue(24, body="Rewrite the parser.", labels=frozenset({"ready-for-agent"})))
     clone_dir = tmp_path / "clone"
@@ -633,12 +633,16 @@ def test_handoff_without_a_committed_note_publishes_as_ordinary_incomplete(tmp_p
 
     result = lifecycle.run_once()
 
-    assert result.outcome is AttemptOutcome.INCOMPLETE
+    assert result.outcome is AttemptOutcome.HANDOFF
     assert remote_has_branch(remote, "agent/issue-24")
-    assert github.added_labels == []
-    [comment] = github.comments
-    assert "## Agent Attempt Result: incomplete" in comment.body
-    assert "no handoff note commit is on the branch" in comment.body
+    assert github.added_labels == [("issue-24", "round-finished")]
+    [comment] = [c for c in github.comments if "Agent Attempt Result: handoff" in c.body]
+    assert "token_soft_threshold" in comment.body
+    subjects = remote_branch_subjects(remote, "agent/issue-24")
+    assert subjects[:2] == ["Handoff note: issue #24", "Half-finish the parser"]
+    note = git(clone_dir, "show", "agent/issue-24:.agent/handoff/24.md")
+    assert "- reason: token_soft_threshold" in note
+    assert "written by the runtime" in note
 
 
 def test_handoff_with_an_uncommitted_note_publishes_as_ordinary_incomplete(tmp_path: Path) -> None:
@@ -669,14 +673,14 @@ def test_handoff_with_an_uncommitted_note_publishes_as_ordinary_incomplete(tmp_p
     )
 
 
-def test_handoff_note_subject_without_a_note_file_publishes_as_ordinary_incomplete(
+def test_handoff_note_subject_without_a_note_file_writes_an_emergency_note(
     tmp_path: Path,
 ) -> None:
     """Note detection is path-based: a matching subject alone proves nothing.
 
     An empty commit carrying the expected ``Handoff note`` subject touches
     no files, so no commit on the branch touches the note path and the
-    attempt publishes as ordinary incomplete progress.
+    runtime writes the emergency note itself instead of rejecting the handoff.
     """
     remote, _ = repository_with_main(tmp_path)
     github = FakeGitHub(issue(24, body="Rewrite the parser.", labels=frozenset({"ready-for-agent"})))
@@ -691,12 +695,14 @@ def test_handoff_note_subject_without_a_note_file_publishes_as_ordinary_incomple
 
     result = lifecycle.run_once()
 
-    assert result.outcome is AttemptOutcome.INCOMPLETE
+    assert result.outcome is AttemptOutcome.HANDOFF
     assert remote_has_branch(remote, "agent/issue-24")
-    assert github.added_labels == []
-    [comment] = github.comments
-    assert "## Agent Attempt Result: incomplete" in comment.body
-    assert "no handoff note commit is on the branch" in comment.body
+    assert github.added_labels == [("issue-24", "round-finished")]
+    [comment] = [c for c in github.comments if "Agent Attempt Result: handoff" in c.body]
+    assert "token_soft_threshold" in comment.body
+    note = git(clone_dir, "show", "agent/issue-24:.agent/handoff/24.md")
+    assert "- reason: token_soft_threshold" in note
+    assert "written by the runtime" in note
 
 
 def test_handoff_note_with_stale_last_work_commit_publishes_as_ordinary_incomplete(tmp_path: Path) -> None:
