@@ -951,6 +951,9 @@ class FakeArchive:
         self.texts[name] = content
         return Path(name)
 
+    def record_evidence_metadata(self, name: str, metadata: dict[str, object]) -> None:
+        return None
+
 
 class FakeEvaluator:
     def evaluate(self, **kwargs: object) -> CompletionDecision:

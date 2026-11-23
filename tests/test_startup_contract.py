@@ -126,7 +126,7 @@ def _status() -> tuple[int, dict]:
 
 
 def _result(envelope: dict) -> dict:
-    assert envelope["contract"] == "1.0"
+    assert envelope["contract"] == "1.2"
     assert envelope["ok"] is True
     return envelope["result"]
 

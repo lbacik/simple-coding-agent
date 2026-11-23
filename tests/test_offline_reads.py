@@ -314,7 +314,7 @@ def test_offline_reads_from_read_only_stopped_volume(
             "backend": "simple-coding-agent",
             "agent_version": agent_version(),
             "capabilities": advertised_capabilities(""),
-            "contract": {"major": 1, "minor": 0},
+            "contract": {"major": 1, "minor": 2},
             "mode": "offline",
             "process_started_at": None,
             "repository": REPOSITORY,

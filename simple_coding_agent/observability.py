@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Mapping
 from datetime import UTC, datetime
 import hashlib
 import json
@@ -21,6 +21,16 @@ if TYPE_CHECKING:
 #: section 11.2). It carries ``sealed_at`` and the frozen manifest, and it
 #: is never listed in a manifest or exported (it would hash itself).
 SEALING_FILENAME = "sealing.json"
+
+#: Per-attempt evidence metadata index for the operator-contract 1.2
+#: manifest link fields (spec section 7.6). A JSON object mapping an
+#: evidence file's bare name onto its link metadata (``at``, ``call_id``,
+#: ``tool``, ``origin``, ``conversation``), written beside the evidence
+#: files when they are archived and read back by both manifest builders.
+#: The leading dot keeps it out of every manifest (names starting with a
+#: dot are never public evidence), so the index never lists itself and
+#: never changes an evidence file's bytes or ``sha256``.
+EVIDENCE_INDEX_FILENAME = ".evidence_index.json"
 
 
 class AttemptArchiveSealedError(Exception):
@@ -62,6 +72,28 @@ def discard_manifest_snapshot(run_dir: Path) -> None:
 
     with _SNAPSHOT_LOCK:
         _SNAPSHOT_REGISTRY.pop(str(run_dir), None)
+
+
+def read_evidence_index(run_dir: Path) -> dict[str, dict[str, object]]:
+    """Return the evidence metadata index of one archive directory.
+
+    Best-effort: a missing, unreadable or malformed index reads as empty,
+    so archives written before the index existed (and corrupt indexes)
+    simply yield manifest entries without the link fields, never a dropped
+    entry or a failed manifest.
+    """
+
+    try:
+        value = json.loads((run_dir / EVIDENCE_INDEX_FILENAME).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(value, dict):
+        return {}
+    index: dict[str, dict[str, object]] = {}
+    for name, metadata in value.items():
+        if isinstance(name, str) and name and isinstance(metadata, dict):
+            index[name] = dict(metadata)
+    return index
 
 
 def _remember_snapshot_file(run_dir: Path, relative: str) -> None:
@@ -279,6 +311,28 @@ class AttemptArchive:
         path.write_text(str(self._redactor.redact(content)))
         _remember_snapshot_file(self.directory, name)
         return path
+
+    def record_evidence_metadata(self, name: str, metadata: Mapping[str, object]) -> None:
+        """Record manifest link metadata for one archived evidence file.
+
+        Merges ``metadata`` (the contract 1.2 link fields ``at``,
+        ``call_id``, ``tool``, ``origin`` and ``conversation``) into the
+        per-attempt index beside the evidence files. Best-effort and never
+        raising: an index failure leaves the entry without the new fields
+        but never drops it or fails the manifest.
+        """
+
+        try:
+            wanted = {"at", "call_id", "tool", "origin", "conversation"}
+            entry = {key: value for key, value in dict(metadata).items() if key in wanted}
+            index = read_evidence_index(self.directory)
+            index[name] = entry
+            self.directory.mkdir(parents=True, exist_ok=True)
+            (self.directory / EVIDENCE_INDEX_FILENAME).write_text(
+                json.dumps(index, sort_keys=True), encoding="utf-8"
+            )
+        except (OSError, ValueError):
+            pass
 
     def copy_cli_transcripts(
         self,

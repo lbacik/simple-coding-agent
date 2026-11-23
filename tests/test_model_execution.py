@@ -509,12 +509,16 @@ class FakeArchive:
     def __init__(self, directory: Path) -> None:
         self._directory = directory
         self.written: dict[str, str] = {}
+        self.metadata: dict[str, dict[str, object]] = {}
 
     def write_text(self, name: str, content: str) -> Path:
         path = self._directory / name
         path.write_text(content)
         self.written[name] = content
         return path
+
+    def record_evidence_metadata(self, name: str, metadata: dict[str, object]) -> None:
+        self.metadata[name] = dict(metadata)
 
 
 def test_offloads_tool_and_model_response_evidence_to_the_attempt_archive(

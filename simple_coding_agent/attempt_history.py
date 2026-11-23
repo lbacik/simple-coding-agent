@@ -29,9 +29,12 @@ from pathlib import Path
 import tarfile
 from typing import Any, BinaryIO
 
+from agent_operator_contract.shared import CONTRACT_VERSION as _CONTRACT_VERSION
+
 from simple_coding_agent.observability import (
     SEALING_FILENAME,
     discard_manifest_snapshot,
+    read_evidence_index,
     read_manifest_snapshot,
 )
 
@@ -189,6 +192,136 @@ def _archive_directories(data_dir: Path) -> list[Path]:
     return run_dirs
 
 
+#: Manifest kinds carrying the contract 1.2 link fields (spec section 7.6).
+_LINKED_KINDS = ("tool_call", "tool_result", "model_output")
+
+#: Link fields allowed only on a call and its result (never on ``model_output``).
+_CALL_RESULT_FIELDS = ("call_id", "tool")
+
+
+def _non_empty_str(value: object) -> bool:
+    """Whether ``value`` is a usable link-field string (never a bool)."""
+
+    return isinstance(value, str) and bool(value) and not isinstance(value, bool)
+
+
+def _scan_entries(run_dir: Path) -> list[dict[str, Any]]:
+    """Hash every public evidence file of one archive directory, sorted by path."""
+
+    entries: list[dict[str, Any]] = []
+    try:
+        children = sorted(run_dir.rglob("*"))
+    except OSError:
+        return entries
+    for path in children:
+        relative = path.relative_to(run_dir).as_posix()
+        if not _is_public_evidence(path, relative):
+            continue
+        try:
+            raw = path.read_bytes()
+        except OSError:
+            continue
+        entries.append(
+            {
+                "kind": _manifest_kind(relative),
+                "media_type": _media_type(relative),
+                "path": relative,
+                "sha256": hashlib.sha256(raw).hexdigest(),
+                "size": len(raw),
+            }
+        )
+    entries.sort(key=lambda entry: entry["path"])
+    return entries
+
+
+def _overlay_evidence_metadata(
+    entries: list[dict[str, Any]], run_dir: Path, *, sealed: bool
+) -> None:
+    """Fill the contract 1.2 link fields onto linked entries, in place.
+
+    The per-attempt index beside the evidence files carries the metadata
+    recorded when each file was written. A missing, unreadable or malformed
+    index (or entry) leaves that entry without the new fields; it never
+    drops the entry or fails the manifest, so archives written before the
+    index existed stay valid. A ``tool_result`` keeps its ``call_id`` in a
+    Sealed manifest only when a ``tool_call`` with the same ``call_id`` is
+    archived in the same Attempt (spec section 7.6); otherwise the
+    ``call_id`` is left off the result while every other field stays.
+    """
+
+    index = read_evidence_index(run_dir)
+    if not index:
+        return
+    for entry in entries:
+        if entry.get("kind") not in _LINKED_KINDS:
+            continue
+        metadata = index.get(str(entry.get("path")))
+        if not isinstance(metadata, dict):
+            continue
+        at = metadata.get("at")
+        if isinstance(at, str) and _is_manifest_timestamp(at):
+            entry["at"] = at
+        for field in ("origin", "conversation"):
+            value = metadata.get(field)
+            if _non_empty_str(value):
+                entry[field] = value
+        if entry.get("kind") != "model_output":
+            for field in _CALL_RESULT_FIELDS:
+                value = metadata.get(field)
+                if _non_empty_str(value):
+                    entry[field] = value
+    if sealed:
+        _prune_sealed_call_ids(entries)
+
+
+def _prune_sealed_call_ids(entries: list[dict[str, Any]]) -> None:
+    """Enforce the sealed cross-entry rules (spec section 7.6), in place.
+
+    Entries arrive in path order, so the first entry of a kind keeps a
+    duplicated ``call_id`` and later duplicates lose it. A ``tool_result``
+    then keeps its ``call_id`` only when a ``tool_call`` with the same
+    ``call_id`` is archived in the same Attempt.
+    """
+
+    seen: dict[str, set[str]] = {"tool_call": set(), "tool_result": set()}
+    for entry in entries:
+        kind = entry.get("kind")
+        if kind not in ("tool_call", "tool_result"):
+            continue
+        call_id = entry.get("call_id")
+        if not _non_empty_str(call_id):
+            continue
+        assert isinstance(call_id, str)
+        if call_id in seen[kind]:
+            del entry["call_id"]
+        else:
+            seen[kind].add(call_id)
+    calls = seen["tool_call"]
+    for entry in entries:
+        if entry.get("kind") != "tool_result":
+            continue
+        call_id = entry.get("call_id")
+        if _non_empty_str(call_id) and call_id not in calls:
+            del entry["call_id"]
+
+
+def _is_manifest_timestamp(value: str) -> bool:
+    """Whether ``value`` is shaped like a contract timestamp (spec section 7).
+
+    Contract timestamps are ISO-8601 UTC with the ``Z`` suffix; a missing
+    suffix or a non-UTC offset never counts, even when ``fromisoformat``
+    could parse it.
+    """
+
+    if not isinstance(value, str) or not value.endswith("Z"):
+        return False
+    try:
+        parsed = datetime.fromisoformat(value.removesuffix("Z") + "+00:00")
+    except (ValueError, AttributeError):
+        return False
+    return parsed.tzinfo is not None
+
+
 def _manifest(directories: list[Path], attempt_id: str) -> list[dict[str, Any]]:
     """Hash every public evidence file of one Attempt, sorted by path."""
 
@@ -196,27 +329,9 @@ def _manifest(directories: list[Path], attempt_id: str) -> list[dict[str, Any]]:
     for run_dir in directories:
         if _read_record(run_dir / "attempt.json").get("started_at") != attempt_id:
             continue
-        try:
-            children = sorted(run_dir.rglob("*"))
-        except OSError:
-            continue
-        for path in children:
-            relative = path.relative_to(run_dir).as_posix()
-            if not _is_public_evidence(path, relative):
-                continue
-            try:
-                raw = path.read_bytes()
-            except OSError:
-                continue
-            entries.append(
-                {
-                    "kind": _manifest_kind(relative),
-                    "media_type": _media_type(relative),
-                    "path": relative,
-                    "sha256": hashlib.sha256(raw).hexdigest(),
-                    "size": len(raw),
-                }
-            )
+        scanned = _scan_entries(run_dir)
+        _overlay_evidence_metadata(scanned, run_dir, sealed=False)
+        entries.extend(scanned)
     entries.sort(key=lambda entry: entry["path"])
     return entries
 
@@ -554,29 +669,8 @@ def seal_archive(run_dir: Path) -> dict[str, Any] | None:
         return existing
     if not run_dir.is_dir():
         return None
-    try:
-        children = sorted(run_dir.rglob("*"))
-    except OSError:
-        return None
-    entries: list[dict[str, Any]] = []
-    for path in children:
-        relative = path.relative_to(run_dir).as_posix()
-        if not _is_public_evidence(path, relative):
-            continue
-        try:
-            raw = path.read_bytes()
-        except OSError:
-            continue
-        entries.append(
-            {
-                "kind": _manifest_kind(relative),
-                "media_type": _media_type(relative),
-                "path": relative,
-                "sha256": hashlib.sha256(raw).hexdigest(),
-                "size": len(raw),
-            }
-        )
-    entries.sort(key=lambda entry: entry["path"])
+    entries = _scan_entries(run_dir)
+    _overlay_evidence_metadata(entries, run_dir, sealed=True)
     sealed_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
     record = {"sealed_at": sealed_at, "manifest": entries}
     payload = json.dumps(record, sort_keys=True)
@@ -654,7 +748,7 @@ def write_export_tar(
 ) -> None:
     """Stream one uncompressed pax export tar: ``manifest.json`` first.
 
-    The manifest member carries ``{"contract": "1.0", "attempt",
+    The manifest member carries ``{"contract": <major.minor>, "attempt",
     "files"}``; every file member that follows is the bytes actually
     read (its tar header size is the live byte count), so for an unsealed
     archive a file that grew after the snapshot surfaces as a ``sha256``
@@ -665,7 +759,7 @@ def write_export_tar(
     """
 
     manifest_doc = {
-        "contract": "1.0",
+        "contract": _CONTRACT_VERSION,
         "attempt": dict(attempt),
         "files": [dict(entry) for entry in entries],
     }

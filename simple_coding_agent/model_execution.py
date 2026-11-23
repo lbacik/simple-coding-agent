@@ -687,6 +687,15 @@ class EvidenceWriter(Protocol):
 
     def write_text(self, name: str, content: str) -> Path: ...
 
+    def record_evidence_metadata(self, name: str, metadata: Mapping[str, object]) -> None:
+        """Record manifest link metadata for one archived evidence file.
+
+        The per-attempt index beside the evidence files; read back by both
+        manifest builders. Implementations must never raise: an index
+        failure leaves the entry without the new fields.
+        """
+        ...
+
 
 #: Background task types that hold a result back. Mirrors the SDK's
 #: ``DEFERRING_TASK_TYPES``: shells and monitors run indefinitely by design,
@@ -1365,12 +1374,22 @@ class ModelExecutor:
         for tool_use_id in list(self._subagent_info.keys()):
             self._finish_subagent(tool_use_id)
 
-    def _archive_evidence(self, kind: str, content: str, *, extension: str) -> str | None:
+    def _archive_evidence(
+        self,
+        kind: str,
+        content: str,
+        *,
+        extension: str,
+        metadata: Mapping[str, Any] | None = None,
+    ) -> str | None:
         """Write full evidence to the attempt archive; return a reference or None.
 
         The reference is the bare filename: every archived file, including
         agent_output.json, lives in the same attempt directory, so a
-        relative-to-itself path is just the name.
+        relative-to-itself path is just the name. ``metadata`` carries the
+        contract 1.2 manifest link fields recorded in the per-attempt index
+        beside the evidence files (never inside them, so names, bytes and
+        ``sha256`` stay unchanged).
         """
 
         if self._archive is None:
@@ -1378,7 +1397,39 @@ class ModelExecutor:
         self._event_sequence += 1
         filename = f"{self._event_sequence:04d}_{kind}.{extension}"
         self._archive.write_text(filename, content)
+        if metadata:
+            record = getattr(self._archive, "record_evidence_metadata", None)
+            if callable(record):
+                try:
+                    record(filename, dict(metadata))
+                except Exception as error:
+                    self._log(
+                        "evidence_index_failed",
+                        f"{filename}: {type(error).__name__}",
+                    )
         return filename
+
+    @staticmethod
+    def _evidence_metadata(
+        clock: Callable[[], datetime],
+        *,
+        origin: str,
+        conversation: str,
+        tool: str | None = None,
+        call_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Build the contract 1.2 manifest link metadata for one evidence file."""
+
+        metadata: dict[str, Any] = {
+            "at": _timestamp(clock()),
+            "origin": origin,
+            "conversation": conversation,
+        }
+        if isinstance(tool, str) and tool:
+            metadata["tool"] = tool
+        if isinstance(call_id, str) and call_id:
+            metadata["call_id"] = call_id
+        return metadata
 
     async def execute(
         self,
@@ -2143,9 +2194,19 @@ class ModelExecutor:
                 elif isinstance(message, AssistantMessage):
                     if deferred_results:
                         model_turn_after_defer = True
+                    response_origin, response_conversation = self._invocation_thread(
+                        getattr(message, "parent_tool_use_id", None)
+                    )
                     for block in message.content:
                         if isinstance(block, TextBlock) and block.text.strip():
-                            self._log("model_response", self._model_response_detail(block.text))
+                            self._log(
+                                "model_response",
+                                self._model_response_detail(
+                                    block.text,
+                                    origin=response_origin,
+                                    conversation=response_conversation,
+                                ),
+                            )
                     self._observe_assistant_message(message)
                 elif isinstance(message, StreamEvent):
                     self._observe_stream_event(message)
@@ -3052,7 +3113,7 @@ class ModelExecutor:
         # crossing here latches exactly like a response-time crossing.
         self._check_limits(_hook_agent_id(hook_input) or "main")
         if self._token_hard_ceiling_reached:
-            self._log_tool_use("tool_call", hook_input)
+            self._log_tool_use("tool_call", hook_input, tool_use_id=tool_use_id)
             self._record_tool_call(hook_input, tool_use_id)
             self._log_pre_tool_denied(hook_input)
             return _deny(
@@ -3061,7 +3122,7 @@ class ModelExecutor:
                 "the attempt was stopped unconditionally and no further tool"
                 " use is allowed, including the handoff skill and git commands."
             )
-        self._log_tool_use("tool_call", hook_input)
+        self._log_tool_use("tool_call", hook_input, tool_use_id=tool_use_id)
         self._record_tool_call(hook_input, tool_use_id)
         self._start_launch_thread(hook_input, tool_use_id)
         if _skill_name(hook_input) == "code-review":
@@ -3260,7 +3321,10 @@ class ModelExecutor:
         self, hook_input: Any, tool_use_id: str | None, context: Any
     ) -> dict[str, Any]:
         self._log_tool_use(
-            "tool_result", hook_input, response=_hook_field(hook_input, "tool_response")
+            "tool_result",
+            hook_input,
+            response=_hook_field(hook_input, "tool_response"),
+            tool_use_id=tool_use_id,
         )
         self._record_tool_result(hook_input, tool_use_id)
         await self._record_skill_event("PostToolUse", hook_input, tool_use_id, context)
@@ -3351,7 +3415,14 @@ class ModelExecutor:
             }
         return {}
 
-    def _log_tool_use(self, event: str, hook_input: Any, *, response: Any = None) -> None:
+    def _log_tool_use(
+        self,
+        event: str,
+        hook_input: Any,
+        *,
+        response: Any = None,
+        tool_use_id: str | None = None,
+    ) -> None:
         tool_name = _hook_field(hook_input, "tool_name")
         if not isinstance(tool_name, str):
             return
@@ -3365,7 +3436,14 @@ class ModelExecutor:
             detail = (
                 f"{label}{thread}: {response!r}"
                 if skill_name
-                else self._tool_result_detail(label, response, thread=thread, agent_id=agent_id)
+                else self._tool_result_detail(
+                    label,
+                    response,
+                    thread=thread,
+                    agent_id=agent_id,
+                    tool_name=tool_name,
+                    tool_use_id=tool_use_id,
+                )
             )
         else:
             tool_input = _hook_field(hook_input, "tool_input", {})
@@ -3373,33 +3451,89 @@ class ModelExecutor:
             detail = (
                 f"{label}{thread}: {tool_input!r}"
                 if skill_name
-                else self._tool_call_detail(label, tool_input, thread=thread, agent_id=agent_id)
+                else self._tool_call_detail(
+                    label,
+                    tool_input,
+                    thread=thread,
+                    agent_id=agent_id,
+                    tool_name=tool_name,
+                    tool_use_id=tool_use_id,
+                )
             )
         self._log(event_name, _truncate(detail))
 
+    @staticmethod
+    def _invocation_thread(agent_id: str | None) -> tuple[str, str]:
+        """The (origin, conversation) of one tool invocation (contract 1.2)."""
+
+        if agent_id:
+            return "subagent", f"subagent:{agent_id}"
+        return "main", "main"
+
     def _tool_call_detail(
-        self, label: str, tool_input: Any, *, thread: str = "", agent_id: str | None = None
+        self,
+        label: str,
+        tool_input: Any,
+        *,
+        thread: str = "",
+        agent_id: str | None = None,
+        tool_name: str | None = None,
+        tool_use_id: str | None = None,
     ) -> str:
+        origin, conversation = self._invocation_thread(agent_id)
         path = self._archive_evidence(
-            "tool_call", _json_or_repr(_with_agent_id(tool_input, agent_id)), extension="json"
+            "tool_call",
+            _json_or_repr(_with_agent_id(tool_input, agent_id)),
+            extension="json",
+            metadata=self._evidence_metadata(
+                self._clock,
+                origin=origin,
+                conversation=conversation,
+                tool=tool_name,
+                call_id=tool_use_id,
+            ),
         )
         if path is None:
             return f"{label}{thread}: {tool_input!r}"
         return f"{label}{thread} -> {path}"
 
     def _tool_result_detail(
-        self, label: str, response: Any, *, thread: str = "", agent_id: str | None = None
+        self,
+        label: str,
+        response: Any,
+        *,
+        thread: str = "",
+        agent_id: str | None = None,
+        tool_name: str | None = None,
+        tool_use_id: str | None = None,
     ) -> str:
+        origin, conversation = self._invocation_thread(agent_id)
         path = self._archive_evidence(
-            "tool_result", _json_or_repr(_with_agent_id(response, agent_id)), extension="json"
+            "tool_result",
+            _json_or_repr(_with_agent_id(response, agent_id)),
+            extension="json",
+            metadata=self._evidence_metadata(
+                self._clock,
+                origin=origin,
+                conversation=conversation,
+                tool=tool_name,
+                call_id=tool_use_id,
+            ),
         )
         if path is None:
             return f"{label}{thread}: {response!r}"
         outcome = _outcome_hint(response)
         return f"{label}{thread} -> {path}" + (f" ({outcome})" if outcome else "")
 
-    def _model_response_detail(self, text: str) -> str:
-        path = self._archive_evidence("model_response", text, extension="txt")
+    def _model_response_detail(self, text: str, *, origin: str = "main", conversation: str = "main") -> str:
+        path = self._archive_evidence(
+            "model_response",
+            text,
+            extension="txt",
+            metadata=self._evidence_metadata(
+                self._clock, origin=origin, conversation=conversation
+            ),
+        )
         if path is None:
             return _truncate(text)
         return f"-> {path} (chars={len(text)})"
