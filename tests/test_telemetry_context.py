@@ -131,11 +131,16 @@ class FakeClient:
             yield message
 
 
-def run_execute(tmp_path: Path, messages: list[object], usage=None) -> tuple[ModelExecutor, FakeClient]:
+def run_execute(
+    tmp_path: Path,
+    messages: list[object],
+    usage=None,
+    **executor_overrides: object,
+) -> tuple[ModelExecutor, FakeClient]:
     FakeClient.instances.clear()
     published: list[object] = []
     executor = ModelExecutor(
-        executor_config(tmp_path),
+        executor_config(tmp_path, **executor_overrides),
         client_factory=lambda options: FakeClient(options, messages, usage),
         attempt_publisher=published.append,
     )
@@ -294,14 +299,32 @@ def test_window_basis_sdk_assumed_without_override(tmp_path: Path, monkeypatch) 
     assert view["auto_compact_threshold_basis"] == "sdk_assumed"
 
 
-def test_window_basis_configured_with_override(tmp_path: Path, monkeypatch) -> None:
-    monkeypatch.setenv("CLAUDE_CODE_MAX_CONTEXT_TOKENS", "200000")
-    executor, client = run_execute(tmp_path, [usage_message(0, 1000), terminal_result()])
+def test_window_basis_configured_with_override(tmp_path: Path) -> None:
+    executor, client = run_execute(
+        tmp_path,
+        [usage_message(0, 1000), terminal_result()],
+        claude_code_max_context_tokens=1048576,
+    )
 
     assert client.usage_calls == 1
     view = dict(executor._live_attempt_view())  # noqa: SLF001
     assert view["context_window_basis"] == "configured"
     assert view["auto_compact_threshold_basis"] == "configured"
+    assert client.options.env["CLAUDE_CODE_MAX_CONTEXT_TOKENS"] == "1048576"
+
+
+def test_window_basis_ignores_parent_env_when_config_unset(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setenv("CLAUDE_CODE_MAX_CONTEXT_TOKENS", "1048576")
+    executor, client = run_execute(
+        tmp_path, [usage_message(0, 1000), terminal_result()]
+    )
+
+    assert client.usage_calls == 1
+    view = dict(executor._live_attempt_view())  # noqa: SLF001
+    assert view["context_window_basis"] == "sdk_assumed"
+    assert "CLAUDE_CODE_MAX_CONTEXT_TOKENS" not in client.options.env
 
 
 def test_failed_context_usage_yields_unavailable(tmp_path: Path, monkeypatch) -> None:

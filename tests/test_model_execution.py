@@ -317,6 +317,42 @@ def test_model_stream_idle_timeout_is_configurable(tmp_path: Path) -> None:
     assert captured[0].options.env["CLAUDE_STREAM_IDLE_TIMEOUT_MS"] == "120000"
 
 
+def test_context_window_override_is_absent_by_default(tmp_path: Path) -> None:
+    captured: list[FakeClient] = []
+
+    def client_factory(options: object) -> FakeClient:
+        client = FakeClient(options, [result()])
+        captured.append(client)
+        return client
+
+    asyncio.run(
+        ModelExecutor(
+            runtime_config(tmp_path),
+            client_factory=client_factory,
+        ).execute(issue_body="Fix it.", working_directory=tmp_path)
+    )
+
+    assert "CLAUDE_CODE_MAX_CONTEXT_TOKENS" not in captured[0].options.env
+
+
+def test_context_window_override_is_forwarded_to_cli_env(tmp_path: Path) -> None:
+    captured: list[FakeClient] = []
+
+    def client_factory(options: object) -> FakeClient:
+        client = FakeClient(options, [result()])
+        captured.append(client)
+        return client
+
+    asyncio.run(
+        ModelExecutor(
+            replace(runtime_config(tmp_path), claude_code_max_context_tokens=1048576),
+            client_factory=client_factory,
+        ).execute(issue_body="Fix it.", working_directory=tmp_path)
+    )
+
+    assert captured[0].options.env["CLAUDE_CODE_MAX_CONTEXT_TOKENS"] == "1048576"
+
+
 def test_enables_project_settings_only_when_the_operator_explicitly_trusts_them(
     tmp_path: Path,
 ) -> None:

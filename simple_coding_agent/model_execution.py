@@ -9,7 +9,6 @@ from datetime import UTC, datetime
 from enum import StrEnum
 import functools
 import json
-import os
 from pathlib import Path
 import re
 import shlex
@@ -85,16 +84,16 @@ CONTEXT_WINDOW_OVERRIDE_ENV_VAR = "CLAUDE_CODE_MAX_CONTEXT_TOKENS"
 MAX_TELEMETRY_SUBAGENTS = _MAX_CONTEXT_SUBAGENTS
 
 
-def _context_window_configured() -> bool:
-    """Whether the operator overrode the context window for this process."""
+def _context_window_basis_for(config: object) -> str:
+    """Basis for a successful context-usage window reading from operator config.
 
-    return bool(os.environ.get(CONTEXT_WINDOW_OVERRIDE_ENV_VAR, "").strip())
+    ``configured`` when the operator set ``CLAUDE_CODE_MAX_CONTEXT_TOKENS``
+    (the value forwarded to the CLI); otherwise the window is whatever the
+    SDK assumes for the model (``sdk_assumed``).
+    """
 
-
-def _context_window_basis() -> str:
-    """Basis for a successful context-usage window reading."""
-
-    return "configured" if _context_window_configured() else "sdk_assumed"
+    window = getattr(config, "claude_code_max_context_tokens", None)
+    return "configured" if window is not None else "sdk_assumed"
 
 
 def _as_non_negative_int(value: object) -> int | None:
@@ -1060,7 +1059,7 @@ class ModelExecutor:
         if not isinstance(usage, Mapping):
             self._mark_context_usage_unavailable("context usage failed: bad response")
             return
-        basis = _context_window_basis()
+        basis = _context_window_basis_for(self._config)
         raw_max = _as_non_negative_int(usage.get("rawMaxTokens"))
         max_tokens = _as_non_negative_int(usage.get("maxTokens"))
         window = raw_max if raw_max is not None else max_tokens
@@ -4258,6 +4257,9 @@ def _model_environment(
     environment["ANTHROPIC_DEFAULT_HAIKU_MODEL"] = model
     environment["CLAUDE_CODE_SUBAGENT_MODEL"] = model
     environment["CLAUDE_STREAM_IDLE_TIMEOUT_MS"] = str(config.model_stream_idle_timeout_ms)
+    context_window = getattr(config, "claude_code_max_context_tokens", None)
+    if context_window is not None:
+        environment[CONTEXT_WINDOW_OVERRIDE_ENV_VAR] = str(context_window)
     if attempt_marker is not None:
         environment[ATTEMPT_PROCESS_MARKER] = attempt_marker
     return environment

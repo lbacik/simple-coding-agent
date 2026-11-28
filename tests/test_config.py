@@ -635,3 +635,85 @@ def test_runtime_config_effective_soft_threshold_matches_the_helper(tmp_path: Pa
 
     assert config.effective_soft_threshold(150_000) == (2_950_000, "reserve", 1_050_000)
     assert config.effective_soft_threshold(50_000) == (3_200_000, "percentage", 350_000)
+
+
+def test_claude_code_max_context_tokens_defaults_to_none(tmp_path: Path) -> None:
+    config = load_runtime_config(_operator_env(tmp_path))
+
+    assert config.claude_code_max_context_tokens is None
+
+
+def test_claude_code_max_context_tokens_parses_documented_window(tmp_path: Path) -> None:
+    config = load_runtime_config(
+        _operator_env(tmp_path, CLAUDE_CODE_MAX_CONTEXT_TOKENS="1048576")
+    )
+
+    assert config.claude_code_max_context_tokens == 1_048_576
+
+
+def test_claude_code_max_context_tokens_blank_means_unset(tmp_path: Path) -> None:
+    config = load_runtime_config(
+        _operator_env(tmp_path, CLAUDE_CODE_MAX_CONTEXT_TOKENS="  ")
+    )
+
+    assert config.claude_code_max_context_tokens is None
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "many", "6.5"])
+def test_claude_code_max_context_tokens_rejects_non_positive(
+    tmp_path: Path, value: str
+) -> None:
+    with pytest.raises(ConfigurationError) as error:
+        load_runtime_config(_operator_env(tmp_path, CLAUDE_CODE_MAX_CONTEXT_TOKENS=value))
+
+    assert "CLAUDE_CODE_MAX_CONTEXT_TOKENS" in str(error.value)
+
+
+def test_warns_when_context_window_exceeds_reserve(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    with caplog.at_level("WARNING", logger="simple_coding_agent.config"):
+        load_runtime_config(
+            _operator_env(tmp_path, CLAUDE_CODE_MAX_CONTEXT_TOKENS="1048576")
+        )
+
+    warnings = [record for record in caplog.records if record.levelname == "WARNING"]
+    assert any("CLAUDE_CODE_MAX_CONTEXT_TOKENS=1048576" in record.message for record in warnings)
+
+
+def test_no_reserve_warning_for_default_assumed_window(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    with caplog.at_level("WARNING", logger="simple_coding_agent.config"):
+        load_runtime_config(
+            _operator_env(tmp_path, CLAUDE_CODE_MAX_CONTEXT_TOKENS="200000")
+        )
+
+    assert all(
+        "leaves no handoff reserve" not in record.message for record in caplog.records
+    )
+
+
+def test_warns_when_context_window_above_documented(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    with caplog.at_level("WARNING", logger="simple_coding_agent.config"):
+        load_runtime_config(
+            _operator_env(tmp_path, CLAUDE_CODE_MAX_CONTEXT_TOKENS="2000000")
+        )
+
+    warnings = [record for record in caplog.records if record.levelname == "WARNING"]
+    assert any("documented" in record.message for record in warnings)
+
+
+def test_no_documented_warning_at_documented_window(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    with caplog.at_level("WARNING", logger="simple_coding_agent.config"):
+        load_runtime_config(
+            _operator_env(tmp_path, CLAUDE_CODE_MAX_CONTEXT_TOKENS="1048576")
+        )
+
+    assert not any(
+        "above Meta's documented" in record.message for record in caplog.records
+    )

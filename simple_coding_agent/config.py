@@ -42,6 +42,18 @@ _DEFAULT_HANDOFF_RESERVE_TURNS = 6
 _MAX_HANDOFF_RESERVE_TURNS = 20
 
 
+#: Context window the pinned CLI assumes for an unknown model (tokens).
+#: The fleet measured ``contextWindow=200000`` with ``autoCompactThreshold``
+#: near 167000 when ``CLAUDE_CODE_MAX_CONTEXT_TOKENS`` is unset.
+CLI_ASSUMED_CONTEXT_WINDOW_TOKENS = 200_000
+
+#: Meta's documented context window for the pinned model (tokens). Live
+#: checks accepted ~1,037,161 tokens and rejected ~1,052,279, consistent
+#: with this window; overflow surfaces as a generic 400, not a
+#: context-length error.
+META_DOCUMENTED_CONTEXT_WINDOW_TOKENS = 1_048_576
+
+
 def _pinned_claude_agent_sdk_version() -> str:
     """The ``claude-agent-sdk==`` pin this package was installed with.
 
@@ -131,6 +143,7 @@ class RuntimeConfig:
     handoff_comment_mode: str = _DEFAULT_HANDOFF_COMMENT_MODE
     worker_id: str = ""
     background_task_grace_seconds: int = 300
+    claude_code_max_context_tokens: int | None = None
 
     @property
     def soft_threshold_tokens(self) -> int:
@@ -248,10 +261,15 @@ def load_runtime_config(environ: Mapping[str, str] | None = None) -> RuntimeConf
         max_conflict_attempts=_non_negative_integer(values, "MAX_CONFLICT_ATTEMPTS", 0),
         handoff_comment_mode=_handoff_comment_mode(values),
         worker_id=_worker_id(values),
+        claude_code_max_context_tokens=_optional_positive_integer(
+            values, "CLAUDE_CODE_MAX_CONTEXT_TOKENS"
+        ),
     )
     _warn_when_claude_code_version_is_set(values)
     _warn_when_claude_agent_sdk_version_is_set(values)
     _warn_when_usd_backstop_is_tighter(config)
+    _warn_when_context_window_exceeds_reserve(config)
+    _warn_when_context_window_above_documented(config)
     return config
 
 
@@ -356,6 +374,50 @@ def _warn_when_usd_backstop_is_tighter(config: RuntimeConfig) -> None:
         )
 
 
+def _warn_when_context_window_exceeds_reserve(config: RuntimeConfig) -> None:
+    """Warn when the configured window leaves no handoff reserve.
+
+    The effective soft threshold keeps ``HANDOFF_RESERVE_TURNS`` turns after
+    the crossing turn at the main thread's latest context size. A configured
+    window at or above ``MAX_BUDGET_TOKENS / (reserve_turns + 1)`` makes the
+    reserve rule fire immediately once the context reaches the window, so a
+    larger window also needs a larger token budget (or fewer reserve turns).
+    """
+
+    window = config.claude_code_max_context_tokens
+    if window is None:
+        return
+    if (config.handoff_reserve_turns + 1) * window >= config.max_budget_tokens:
+        logger.warning(
+            "CLAUDE_CODE_MAX_CONTEXT_TOKENS=%d leaves no handoff reserve with "
+            "MAX_BUDGET_TOKENS=%d and HANDOFF_RESERVE_TURNS=%d; the soft "
+            "threshold will fire as soon as the context reaches the window",
+            window,
+            config.max_budget_tokens,
+            config.handoff_reserve_turns,
+        )
+
+
+def _warn_when_context_window_above_documented(config: RuntimeConfig) -> None:
+    """Warn when the configured window exceeds Meta's documented window.
+
+    Live checks accepted ~1,037,161 tokens and rejected ~1,052,279 for the
+    pinned model, consistent with 1,048,576; anything above that fails with
+    a generic 400, not a context-length error.
+    """
+
+    window = config.claude_code_max_context_tokens
+    if window is None:
+        return
+    if window > META_DOCUMENTED_CONTEXT_WINDOW_TOKENS:
+        logger.warning(
+            "CLAUDE_CODE_MAX_CONTEXT_TOKENS=%d is above Meta's documented "
+            "window %d; requests past the documented window fail",
+            window,
+            META_DOCUMENTED_CONTEXT_WINDOW_TOKENS,
+        )
+
+
 def _required(values: Mapping[str, str], name: str) -> str:
     value = values.get(name, "")
     if not value.strip():
@@ -380,6 +442,27 @@ def _positive_integer(values: Mapping[str, str], name: str, default: int) -> int
     value = values.get(name, str(default))
     try:
         number = int(value)
+    except ValueError as error:
+        raise ConfigurationError(f"{name} must be a positive integer") from error
+    if number <= 0:
+        raise ConfigurationError(f"{name} must be a positive integer")
+    return number
+
+
+def _optional_positive_integer(values: Mapping[str, str], name: str) -> int | None:
+    """An optional positive integer operator setting (``None`` when unset).
+
+    Blank or missing means the CLI default applies; anything else must be a
+    positive integer.
+    """
+
+    if name not in values:
+        return None
+    raw = values[name]
+    if isinstance(raw, str) and not raw.strip():
+        return None
+    try:
+        number = int(str(raw).strip())
     except ValueError as error:
         raise ConfigurationError(f"{name} must be a positive integer") from error
     if number <= 0:

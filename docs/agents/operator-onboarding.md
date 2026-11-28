@@ -312,6 +312,20 @@ read/inspection or git wrap-up commands (e.g. `git status`, `git add`, `git comm
 Turns and `MODEL_TIMEOUT` get no soft threshold: reaching either limit gets
 one best-effort same-client handoff follow-up instead.
 
+The CLI assumes a 200,000-token context window for `muse-spark-1.3-contributor`
+(auto-compaction near 167,000 tokens) unless the operator sets
+`CLAUDE_CODE_MAX_CONTEXT_TOKENS`. Meta's documented window is 1,048,576 tokens
+(live checks accepted ~1,037,161 and rejected ~1,052,279; overflow is a generic
+400, not a context-length error). Setting `CLAUDE_CODE_MAX_CONTEXT_TOKENS=1048576`
+opts into the real window (auto-compaction then near 1,015,576): every turn
+re-sends the whole context, so expect higher per-turn spend and TPM pressure on
+the shared team limit, and note that a main context at or above
+`MAX_BUDGET_TOKENS / (HANDOFF_RESERVE_TURNS + 1)` (~571,000 tokens with defaults)
+makes the handoff reserve rule fire immediately. The fleet dashboard reports the
+window the CLI actually uses as `context.window` (and the compaction point as
+`context.auto_compact_threshold`) with basis `configured` when the override is set
+and `sdk_assumed` otherwise.
+
 If the token hard ceiling (`MAX_BUDGET_TOKENS` tokens, default 4000000) is
 reached, the attempt is stopped unconditionally, regardless of the model and
 whether or not it has handed off: every tool call is denied (the `handoff`
