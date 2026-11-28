@@ -16,7 +16,7 @@ import signal
 import subprocess
 import threading
 import time
-from typing import Any, Literal, Protocol
+from typing import TYPE_CHECKING, Any, Literal, Protocol
 
 from simple_coding_agent.attempt_state import (
     ATTEMPT_KIND_CONFLICT,
@@ -28,6 +28,9 @@ from simple_coding_agent.attempt_state import (
     RecordedVerdict,
 )
 from simple_coding_agent.attempt_workspace import AttemptWorkspace, ConflictState
+
+if TYPE_CHECKING:
+    from simple_coding_agent.recovery import RetryEvidence
 from simple_coding_agent.control import (
     ActiveAttemptInfo,
     CommandAcknowledgement,
@@ -3676,48 +3679,28 @@ class AgentLifecycle:
             f" retained work secured at {saved_at}; the hold is cleared"
         )
 
-    def _infer_retry_decision(
+    def _collect_retry_evidence(
         self, checkpoint: AttemptCheckpoint, claim: Claim, prepared: PreparedAttempt
-    ) -> tuple[CompletionDecision, str, str | None, bool]:
-        """Infer the safe republication decision without invoking the model."""
+    ) -> RetryEvidence:
+        """Gather workspace evidence for retained-attempt retry inference.
+
+        Impure (workspace, archive, and handoff-note reads); the pure
+        decision lives in :func:`recovery.infer_retry_decision`. Emits the
+        handoff-note validation events so startup reconciliation and
+        recovery retry observe the same validation.
+        """
+
+        from simple_coding_agent.recovery import RetryEvidence
 
         archive = self._archive_for(claim.issue.number, checkpoint.started_at)
         commits = self._workspace.commits_added(prepared)
         has_commits = bool(commits)
         if checkpoint.phase is AttemptPhase.MODEL_RUNNING:
-            if commits:
-                if _final_check_was_interrupted(archive):
-                    decision = CompletionDecision(
-                        AttemptOutcome.INFRASTRUCTURE_ERROR,
-                        False,
-                        PublicationPath.PARTIAL,
-                        (
-                            "Final check was interrupted before completing;"
-                            " committed work is preserved on the branch.",
-                        ),
-                    )
-                else:
-                    try:
-                        self._attempt_state.transition(AttemptPhase.PUSHING)
-                        self._event_log(
-                            "attempt_phase_transitioned",
-                            f"phase={AttemptPhase.PUSHING.value}",
-                            level="INFO",
-                            issue_number=claim.issue.number,
-                        )
-                    except AttemptStateError:
-                        pass
-                    decision = CompletionDecision(
-                        AttemptOutcome.INCOMPLETE,
-                        False,
-                        PublicationPath.PARTIAL,
-                        ("Model execution was interrupted; preserved committed work.",),
-                    )
-            else:
-                decision = _infrastructure_decision(
-                    "Model execution was interrupted without commits."
-                )
-            return (decision, decision.reasons[0], None, has_commits)
+            return RetryEvidence(
+                phase=checkpoint.phase,
+                has_commits=has_commits,
+                final_check_interrupted=_final_check_was_interrupted(archive),
+            )
         if checkpoint.phase in (AttemptPhase.PUSHING, AttemptPhase.PUBLISHING):
             note_commit = self._workspace.handoff_note_commit(
                 prepared, claim.issue.number, attempt_id=checkpoint.started_at
@@ -3740,45 +3723,84 @@ class AgentLifecycle:
                     self._event_log, claim.issue.number, validation
                 )
                 if validation.valid:
-                    decision = CompletionDecision(
-                        AttemptOutcome.HANDOFF,
-                        False,
-                        PublicationPath.PARTIAL,
-                        (
-                            "Recovered a previously committed handoff note"
-                            " for publication.",
+                    return RetryEvidence(
+                        phase=checkpoint.phase,
+                        has_commits=has_commits,
+                        note_revision=note_commit.revision,
+                        note_valid=True,
+                        note_details=_read_handoff_note(
+                            self._workspace.working_directory, claim.issue.number
                         ),
                     )
-                    details = _read_handoff_note(
-                        self._workspace.working_directory, claim.issue.number
-                    )
-                    return (decision, details, note_commit.revision, has_commits)
-                # An invalid recovered note is ordinary incomplete work, not
-                # an infrastructure failure: the preserved commits still
-                # publish on the partial path with the validation reason.
-                decision = CompletionDecision(
-                    AttemptOutcome.INCOMPLETE,
-                    False,
-                    PublicationPath.PARTIAL,
-                    (validation.reason,),
+                return RetryEvidence(
+                    phase=checkpoint.phase,
+                    has_commits=has_commits,
+                    note_revision=note_commit.revision,
+                    note_valid=False,
+                    note_reason=validation.reason,
                 )
-                return (decision, validation.reason, None, has_commits)
-            decision = CompletionDecision(
-                None,
-                True,
-                PublicationPath.COMPLETE,
-                ("Recovered previously completed local evidence for publication.",),
+            return RetryEvidence(
+                phase=checkpoint.phase, has_commits=has_commits
             )
-            return (decision, decision.reasons[0], None, has_commits)
-        decision = _infrastructure_decision(
-            "Attempt was interrupted before model execution."
+        return RetryEvidence(
+            phase=checkpoint.phase, has_commits=has_commits
         )
-        return (decision, decision.reasons[0], None, has_commits)
+
+    def _apply_retry_advance(self, advance_to_pushing: bool, issue_number: int) -> None:
+        """Perform the one retry side effect the pure inference requests.
+
+        Shared by startup reconciliation and ``recovery retry`` so the
+        ``MODEL_RUNNING``-with-commits → ``PUSHING`` transition cannot drift
+        between the two callers. A failed transition is ignored: the
+        checkpoint already records the phase.
+        """
+
+        if not advance_to_pushing:
+            return
+        try:
+            self._attempt_state.transition(AttemptPhase.PUSHING)
+            self._event_log(
+                "attempt_phase_transitioned",
+                f"phase={AttemptPhase.PUSHING.value}",
+                level="INFO",
+                issue_number=issue_number,
+            )
+        except AttemptStateError:
+            pass
+
+    def _infer_retry_decision(
+        self, checkpoint: AttemptCheckpoint, claim: Claim, prepared: PreparedAttempt
+    ) -> tuple[CompletionDecision, str, str | None, bool]:
+        """Infer the safe republication decision without invoking the model.
+
+        Delegates to :func:`recovery.infer_retry_decision`; performs the
+        one lifecycle side effect (advancing a ``MODEL_RUNNING``
+        checkpoint with preserved commits to ``PUSHING``) when the
+        inference requests it.
+        """
+
+        from simple_coding_agent.recovery import infer_retry_decision
+
+        evidence = self._collect_retry_evidence(checkpoint, claim, prepared)
+        inference = infer_retry_decision(evidence)
+        self._apply_retry_advance(inference.advance_to_pushing, claim.issue.number)
+        return (
+            inference.decision,
+            inference.details,
+            inference.note_sha,
+            inference.has_commits,
+        )
 
     def _infer_release_outcome(
         self, checkpoint: AttemptCheckpoint, claim: Claim, prepared: PreparedAttempt
     ) -> tuple[AttemptOutcome, str]:
-        """Infer the actual outcome recorded by ``recovery release``."""
+        """Infer the actual outcome recorded by ``recovery release``.
+
+        Delegates to :func:`recovery.infer_release_outcome`; this method
+        keeps only the workspace reads and validation-event emission.
+        """
+
+        from simple_coding_agent.recovery import ReleaseEvidence, infer_release_outcome
 
         try:
             commits = self._workspace.commits_added(prepared)
@@ -3790,6 +3812,7 @@ class AgentLifecycle:
             )
         except Exception:
             note_commit = None
+        note_valid = False
         if note_commit is not None:
             try:
                 validation = _validate_handoff_note(
@@ -3811,34 +3834,15 @@ class AgentLifecycle:
                 _emit_handoff_note_events(
                     self._event_log, claim.issue.number, validation
                 )
-            if validation is not None and validation.valid:
-                return (
-                    AttemptOutcome.HANDOFF,
-                    "The handoff note was committed but finalization never"
-                    f" completed in phase {checkpoint.phase.value}; the handoff"
-                    " is recorded as not fulfilled (not a successful handoff),"
-                    " and the retained branch is not published as a success.",
-                )
-        if commits:
-            return (
-                AttemptOutcome.INCOMPLETE,
-                "Local work was preserved on the branch but finalization never"
-                f" completed in phase {checkpoint.phase.value}; the operator"
-                " secured the retained work and released the attempt.",
+            note_valid = bool(validation is not None and validation.valid)
+        inference = infer_release_outcome(
+            ReleaseEvidence(
+                phase=checkpoint.phase,
+                has_commits=bool(commits),
+                note_valid=note_valid,
             )
-        if checkpoint.phase in (AttemptPhase.CLAIMED, AttemptPhase.SETUP):
-            return (
-                AttemptOutcome.INFRASTRUCTURE_ERROR,
-                "The attempt was interrupted before model execution produced"
-                f" commits (phase {checkpoint.phase.value}); the operator"
-                " secured the retained state and released the attempt.",
-            )
-        return (
-            AttemptOutcome.INFRASTRUCTURE_ERROR,
-            "Finalization was interrupted before its completion boundary"
-            f" (phase {checkpoint.phase.value}); the operator secured the"
-            " retained work and released the attempt.",
         )
+        return (inference.outcome, inference.reason)
 
     def _confirm_release_comment(
         self, claim: Claim, marker: str, body: str, attempt_id: str, *, requeue_source: str = "human"
@@ -3911,44 +3915,44 @@ class AgentLifecycle:
         overwrite it).
         """
 
+        from simple_coding_agent.recovery import ConflictEvidence, infer_conflict_reason
+
         try:
             fresh = self._tracker.fetch_issue(checkpoint.issue_number)
         except Exception as error:
-            return (
-                "remote issue state is ambiguous"
-                f" ({_exception_detail(error)}); the retry must not replay"
-                " a side effect it cannot verify."
+            return infer_conflict_reason(
+                ConflictEvidence(
+                    issue_number=checkpoint.issue_number,
+                    fetch_error=_exception_detail(error),
+                )
             )
         if fresh is None:
-            return (
-                f"issue #{checkpoint.issue_number} is unavailable on GitHub;"
-                " the retry must not replay a side effect it cannot verify."
+            return infer_conflict_reason(
+                ConflictEvidence(
+                    issue_number=checkpoint.issue_number, missing=True
+                )
             )
         try:
             self_assigned = bool(self._tracker.is_self_assigned(fresh))
         except Exception as error:
-            return (
-                "remote assignment is ambiguous"
-                f" ({_exception_detail(error)}); the retry must not replay"
-                " a side effect it cannot verify."
+            return infer_conflict_reason(
+                ConflictEvidence(
+                    issue_number=checkpoint.issue_number,
+                    assignment_error=_exception_detail(error),
+                )
             )
         if not self_assigned:
-            holders = ", ".join(getattr(fresh, "assignee_logins", ()) or ())
+            holders = tuple(getattr(fresh, "assignee_logins", ()) or ())
             marker_detail = _foreign_marker_detail(
                 getattr(self._tracker, "worker_id", ""), fresh
             )
-            if holders:
-                return (
-                    f"issue #{checkpoint.issue_number} shows conflicting"
-                    f" assignment changes (assigned to another assignee:"
-                    f" {holders}{marker_detail}); the retry"
-                    " must not overwrite them and requires operator repair."
+            return infer_conflict_reason(
+                ConflictEvidence(
+                    issue_number=checkpoint.issue_number,
+                    self_assigned=False,
+                    holders=holders,
+                    foreign_marker=marker_detail,
                 )
-            return (
-                f"issue #{checkpoint.issue_number} shows conflicting"
-                " assignment changes (it is assigned to another assignee,"
-                f" no longer this agent{marker_detail}); the"
-                " retry must not overwrite them and requires operator repair."
             )
         return None
 
@@ -4069,12 +4073,17 @@ class AgentLifecycle:
     def _recovery_snapshot_locked(
         self, checkpoint: AttemptCheckpoint | None
     ) -> dict | None:
-        """Build the status ``recovery`` section (caller holds the lock)."""
+        """Build the status ``recovery`` section (caller holds the lock).
+
+        Delegates dict assembly to :mod:`recovery` snapshot builders; this
+        method keeps only the evidence reads (startup hold, dirty state,
+        ledger outcome, publication progress).
+        """
 
         from simple_coding_agent.recovery import (
-            describe_hold,
-            release_next_action,
-            retry_next_action,
+            dirty_tree_snapshot,
+            retained_snapshot,
+            startup_unreadable_snapshot,
         )
 
         if checkpoint is None:
@@ -4089,50 +4098,17 @@ class AgentLifecycle:
                     reason += " The working tree is also dirty" + (
                         suffix if suffix else "."
                     )
-                return {
-                    "attempt_id": None,
-                    "issue_number": None,
-                    "phase": None,
-                    "outcome": None,
-                    "branch": None,
-                    "workspace": str(self._workspace.working_directory),
-                    "workspace_dirty": workspace_dirty,
-                    "checkpoint": False,
-                    "publication": {
-                        "phase": None,
-                        "comment_confirmed": None,
-                        "pull_request": None,
-                    },
-                    "hold_reason": reason,
-                    "next_action": (
-                        "Repair or remove the unreadable state file described"
-                        " in the hold reason; intake resumes automatically"
-                        " once it reads cleanly."
-                    ),
-                }
+                return startup_unreadable_snapshot(
+                    workspace=str(self._workspace.working_directory),
+                    workspace_dirty=workspace_dirty,
+                    reason=reason,
+                )
             if not self._workspace_is_dirty():
                 return None
-            reason = self._dirty_tree_detail()
-            return {
-                "attempt_id": None,
-                "issue_number": None,
-                "phase": None,
-                "outcome": None,
-                "branch": None,
-                "workspace": str(self._workspace.working_directory),
-                "workspace_dirty": True,
-                "checkpoint": False,
-                "publication": {
-                    "phase": None,
-                    "comment_confirmed": None,
-                    "pull_request": None,
-                },
-                "hold_reason": reason,
-                "next_action": (
-                    "Inspect the working tree and repair or remove the"
-                    " unexplained changes before intake can resume."
-                ),
-            }
+            return dirty_tree_snapshot(
+                workspace=str(self._workspace.working_directory),
+                reason=self._dirty_tree_detail(),
+            )
         hold = self._recovery_hold_locked(checkpoint)
         if hold is None and not self._recovering:
             return None
@@ -4147,75 +4123,61 @@ class AgentLifecycle:
             except Exception:
                 outcome = None
         publication = self._publication_progress_locked(checkpoint)
-        if self._recovering:
-            next_action = (
-                "Wait for startup reconciliation to finish; do not run recovery"
-                " commands while it is still running."
-            )
-        elif outcome is not None:
-            next_action = (
-                "The attempt is finalized in the ledger; wait for the leftover"
-                " checkpoint to be removed on the next intake cycle."
-            )
-        else:
-            next_action = retry_next_action(checkpoint.started_at)
-        return {
-            "attempt_id": checkpoint.started_at,
-            "issue_number": checkpoint.issue_number,
-            "phase": checkpoint.phase.value,
-            "outcome": outcome,
-            "branch": checkpoint.branch,
-            "workspace": str(self._workspace.working_directory),
-            "workspace_dirty": self._workspace_is_dirty(),
-            "checkpoint": True,
-            "publication": publication,
-            "hold_reason": describe_hold(
-                issue_number=checkpoint.issue_number,
-                attempt_id=checkpoint.started_at,
-                phase=checkpoint.phase.value,
-                reason=reason,
-            ),
-            "next_action": next_action
-            if self._recovering or outcome is not None
-            else f"{next_action} {release_next_action()}",
-        }
+        return retained_snapshot(
+            attempt_id=checkpoint.started_at,
+            issue_number=checkpoint.issue_number,
+            phase=checkpoint.phase.value,
+            outcome=outcome,
+            branch=checkpoint.branch,
+            workspace=str(self._workspace.working_directory),
+            workspace_dirty=self._workspace_is_dirty(),
+            publication=publication,
+            hold_reason=reason,
+            recovering=self._recovering,
+            finalized=outcome is not None,
+        )
 
     def _publication_progress_locked(
         self, checkpoint: AttemptCheckpoint
     ) -> dict:
-        """Best-effort confirmed publication progress for status (read-only)."""
+        """Best-effort confirmed publication progress for status (read-only).
 
-        from simple_coding_agent.recovery import attempt_marker
+        Shape lives in :func:`recovery.publication_progress`; this method
+        keeps only the GitHub lookups.
+        """
 
-        progress: dict = {
-            "phase": checkpoint.phase.value,
-            "comment_confirmed": None,
-            "pull_request": None,
-        }
+        from simple_coding_agent.recovery import attempt_marker, publication_progress
+
+        comment_confirmed: bool | None = None
+        pull_request: dict | None = None
         github = getattr(self._publisher, "_github", None)
         repository = getattr(self._publisher, "_repository", None) or self._repository
         find_comment = getattr(github, "find_attempt_comment", None)
         if callable(find_comment):
             try:
-                progress["comment_confirmed"] = bool(
+                comment_confirmed = bool(
                     find_comment(
                         repository, checkpoint.issue_number, attempt_marker(checkpoint.started_at)
                     )
                 )
             except Exception:
-                progress["comment_confirmed"] = None
+                comment_confirmed = None
         find_pr = getattr(github, "find_pull_request", None)
         if callable(find_pr):
             try:
                 existing = find_pr(repository, checkpoint.branch)
                 if existing is not None:
-                    progress["pull_request"] = {
+                    pull_request = {
                         "number": getattr(existing, "number", None),
                         "url": getattr(existing, "url", None),
                     }
             except Exception:
-                progress["pull_request"] = None
-        return progress
+                pull_request = None
+        return publication_progress(
+            checkpoint.phase.value,
+            comment_confirmed=comment_confirmed,
+            pull_request=pull_request,
+        )
 
     def _is_self_assignment(self, found: TrackerIssue) -> bool:
         """Whether a revalidated target is assigned to this agent itself.
@@ -5221,35 +5183,19 @@ class AgentLifecycle:
         """
 
         from simple_coding_agent.recovery import (
-            describe_hold,
-            release_next_action,
-            retry_next_action,
+            publication_progress,
+            retained_snapshot,
+            startup_unreadable_snapshot,
         )
 
         if checkpoint is None:
             if self._startup_hold_detail is None:
                 return None
-            return {
-                "attempt_id": None,
-                "issue_number": None,
-                "phase": None,
-                "outcome": None,
-                "branch": None,
-                "workspace": str(self._workspace.working_directory),
-                "workspace_dirty": None,
-                "checkpoint": False,
-                "publication": {
-                    "phase": None,
-                    "comment_confirmed": None,
-                    "pull_request": None,
-                },
-                "hold_reason": self._startup_hold_detail,
-                "next_action": (
-                    "Repair or remove the unreadable state file described"
-                    " in the hold reason; intake resumes automatically"
-                    " once it reads cleanly."
-                ),
-            }
+            return startup_unreadable_snapshot(
+                workspace=str(self._workspace.working_directory),
+                workspace_dirty=None,
+                reason=self._startup_hold_detail,
+            )
         hold = self._recovery_hold_network_free(checkpoint)
         if hold is None and not self._recovering:
             return None
@@ -5265,54 +5211,34 @@ class AgentLifecycle:
                 outcome = None
         remembered = self._observed_publication.get(checkpoint.started_at)
         if remembered is not None:
-            publication = {
-                "phase": remembered.get("phase")
+            publication = publication_progress(
+                remembered.get("phase")
                 if remembered.get("phase") is not None
                 else checkpoint.phase.value,
-                "comment_confirmed": remembered.get("comment_confirmed"),
-                "pull_request": copy.deepcopy(remembered.get("pull_request"))
+                comment_confirmed=remembered.get("comment_confirmed"),
+                pull_request=copy.deepcopy(remembered.get("pull_request"))
                 if remembered.get("pull_request") is not None
                 else None,
-            }
-        else:
-            publication = {
-                "phase": checkpoint.phase.value,
-                "comment_confirmed": None,
-                "pull_request": None,
-            }
-        workspace_dirty = self._observed_workspace_dirty.get(checkpoint.started_at)
-        if self._recovering:
-            next_action = (
-                "Wait for startup reconciliation to finish; do not run recovery"
-                " commands while it is still running."
-            )
-        elif outcome is not None:
-            next_action = (
-                "The attempt is finalized in the ledger; wait for the leftover"
-                " checkpoint to be removed on the next intake cycle."
             )
         else:
-            next_action = retry_next_action(checkpoint.started_at)
-        return {
-            "attempt_id": checkpoint.started_at,
-            "issue_number": checkpoint.issue_number,
-            "phase": checkpoint.phase.value,
-            "outcome": outcome,
-            "branch": checkpoint.branch,
-            "workspace": str(self._workspace.working_directory),
-            "workspace_dirty": workspace_dirty,
-            "checkpoint": True,
-            "publication": publication,
-            "hold_reason": describe_hold(
-                issue_number=checkpoint.issue_number,
-                attempt_id=checkpoint.started_at,
-                phase=checkpoint.phase.value,
-                reason=reason,
-            ),
-            "next_action": next_action
-            if self._recovering or outcome is not None
-            else f"{next_action} {release_next_action()}",
-        }
+            publication = publication_progress(
+                checkpoint.phase.value,
+                comment_confirmed=None,
+                pull_request=None,
+            )
+        return retained_snapshot(
+            attempt_id=checkpoint.started_at,
+            issue_number=checkpoint.issue_number,
+            phase=checkpoint.phase.value,
+            outcome=outcome,
+            branch=checkpoint.branch,
+            workspace=str(self._workspace.working_directory),
+            workspace_dirty=self._observed_workspace_dirty.get(checkpoint.started_at),
+            publication=publication,
+            hold_reason=reason,
+            recovering=self._recovering,
+            finalized=outcome is not None,
+        )
 
     def _poll_sleep_seconds(self) -> float:
         """This idle cycle's poll sleep: uniform within ±20% of the interval.
@@ -7204,98 +7130,31 @@ class AgentLifecycle:
                 base_branch=profile.base_branch, issue_number=claim.issue.number
             )
             self._record_claim_lease(prepared, claim.issue.number)
-            if checkpoint.phase is AttemptPhase.MODEL_RUNNING:
-                commits = self._workspace.commits_added(prepared)
-                has_commits = bool(commits)
-                if commits:
-                    if _final_check_was_interrupted(archive):
-                        # The previous process logged final_check_started but
-                        # never finished the check (kill, crash, or container
-                        # restart). Report that honestly instead of blaming
-                        # model execution; the branch is retained for resume.
-                        self._event_log(
-                            "final_check_interrupted",
-                            "The final check started but never finished; the attempt process "
-                            "died mid-check.",
-                            level="ERROR",
-                            issue_number=claim.issue.number,
-                        )
-                        decision = CompletionDecision(
-                            AttemptOutcome.INFRASTRUCTURE_ERROR,
-                            False,
-                            PublicationPath.PARTIAL,
-                            (
-                                "Final check was interrupted before completing; committed work "
-                                "is preserved on the branch.",
-                            ),
-                        )
-                    else:
-                        self._attempt_state.transition(AttemptPhase.PUSHING)
-                        self._event_log(
-                            "attempt_phase_transitioned",
-                            f"phase={AttemptPhase.PUSHING.value}",
-                            level="INFO",
-                            issue_number=claim.issue.number,
-                        )
-                        decision = CompletionDecision(
-                            AttemptOutcome.INCOMPLETE, False, PublicationPath.PARTIAL,
-                            ("Model execution was interrupted; preserved committed work.",),
-                        )
-                else:
-                    decision = _infrastructure_decision("Model execution was interrupted without commits.")
-            elif checkpoint.phase in (AttemptPhase.PUSHING, AttemptPhase.PUBLISHING):
-                recovered_commits = self._workspace.commits_added(prepared)
-                has_commits = bool(recovered_commits)
-                recovered_note_commit = self._workspace.handoff_note_commit(
-                    prepared, claim.issue.number, attempt_id=checkpoint.started_at
+            from simple_coding_agent.recovery import infer_retry_decision
+
+            evidence = self._collect_retry_evidence(checkpoint, claim, prepared)
+            inference = infer_retry_decision(evidence)
+            decision = inference.decision
+            has_commits = inference.has_commits
+            if (
+                checkpoint.phase is AttemptPhase.MODEL_RUNNING
+                and has_commits
+                and evidence.final_check_interrupted
+            ):
+                # The previous process logged final_check_started but
+                # never finished the check (kill, crash, or container
+                # restart). Report that honestly instead of blaming
+                # model execution; the branch is retained for resume.
+                self._event_log(
+                    "final_check_interrupted",
+                    "The final check started but never finished; the attempt process "
+                    "died mid-check.",
+                    level="ERROR",
+                    issue_number=claim.issue.number,
                 )
-                if recovered_note_commit is not None:
-                    validation = _validate_handoff_note(
-                        recovered_note_commit,
-                        recovered_commits,
-                        claim.issue.number,
-                        self._workspace.working_directory,
-                        prepared.base_revision,
-                        note_commit_revisions=_this_attempt_note_commit_revisions(
-                            self._workspace,
-                            prepared,
-                            claim.issue.number,
-                            checkpoint.started_at,
-                        ),
-                    )
-                    _emit_handoff_note_events(
-                        self._event_log, claim.issue.number, validation
-                    )
-                    if validation.valid:
-                        decision = CompletionDecision(
-                            AttemptOutcome.HANDOFF, False, PublicationPath.PARTIAL,
-                            ("Recovered a previously committed handoff note for publication.",),
-                        )
-                    else:
-                        # An invalid recovered note is ordinary incomplete
-                        # work, not an infrastructure failure: the preserved
-                        # commits still publish on the partial path with the
-                        # validation reason attached.
-                        decision = CompletionDecision(
-                            AttemptOutcome.INCOMPLETE, False, PublicationPath.PARTIAL,
-                            (validation.reason,),
-                        )
-                else:
-                    decision = CompletionDecision(
-                        None, True, PublicationPath.COMPLETE,
-                        ("Recovered previously completed local evidence for publication.",),
-                    )
-            else:
-                decision = _infrastructure_decision("Attempt was interrupted before model execution.")
-            details = decision.reasons[0]
-            note_commit_sha = None
-            if decision.outcome is AttemptOutcome.HANDOFF:
-                details = _read_handoff_note(self._workspace.working_directory, claim.issue.number)
-                note_commit = self._workspace.handoff_note_commit(
-                    prepared, claim.issue.number, attempt_id=checkpoint.started_at
-                )
-                if note_commit is not None:
-                    note_commit_sha = note_commit.revision
+            self._apply_retry_advance(inference.advance_to_pushing, claim.issue.number)
+            details = inference.details
+            note_commit_sha = inference.note_sha
             publication_started_at = self._clock()
             # A verdict recorded before the restart is never recomputed (ADR
             # 0010): republication aims at it, and when that cannot be done
@@ -8756,16 +8615,17 @@ class AgentLifecycle:
 def _final_check_was_interrupted(archive: AttemptArchive | None) -> bool:
     """Whether a previous process died after starting the final check.
 
-    The runner records ``final_check_started`` immediately before running the
-    check and ``final_check_finished`` right after it returns, so a marker
-    without its finish means the process never survived the check — the one
-    signature a SIGKILL/OOM leaves behind.
+    Delegates to :func:`recovery.final_check_interrupted`: the runner
+    records ``final_check_started`` immediately before running the check
+    and ``final_check_finished`` right after it returns, so a marker
+    without its finish means the process never survived the check.
     """
+
+    from simple_coding_agent.recovery import final_check_interrupted
 
     if archive is None:
         return False
-    record = archive.read_attempt()
-    return bool(record.get("final_check_started")) and not record.get("final_check_finished")
+    return final_check_interrupted(archive.read_attempt())
 
 
 def _format_conflicted_files(files: tuple[str, ...]) -> str:
@@ -10247,12 +10107,6 @@ def _decision_for_recorded_verdict(
         else PublicationPath.NONE
     )
     return (CompletionDecision(outcome, False, path, (text,)), text, None)
-
-
-def _infrastructure_decision(reason: str) -> CompletionDecision:
-    return CompletionDecision(
-        AttemptOutcome.INFRASTRUCTURE_ERROR, False, PublicationPath.NONE, (reason,)
-    )
 
 
 def _exception_detail(error: Exception) -> str:

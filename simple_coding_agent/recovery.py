@@ -6,15 +6,27 @@ issue was not released, local cleanup is not durable, or accounting never
 committed. While such a checkpoint (or unexplained dirty work) exists,
 intake stays blocked and ``resume`` is rejected.
 
-This module holds the small, testable recovery helpers. The lifecycle owns
-the serialized execution; the control store owns the durable command
-record; the CLI and socket only transport requests.
+This module owns retained-attempt inference: given a retained checkpoint
+and workspace evidence, what happened and what may safely be redone.
+Startup reconciliation and the operator recovery retry/release commands
+both infer through this module; the lifecycle keeps only locking,
+control-store bookkeeping, and side-effecting execution. The control
+store owns the durable command record; the CLI and socket only transport
+requests.
 """
 
 from __future__ import annotations
 
-from collections.abc import Container, Iterable
+from collections.abc import Container, Iterable, Mapping
+from dataclasses import dataclass
 import re
+
+from simple_coding_agent.attempt_state import AttemptPhase
+from simple_coding_agent.completion import (
+    AttemptOutcome,
+    CompletionDecision,
+    PublicationPath,
+)
 
 
 class RecoveryRejectedError(ValueError):
@@ -965,3 +977,417 @@ def filter_prompt_comments(bodies: Iterable[str]) -> tuple[str, ...]:
             continue
         filtered.append(body)
     return tuple(filtered)
+
+
+# ---------------------------------------------------------------------------
+# Retained-attempt inference (issue #111)
+# ---------------------------------------------------------------------------
+#
+# Single source of truth for "checkpoint phase + commits + archive markers
+# -> what happened, what may safely be redone". Both startup reconciliation
+# and ``recovery retry`` infer through :func:`infer_retry_decision`;
+# ``recovery release`` infers through :func:`infer_release_outcome`.
+# Conflict detection (:func:`infer_conflict_reason`) and the status hold
+# snapshot builders below live here for the same reason: one set of
+# recovery rules, testable without constructing a lifecycle.
+#
+# The functions are pure: workspace reads (commits, handoff-note commits,
+# dirty state) and archive reads happen at the call site through the
+# attempt-workspace seam and are passed in as plain evidence. The one
+# lifecycle side effect the old inference performed inline -- advancing a
+# ``MODEL_RUNNING`` checkpoint with preserved commits to ``PUSHING`` -- is
+# reported as :attr:`RetryInference.advance_to_pushing` so the caller
+# performs it alongside its event log.
+
+#: Reason when the final check started but never finished.
+RETRY_FINAL_CHECK_INTERRUPTED_REASON = (
+    "Final check was interrupted before completing;"
+    " committed work is preserved on the branch."
+)
+
+#: Reason when model execution left preserved commits behind.
+RETRY_MODEL_INTERRUPTED_WITH_COMMITS_REASON = (
+    "Model execution was interrupted; preserved committed work."
+)
+
+#: Reason when model execution left no commits behind.
+RETRY_MODEL_INTERRUPTED_NO_COMMITS_REASON = (
+    "Model execution was interrupted without commits."
+)
+
+#: Reason when the attempt never reached model execution.
+RETRY_BEFORE_MODEL_REASON = "Attempt was interrupted before model execution."
+
+#: Reason when pushing/publishing left completed local evidence behind.
+RETRY_RECOVERED_EVIDENCE_REASON = (
+    "Recovered previously completed local evidence for publication."
+)
+
+#: Reason when pushing/publishing left a valid handoff note behind.
+RETRY_RECOVERED_HANDOFF_REASON = (
+    "Recovered a previously committed handoff note for publication."
+)
+
+
+def _infrastructure_decision(reason: str) -> CompletionDecision:
+    """An infrastructure-error decision that publishes nothing."""
+
+    return CompletionDecision(
+        AttemptOutcome.INFRASTRUCTURE_ERROR, False, PublicationPath.NONE, (reason,)
+    )
+
+
+@dataclass(frozen=True)
+class RetryEvidence:
+    """Workspace evidence for one retained-attempt retry inference."""
+
+    phase: AttemptPhase
+    has_commits: bool
+    final_check_interrupted: bool = False
+    note_revision: str | None = None
+    note_valid: bool | None = None
+    note_reason: str | None = None
+    note_details: str | None = None
+
+
+@dataclass(frozen=True)
+class RetryInference:
+    """What a retained attempt means and what retry may safely redo."""
+
+    decision: CompletionDecision
+    details: str
+    note_sha: str | None
+    has_commits: bool
+    advance_to_pushing: bool
+
+
+def infer_retry_decision(evidence: RetryEvidence) -> RetryInference:
+    """Infer the safe republication decision for a retained attempt.
+
+    Pure: every workspace/archive read is already reflected in
+    ``evidence``. ``advance_to_pushing`` is True exactly when the caller
+    should advance a ``MODEL_RUNNING`` checkpoint with preserved commits
+    (and no interrupted final check) to ``PUSHING`` before publishing.
+    """
+
+    if evidence.phase is AttemptPhase.MODEL_RUNNING:
+        if evidence.has_commits:
+            if evidence.final_check_interrupted:
+                decision = CompletionDecision(
+                    AttemptOutcome.INFRASTRUCTURE_ERROR,
+                    False,
+                    PublicationPath.PARTIAL,
+                    (RETRY_FINAL_CHECK_INTERRUPTED_REASON,),
+                )
+                return RetryInference(
+                    decision, decision.reasons[0], None, True, False
+                )
+            decision = CompletionDecision(
+                AttemptOutcome.INCOMPLETE,
+                False,
+                PublicationPath.PARTIAL,
+                (RETRY_MODEL_INTERRUPTED_WITH_COMMITS_REASON,),
+            )
+            return RetryInference(
+                decision, decision.reasons[0], None, True, True
+            )
+        decision = _infrastructure_decision(
+            RETRY_MODEL_INTERRUPTED_NO_COMMITS_REASON
+        )
+        return RetryInference(decision, decision.reasons[0], None, False, False)
+    if evidence.phase in (AttemptPhase.PUSHING, AttemptPhase.PUBLISHING):
+        if evidence.note_revision is not None:
+            if evidence.note_valid:
+                decision = CompletionDecision(
+                    AttemptOutcome.HANDOFF,
+                    False,
+                    PublicationPath.PARTIAL,
+                    (RETRY_RECOVERED_HANDOFF_REASON,),
+                )
+                details = evidence.note_details or decision.reasons[0]
+                return RetryInference(
+                    decision, details, evidence.note_revision,
+                    evidence.has_commits, False,
+                )
+            reason = evidence.note_reason or (
+                "Handoff was requested, but no handoff note commit"
+                " is on the branch."
+            )
+            decision = CompletionDecision(
+                AttemptOutcome.INCOMPLETE,
+                False,
+                PublicationPath.PARTIAL,
+                (reason,),
+            )
+            return RetryInference(
+                decision, reason, None, evidence.has_commits, False
+            )
+        decision = CompletionDecision(
+            None,
+            True,
+            PublicationPath.COMPLETE,
+            (RETRY_RECOVERED_EVIDENCE_REASON,),
+        )
+        return RetryInference(
+            decision, decision.reasons[0], None, evidence.has_commits, False
+        )
+    decision = _infrastructure_decision(RETRY_BEFORE_MODEL_REASON)
+    return RetryInference(
+        decision, decision.reasons[0], None, evidence.has_commits, False
+    )
+
+
+def final_check_interrupted(record: Mapping[str, object] | None) -> bool:
+    """Whether an archive record shows a final check that never finished.
+
+    The runner records ``final_check_started`` immediately before running
+    the check and ``final_check_finished`` right after it returns, so a
+    marker without its finish means the process never survived the check.
+    ``None`` (no archive) reads as not interrupted.
+    """
+
+    if record is None:
+        return False
+    return bool(record.get("final_check_started")) and not record.get(
+        "final_check_finished"
+    )
+
+
+@dataclass(frozen=True)
+class ReleaseEvidence:
+    """Workspace evidence for one retained-attempt release inference."""
+
+    phase: AttemptPhase
+    has_commits: bool
+    note_valid: bool = False
+
+
+@dataclass(frozen=True)
+class ReleaseInference:
+    """The actual outcome a ``recovery release`` records."""
+
+    outcome: AttemptOutcome
+    reason: str
+
+
+def infer_release_outcome(evidence: ReleaseEvidence) -> ReleaseInference:
+    """Infer the actual outcome recorded by ``recovery release``.
+
+    Pure: ``note_valid`` is whether a committed handoff note validated,
+    ``has_commits`` is whether any work commit is on the branch.
+    """
+
+    phase_name = evidence.phase.value
+    if evidence.note_valid:
+        return ReleaseInference(
+            AttemptOutcome.HANDOFF,
+            "The handoff note was committed but finalization never"
+            f" completed in phase {phase_name}; the handoff"
+            " is recorded as not fulfilled (not a successful handoff),"
+            " and the retained branch is not published as a success.",
+        )
+    if evidence.has_commits:
+        return ReleaseInference(
+            AttemptOutcome.INCOMPLETE,
+            "Local work was preserved on the branch but finalization never"
+            f" completed in phase {phase_name}; the operator"
+            " secured the retained work and released the attempt.",
+        )
+    if evidence.phase in (AttemptPhase.CLAIMED, AttemptPhase.SETUP):
+        return ReleaseInference(
+            AttemptOutcome.INFRASTRUCTURE_ERROR,
+            "The attempt was interrupted before model execution produced"
+            f" commits (phase {phase_name}); the operator"
+            " secured the retained state and released the attempt.",
+        )
+    return ReleaseInference(
+        AttemptOutcome.INFRASTRUCTURE_ERROR,
+        "Finalization was interrupted before its completion boundary"
+        f" (phase {phase_name}); the operator secured the"
+        " retained work and released the attempt.",
+    )
+
+
+@dataclass(frozen=True)
+class ConflictEvidence:
+    """Remote-claim evidence for the pre-retry conflict probe."""
+
+    issue_number: int
+    fetch_error: str | None = None
+    missing: bool = False
+    assignment_error: str | None = None
+    self_assigned: bool | None = None
+    holders: tuple[str, ...] = ()
+    foreign_marker: str = ""
+
+
+def infer_conflict_reason(evidence: ConflictEvidence) -> str | None:
+    """Detect conflicting assignment before a retry.
+
+    Returns a hold reason, or ``None`` when no conflict blocks the retry.
+    A fetch failure or an unreadable assignment is ambiguous (the hold
+    remains); a confidently observed assignment to someone else is
+    conflicting (the retry must not overwrite it).
+    """
+
+    if evidence.fetch_error is not None:
+        return (
+            "remote issue state is ambiguous"
+            f" ({evidence.fetch_error}); the retry must not replay"
+            " a side effect it cannot verify."
+        )
+    if evidence.missing:
+        return (
+            f"issue #{evidence.issue_number} is unavailable on GitHub;"
+            " the retry must not replay a side effect it cannot verify."
+        )
+    if evidence.assignment_error is not None:
+        return (
+            "remote assignment is ambiguous"
+            f" ({evidence.assignment_error}); the retry must not replay"
+            " a side effect it cannot verify."
+        )
+    if not evidence.self_assigned:
+        if evidence.holders:
+            holders = ", ".join(evidence.holders)
+            return (
+                f"issue #{evidence.issue_number} shows conflicting"
+                " assignment changes (assigned to another assignee:"
+                f" {holders}{evidence.foreign_marker}); the retry"
+                " must not overwrite them and requires operator repair."
+            )
+        return (
+            f"issue #{evidence.issue_number} shows conflicting"
+            " assignment changes (it is assigned to another assignee,"
+            f" no longer this agent{evidence.foreign_marker}); the"
+            " retry must not overwrite them and requires operator repair."
+        )
+    return None
+
+
+def publication_progress(
+    phase: str,
+    *,
+    comment_confirmed: bool | None,
+    pull_request: dict | None,
+) -> dict:
+    """Best-effort confirmed publication progress for status (read-only)."""
+
+    return {
+        "phase": phase,
+        "comment_confirmed": comment_confirmed,
+        "pull_request": pull_request,
+    }
+
+
+def startup_unreadable_snapshot(
+    *,
+    workspace: str,
+    workspace_dirty: bool | None,
+    reason: str,
+) -> dict:
+    """Status ``recovery`` section when no checkpoint is readable."""
+
+    return {
+        "attempt_id": None,
+        "issue_number": None,
+        "phase": None,
+        "outcome": None,
+        "branch": None,
+        "workspace": workspace,
+        "workspace_dirty": workspace_dirty,
+        "checkpoint": False,
+        "publication": {
+            "phase": None,
+            "comment_confirmed": None,
+            "pull_request": None,
+        },
+        "hold_reason": reason,
+        "next_action": (
+            "Repair or remove the unreadable state file described"
+            " in the hold reason; intake resumes automatically"
+            " once it reads cleanly."
+        ),
+    }
+
+
+def dirty_tree_snapshot(*, workspace: str, reason: str) -> dict:
+    """Status ``recovery`` section for unexplained dirty work alone."""
+
+    return {
+        "attempt_id": None,
+        "issue_number": None,
+        "phase": None,
+        "outcome": None,
+        "branch": None,
+        "workspace": workspace,
+        "workspace_dirty": True,
+        "checkpoint": False,
+        "publication": {
+            "phase": None,
+            "comment_confirmed": None,
+            "pull_request": None,
+        },
+        "hold_reason": reason,
+        "next_action": (
+            "Inspect the working tree and repair or remove the"
+            " unexplained changes before intake can resume."
+        ),
+    }
+
+
+def retained_snapshot(
+    *,
+    attempt_id: str,
+    issue_number: int,
+    phase: str,
+    outcome: str | None,
+    branch: str,
+    workspace: str,
+    workspace_dirty: bool | None,
+    publication: dict,
+    hold_reason: str,
+    recovering: bool,
+    finalized: bool,
+) -> dict:
+    """Status ``recovery`` section for one retained attempt.
+
+    ``hold_reason`` is the raw hold (without the ``Retained attempt ...``
+    prefix); ``finalized`` is whether the completion ledger already
+    records the attempt. ``recovering`` selects the startup wait message.
+    """
+
+    if recovering:
+        next_action = (
+            "Wait for startup reconciliation to finish; do not run recovery"
+            " commands while it is still running."
+        )
+    elif finalized:
+        next_action = (
+            "The attempt is finalized in the ledger; wait for the leftover"
+            " checkpoint to be removed on the next intake cycle."
+        )
+    else:
+        next_action = retry_next_action(attempt_id)
+    return {
+        "attempt_id": attempt_id,
+        "issue_number": issue_number,
+        "phase": phase,
+        "outcome": outcome,
+        "branch": branch,
+        "workspace": workspace,
+        "workspace_dirty": workspace_dirty,
+        "checkpoint": True,
+        "publication": publication,
+        "hold_reason": describe_hold(
+            issue_number=issue_number,
+            attempt_id=attempt_id,
+            phase=phase,
+            reason=hold_reason,
+        ),
+        "next_action": (
+            next_action
+            if (recovering or finalized)
+            else f"{next_action} {release_next_action()}"
+        ),
+    }
