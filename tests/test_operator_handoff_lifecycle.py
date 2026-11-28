@@ -40,6 +40,7 @@ from simple_coding_agent.model_execution import (
     ModelExecutionStatus,
     SkillEvent,
 )
+from simple_coding_agent.recovery import RetryEvidence, infer_retry_decision
 from tests.fakes import FakePublisher, FakeTracker, InMemoryWorkspace
 
 
@@ -972,32 +973,28 @@ def test_a_handoff_interrupted_by_a_crash_is_not_fulfilled_and_recovery_finalize
     assert tracker.cleanup == [(ISSUE_NUMBER, "round-finished", "agent-id")]
 
 
-def test_retry_with_an_invalid_recovered_note_reports_incomplete_not_infrastructure_error(
-    tmp_path: Path,
-) -> None:
-    """Recovery retry replays an invalid note as ordinary incomplete work."""
+def test_retry_with_an_invalid_recovered_note_reports_incomplete_not_infrastructure_error() -> None:
+    """Recovery retry replays an invalid note as ordinary incomplete work.
 
-    working_directory = tmp_path / "work"
-    working_directory.mkdir()
-    write_operator_note(working_directory, reason="bogus_reason")
-    workspace = seeded_workspace(working_directory, note=True, work_subject="Half-finish the parser")
-    lifecycle, _, _ = make_lifecycle(
-        tmp_path, next_claim=None, workspace=workspace, attempt_runner=lambda c, p, r: None
+    Decision-table coverage through the public recovery interface (issue
+    #111): an invalid handoff note on a PUSHING checkpoint replays as
+    ordinary incomplete work on the partial path, never as an
+    infrastructure error. No lifecycle construction.
+    """
+
+    inference = infer_retry_decision(
+        RetryEvidence(
+            phase=AttemptPhase.PUSHING,
+            has_commits=True,
+            note_revision=NOTE_REV,
+            note_valid=False,
+            note_reason="bogus_reason: the handoff note failed validation",
+        )
     )
-    attempt_state = AttemptStateStore(tmp_path)
-    attempt_state.start(issue_number=ISSUE_NUMBER, branch=f"agent/issue-{ISSUE_NUMBER}")
-    attempt_state.transition(AttemptPhase.SETUP)
-    attempt_state.transition(AttemptPhase.MODEL_RUNNING)
-    attempt_state.transition(AttemptPhase.PUSHING)
-    checkpoint = attempt_state.read()
-    assert checkpoint is not None
-    prepared = workspace.prepare_attempt(base_branch="main", issue_number=ISSUE_NUMBER)
 
-    decision, _, _, _ = lifecycle._infer_retry_decision(checkpoint, claim(), prepared)
-
-    assert decision.outcome is AttemptOutcome.INCOMPLETE
-    assert decision.publication_path is PublicationPath.PARTIAL
-    assert "reason" in decision.reasons[0].lower()
+    assert inference.decision.outcome is AttemptOutcome.INCOMPLETE
+    assert inference.decision.publication_path is PublicationPath.PARTIAL
+    assert "bogus_reason" in inference.decision.reasons[0]
 
 
 def test_hold_ignores_a_handoff_failure_owned_by_an_earlier_attempt(

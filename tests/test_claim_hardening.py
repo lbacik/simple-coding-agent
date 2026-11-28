@@ -34,6 +34,7 @@ from simple_coding_agent.github_tracker import (
     TrackerIssue,
 )
 from tests.fakes import FakePublisher, FakeTracker, InMemoryWorkspace
+from simple_coding_agent.recovery import ConflictEvidence, infer_conflict_reason
 
 
 def issue(number: int, **overrides: object) -> TrackerIssue:
@@ -425,29 +426,27 @@ def test_is_self_assigned_docstring_no_longer_assumes_a_serialized_boundary() ->
     assert "only this process claims through the serialized boundary" not in doc
 
 
-def test_recovery_retry_messages_name_another_assignee_not_a_human(tmp_path: Path) -> None:
-    lifecycle, tracker, _store, _events = make_lifecycle(
-        tmp_path,
-        {
-            24: issue(24, assignee_logins=("rival-worker",)),
-            25: issue(25),
-        },
-        fifo=[],
+def test_recovery_retry_messages_name_another_assignee_not_a_human() -> None:
+    """The conflict hold names the rival assignee through the public interface.
+
+    Decision-table coverage through :func:`recovery.infer_conflict_reason`
+    (issue #111): a rival assignment reads as another assignee, never as
+    human changes. No lifecycle construction.
+    """
+
+    taken = infer_conflict_reason(
+        ConflictEvidence(
+            issue_number=24, self_assigned=False, holders=("rival-worker",)
+        )
     )
-
-    class _Checkpoint:
-        issue_number = 24
-
-    taken = lifecycle._recovery_conflict_reason(None, _Checkpoint())  # type: ignore[arg-type]
 
     assert taken is not None
     assert "another assignee" in taken
     assert "human changes" not in taken
 
-    class _Bare:
-        issue_number = 25
-
-    bare = lifecycle._recovery_conflict_reason(None, _Bare())  # type: ignore[arg-type]
+    bare = infer_conflict_reason(
+        ConflictEvidence(issue_number=25, self_assigned=False, holders=())
+    )
 
     assert bare is not None
     assert "another assignee" in bare

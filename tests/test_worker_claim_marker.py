@@ -36,6 +36,7 @@ if TYPE_CHECKING:
     from simple_coding_agent.lifecycle import AgentLifecycle
 
 from tests.fakes import FakePublisher, FakeTracker, InMemoryWorkspace
+from simple_coding_agent.recovery import ConflictEvidence, infer_conflict_reason
 
 
 def issue(number: int, **overrides: object) -> TrackerIssue:
@@ -538,26 +539,21 @@ def _lifecycle(tmp_path: Path, tracker: FakeTracker) -> AgentLifecycle:
     )
 
 
-def test_retry_conflict_names_another_workers_marker_on_the_shared_login(
-    tmp_path: Path,
-) -> None:
-    from types import SimpleNamespace
+def test_retry_conflict_names_another_workers_marker_on_the_shared_login() -> None:
+    """The conflict hold names the foreign claim marker (issue #111).
 
-    tracker = FakeTracker(
-        issues={
-            24: issue(
-                24,
-                labels=frozenset({"ready-for-agent", "claimed-by:worker-b"}),
-                assignee_logins=("agent",),
-            )
-        },
-        worker_id="worker-a",
-    )
-    lifecycle = _lifecycle(tmp_path, tracker)
+    Decision-table coverage through the public recovery interface: a shared
+    login carrying only another Worker's ``claimed-by`` marker reads as
+    another assignee and names the marker. No lifecycle construction.
+    """
 
-    reason = lifecycle._recovery_conflict_reason(
-        SimpleNamespace(issue_number=24),  # type: ignore[arg-type]
-        SimpleNamespace(issue_number=24),  # type: ignore[arg-type]
+    reason = infer_conflict_reason(
+        ConflictEvidence(
+            issue_number=24,
+            self_assigned=False,
+            holders=("agent",),
+            foreign_marker="; claimed by another worker (claimed-by:worker-b)",
+        )
     )
 
     assert reason is not None
@@ -565,18 +561,13 @@ def test_retry_conflict_names_another_workers_marker_on_the_shared_login(
     assert "claimed-by:worker-b" in reason
 
 
-def test_retry_conflict_without_a_marker_reads_as_before(tmp_path: Path) -> None:
-    from types import SimpleNamespace
+def test_retry_conflict_without_a_marker_reads_as_before() -> None:
+    """A marker-less rival assignment holds without marker detail (issue #111)."""
 
-    tracker = FakeTracker(
-        issues={24: issue(24, assignee_logins=("rival-worker",))},
-        worker_id="worker-a",
-    )
-    lifecycle = _lifecycle(tmp_path, tracker)
-
-    reason = lifecycle._recovery_conflict_reason(
-        SimpleNamespace(issue_number=24),  # type: ignore[arg-type]
-        SimpleNamespace(issue_number=24),  # type: ignore[arg-type]
+    reason = infer_conflict_reason(
+        ConflictEvidence(
+            issue_number=24, self_assigned=False, holders=("rival-worker",)
+        )
     )
 
     assert reason is not None
