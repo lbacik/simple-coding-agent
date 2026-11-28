@@ -1848,6 +1848,70 @@ class AgentLifecycle:
             pass
         return record
 
+    def _load_existing_for_replay(
+        self, store: Any, request_id: str
+    ) -> Any:
+        """Return the stored record for one request ID without side effects.
+
+        Centralizes the idempotent-replay lookup the store already enforces:
+        callers check the result to skip live work (GitHub fetch, counter
+        reset, recovery execution) on a retry, then delegate to the store's
+        ``submit_*`` which enforces the identical-payload rule once. Read
+        failures surface as :class:`ControlStoreError`; anything else is
+        never re-applied.
+        """
+
+        from simple_coding_agent.control import ControlStoreError
+
+        try:
+            return store.get_command(request_id)
+        except ControlStoreError:
+            raise
+        except Exception as error:
+            raise ControlStoreError("Control command could not be read") from error
+
+    def submit_registered_command(
+        self, op: str, request_id: str, payload: dict | None = None
+    ) -> CommandRecord:
+        """Submit one registered command through its live handler.
+
+        Generic entry for the command registry: every registered ``op``
+        routes to its ``submit_*`` handler which owns the live-state checks
+        (attempt liveness, recovery holds, eligibility, counters). Pure
+        store commands (``needs_lifecycle is False`` in the registry) bypass
+        the lifecycle in the server and never reach this method; today every
+        command needs live state, so this method covers all eight.
+        """
+
+        from simple_coding_agent.control_registry import get_spec
+
+        spec = get_spec(op)
+        if spec is None:
+            raise KeyError(f"Unknown operation: {op!r}.")
+        payload = payload or {}
+        if op == "stop":
+            return self.submit_stop(request_id)
+        if op == "stop_after":
+            return self.submit_stop_after(request_id, payload.get("after"))
+        if op == "resume":
+            reject_open = bool(payload.get("reject_open_intake", False))
+            if reject_open:
+                return self.submit_resume(request_id, reject_open_intake=True)
+            return self.submit_resume(request_id)
+        if op == "handoff":
+            return self.submit_handoff(request_id)
+        if op == "next_issue":
+            return self.submit_next_issue(request_id, payload.get("issue"))
+        if op == "recovery_retry":
+            return self.submit_recovery_retry(request_id, payload.get("attempt_id"))
+        if op == "recovery_release":
+            return self.submit_recovery_release(
+                request_id, payload.get("attempt_id"), payload.get("saved_at")
+            )
+        if op == "errors_reset":
+            return self.submit_errors_reset(request_id)
+        raise KeyError(f"Unknown operation: {op!r}.")  # pragma: no cover
+
     @property
     def active_issue_number(self) -> int | None:
         """The issue owned by the in-flight attempt, for interruption reporting."""
@@ -2152,12 +2216,7 @@ class AgentLifecycle:
             store = self._control_store
             if not isinstance(request_id, str) or not request_id.strip():
                 return store.submit_next_issue(request_id, issue)
-            try:
-                existing = store.get_command(request_id)
-            except ControlStoreError:
-                raise
-            except Exception as error:
-                raise ControlStoreError("Control command could not be read") from error
+            existing = self._load_existing_for_replay(store, request_id)
             if existing is not None:
                 # Idempotent retry: let the store enforce the
                 # identical-payload rule without touching GitHub, so an
@@ -2253,12 +2312,7 @@ class AgentLifecycle:
         _check_recovery_request_id(request_id)
         with self._control_lock:
             store = self._control_store
-            try:
-                existing = store.get_command(request_id)
-            except ControlStoreError:
-                raise
-            except Exception as error:
-                raise ControlStoreError("Control command could not be read") from error
+            existing = self._load_existing_for_replay(store, request_id)
             if existing is not None:
                 # Idempotent retry: the store enforces the identical-payload
                 # rule; a terminal record is returned without re-executing.
@@ -2345,12 +2399,7 @@ class AgentLifecycle:
         _check_recovery_request_id(request_id)
         with self._control_lock:
             store = self._control_store
-            try:
-                existing = store.get_command(request_id)
-            except ControlStoreError:
-                raise
-            except Exception as error:
-                raise ControlStoreError("Control command could not be read") from error
+            existing = self._load_existing_for_replay(store, request_id)
             if existing is not None:
                 record = store.submit_recovery_release(
                     request_id, parsed_attempt, parsed_saved
@@ -4680,12 +4729,7 @@ class AgentLifecycle:
             raise ControlStoreError("Operator control is not configured")
         with self._control_lock:
             store = self._control_store
-            try:
-                existing = store.get_command(request_id)
-            except ControlStoreError:
-                raise
-            except Exception as error:
-                raise ControlStoreError("Control command could not be read") from error
+            existing = self._load_existing_for_replay(store, request_id)
             if existing is not None:
                 return self._record_command_commit(store.submit_errors_reset(request_id))
             previous_count = self._consecutive_error_count_or_none()
