@@ -58,7 +58,15 @@ from simple_coding_agent.completion import (
     final_check_dirty_reason,
 )
 from simple_coding_agent.config import RepositoryProfile
-from simple_coding_agent.finalization import AttemptCompletionStore, CompletionStoreError
+from simple_coding_agent.finalization import (
+    AttemptCompletionStore,
+    CompletionStoreError,
+    FinalizeRequest,
+    FinalizeResult,
+    FinalizeStatus,
+    commit_recovered_attempt,
+    finalize_attempt,
+)
 from simple_coding_agent.unpushed_revision import (
     RECOVERY_ALREADY_PUBLISHED,
     RECOVERY_PRESERVED,
@@ -3380,17 +3388,12 @@ class AgentLifecycle:
                 " handoff record could not be verified); the hold remains."
                 f" {hold_suffix}"
             )
-        try:
-            self._release(claim, outcome, checkpoint)
-        except Exception as error:
-            return False, (
-                f"recovery retry for attempt {attempt_id} not fulfilled:"
-                f" issue release failed ({_exception_detail(error)});"
-                " the hold remains."
-                f" {hold_suffix}"
-            )
-        try:
-            retain_branch = getattr(published, "branch_url", None) is None and (
+        # The recovery tail (release, cleanup, ledger commit, handoff
+        # resolution) lives in ``simple_coding_agent.finalization``; only
+        # the republication and outcome above are retry-specific.
+        retain_branch_value = bool(
+            getattr(published, "branch_url", None) is None
+            and (
                 has_commits
                 and (
                     outcome is AttemptOutcome.INFRASTRUCTURE_ERROR
@@ -3400,62 +3403,51 @@ class AgentLifecycle:
                     )
                 )
             )
+        )
+
+        def _retry_cleanup() -> None:
             self._workspace.cleanup(
                 base_branch=profile.base_branch,
                 prepared=prepared,
                 # comment_posted is True here (the unconfirmed path returned
                 # above), so only genuinely unpublished work retains.
-                retain_branch=bool(retain_branch),
+                retain_branch=retain_branch_value,
                 issue_number=claim.issue.number,
                 attempt_id=attempt_id,
             )
             self._observe_and_remember_workspace_dirty(attempt_id)
-        except DirtyWorkspaceError as error:
-            # Cleanup refused to leave the attempt branch while the tree is
-            # dirty: the hold remains with everything preserved for
-            # operator inspection. Unlike the attempt paths this does not
-            # exit the process: recovery retry is an operator command, and
-            # the failed result below already keeps the hold in place.
-            self._emit_workspace_hold(claim.issue.number, error)
-            return False, (
-                f"recovery retry for attempt {attempt_id} not fulfilled:"
-                f" local cleanup failed ({_exception_detail(error)});"
-                " the hold remains."
-                f" {hold_suffix}"
-            )
-        except Exception as error:
-            return False, (
-                f"recovery retry for attempt {attempt_id} not fulfilled:"
-                f" local cleanup failed ({_exception_detail(error)});"
-                " the hold remains."
-                f" {hold_suffix}"
-            )
-        try:
-            archive = self._archive_for(claim.issue.number, attempt_id)
+
+        retry_archive = self._archive_for(claim.issue.number, attempt_id)
+
+        def _retry_commit(commit_branch: str) -> None:
             self._commit_finalization(
-                checkpoint,
-                claim.issue.number,
-                prepared.branch,
-                outcome,
-                archive,
+                checkpoint, claim.issue.number, commit_branch, outcome, retry_archive
             )
-            self._resolve_pending_handoff(
+
+        def _retry_resolve() -> bool | None:
+            return self._resolve_pending_handoff(
                 issue_number=claim.issue.number,
                 attempt_id=attempt_id,
                 outcome=outcome,
                 prepared=prepared,
             )
-        except SystemExit as error:
+
+        retry_finalized = commit_recovered_attempt(
+            attempt_id=attempt_id,
+            branch=prepared.branch,
+            is_finalized=self._is_attempt_finalized,
+            release=lambda: self._release(claim, outcome, checkpoint),
+            cleanup=_retry_cleanup,
+            commit=_retry_commit,
+            resolve_handoff=_retry_resolve,
+            on_dirty=lambda error: self._emit_workspace_hold(claim.issue.number, error),  # type: ignore[arg-type]
+        )
+        if retry_finalized.idempotent:
+            self._clear_already_finalized_checkpoint(claim.issue.number, attempt_id)
+        elif retry_finalized.status is not FinalizeStatus.FINALIZED:
             return False, (
                 f"recovery retry for attempt {attempt_id} not fulfilled:"
-                f" accounting is held ({_exception_detail(error)});"
-                " the hold remains."
-                f" {hold_suffix}"
-            )
-        except Exception as error:
-            return False, (
-                f"recovery retry for attempt {attempt_id} not fulfilled:"
-                f" accounting failed ({_exception_detail(error)});"
+                f" {retry_finalized.detail};"
                 " the hold remains."
                 f" {hold_suffix}"
             )
@@ -3615,20 +3607,19 @@ class AgentLifecycle:
                 " the result comment could not be confirmed on GitHub;"
                 " the hold remains and no work was discarded."
             )
-        try:
+        # The recovery tail (release, cleanup, ledger commit, handoff
+        # resolution) lives in ``simple_coding_agent.finalization``; only
+        # the confirmed comment and inferred outcome above are
+        # release-specific.
+        def _abandon_release() -> None:
             # Plain release only: never add ``round-finished`` here, so the
             # release never claims a successful handoff. The comment above
             # already states the actual outcome and the failure.
             self._tracker.release_attempt(
                 claim.issue.number, "ready-for-agent", claim.assignment.assignee_id
             )
-        except Exception as error:
-            return False, (
-                f"recovery release for attempt {attempt_id} not fulfilled:"
-                f" issue release failed ({_exception_detail(error)});"
-                " the hold remains and no work was discarded."
-            )
-        try:
+
+        def _abandon_cleanup() -> None:
             self._workspace.cleanup(
                 base_branch=profile.base_branch,
                 prepared=prepared,
@@ -3636,38 +3627,42 @@ class AgentLifecycle:
                 issue_number=claim.issue.number,
                 attempt_id=attempt_id,
             )
-        except Exception as error:
-            return False, (
-                f"recovery release for attempt {attempt_id} not fulfilled:"
-                f" local cleanup failed ({_exception_detail(error)});"
-                " the hold remains and no work was discarded."
-            )
-        try:
-            archive = self._archive_for(claim.issue.number, attempt_id)
+
+        abandon_archive = self._archive_for(claim.issue.number, attempt_id)
+
+        def _abandon_commit(commit_branch: str) -> None:
             self._commit_finalization(
                 checkpoint,
                 claim.issue.number,
-                branch,
+                commit_branch,
                 actual_outcome,
-                archive,
+                abandon_archive,
                 released=True,
             )
-            self._resolve_pending_handoff(
+
+        def _abandon_resolve() -> bool | None:
+            return self._resolve_pending_handoff(
                 issue_number=claim.issue.number,
                 attempt_id=attempt_id,
                 outcome=actual_outcome,
                 prepared=prepared,
             )
-        except SystemExit as error:
+
+        abandon_finalized = commit_recovered_attempt(
+            attempt_id=attempt_id,
+            branch=branch,
+            is_finalized=self._is_attempt_finalized,
+            release=_abandon_release,
+            cleanup=_abandon_cleanup,
+            commit=_abandon_commit,
+            resolve_handoff=_abandon_resolve,
+        )
+        if abandon_finalized.idempotent:
+            self._clear_already_finalized_checkpoint(claim.issue.number, attempt_id)
+        elif abandon_finalized.status is not FinalizeStatus.FINALIZED:
             return False, (
                 f"recovery release for attempt {attempt_id} not fulfilled:"
-                f" accounting is held ({_exception_detail(error)});"
-                " the hold remains and no work was discarded."
-            )
-        except Exception as error:
-            return False, (
-                f"recovery release for attempt {attempt_id} not fulfilled:"
-                f" accounting failed ({_exception_detail(error)});"
+                f" {abandon_finalized.detail};"
                 " the hold remains and no work was discarded."
             )
         return True, (
@@ -5697,98 +5692,28 @@ class AgentLifecycle:
                 comment_posted = False
             raise
         finally:
-            # Durable completion boundary: the attempt is finalized only when
-            # its outcome is published (confirmed comment), the issue is
-            # released, and local cleanup is durable. Anything short of that
-            # keeps the checkpoint, branch, and entire working tree —
-            # including dirty and untracked work — for recovery or inspection.
-            # Cleanup itself never deletes branches, and deletes files only
-            # for reproducible artifacts the attempt branch ignored but the
-            # base branch exposes as untracked; unexplained work is preserved.
-            # A failed operator handoff holds the same boundary: the result
-            # comment is already published truthfully, but the issue stays
-            # assigned and the checkpoint, branch, and working tree stay
-            # retained for `recovery retry` or `recovery release` instead of
-            # finalizing. The hold is checked before release and again before
-            # the ledger commit, so slow remote steps cannot slip a deadline
-            # past the verdict.
-            hold = comment_posted and self._hold_failed_handoff(
-                issue_number=claim.issue.number,
-                attempt_id=checkpoint.started_at,
-                outcome=outcome,
+            # The durable completion boundary lives in one module
+            # (``simple_coding_agent.finalization.finalize_attempt``):
+            # first handoff hold check, release, cleanup, second hold
+            # check, ledger commit, handoff resolution. Anything short of
+            # finalized keeps the checkpoint, branch, and working tree for
+            # recovery or inspection.
+            self._finalize_live_attempt(
+                claim=claim,
+                checkpoint=checkpoint,
                 prepared=prepared,
+                outcome=outcome,
+                comment_posted=comment_posted,
+                retain_branch=retain_branch,
+                profile=profile,
                 publication_started_at=publication_started_at,
+                archive=archive,
             )
-            released = False
-            try:
-                if comment_posted and not hold:
-                    self._release(claim, outcome, checkpoint)
-                    released = True
-            finally:
-                cleanup_ok = prepared is None
-                try:
-                    if prepared is not None and not hold:
-                        self._workspace.cleanup(
-                            base_branch=profile.base_branch if profile is not None else "main",
-                            prepared=prepared,
-                            retain_branch=retain_branch or not comment_posted,
-                            issue_number=claim.issue.number,
-                            attempt_id=checkpoint.started_at,
-                        )
-                        cleanup_ok = True
-                        self._observe_and_remember_workspace_dirty(
-                            checkpoint.started_at
-                        )
-                except DirtyWorkspaceError as error:
-                    # Cleanup refused to leave the attempt branch while the
-                    # tree is dirty: hold intake with everything preserved
-                    # for operator inspection instead of carrying uncommitted
-                    # work onto the base or claiming further issues.
-                    self._hold_dirty_workspace(claim.issue.number, error)
-                finally:
-                    if comment_posted and released and cleanup_ok and not hold:
-                        # Publication already confirmed (comment posted) before
-                        # release began: only the whole-command budget still
-                        # applies, not the concluded publication window.
-                        # Cleanup has checked the base back out, so the note
-                        # is not re-read from the tree: the check before
-                        # release already validated it on the attempt's tree.
-                        hold = self._hold_failed_handoff(
-                            issue_number=claim.issue.number,
-                            attempt_id=checkpoint.started_at,
-                            outcome=outcome,
-                            prepared=None,
-                            publication_started_at=publication_started_at,
-                            check_allowance=False,
-                        )
-                    if comment_posted and released and cleanup_ok and not hold:
-                        self._commit_finalization(
-                            checkpoint, claim.issue.number, prepared.branch
-                            if prepared is not None else f"agent/issue-{claim.issue.number}",
-                            outcome, archive,
-                        )
-                        self._resolve_pending_handoff(
-                            issue_number=claim.issue.number,
-                            attempt_id=checkpoint.started_at,
-                            outcome=outcome,
-                            prepared=None,  # tree already cleaned up
-                            publication_started_at=publication_started_at,
-                            check_allowance=False,
-                        )
-                    else:
-                        self._event_log(
-                            "attempt_finalization_held",
-                            "Publication, release, or cleanup is unconfirmed, or a failed"
-                            " operator handoff owns this attempt; the branch, "
-                            "checkpoint, and working tree are preserved for recovery.",
-                            level="WARNING",
-                            issue_number=claim.issue.number,
-                        )
-                    # The attempt's processing is finished (finalized or held
-                    # for recovery); a later resume sees a retained checkpoint
-                    # here instead of an active attempt.
-                    with self._control_lock:
-                        self._attempt_processing = False
+            # The attempt's processing is finished (finalized or held
+            # for recovery); a later resume sees a retained checkpoint
+            # here instead of an active attempt.
+            with self._control_lock:
+                self._attempt_processing = False
         self._active_issue_number = None
         return LifecycleResult(LifecycleStatus.ATTEMPTED, outcome)
 
@@ -6684,6 +6609,133 @@ class AgentLifecycle:
             issue_number=issue_number,
         )
 
+    def _finalize_live_attempt(
+        self,
+        *,
+        claim: Claim,
+        checkpoint: AttemptCheckpoint,
+        prepared: PreparedAttempt | None,
+        outcome: AttemptOutcome,
+        comment_posted: bool,
+        retain_branch: bool,
+        profile: RepositoryProfile | None,
+        publication_started_at: datetime | None,
+        archive: AttemptArchive | None,
+    ) -> FinalizeResult:
+        """Run the one durable completion boundary for a live attempt.
+
+        ``run_once`` and startup reconciliation arrive at their outcomes
+        differently, then both finish here: first handoff hold check,
+        issue release, workspace cleanup, second hold check
+        (``check_allowance=False``), ledger commit, handoff resolution.
+        The ledger branch always falls back to the checkpoint's durable
+        identity once the tree is cleaned up.
+        """
+
+        checkpoint_branch = checkpoint.branch
+        prepared_branch = prepared.branch if prepared is not None else None
+        prepared_object = prepared
+        store = self._completion_store
+
+        def _is_finalized(attempt_id: str) -> bool:
+            return store is not None and store.is_finalized(attempt_id)
+
+        def _check_hold(*, prepared: bool, check_allowance: bool) -> bool:
+            return self._hold_failed_handoff(
+                issue_number=claim.issue.number,
+                attempt_id=checkpoint.started_at,
+                outcome=outcome,
+                prepared=prepared_object if prepared else None,
+                publication_started_at=publication_started_at,
+                check_allowance=check_allowance,
+            )
+
+        def _release() -> None:
+            self._release(claim, outcome, checkpoint)
+
+        def _cleanup() -> None:
+            assert prepared is not None
+            self._workspace.cleanup(
+                base_branch=profile.base_branch if profile is not None else "main",
+                prepared=prepared,
+                retain_branch=retain_branch or not comment_posted,
+                issue_number=claim.issue.number,
+                attempt_id=checkpoint.started_at,
+            )
+            self._observe_and_remember_workspace_dirty(checkpoint.started_at)
+
+        def _commit(branch: str) -> None:
+            self._commit_finalization(
+                checkpoint, claim.issue.number, branch, outcome, archive
+            )
+
+        def _resolve() -> bool | None:
+            return self._resolve_pending_handoff(
+                issue_number=claim.issue.number,
+                attempt_id=checkpoint.started_at,
+                outcome=outcome,
+                prepared=None,  # tree already cleaned up
+                publication_started_at=publication_started_at,
+                check_allowance=False,
+            )
+
+        def _on_held(reason: object, detail: str) -> None:
+            _ = (reason, detail)
+            self._event_log(
+                "attempt_finalization_held",
+                "Publication, release, or cleanup is unconfirmed, or a failed"
+                " operator handoff owns this attempt; the branch, "
+                "checkpoint, and working tree are preserved for recovery.",
+                level="WARNING",
+                issue_number=claim.issue.number,
+            )
+
+        def _on_dirty(error: Exception) -> None:
+            self._hold_dirty_workspace(claim.issue.number, error)  # type: ignore[arg-type]
+
+        return finalize_attempt(
+            FinalizeRequest(
+                issue_number=claim.issue.number,
+                attempt_id=checkpoint.started_at,
+                checkpoint_branch=checkpoint_branch,
+                prepared_branch=prepared_branch,
+                outcome=outcome,
+                comment_posted=comment_posted,
+                has_prepared=prepared is not None,
+                publication_started_at=publication_started_at,
+            ),
+            is_finalized=_is_finalized,
+            check_hold=_check_hold,
+            release=_release,
+            cleanup=_cleanup,
+            commit=_commit,
+            resolve_handoff=_resolve,
+            on_held=_on_held,
+            on_dirty=_on_dirty,
+        )
+
+    def _is_attempt_finalized(self, attempt_id: str) -> bool:
+        """Whether the completion ledger already holds this attempt ID."""
+
+        store = self._completion_store
+        return store is not None and store.is_finalized(attempt_id)
+
+    def _clear_already_finalized_checkpoint(
+        self, issue_number: int, attempt_id: str
+    ) -> None:
+        """Drop the leftover checkpoint for an already-finalized attempt.
+
+        Every boundary step is durable (the ledger proves it); only the
+        checkpoint removal and its seal remain.
+        """
+
+        self._attempt_state.delete()
+        self._seal_archive_and_emit(
+            self._archive_for(issue_number, attempt_id),
+            attempt_id,
+            issue_number=issue_number,
+        )
+
     def _commit_finalization(
         self,
         checkpoint: object,
@@ -7537,92 +7589,28 @@ class AgentLifecycle:
             outcome = AttemptOutcome.INFRASTRUCTURE_ERROR
             raise
         finally:
-            # Same durable completion boundary as the live-attempt path (see
-            # run_once): only a confirmed comment plus a completed release
-            # plus durable cleanup may record the attempt and remove its
-            # checkpoint. Anything else preserves everything for recovery.
-            # A failed operator handoff holds the same boundary: the result
-            # comment is already published truthfully, but the issue stays
-            # assigned and the checkpoint, branch, and working tree stay
-            # retained for `recovery retry` or `recovery release` instead of
-            # finalizing, across restarts with the original deadlines.
-            hold = comment_posted and self._hold_failed_handoff(
-                issue_number=claim.issue.number,
-                attempt_id=checkpoint.started_at,
-                outcome=outcome,
+            # The durable completion boundary lives in one module
+            # (``simple_coding_agent.finalization.finalize_attempt``):
+            # first handoff hold check, release, cleanup, second hold
+            # check, ledger commit, handoff resolution. Anything short of
+            # finalized keeps the checkpoint, branch, and working tree for
+            # recovery or inspection.
+            self._finalize_live_attempt(
+                claim=claim,
+                checkpoint=checkpoint,
                 prepared=prepared,
+                outcome=outcome,
+                comment_posted=comment_posted,
+                retain_branch=retain_branch,
+                profile=profile,
                 publication_started_at=publication_started_at,
+                archive=archive,
             )
-            released = False
-            try:
-                if comment_posted and not hold:
-                    self._release(claim, outcome, checkpoint)
-                    released = True
-            finally:
-                cleanup_ok = prepared is None
-                try:
-                    if prepared is not None and not hold:
-                        self._workspace.cleanup(
-                            base_branch=profile.base_branch if profile is not None else "main",
-                            prepared=prepared,
-                            retain_branch=retain_branch or not comment_posted,
-                            issue_number=claim.issue.number,
-                            attempt_id=checkpoint.started_at,
-                        )
-                        cleanup_ok = True
-                        self._observe_and_remember_workspace_dirty(
-                            checkpoint.started_at
-                        )
-                except DirtyWorkspaceError as error:
-                    # Cleanup refused to leave the attempt branch while the
-                    # tree is dirty: hold intake with everything preserved
-                    # for operator inspection instead of carrying uncommitted
-                    # work onto the base or claiming further issues.
-                    self._hold_dirty_workspace(claim.issue.number, error)
-                finally:
-                    if comment_posted and released and cleanup_ok and not hold:
-                        # Publication already confirmed (comment posted) before
-                        # release began: only the whole-command budget still
-                        # applies, not the concluded publication window.
-                        # Cleanup has checked the base back out, so the note
-                        # is not re-read from the tree: the check before
-                        # release already validated it on the attempt's tree.
-                        hold = self._hold_failed_handoff(
-                            issue_number=claim.issue.number,
-                            attempt_id=checkpoint.started_at,
-                            outcome=outcome,
-                            prepared=None,
-                            publication_started_at=publication_started_at,
-                            check_allowance=False,
-                        )
-                    if comment_posted and released and cleanup_ok and not hold:
-                        self._commit_finalization(
-                            checkpoint, claim.issue.number, prepared.branch
-                            if prepared is not None else checkpoint.branch,
-                            outcome, archive,
-                        )
-                        self._resolve_pending_handoff(
-                            issue_number=claim.issue.number,
-                            attempt_id=checkpoint.started_at,
-                            outcome=outcome,
-                            prepared=None,  # tree already cleaned up
-                            publication_started_at=publication_started_at,
-                            check_allowance=False,
-                        )
-                    else:
-                        self._event_log(
-                            "attempt_finalization_held",
-                            "Publication, release, or cleanup is unconfirmed, or a failed"
-                            " operator handoff owns this attempt; the branch, "
-                            "checkpoint, and working tree are preserved for recovery.",
-                            level="WARNING",
-                            issue_number=claim.issue.number,
-                        )
-                    # Reconciliation is finished (finalized or held); a later
-                    # resume sees a retained checkpoint here, not an active
-                    # attempt.
-                    with self._control_lock:
-                        self._attempt_processing = False
+            # Reconciliation is finished (finalized or held); a later
+            # resume sees a retained checkpoint here, not an active
+            # attempt.
+            with self._control_lock:
+                self._attempt_processing = False
         self._active_issue_number = None
         return outcome
 
