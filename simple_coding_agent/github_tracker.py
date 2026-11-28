@@ -33,6 +33,7 @@ READY_FOR_AGENT = "ready-for-agent"
 ROUND_FINISHED = "round-finished"
 READY_FOR_HUMAN = "ready-for-human"
 MERGE_CONFLICT = "merge-conflict"
+FIX_BASELINE = "fix-baseline"
 
 #: Fixed colour for the auto-created ``merge-conflict`` repository label.
 MERGE_CONFLICT_LABEL_COLOR = "d93f0b"
