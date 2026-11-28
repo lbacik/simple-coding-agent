@@ -6,8 +6,11 @@ fulfilled), the deadlines computed *and* parsed in one place, and the
 verdict handed to the executor (``fallback`` / ``expire``) and to the
 lifecycle (complete / fail / hold).
 
-The ControlStore stays persistence only; the clock is an injected port so
-tests run on a fake clock against a real sqlite ControlStore in tmp.
+The ControlStore remains the persistence and transition boundary; this
+module interprets the snapshots it persists, owns deadlines (computed and
+parsed in one place) and verdicts, and exposes the narrow executor ports.
+The clock is an injected port so tests run on a fake clock against a real
+sqlite ControlStore in tmp.
 """
 
 from __future__ import annotations
