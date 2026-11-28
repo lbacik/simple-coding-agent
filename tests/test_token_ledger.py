@@ -156,14 +156,22 @@ def test_first_response_that_settles_without_usage_is_reported_once() -> None:
 
     assert ledger.first_settled_without_usage is None
 
+    # A tool result settling without usage defers: the usage may still arrive
+    # after the tool result (Meta backend), so nothing is reported yet.
     ledger.observe_input("main", chars=10)
-    notice = ledger.first_settled_without_usage
-    assert notice is not None
-    assert notice.thread == "main"
-    assert notice.subagent_type is None
+    assert ledger.first_settled_without_usage is None
+    assert ledger.settled_response_ids("main") == ()
 
     ledger.observe_response("toolu_9", "s1", visible_chars=100)
     ledger.observe_response("toolu_9", "s2", visible_chars=100)
+
+    # The subagent response settles on the next response without usage, so it
+    # reports immediately and latches first: the deferred main response must
+    # not use up the latch before its late usage has a chance to arrive.
+    notice = ledger.first_settled_without_usage
+    assert notice is not None
+    assert notice.thread == "toolu_9"
+    assert notice.subagent_type == "Explore"
 
     settled_again = ledger.first_settled_without_usage
     assert settled_again is notice
@@ -390,3 +398,56 @@ def test_mark_interrupted_only_flags_inflight_responses() -> None:
     assert result.mode == "mixed"
     assert result.unreported_estimated_tokens == estimate_r1
     assert result.interrupted_estimated_tokens == estimate_r2
+
+
+def test_tool_settled_response_with_late_usage_reports_measured_not_degraded() -> None:
+    """A main response whose usage arrives after its tool result is measured.
+
+    Regression test for #233 (Meta backend streams the tool result before
+    the response's ``message_delta`` usage): settling on the tool result
+    must defer the entry until usage arrives, then report measured figures
+    with no ``token_estimate_degraded`` latch.
+    """
+
+    ledger = TokenLedger()
+    ledger.start_thread("main", kind="main", prompt_chars=0)
+    ledger.observe_response("main", "r1", visible_chars=120)
+    ledger.observe_input("main", chars=1_000)
+
+    assert ledger.first_settled_without_usage is None
+    assert ledger.settled_response_ids("main") == ()
+
+    usage = {
+        "input_tokens": 20_000,
+        "cache_read_input_tokens": 4_000,
+        "cache_creation_input_tokens": 500,
+        "output_tokens": 1_060,
+    }
+    ledger.observe_usage("main", "r1", usage)
+
+    assert ledger.first_settled_without_usage is None
+    assert ledger.settled_response_ids("main") == ("r1",)
+    reading = ledger.settled_reading("main", "r1")
+    assert reading is not None
+    assert reading.measured_tokens == 25_560
+    assert reading.estimated_tokens == 0
+    assert reading.budget_tokens == 25_560
+
+
+def test_deferred_tool_settled_response_confirmed_by_next_response() -> None:
+    """A deferred estimate with no late usage confirms on the next response."""
+
+    ledger = TokenLedger()
+    ledger.start_thread("main", kind="main", prompt_chars=0)
+    ledger.observe_response("main", "r1", visible_chars=100)
+    ledger.observe_input("main", chars=10)
+
+    assert ledger.first_settled_without_usage is None
+
+    ledger.observe_response("main", "r2", visible_chars=100)
+
+    notice = ledger.first_settled_without_usage
+    assert notice is not None
+    assert notice.thread == "main"
+    assert notice.response_id == "r1"
+    assert ledger.settled_response_ids("main") == ("r1",)
