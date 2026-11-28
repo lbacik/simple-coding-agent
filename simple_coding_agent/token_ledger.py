@@ -25,14 +25,20 @@ The model (decided in #127 from the ``prototype/token-estimator`` replay):
   tool result) are settled explicitly via :meth:`TokenLedger.settle_thread`
   / :meth:`TokenLedger.settle_all_threads`. Responses cut off by an
   interrupt stay unsettled (see ``mark_interrupted`` below) and produce no
-  entry, so entries stay "once per settled response". The first
-  response per attempt that settles without reported usage is reported via
+  entry, so entries stay "once per settled response". A response that
+  settles on a tool result without usage is deferred (see ``_settle``):
+  its entry and the ``token_estimate_degraded`` latch wait until usage
+  arrives late (then it counts as measured) or until the next response on
+  its thread confirms that no usage will arrive. The first
+  response per attempt that settles without reported usage and is not
+  deferred is reported via
   :attr:`TokenLedger.first_settled_without_usage` so the executor can log
   ``token_estimate_degraded``. The ledger captures a
   :class:`SettledReading` for each settled response at settle time, before
   the event that settled it is applied, so ``limits_checked`` can report
   the settled response's own figures instead of the live ledger state
-  (which already carries the next response's estimate).
+  (which already carries the next response's estimate); deferred readings
+  are updated to measured figures when late usage arrives.
 * A response cut off by an interrupt (for example the hard ceiling firing
   right after its first ``AssistantMessage``, before usage arrives) is
   flagged via :meth:`TokenLedger.mark_interrupted`. Interrupted estimates
@@ -224,6 +230,7 @@ class _Response:
     settled: bool = False
     compacted_before: bool = False
     interrupted: bool = False
+    deferred: bool = False
 
     def counted(self) -> float:
         """Tokens this response contributes to the budget reading."""
@@ -308,7 +315,7 @@ class TokenLedger:
         for response in thread.responses:
             if response.id == response_id:
                 return response.counted()
-        self._settle(thread)
+        self._settle(thread, cause="response")
         output_estimate = visible_chars / OUTPUT_CHARS_PER_TOKEN + THINKING_ALLOWANCE_TOKENS
         estimate = thread.context + output_estimate
         thread.responses.append(
@@ -322,6 +329,7 @@ class TokenLedger:
         self._compaction_pending.discard(thread_id)
         thread.context += output_estimate
         self._track_peak(thread)
+        self._confirm_deferred(thread)
         return estimate
 
     def observe_usage(
@@ -343,6 +351,8 @@ class TokenLedger:
         response = self._response_for_usage(thread, response_id)
         if response is None:
             return
+        had_no_usage = response.usage is None
+        previous_counted = response.counted()
         if response.usage is None:
             response.usage = merged
         else:
@@ -355,12 +365,16 @@ class TokenLedger:
             + response.usage["output_tokens"]
         )
         self._track_peak(thread, basis="measured")
+        if response.settled:
+            self._refresh_settled_reading(thread, response, previous_counted, had_no_usage)
+            if response.deferred and response.usage is not None:
+                response.deferred = False
 
     def observe_input(self, thread_id: str, chars: int) -> None:
         """Grow a thread's context with a tool result or user message."""
 
         thread = self._threads[thread_id]
-        self._settle(thread)
+        self._settle(thread, cause="input")
         thread.context += chars / INPUT_CHARS_PER_TOKEN + FRAMING_TOKENS_PER_MESSAGE
         self._track_peak(thread)
 
@@ -386,7 +400,7 @@ class TokenLedger:
         """
 
         for thread in self._threads.values():
-            self._settle(thread)
+            self._settle(thread, cause="explicit")
         estimated_total = self.budget_tokens
         measured = self.measured_tokens
         interrupted = self.interrupted_estimated_tokens
@@ -652,10 +666,19 @@ class TokenLedger:
         return len(self._threads[thread_id].responses)
 
     def settled_response_ids(self, thread_id: str) -> tuple[str, ...]:
-        """Ids of a thread's settled responses, in counting order."""
+        """Ids of a thread's settled responses, in counting order.
+
+        Responses that settled on a tool result without usage are deferred:
+        their ``limits_checked`` entry waits until usage arrives (then it is
+        reported as measured) or until the next response on the thread
+        confirms that no usage will arrive (then it is reported as an
+        estimate). Deferred ids are excluded until then.
+        """
 
         return tuple(
-            response.id for response in self._threads[thread_id].responses if response.settled
+            response.id
+            for response in self._threads[thread_id].responses
+            if response.settled and not response.deferred
         )
 
     def settled_reading(self, thread_id: str, response_id: str) -> SettledReading | None:
@@ -666,20 +689,26 @@ class TokenLedger:
     def settle_thread(self, thread_id: str) -> tuple[str, ...]:
         """Settle one thread's in-flight response, unless it was interrupted.
 
-        Returns the newly settled response ids (at most one). Responses
-        flagged via :meth:`mark_interrupted` stay unsettled: they keep their
-        interrupted accounting and produce no ``limits_checked`` entry, so
-        entries stay "once per settled response".
+        Returns the newly reportable response ids (the in-flight settle plus
+        any deferred tool-settled responses confirmed at the same time).
+        Responses flagged via :meth:`mark_interrupted` stay unsettled: they
+        keep their interrupted accounting and produce no ``limits_checked``
+        entry, so entries stay "once per settled response".
         """
 
         thread = self._threads.get(thread_id)
         if thread is None or not thread.responses:
             return ()
+        before = set(self.settled_response_ids(thread_id))
         response = thread.responses[-1]
-        if response.settled or response.interrupted:
-            return ()
-        self._settle(thread)
-        return (response.id,)
+        if not response.settled and not response.interrupted:
+            self._settle(thread, cause="explicit")
+        self._confirm_deferred(thread)
+        after = set(self.settled_response_ids(thread_id))
+        newly = tuple(
+            response.id for response in thread.responses if response.id in after - before
+        )
+        return newly
 
     def settle_all_threads(self) -> dict[str, tuple[str, ...]]:
         """Settle every thread's in-flight response, skipping interrupted ones.
@@ -699,12 +728,19 @@ class TokenLedger:
 
     # -- internals --------------------------------------------------------
 
-    def _settle(self, thread: _Thread) -> None:
+    def _settle(self, thread: _Thread, *, cause: str = "explicit") -> None:
         """Settle a thread's in-flight response as the next event arrives.
 
         The reading is captured before the settling event is applied: at
         this point the ledger still holds the settled response's own
         state, without the next response's estimate or tool-input growth.
+
+        A response that settles on a tool result (``cause="input"``) without
+        usage is deferred: its ``limits_checked`` entry and the
+        ``token_estimate_degraded`` latch wait until usage arrives (late
+        usage on this backend) or until the next response on the thread
+        confirms that no usage will arrive. Settling on the next response
+        or explicitly always reports immediately.
         """
 
         if not thread.responses:
@@ -714,11 +750,83 @@ class TokenLedger:
             return
         self._settled_readings[(thread.id, response.id)] = self._current_reading()
         response.settled = True
-        if response.usage is None and self._first_settled_without_usage is None:
+        if response.usage is not None:
+            return
+        if cause == "input":
+            response.deferred = True
+            return
+        self._latch_degraded(thread, response)
+
+    def _latch_degraded(self, thread: _Thread, response: _Response) -> None:
+        """Latch the first settled-without-usage notice, once per attempt."""
+
+        if self._first_settled_without_usage is None:
             self._first_settled_without_usage = DegradedNotice(
                 thread=thread.id,
                 subagent_type=thread.subagent_type,
                 response_id=response.id,
+            )
+
+    def _confirm_deferred(self, thread: _Thread) -> tuple[str, ...]:
+        """Confirm deferred tool-settled responses that still lack usage.
+
+        Called when the next response is counted or when the thread is
+        settled explicitly: usage that has not arrived by then is treated
+        as never arriving, so the deferred estimate becomes reportable and
+        latches ``token_estimate_degraded``. Returns newly confirmed ids.
+        """
+
+        newly: list[str] = []
+        for response in thread.responses:
+            if response.settled and response.deferred and response.usage is None:
+                response.deferred = False
+                self._latch_degraded(thread, response)
+                newly.append(response.id)
+        return tuple(newly)
+
+    def _refresh_settled_reading(
+        self,
+        thread: _Thread,
+        response: _Response,
+        previous_counted: float,
+        had_no_usage: bool,
+    ) -> None:
+        """Update a settled response's reading after late usage arrives.
+
+        The provisional reading captured at settle time carried the
+        response's estimate; replace that estimate slice with the measured
+        total so ``limits_checked`` reports measured usage. The adjustment
+        is relative to the provisional reading (not the live ledger, which
+        may already carry the next response's estimate).
+        """
+
+        key = (thread.id, response.id)
+        provisional = self._settled_readings.get(key)
+        if provisional is None:
+            return
+        measured_total = response.counted()
+        if had_no_usage:
+            self._settled_readings[key] = SettledReading(
+                budget_tokens=provisional.budget_tokens - previous_counted + measured_total,
+                measured_tokens=provisional.measured_tokens + measured_total,
+                estimated_tokens=provisional.estimated_tokens - previous_counted,
+                main_context_tokens=(
+                    thread.context if thread.id == "main" else provisional.main_context_tokens
+                ),
+                main_response_count=provisional.main_response_count,
+            )
+        else:
+            delta = measured_total - previous_counted
+            if delta == 0:
+                return
+            self._settled_readings[key] = SettledReading(
+                budget_tokens=provisional.budget_tokens + delta,
+                measured_tokens=provisional.measured_tokens + delta,
+                estimated_tokens=provisional.estimated_tokens,
+                main_context_tokens=(
+                    thread.context if thread.id == "main" else provisional.main_context_tokens
+                ),
+                main_response_count=provisional.main_response_count,
             )
 
     def _current_reading(self) -> SettledReading:

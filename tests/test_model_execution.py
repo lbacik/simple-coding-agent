@@ -2205,6 +2205,80 @@ def test_measured_usage_from_deltas_sums_once_per_response(tmp_path: Path) -> No
     assert "turns=2" in terminal_detail
 
 
+def test_late_usage_after_tool_result_does_not_degrade_and_reports_measured(tmp_path: Path) -> None:
+    """Regression test for #233: Meta streams the tool result before usage.
+
+    A main response whose ``message_delta`` usage arrives after the tool
+    result that settles it must not raise ``token_estimate_degraded``, and
+    its deferred ``limits_checked`` entry must report measured usage.
+    """
+
+    events: list[tuple[str, str, str]] = []
+
+    def client_factory(options: object) -> FakeClient:
+        return FakeClient(
+            options,
+            [
+                stream_event(
+                    {"type": "message_start", "message": {"id": "r1"}}, uuid="e-start-1"
+                ),
+                AssistantMessage(
+                    content=[TextBlock(text="hello")],
+                    model="muse-spark-1.3-contributor",
+                    message_id="r1",
+                    usage=None,
+                ),
+                # The tool result arrives before r1's usage on this backend,
+                # settling r1 without usage; the entry must wait for usage.
+                UserMessage(content="tool output"),
+                stream_event(
+                    {"type": "message_delta", "usage": {"input_tokens": 1000, "output_tokens": 200}},
+                    uuid="e-delta-1",
+                ),
+                stream_event(
+                    {"type": "message_start", "message": {"id": "r2"}}, uuid="e-start-2"
+                ),
+                AssistantMessage(
+                    content=[TextBlock(text="world")],
+                    model="muse-spark-1.3-contributor",
+                    message_id="r2",
+                    usage=None,
+                ),
+                UserMessage(content="second tool output"),
+                stream_event(
+                    {"type": "message_delta", "usage": {"input_tokens": 3000, "output_tokens": 400}},
+                    uuid="e-delta-2",
+                ),
+                result(),
+            ],
+        )
+
+    executor = ModelExecutor(
+        runtime_config(tmp_path),
+        client_factory=client_factory,
+        event_log=lambda event, detail="", level="INFO", issue_number=None: events.append(
+            (event, detail, level)
+        ),
+    )
+    execution = asyncio.run(executor.execute(issue_body="Fix it.", working_directory=tmp_path))
+
+    assert execution.status is ModelExecutionStatus.SUCCEEDED
+    assert executor._ledger.measured_tokens == 4600
+    assert executor._ledger.estimated_tokens == 0
+    assert not [name for name, _, _ in events if name == "token_estimate_degraded"]
+
+    limits_events = [
+        detail for name, detail, _ in events if name == "limits_checked" and detail.startswith("thread=")
+    ]
+    assert len(limits_events) == 2
+    assert "measured_tokens=1200" in limits_events[0]
+    assert "estimated_tokens=0" in limits_events[0]
+    assert "budget_tokens=1200" in limits_events[0]
+    assert "measured_tokens=4600" in limits_events[1]
+    assert "estimated_tokens=0" in limits_events[1]
+    assert "budget_tokens=4600" in limits_events[1]
+
+
 def test_subagent_responses_count_on_their_own_thread(tmp_path: Path) -> None:
     events: list[tuple[str, str, str]] = []
 
