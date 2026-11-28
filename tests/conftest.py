@@ -32,7 +32,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 
 @pytest.fixture
 def tmp_path() -> Iterator[Path]:
-    path = Path(tempfile.mkdtemp(dir="/var/lib/coding-agent/tmp-exec", prefix="sca-"))
+    path = Path(tempfile.mkdtemp(dir="/tmp", prefix="sca-"))
     try:
         yield path
     finally:
