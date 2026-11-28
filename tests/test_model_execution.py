@@ -4482,3 +4482,145 @@ def test_result_after_operator_note_commit_is_final_with_pending_background(
     assert terminal is not None
     assert not [name for name, _ in events if name == "background_result_deferred"]
     assert getattr(client, "stopped_tasks", []) == ["A"]
+
+
+def _usage_result(*, is_error: bool = False, stop_reason: str | None = "end_turn", input_tokens: int) -> object:
+    return SimpleNamespace(
+        is_error=is_error,
+        stop_reason=stop_reason,
+        model_usage={"muse-spark-1.3-contributor": {"input_tokens": input_tokens}},
+    )
+
+
+def test_limit_followup_without_handoff_reconciles_against_followup_terminal(
+    tmp_path: Path,
+) -> None:
+    """The follow-up's cumulative model_usage must win even without a handoff (#234)."""
+
+    def client_factory(options: object) -> FakeClient:
+        return FakeClient(
+            options,
+            [_usage_result(stop_reason="max_turns_exceeded", input_tokens=12)],
+            followup_messages=[_usage_result(stop_reason="end_turn", input_tokens=999)],
+        )
+
+    executor = ModelExecutor(runtime_config(tmp_path), client_factory=client_factory)
+    execution = asyncio.run(executor.execute(issue_body="Fix it.", working_directory=tmp_path))
+
+    assert execution.status is ModelExecutionStatus.MODEL_LIMIT_REACHED
+    assert execution.model_usage == {"muse-spark-1.3-contributor": {"input_tokens": 999}}
+    assert execution.token_budget is not None
+    assert execution.token_budget["actual_tokens"] == 999
+
+
+def test_timeout_followup_without_handoff_reconciles_against_followup_terminal(
+    tmp_path: Path,
+) -> None:
+    """A timed-out attempt whose follow-up ends without a handoff still reconciles (#234)."""
+
+    class HangingClient(FakeClient):
+        async def receive_response(self):
+            if self.queried_prompts:
+                for message in self._followup_messages:
+                    yield message
+                return
+            while not self.interrupted:
+                await asyncio.sleep(0)
+            return
+
+    def client_factory(options: object) -> FakeClient:
+        return HangingClient(
+            options,
+            [],
+            followup_messages=[_usage_result(stop_reason="end_turn", input_tokens=777)],
+        )
+
+    config = replace(runtime_config(tmp_path), model_timeout=0)
+    executor = ModelExecutor(config, client_factory=client_factory)
+    execution = asyncio.run(executor.execute(issue_body="Fix it.", working_directory=tmp_path))
+
+    assert execution.status is ModelExecutionStatus.INFRASTRUCTURE_ERROR
+    assert execution.model_usage == {"muse-spark-1.3-contributor": {"input_tokens": 777}}
+    assert execution.token_budget is not None
+    assert execution.token_budget["actual_tokens"] == 777
+
+
+def test_soft_threshold_followup_without_handoff_reconciles_against_followup_terminal(
+    tmp_path: Path,
+) -> None:
+    """Token soft-threshold follow-ups without a handoff use the follow-up usage (#234)."""
+
+    def client_factory(options: object) -> FakeClient:
+        return FakeClient(
+            options,
+            [*soft_crossing_messages(), _usage_result(input_tokens=12)],
+            followup_messages=[_usage_result(stop_reason="end_turn", input_tokens=950_000)],
+        )
+
+    executor = ModelExecutor(
+        replace(runtime_config(tmp_path), max_budget_tokens=1_000_000), client_factory=client_factory
+    )
+    execution = asyncio.run(executor.execute(issue_body="Fix it.", working_directory=tmp_path))
+
+    assert execution.status is ModelExecutionStatus.MODEL_LIMIT_REACHED
+    assert execution.model_usage == {"muse-spark-1.3-contributor": {"input_tokens": 950_000}}
+    assert execution.token_budget is not None
+    assert execution.token_budget["actual_tokens"] == 950_000
+
+
+def test_followup_without_terminal_excludes_followup_estimates_from_error_ratio(
+    tmp_path: Path,
+) -> None:
+    """A follow-up that produces no terminal leaves its estimates interrupted (#234)."""
+
+    followup_assistant = AssistantMessage(
+        content=[TextBlock(text="hello followup work " * 20)],
+        model="muse-spark-1.3-contributor",
+    )
+
+    def client_factory(options: object) -> FakeClient:
+        return FakeClient(
+            options,
+            [_usage_result(stop_reason="max_turns_exceeded", input_tokens=12)],
+            followup_messages=[followup_assistant],
+        )
+
+    executor = ModelExecutor(runtime_config(tmp_path), client_factory=client_factory)
+    execution = asyncio.run(executor.execute(issue_body="Fix it.", working_directory=tmp_path))
+
+    assert execution.status is ModelExecutionStatus.MODEL_LIMIT_REACHED
+    assert execution.model_usage == {"muse-spark-1.3-contributor": {"input_tokens": 12}}
+    assert execution.token_budget is not None
+    assert execution.token_budget["interrupted"]["estimated_tokens"] > 0
+    # The follow-up estimate is excluded from the unreported bucket, like #154.
+    assert execution.token_budget["unreported"]["estimated_tokens"] == 0
+
+
+def test_hard_ceiling_in_followup_reconciles_against_followup_terminal(
+    tmp_path: Path,
+) -> None:
+    """A hard ceiling latched inside the follow-up reconciles against its terminal (#234)."""
+
+    big = AssistantMessage(
+        content=[],
+        model="muse-spark-1.3-contributor",
+        message_id="r-big",
+        usage={"input_tokens": 1_100_000},
+    )
+
+    def client_factory(options: object) -> FakeClient:
+        return FakeClient(
+            options,
+            [_usage_result(stop_reason="max_turns_exceeded", input_tokens=12)],
+            followup_messages=[big, _usage_result(stop_reason="end_turn", input_tokens=1_200_000)],
+        )
+
+    config = replace(runtime_config(tmp_path), max_budget_tokens=1_000_000)
+    executor = ModelExecutor(config, client_factory=client_factory)
+    execution = asyncio.run(executor.execute(issue_body="Fix it.", working_directory=tmp_path))
+
+    assert execution.status is ModelExecutionStatus.MODEL_LIMIT_REACHED
+    assert execution.token_hard_ceiling_reached is True
+    assert execution.model_usage == {"muse-spark-1.3-contributor": {"input_tokens": 1_200_000}}
+    assert execution.token_budget is not None
+    assert execution.token_budget["actual_tokens"] == 1_200_000
