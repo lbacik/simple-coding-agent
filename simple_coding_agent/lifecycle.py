@@ -3774,15 +3774,33 @@ class AgentLifecycle:
         """Infer the safe republication decision without invoking the model.
 
         Delegates to :func:`recovery.infer_retry_decision`; performs the
-        one lifecycle side effect (advancing a ``MODEL_RUNNING``
-        checkpoint with preserved commits to ``PUSHING``) when the
-        inference requests it.
+        lifecycle side effects shared by startup reconciliation and
+        ``recovery retry``: reporting an interrupted final check honestly
+        instead of blaming model execution, and advancing a
+        ``MODEL_RUNNING`` checkpoint with preserved commits to ``PUSHING``
+        when the inference requests it.
         """
 
         from simple_coding_agent.recovery import infer_retry_decision
 
         evidence = self._collect_retry_evidence(checkpoint, claim, prepared)
         inference = infer_retry_decision(evidence)
+        if (
+            checkpoint.phase is AttemptPhase.MODEL_RUNNING
+            and inference.has_commits
+            and evidence.final_check_interrupted
+        ):
+            # The previous process logged final_check_started but never
+            # finished the check (kill, crash, or container restart).
+            # Report that honestly instead of blaming model execution;
+            # the branch is retained for resume.
+            self._event_log(
+                "final_check_interrupted",
+                "The final check started but never finished; the attempt process "
+                "died mid-check.",
+                level="ERROR",
+                issue_number=claim.issue.number,
+            )
         self._apply_retry_advance(inference.advance_to_pushing, claim.issue.number)
         return (
             inference.decision,
@@ -7132,31 +7150,9 @@ class AgentLifecycle:
                 base_branch=profile.base_branch, issue_number=claim.issue.number
             )
             self._record_claim_lease(prepared, claim.issue.number)
-            from simple_coding_agent.recovery import infer_retry_decision
-
-            evidence = self._collect_retry_evidence(checkpoint, claim, prepared)
-            inference = infer_retry_decision(evidence)
-            decision = inference.decision
-            has_commits = inference.has_commits
-            if (
-                checkpoint.phase is AttemptPhase.MODEL_RUNNING
-                and has_commits
-                and evidence.final_check_interrupted
-            ):
-                # The previous process logged final_check_started but
-                # never finished the check (kill, crash, or container
-                # restart). Report that honestly instead of blaming
-                # model execution; the branch is retained for resume.
-                self._event_log(
-                    "final_check_interrupted",
-                    "The final check started but never finished; the attempt process "
-                    "died mid-check.",
-                    level="ERROR",
-                    issue_number=claim.issue.number,
-                )
-            self._apply_retry_advance(inference.advance_to_pushing, claim.issue.number)
-            details = inference.details
-            note_commit_sha = inference.note_sha
+            decision, details, note_commit_sha, has_commits = self._infer_retry_decision(
+                checkpoint, claim, prepared
+            )
             publication_started_at = self._clock()
             # A verdict recorded before the restart is never recomputed (ADR
             # 0010): republication aims at it, and when that cannot be done
