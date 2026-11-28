@@ -127,7 +127,7 @@ def _tail_stream(output: object, *, limit: int = _BASELINE_PROMPT_STREAM_LIMIT) 
 
 
 def _build_baseline_failure_section(
-    baseline: object, *, after_conflict_resolution: bool = False
+    baseline: object, *, after_conflict_resolution: bool = False, fresh_tolerated: bool = False
 ) -> str:
     """Render a red baseline for the continuation starting prompt.
 
@@ -139,7 +139,10 @@ def _build_baseline_failure_section(
     The ``after_conflict_resolution`` form describes a deferred baseline that
     failed on the resolved branch (used by
     :func:`deferred_baseline_failed_reason`); the default form describes a
-    pre-model baseline that failed before the attempt started.
+    pre-model baseline that failed before the attempt started. The
+    ``fresh_tolerated`` form describes a red baseline on a fresh
+    fix-the-baseline attempt: the failure comes from the base branch itself,
+    not from earlier attempt commits.
     """
 
     header = "## Baseline check failure (fix before finishing)\n\n"
@@ -152,6 +155,18 @@ def _build_baseline_failure_section(
             "The conflicts are resolved, so the next round must start by making"
             " this check pass on the resolved branch: fix the underlying"
             " failure as part of that attempt rather than working around it."
+        )
+    elif fresh_tolerated:
+        header += (
+            "The baseline check — the same gate the final check uses — failed on the "
+            "base branch before this attempt started"
+        )
+        instruction = (
+            "This is a fresh attempt starting on a red baseline, so the failure "
+            "comes from the base branch itself rather than from earlier attempt "
+            "commits. You must pass this check before the work is considered done: "
+            "fix the underlying failure as part of this attempt rather than working "
+            "around it."
         )
     else:
         header += (
@@ -210,6 +225,7 @@ class VerificationRunner:
         working_directory: Path,
         *,
         continuation: bool = False,
+        tolerate_red_baseline: bool = False,
     ) -> PreparationEvidence:
         """Run setup and, only after success, an uncached baseline check."""
 
@@ -225,7 +241,7 @@ class VerificationRunner:
             self._baseline_passed = False
             return PreparationEvidence(setup=setup, baseline=None)
         baseline = self._run_check(profile, working_directory)
-        self._baseline_passed = baseline.succeeded or continuation
+        self._baseline_passed = baseline.succeeded or continuation or tolerate_red_baseline
         return PreparationEvidence(setup=setup, baseline=baseline)
 
     def mark_review_complete(
@@ -285,6 +301,7 @@ class CompletionEvaluator:
         continuation: bool = False,
         final_check_dirty_paths: Sequence[str] | None = None,
         deferred_baseline_failed: bool = False,
+        tolerate_red_baseline: bool = False,
     ) -> CompletionDecision:
         """Classify observed evidence; a local pass is eligibility, not completion."""
 
@@ -304,7 +321,7 @@ class CompletionEvaluator:
                 "Baseline check was not observed.",
                 commit_count,
             )
-        if not baseline.succeeded and not continuation:
+        if not baseline.succeeded and not continuation and not tolerate_red_baseline:
             return _decision(
                 AttemptOutcome.INCOMPLETE,
                 "Baseline check failed before model execution.",

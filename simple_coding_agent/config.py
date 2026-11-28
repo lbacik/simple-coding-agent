@@ -177,6 +177,7 @@ class RepositoryProfile:
     setup_timeout: int
     env: dict[str, str]
     model_instructions: str = ""
+    tolerate_red_baseline: bool = False
 
 
 def load_runtime_config(environ: Mapping[str, str] | None = None) -> RuntimeConfig:
@@ -286,6 +287,7 @@ def load_repository_profile(repository_dir: Path, profile_path: str = "") -> Rep
         "setup_timeout",
         "env",
         "model_instructions",
+        "baseline",
     }
     unknown_keys = raw_profile.keys() - allowed_keys
     if unknown_keys:
@@ -299,6 +301,7 @@ def load_repository_profile(repository_dir: Path, profile_path: str = "") -> Rep
         setup_timeout=_profile_duration(raw_profile, "setup_timeout", 120),
         env=_profile_environment(raw_profile),
         model_instructions=_profile_model_instructions(raw_profile),
+        tolerate_red_baseline=_profile_baseline_tolerance(raw_profile),
     )
 
 
@@ -535,3 +538,26 @@ def _profile_model_instructions(profile: dict[object, object]) -> str:
     if not isinstance(value, str):
         raise ProfileError("Repository profile model_instructions must be a string")
     return value
+
+
+def _profile_baseline_tolerance(profile: dict[object, object]) -> bool:
+    """Read the optional red-baseline tolerance for fix-the-baseline work.
+
+    ``baseline: tolerate`` lets a fresh attempt start on a red baseline so
+    an issue whose whole purpose is to turn ``base_branch`` green again can
+    be automated. The default (absent ``baseline``) is ``require``: a red
+    baseline stops a fresh attempt before model dispatch. Any other value
+    is rejected.
+    """
+
+    if "baseline" not in profile:
+        return False
+    value = profile.get("baseline")
+    if not isinstance(value, str):
+        raise ProfileError("Repository profile baseline must be require or tolerate")
+    normalized = value.strip().lower()
+    if normalized == "require":
+        return False
+    if normalized == "tolerate":
+        return True
+    raise ProfileError("Repository profile baseline must be require or tolerate")

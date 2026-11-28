@@ -146,6 +146,7 @@ from simple_coding_agent.conflict_attempt import (
     success_details as _conflict_success_details,
 )
 from simple_coding_agent.github_tracker import (
+    FIX_BASELINE,
     MERGE_CONFLICT,
     ROUND_FINISHED,
     Claim,
@@ -537,6 +538,8 @@ class ModelAttemptRunner:
         )
         initial_commits = self._workspace.commits_added(prepared)
         continuation = bool(initial_commits)
+        tolerates_red_baseline = _tolerates_red_baseline(claim.issue, profile)
+        fresh_baseline_tolerated = bool(tolerates_red_baseline and not continuation)
         # A retained branch rebased onto its base can be left with conflict
         # markers for the model to resolve. Setup commands parse every source
         # file, so they must never run against that half-rebased tree; they
@@ -563,7 +566,12 @@ class ModelAttemptRunner:
             )
         else:
             early = self._run_preparation(
-                claim, profile, archive, continuation=continuation, deferred=False
+                claim,
+                profile,
+                archive,
+                continuation=continuation,
+                tolerate_red_baseline=tolerates_red_baseline,
+                deferred=False,
             )
             if isinstance(early, AttemptEvidence):
                 # Setup (or the mandatory baseline) failed before model
@@ -586,18 +594,38 @@ class ModelAttemptRunner:
         # point is carried over from a resumed attempt, not produced by this
         # run. `commits_added` is read again after the model runs to count
         # what this run itself added.
-        # A tolerated red baseline on a continuation is the model's to fix
-        # (it almost always comes from the earlier attempt's own commits), so
-        # the failure rides along in the starting prompt. A red first-attempt
-        # baseline never reaches here: preparation returns early above.
+        # A tolerated red baseline (a continuation, or a fresh fix-baseline
+        # attempt) is the model's to fix, so the failure rides along in the
+        # starting prompt. Any other red first-attempt baseline never reaches
+        # here: preparation returns early above.
+        baseline_tolerated = bool(continuation or tolerates_red_baseline)
         failed_baseline = None
         if (
             preparation is not None
-            and continuation
+            and baseline_tolerated
             and preparation.baseline is not None
             and not preparation.baseline.succeeded
         ):
             failed_baseline = preparation.baseline
+        if failed_baseline is not None and fresh_baseline_tolerated:
+            sources = _red_baseline_tolerance_sources(claim.issue, profile)
+            detail = _command_failure_detail(failed_baseline)
+            source_text = f" ({', '.join(sources)})" if sources else ""
+            self._event_log(
+                "red_baseline_tolerated",
+                f"Fresh attempt starts on a red baseline{source_text}: {detail}",
+                level="WARNING",
+                issue_number=claim.issue.number,
+            )
+            if archive is not None:
+                archive.write_attempt(
+                    {
+                        "red_baseline_tolerated": {
+                            "reason": f"Fresh attempt starts on a red baseline{source_text}: {detail}",
+                            "sources": list(sources),
+                        }
+                    }
+                )
         prompt_body = _build_starting_prompt(
             claim.issue.body,
             self._prompt_comments(claim.issue),
@@ -607,6 +635,7 @@ class ModelAttemptRunner:
             redactions=self._prompt_redactions,
             setup_deferred=setup_deferred,
             baseline=failed_baseline,
+            fresh_baseline_tolerated=fresh_baseline_tolerated,
         )
         self._event_log(
             "model_dispatch_starting",
@@ -1017,20 +1046,37 @@ class ModelAttemptRunner:
                 commits = self._workspace.commits_added(prepared)
                 commit_count = len(commits)
         try:
-            decision = self._evaluator.evaluate(
-                setup=preparation.setup,
-                baseline=preparation.baseline,
-                model_status=execution.status,
-                commit_count=commit_count,
-                acceptance_criteria_satisfied=(
-                    review_count > 0 and self._acceptance_criteria_satisfied(claim)
-                ),
-                review=review,
-                final_check=final_check,
-                continuation=continuation,
-                final_check_dirty_paths=final_check_dirty_paths,
-                deferred_baseline_failed=deferred_baseline is not None,
-            )
+            try:
+                decision = self._evaluator.evaluate(
+                    setup=preparation.setup,
+                    baseline=preparation.baseline,
+                    model_status=execution.status,
+                    commit_count=commit_count,
+                    acceptance_criteria_satisfied=(
+                        review_count > 0 and self._acceptance_criteria_satisfied(claim)
+                    ),
+                    review=review,
+                    final_check=final_check,
+                    continuation=continuation,
+                    final_check_dirty_paths=final_check_dirty_paths,
+                    deferred_baseline_failed=deferred_baseline is not None,
+                    tolerate_red_baseline=tolerates_red_baseline,
+                )
+            except TypeError:
+                decision = self._evaluator.evaluate(
+                    setup=preparation.setup,
+                    baseline=preparation.baseline,
+                    model_status=execution.status,
+                    commit_count=commit_count,
+                    acceptance_criteria_satisfied=(
+                        review_count > 0 and self._acceptance_criteria_satisfied(claim)
+                    ),
+                    review=review,
+                    final_check=final_check,
+                    continuation=bool(continuation or tolerates_red_baseline),
+                    final_check_dirty_paths=final_check_dirty_paths,
+                    deferred_baseline_failed=deferred_baseline is not None,
+                )
         except TypeError:
             decision = self._evaluator.evaluate(
                 setup=preparation.setup,
@@ -1479,6 +1525,7 @@ class ModelAttemptRunner:
         *,
         continuation: bool,
         deferred: bool,
+        tolerate_red_baseline: bool = False,
     ) -> PreparationEvidence | AttemptEvidence:
         """Run setup and the baseline check once; return early evidence on failure."""
 
@@ -1486,12 +1533,21 @@ class ModelAttemptRunner:
         self._event_log(
             "setup_started", deferral.strip(), level="INFO", issue_number=claim.issue.number
         )
+        baseline_tolerated = bool(continuation or tolerate_red_baseline)
         try:
-            preparation = self._verifier.prepare(
-                profile,
-                self._workspace.working_directory,
-                continuation=continuation,
-            )
+            try:
+                preparation = self._verifier.prepare(
+                    profile,
+                    self._workspace.working_directory,
+                    continuation=continuation,
+                    tolerate_red_baseline=tolerate_red_baseline,
+                )
+            except TypeError:
+                preparation = self._verifier.prepare(
+                    profile,
+                    self._workspace.working_directory,
+                    continuation=baseline_tolerated,
+                )
         except TypeError:
             preparation = self._verifier.prepare(
                 profile,
@@ -1513,7 +1569,7 @@ class ModelAttemptRunner:
                 self._event_log(
                     "baseline_check_failed",
                     _command_failure_detail(preparation.baseline),
-                    level="WARNING" if continuation else "ERROR",
+                    level="WARNING" if baseline_tolerated else "ERROR",
                     issue_number=claim.issue.number,
                 )
             else:
@@ -1523,19 +1579,32 @@ class ModelAttemptRunner:
         if (
             not preparation.setup.succeeded
             or preparation.baseline is None
-            or (not preparation.baseline.succeeded and not continuation)
+            or (not preparation.baseline.succeeded and not baseline_tolerated)
         ):
             try:
-                decision = self._evaluator.evaluate(
-                    setup=preparation.setup,
-                    baseline=preparation.baseline,
-                    model_status=None,
-                    commit_count=0,
-                    acceptance_criteria_satisfied=False,
-                    review=ReviewEvidence((), 0),
-                    final_check=None,
-                    continuation=continuation,
-                )
+                try:
+                    decision = self._evaluator.evaluate(
+                        setup=preparation.setup,
+                        baseline=preparation.baseline,
+                        model_status=None,
+                        commit_count=0,
+                        acceptance_criteria_satisfied=False,
+                        review=ReviewEvidence((), 0),
+                        final_check=None,
+                        continuation=continuation,
+                        tolerate_red_baseline=tolerate_red_baseline,
+                    )
+                except TypeError:
+                    decision = self._evaluator.evaluate(
+                        setup=preparation.setup,
+                        baseline=preparation.baseline,
+                        model_status=None,
+                        commit_count=0,
+                        acceptance_criteria_satisfied=False,
+                        review=ReviewEvidence((), 0),
+                        final_check=None,
+                        continuation=baseline_tolerated,
+                    )
             except TypeError:
                 decision = self._evaluator.evaluate(
                     setup=preparation.setup,
@@ -9205,6 +9274,7 @@ def _build_starting_prompt(
     redactions: Sequence[str] = (),
     setup_deferred: bool = False,
     baseline: object | None = None,
+    fresh_baseline_tolerated: bool = False,
 ) -> str:
     """Compose the model's starting context from the issue body and trusted comments.
 
@@ -9215,8 +9285,9 @@ def _build_starting_prompt(
     already reachable on the resumed branch. A setup-deferred attempt adds
     the rebase-conflict resolution instruction.
 
-    A failed pre-model ``baseline`` (only possible on a tolerated continuation
-    baseline; a red first-attempt baseline stops before dispatch) adds the
+    A failed pre-model ``baseline`` (possible on a tolerated continuation
+    baseline or on a fresh fix-the-baseline attempt; any other red
+    first-attempt baseline stops before dispatch) adds the
     failure section so the model knows the branch is red and what to fix. A
     passing or absent baseline leaves the prompt byte-for-byte unchanged.
 
@@ -9245,9 +9316,40 @@ def _build_starting_prompt(
             "then continue the implementation."
         )
     if baseline is not None and not getattr(baseline, "succeeded", True):
-        parts.append(_build_baseline_failure_section(baseline))
+        parts.append(
+            _build_baseline_failure_section(
+                baseline, fresh_tolerated=fresh_baseline_tolerated and not continuation
+            )
+        )
     parts.append(_gate_section(profile, redactions))
     return "\n\n".join(parts)
+
+
+def _tolerates_red_baseline(issue: TrackerIssue, profile: object) -> bool:
+    """Whether a fresh attempt on this issue may start on a red baseline.
+
+    Either the ``fix-baseline`` label (the issue's whole purpose is to turn
+    the base branch green again) or the repository profile's
+    ``baseline: tolerate`` setting opts in. A continuation already tolerates
+    a red baseline, so this only matters for fresh attempts.
+    """
+
+    labels = getattr(issue, "labels", frozenset()) or frozenset()
+    if FIX_BASELINE in labels:
+        return True
+    return bool(getattr(profile, "tolerate_red_baseline", False))
+
+
+def _red_baseline_tolerance_sources(issue: TrackerIssue, profile: object) -> tuple[str, ...]:
+    """Human-readable sources that opted this attempt into red-baseline tolerance."""
+
+    sources: list[str] = []
+    labels = getattr(issue, "labels", frozenset()) or frozenset()
+    if FIX_BASELINE in labels:
+        sources.append(f"label:{FIX_BASELINE}")
+    if bool(getattr(profile, "tolerate_red_baseline", False)):
+        sources.append("profile:baseline=tolerate")
+    return tuple(sources)
 
 
 #: Result comments carrying this branch line never published a branch, so they
