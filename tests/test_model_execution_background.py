@@ -33,7 +33,12 @@ from simple_coding_agent.completion import (
 from simple_coding_agent.config import RepositoryProfile, RuntimeConfig
 from simple_coding_agent.github_tracker import Assignment, Claim, TrackerIssue
 from simple_coding_agent.git_workspace import PreparedAttempt
-from simple_coding_agent.lifecycle import ModelAttemptRunner, _review_findings_text
+from simple_coding_agent.lifecycle import (
+    ModelAttemptRunner,
+    _collect_review_evidence,
+    _gate_section,
+    _review_findings_text,
+)
 from simple_coding_agent.completion import ReviewEvidence, ReviewFinding
 from simple_coding_agent.model_execution import (
     ModelExecution,
@@ -434,9 +439,11 @@ class FakeModelExecutor:
         *,
         status: ModelExecutionStatus = ModelExecutionStatus.MODEL_LIMIT_REACHED,
         skill_events: tuple[SkillEvent, ...] = (),
+        last_assistant_text: str | None = None,
     ) -> None:
         self._status = status
         self._skill_events = skill_events
+        self._last_assistant_text = last_assistant_text
 
     async def execute(
         self, *, issue_body: str, working_directory: Path, issue_number=None, archive=None
@@ -448,6 +455,7 @@ class FakeModelExecutor:
             model_usage=None,
             observed_models=(),
             skill_events=self._skill_events,
+            last_assistant_text=self._last_assistant_text,
         )
 
 
@@ -545,6 +553,76 @@ def test_review_findings_join_when_findings_exist() -> None:
     )
     assert _review_findings_text(ReviewEvidence((), 1), 2) == "not collected"
     assert _review_findings_text(ReviewEvidence((), 0), 0) == "not run"
+
+
+def test_review_findings_none_when_all_clear_is_collected() -> None:
+    assert _review_findings_text(ReviewEvidence((), 1, True), 2) == "none"
+
+
+def _code_review_events(count: int = 1) -> tuple[SkillEvent, ...]:
+    return tuple(
+        SkillEvent(
+            phase="PreToolUse",
+            name="code-review",
+            agent_id=None,
+            timestamp="2026-10-11T00:00:00Z",
+        )
+        for _ in range(count)
+    )
+
+
+def test_collected_findings_flow_into_attempt_evidence(tmp_path: Path) -> None:
+    executor = FakeModelExecutor(
+        skill_events=_code_review_events(2),
+        last_assistant_text=(
+            "done\n```review-findings\n- must-fix: data race\n```"
+        ),
+    )
+
+    evidence = run_attempt(tmp_path, executor)
+
+    assert evidence.review_cycles == 1
+    assert evidence.review_findings == "data race"
+
+
+def test_collected_all_clear_renders_none(tmp_path: Path) -> None:
+    executor = FakeModelExecutor(
+        skill_events=_code_review_events(1),
+        last_assistant_text="done\n```review-findings\nnone\n```",
+    )
+
+    evidence = run_attempt(tmp_path, executor)
+
+    assert evidence.review_findings == "none"
+
+
+def test_findings_block_without_a_review_invocation_is_ignored(tmp_path: Path) -> None:
+    executor = FakeModelExecutor(
+        skill_events=(),
+        last_assistant_text="done\n```review-findings\n- must-fix: data race\n```",
+    )
+
+    evidence = run_attempt(tmp_path, executor)
+
+    assert evidence.review_findings == "not run"
+
+
+def test_collect_review_evidence_requires_a_review_invocation() -> None:
+    execution = SimpleNamespace(last_assistant_text="```review-findings\nnone\n```")
+
+    assert _collect_review_evidence(execution, 0, 0) == ReviewEvidence((), 0)
+    assert _collect_review_evidence(execution, 1, 0) == ReviewEvidence((), 0, True)
+
+
+def test_completion_gate_instructs_the_review_findings_block() -> None:
+    profile = attempt_profile()
+
+    prompt = _gate_section(profile, ())
+
+    assert "code-review" in prompt
+    assert "review-findings" in prompt
+    assert "must-fix" in prompt
+    assert "none" in prompt
 
 
 class RaisingStopClient(BackgroundFakeClient):

@@ -13,6 +13,7 @@ from simple_coding_agent.completion import (
     ReviewFinding,
     VerificationRunner,
     VerificationOrderError,
+    parse_review_findings,
 )
 from simple_coding_agent.config import ProfileError, RepositoryProfile
 from simple_coding_agent.model_execution import ModelExecutionStatus
@@ -429,3 +430,71 @@ def test_deferred_baseline_flag_defaults_to_the_existing_contract() -> None:
 
     assert evaluator.evaluate(**arguments, deferred_baseline_failed=False).publication_eligible is True
     assert evaluator.evaluate(**arguments).publication_eligible is True
+
+
+def test_parse_review_findings_returns_none_without_a_block() -> None:
+    assert parse_review_findings(None) is None
+    assert parse_review_findings("") is None
+    assert parse_review_findings("fixed the bug, review looks good") is None
+
+
+def test_parse_review_findings_collects_an_explicit_all_clear() -> None:
+    assert parse_review_findings("```review-findings\nnone\n```") == ()
+    assert parse_review_findings("```review-findings\nAll Clear\n```") == ()
+
+
+def test_parse_review_findings_captures_severity_and_summary() -> None:
+    parsed = parse_review_findings(
+        "done\n```review-findings\n"
+        "- must-fix: data race in the ledger\n"
+        "- suggestion: rename for clarity\n"
+        "```"
+    )
+
+    assert parsed == (
+        ReviewFinding("must-fix", "data race in the ledger"),
+        ReviewFinding("suggestion", "rename for clarity"),
+    )
+
+
+def test_parse_review_findings_uses_the_last_block_and_normalizes_severity() -> None:
+    parsed = parse_review_findings(
+        "```review-findings\n- suggestion: stale\n```\n"
+        "after re-review\n"
+        "```review-findings\n- Must_Fix: trailing whitespace\n```"
+    )
+
+    assert parsed == (ReviewFinding("must-fix", "trailing whitespace"),)
+
+
+def test_parse_review_findings_ignores_an_unparseable_block() -> None:
+    assert parse_review_findings("```review-findings\njust some prose\n```") is None
+
+
+def test_collected_must_fix_blocks_completion() -> None:
+    evaluator = CompletionEvaluator({"must-fix"})
+    parsed = parse_review_findings("```review-findings\n- must-fix: data race\n```")
+    assert parsed is not None
+    decision = evaluator.evaluate(
+        setup=command_result(), baseline=command_result(), commit_count=1,
+        acceptance_criteria_satisfied=True, final_check=command_result(),
+        model_status=ModelExecutionStatus.SUCCEEDED,
+        review=ReviewEvidence(parsed, 0, True),
+    )
+
+    assert decision.outcome is AttemptOutcome.INCOMPLETE
+    assert decision.reasons == ("Final review has blocking findings.",)
+
+
+def test_collected_suggestion_does_not_block_by_default() -> None:
+    evaluator = CompletionEvaluator({"must-fix"})
+    parsed = parse_review_findings("```review-findings\n- suggestion: rename\n```")
+    assert parsed is not None
+    decision = evaluator.evaluate(
+        setup=command_result(), baseline=command_result(), commit_count=1,
+        acceptance_criteria_satisfied=True, final_check=command_result(),
+        model_status=ModelExecutionStatus.SUCCEEDED,
+        review=ReviewEvidence(parsed, 0, True),
+    )
+
+    assert decision.publication_eligible is True

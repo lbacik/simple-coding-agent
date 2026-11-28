@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Sequence
 from dataclasses import dataclass
 from enum import StrEnum
@@ -52,6 +53,67 @@ class ReviewEvidence:
 
     findings: tuple[ReviewFinding, ...]
     repair_cycles: int
+    collected: bool = False
+
+
+#: Fenced ``review-findings`` block the model writes as its final review
+#: aggregation. The last such block in the main-thread text is the collected
+#: report; anything elsewhere is not parsed.
+_REVIEW_FINDINGS_FENCE = re.compile(
+    r"```\s*review-findings\s*\n(.*?)```", re.DOTALL | re.IGNORECASE
+)
+
+#: Block bodies that mean "the review ran and found nothing".
+_REVIEW_FINDINGS_NONE = frozenset({"none", "no findings", "all clear"})
+
+
+def parse_review_findings(text: object) -> tuple[ReviewFinding, ...] | None:
+    """Parse the collected ``review-findings`` block from final model text.
+
+    The main thread's final message is the auditable aggregation of the
+    ``code-review`` skill: after invoking the skill the model reports its
+    final findings in a fenced block such as::
+
+        ```review-findings
+        - must-fix: data race in the token ledger
+        - suggestion: rename for clarity
+        ```
+
+    or a block containing only ``none`` when the review found nothing.
+    Returns the parsed findings (``()`` for an explicit all-clear), or
+    ``None`` when no block was collected: no block, an empty message, or a
+    block with no parseable ``severity: summary`` lines. The ``None`` case
+    must never render as an all-clear downstream.
+    """
+
+    if not isinstance(text, str) or not text.strip():
+        return None
+    matches = list(_REVIEW_FINDINGS_FENCE.finditer(text))
+    if not matches:
+        return None
+    block = matches[-1].group(1).strip()
+    if not block or block.lower() in _REVIEW_FINDINGS_NONE:
+        return ()
+    findings: list[ReviewFinding] = []
+    for raw_line in block.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        if line.startswith(("-", "*")):
+            line = line[1:].strip()
+        if ":" not in line:
+            continue
+        severity_raw, summary = line.split(":", 1)
+        severity = (
+            severity_raw.strip().lower().replace("_", "-").replace(" ", "-")
+        )
+        summary = " ".join(summary.split())
+        if not severity or not summary:
+            continue
+        findings.append(ReviewFinding(severity, summary))
+    if not findings:
+        return None
+    return tuple(findings)
 
 
 def final_check_dirty_reason(paths: Sequence[str]) -> str:
