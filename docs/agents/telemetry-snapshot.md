@@ -60,6 +60,9 @@ with it.
   auto-compact threshold, compactions, up to 20 running-first subagents),
   `provider_rate_limit` (always `unavailable` in v1), and
   `elapsed_seconds`/`timeout_seconds`. USD cost is intentionally out of v1.
+  `context.window` and `context.auto_compact_threshold` are the window the CLI
+  actually uses: `configured` when `CLAUDE_CODE_MAX_CONTEXT_TOKENS` is set,
+  `sdk_assumed` (currently 200000) otherwise.
 - `last_finished` (`attempt_id`, `issue_number`, `issue_title`, `outcome`,
   `finished_at`, `budget_used`, `turns`, `pull_request: {number, url} |
   null`) is held in memory, updated at finalisation, and seeded at startup
