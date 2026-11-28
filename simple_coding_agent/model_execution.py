@@ -1586,6 +1586,8 @@ class ModelExecutor:
         client = self._client_factory(
             self._options(working_directory, attempt_marker=session_marker)
         )
+        followup_terminal_for_reconciliation: object | None = None
+        followup_observed_for_reconciliation: tuple[str, ...] | None = None
         try:
             try:
                 await client.connect(f"/implement\n\n{issue_body}")
@@ -1599,22 +1601,33 @@ class ModelExecutor:
                     await self._drain(client)
                     if self._token_hard_ceiling_reached:
                         return self._hard_ceiling_evidence(None, ())
-                    followup = await self._attempt_handoff_followup(client, ())
-                    if followup is not None:
-                        return followup
+                    outcome = await self._attempt_handoff_followup(client, ())
+                    if outcome.evidence is not None:
+                        return outcome.evidence
+                    if outcome.terminal is not None:
+                        return self._evidence(
+                            ModelExecutionStatus.INFRASTRUCTURE_ERROR,
+                            "Model execution exceeded MODEL_TIMEOUT and was interrupted.",
+                            None,
+                            getattr(outcome.terminal, "model_usage", None),
+                            outcome.observed_models,
+                        )
                     return self._evidence(
                         ModelExecutionStatus.INFRASTRUCTURE_ERROR,
                         "Model execution exceeded MODEL_TIMEOUT and was interrupted.",
                         None,
                         None,
-                        (),
+                        outcome.observed_models,
                     )
                 if self._token_hard_ceiling_reached:
                     return self._classify(terminal, observed_models)
                 if terminal is not None and self._is_model_limit(terminal, observed_models):
-                    followup = await self._attempt_handoff_followup(client, observed_models)
-                    if followup is not None:
-                        return followup
+                    outcome = await self._attempt_handoff_followup(client, observed_models)
+                    if outcome.evidence is not None:
+                        return outcome.evidence
+                    if outcome.terminal is not None:
+                        followup_terminal_for_reconciliation = outcome.terminal
+                        followup_observed_for_reconciliation = outcome.observed_models
                 elif terminal is not None and self._needs_cost_handoff_followup(
                     terminal, observed_models
                 ):
@@ -1624,7 +1637,7 @@ class ModelExecutor:
                         " crossing without a main-thread handoff; issuing the"
                         " single token follow-up handoff prompt.",
                     )
-                    followup = await self._attempt_handoff_followup(
+                    outcome = await self._attempt_handoff_followup(
                         client,
                         observed_models,
                         prompt=_cost_handoff_followup_prompt(
@@ -1638,8 +1651,11 @@ class ModelExecutor:
                         ),
                         allow_note_commit=True,
                     )
-                    if followup is not None:
-                        return followup
+                    if outcome.evidence is not None:
+                        return outcome.evidence
+                    if outcome.terminal is not None:
+                        followup_terminal_for_reconciliation = outcome.terminal
+                        followup_observed_for_reconciliation = outcome.observed_models
             finally:
                 await self._disconnect_client(client)
                 await self._reap_attempt_processes(session_marker)
@@ -1661,6 +1677,13 @@ class ModelExecutor:
                 None,
                 None,
                 observed_models,
+            )
+        if followup_terminal_for_reconciliation is not None:
+            return self._classify(
+                terminal,
+                observed_models,
+                followup_terminal=followup_terminal_for_reconciliation,
+                followup_observed_models=followup_observed_for_reconciliation,
             )
         return self._classify(terminal, observed_models)
 
@@ -2032,6 +2055,27 @@ class ModelExecutor:
             return False
         return True
 
+    @dataclass
+    class _HandoffFollowupOutcome:
+        """Result of the single same-client handoff follow-up query.
+
+        ``evidence`` is the HANDOFF_REQUESTED evidence when the model handed
+        off during the follow-up, otherwise ``None``. ``terminal`` is the
+        follow-up's terminal ``ResultMessage`` when one was produced,
+        regardless of whether a handoff happened: its ``model_usage`` is the
+        cumulative session usage and must be used for reconciliation even
+        when the outcome classification still comes from the pre-follow-up
+        terminal. ``observed_models`` merges the pre-follow-up observed
+        models with the follow-up's. When no terminal was produced the
+        ledger's follow-up estimates are flagged interrupted so they are
+        excluded from ``mode``/``error_ratio`` like other interrupted
+        responses.
+        """
+
+        evidence: ModelExecution | None
+        terminal: object | None
+        observed_models: tuple[str, ...]
+
     async def _attempt_handoff_followup(
         self,
         client: SDKClient,
@@ -2042,16 +2086,19 @@ class ModelExecutor:
             "Model invoked the handoff skill after reaching a turns/timeout limit."
         ),
         allow_note_commit: bool = False,
-    ) -> ModelExecution | None:
+    ) -> _HandoffFollowupOutcome:
         """Best-effort same-client follow-up after a turns/timeout/token limit.
 
-        Returns a HANDOFF_REQUESTED evidence only when the model actually
-        handed off in the main thread during the follow-up (the ``handoff``
-        skill invocation; on the token path a note commit made during the
-        follow-up counts as success too when ``allow_note_commit`` holds);
-        otherwise returns None so the caller falls back to its ordinary limit
-        classification. This never retries: a follow-up that fails or times
-        out is itself evidence that handoff is not achievable right now.
+        ``evidence`` is HANDOFF_REQUESTED only when the model actually handed
+        off in the main thread during the follow-up (the ``handoff`` skill
+        invocation; on the token path a note commit made during the follow-up
+        counts as success too when ``allow_note_commit`` holds); otherwise it
+        is ``None`` and the caller falls back to its ordinary limit
+        classification. ``terminal`` is still the follow-up's terminal
+        ``ResultMessage`` whenever one was produced, so the caller can
+        reconcile against its cumulative ``model_usage``. This never retries:
+        a follow-up that fails or times out is itself evidence that handoff is
+        not achievable right now.
         """
 
         if prompt is None:
@@ -2061,14 +2108,19 @@ class ModelExecutor:
             async with asyncio.timeout(_HANDOFF_FOLLOWUP_TIMEOUT):
                 followup_terminal, followup_models = await self._receive_terminal(client)
         except Exception:
-            return None
+            self._ledger.mark_interrupted()
+            return self._HandoffFollowupOutcome(None, None, observed_models)
         if followup_terminal is None:
-            return None
+            self._ledger.mark_interrupted()
+            return self._HandoffFollowupOutcome(
+                None, None, tuple(dict.fromkeys((*observed_models, *followup_models)))
+            )
         all_models = tuple(dict.fromkeys((*observed_models, *followup_models)))
         skill_invoked = self._main_thread_handoff_invoked()
         note_committed = allow_note_commit and self._handoff_note_committed
         if not (skill_invoked or note_committed):
-            return None
+            self._note_terminal(followup_terminal)
+            return self._HandoffFollowupOutcome(None, followup_terminal, all_models)
         self._note_terminal(followup_terminal)
         if note_committed and not skill_invoked:
             explanation = (
@@ -2077,13 +2129,14 @@ class ModelExecutor:
             )
         else:
             explanation = success_explanation
-        return self._evidence(
+        evidence = self._evidence(
             ModelExecutionStatus.HANDOFF_REQUESTED,
             explanation,
             followup_terminal.stop_reason,
             getattr(followup_terminal, "model_usage", None),
             all_models,
         )
+        return self._HandoffFollowupOutcome(evidence, followup_terminal, all_models)
 
     def _options(
         self, working_directory: Path, *, attempt_marker: str | None = None
@@ -3007,10 +3060,26 @@ class ModelExecutor:
         return terminal
 
     def _classify(
-        self, terminal: ResultMessage | None, observed_models: tuple[str, ...]
+        self,
+        terminal: ResultMessage | None,
+        observed_models: tuple[str, ...],
+        *,
+        followup_terminal: object | None = None,
+        followup_observed_models: tuple[str, ...] | None = None,
     ) -> ModelExecution:
         self._note_terminal(terminal)
+        if followup_terminal is not None:
+            self._note_terminal(followup_terminal)
         if self._token_hard_ceiling_reached:
+            if followup_terminal is not None:
+                return self._hard_ceiling_evidence(
+                    getattr(followup_terminal, "model_usage", None),
+                    followup_observed_models
+                    if followup_observed_models is not None
+                    else observed_models,
+                    stop_reason=getattr(terminal, "stop_reason", None),
+                    terminal_reason=getattr(terminal, "terminal_reason", None),
+                )
             return self._hard_ceiling_evidence(
                 getattr(terminal, "model_usage", None),
                 observed_models,
@@ -3019,9 +3088,30 @@ class ModelExecutor:
             )
         # SDK 0.2.163 exposes these runtime fields, unlike the current reference
         # documentation's terminal_reason/total_cost_usd/input_tokens examples.
-        model_usage = getattr(terminal, "model_usage", None)
-        result_models = tuple(model_usage.keys()) if isinstance(model_usage, Mapping) else ()
-        all_models = tuple(dict.fromkeys((*observed_models, *result_models)))
+        # When a follow-up produced a terminal, its cumulative ``model_usage``
+        # is the reconciliation source even though the outcome classification
+        # still comes from the pre-follow-up terminal.
+        if followup_terminal is not None:
+            reconciliation_usage = getattr(followup_terminal, "model_usage", None)
+            effective_observed = (
+                followup_observed_models
+                if followup_observed_models is not None
+                else observed_models
+            )
+            result_models = (
+                tuple(reconciliation_usage.keys())
+                if isinstance(reconciliation_usage, Mapping)
+                else ()
+            )
+            all_models = tuple(dict.fromkeys((*effective_observed, *result_models)))
+            evidence_usage = reconciliation_usage
+            evidence_models = all_models
+        else:
+            model_usage = getattr(terminal, "model_usage", None)
+            result_models = tuple(model_usage.keys()) if isinstance(model_usage, Mapping) else ()
+            all_models = tuple(dict.fromkeys((*observed_models, *result_models)))
+            evidence_usage = model_usage
+            evidence_models = all_models
         mismatches = tuple(model for model in all_models if model != self._config.model)
         stop_reason = getattr(terminal, "stop_reason", None)
         terminal_reason = getattr(terminal, "terminal_reason", None)
@@ -3033,8 +3123,8 @@ class ModelExecutor:
                 ModelExecutionStatus.HANDOFF_REQUESTED,
                 "Model invoked the handoff skill after an operator handoff request.",
                 stop_reason,
-                model_usage,
-                all_models,
+                evidence_usage,
+                evidence_models,
                 terminal_reason=terminal_reason,
             )
         if self._token_handoff_done():
@@ -3052,8 +3142,8 @@ class ModelExecutor:
                 ModelExecutionStatus.HANDOFF_REQUESTED,
                 explanation,
                 stop_reason,
-                model_usage,
-                all_models,
+                evidence_usage,
+                evidence_models,
                 terminal_reason=terminal_reason,
             )
         if mismatches:
@@ -3061,8 +3151,8 @@ class ModelExecutor:
                 ModelExecutionStatus.INFRASTRUCTURE_ERROR,
                 f"Observed model mismatch: {', '.join(mismatches)}.",
                 stop_reason,
-                model_usage,
-                all_models,
+                evidence_usage,
+                evidence_models,
                 terminal_reason=terminal_reason,
             )
         if (
@@ -3074,8 +3164,8 @@ class ModelExecutor:
                 ModelExecutionStatus.MODEL_LIMIT_REACHED,
                 "Model execution reached max_turns.",
                 stop_reason,
-                model_usage,
-                all_models,
+                evidence_usage,
+                evidence_models,
                 terminal_reason=terminal_reason,
             )
         if (
@@ -3088,8 +3178,8 @@ class ModelExecutor:
                 ModelExecutionStatus.INFRASTRUCTURE_ERROR,
                 f"Model execution stopped with {reason_name}.",
                 stop_reason,
-                model_usage,
-                all_models,
+                evidence_usage,
+                evidence_models,
                 terminal_reason=terminal_reason,
             )
         if (
@@ -3109,8 +3199,8 @@ class ModelExecutor:
                 f"num_turns={getattr(terminal, 'num_turns', None)}); no further implementation "
                 "work was permitted.",
                 stop_reason,
-                model_usage,
-                all_models,
+                evidence_usage,
+                evidence_models,
                 terminal_reason=terminal_reason,
             )
         if getattr(terminal, "is_error", True):
@@ -3123,8 +3213,8 @@ class ModelExecutor:
                 f"api_error_status={getattr(terminal, 'api_error_status', None)!r}, "
                 f"errors={getattr(terminal, 'errors', None)!r}).",
                 stop_reason,
-                model_usage,
-                all_models,
+                evidence_usage,
+                evidence_models,
                 terminal_reason=terminal_reason,
             )
         if self._soft_threshold_crossed and not self._token_handoff_done():
@@ -3136,16 +3226,16 @@ class ModelExecutor:
                 "Token soft threshold was crossed without a main-thread handoff, "
                 "so the attempt ends incomplete instead of succeeding.",
                 stop_reason,
-                model_usage,
-                all_models,
+                evidence_usage,
+                evidence_models,
                 terminal_reason=terminal_reason,
             )
         return self._evidence(
             ModelExecutionStatus.SUCCEEDED,
             "Claude SDK completed the implementation workflow.",
             stop_reason,
-            model_usage,
-            all_models,
+            evidence_usage,
+            evidence_models,
             terminal_reason=terminal_reason,
         )
 
