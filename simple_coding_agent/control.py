@@ -26,6 +26,12 @@ import threading
 from pathlib import Path
 
 from simple_coding_agent.agent_version import agent_version
+from simple_coding_agent.operator_handoff import (
+    HANDOFF_ABSOLUTE_DEADLINE_SECONDS as HANDOFF_ABSOLUTE_DEADLINE_SECONDS,
+    HANDOFF_MODEL_DEADLINE_SECONDS as HANDOFF_MODEL_DEADLINE_SECONDS,
+    HANDOFF_PUBLICATION_ALLOWANCE_SECONDS as HANDOFF_PUBLICATION_ALLOWANCE_SECONDS,
+    handoff_deadlines as handoff_deadlines,
+)
 
 
 class IntakeState(StrEnum):
@@ -147,16 +153,11 @@ class RecoveryHold:
     reason: str
 
 
-# Operator-handoff timing from the durable acceptance commit: the model must
-# finish its local handoff work within 240 seconds, and the driving process
-# gets at most a further 120 seconds to confirm publication (360 total).
-# Restart never resets these bounds; they are recomputed from the original
-# ``accepted_at`` on every read.
-HANDOFF_MODEL_DEADLINE_SECONDS = 240
-HANDOFF_PUBLICATION_ALLOWANCE_SECONDS = 120
-HANDOFF_ABSOLUTE_DEADLINE_SECONDS = (
-    HANDOFF_MODEL_DEADLINE_SECONDS + HANDOFF_PUBLICATION_ALLOWANCE_SECONDS
-)
+# Operator-handoff timing lives in the Operator handoff module (issue #112):
+# the model must finish its local handoff work within 240 seconds, and the
+# driving process gets at most a further 120 seconds to confirm publication
+# (360 total). Restart never resets these bounds; they are recomputed from
+# the original ``accepted_at`` on every read.
 _STORE_FILENAME = "control.sqlite3"
 _STOP_KIND = "stop"
 _STOP_AFTER_KIND = "stop_after"
@@ -2129,51 +2130,6 @@ class ControlStore:
         if value.tzinfo is None:
             raise ControlStoreError("Control clock must include a timezone")
         return value.astimezone(UTC).isoformat().replace("+00:00", "Z")
-
-
-def handoff_deadlines(accepted_at: object) -> dict[str, str | None]:
-    """Compute the original handoff deadlines from the acceptance timestamp.
-
-    Returns ``model_deadline_at`` (acceptance + 240s) and
-    ``publication_deadline_at`` (acceptance + 360s) as ``Z``-suffixed ISO
-    strings, or ``None`` values when the acceptance time cannot be parsed.
-    The bounds always derive from the original durable commit, so a process
-    restart can neither extend nor renew them.
-    """
-
-    from datetime import timedelta
-
-    parsed = _parse_control_timestamp(accepted_at)
-    if parsed is None:
-        return {"model_deadline_at": None, "publication_deadline_at": None}
-    return {
-        "model_deadline_at": _format_control_timestamp(
-            parsed + timedelta(seconds=HANDOFF_MODEL_DEADLINE_SECONDS)
-        ),
-        "publication_deadline_at": _format_control_timestamp(
-            parsed + timedelta(seconds=HANDOFF_ABSOLUTE_DEADLINE_SECONDS)
-        ),
-    }
-
-
-def _parse_control_timestamp(value: object) -> datetime | None:
-    """Parse a durable ``Z``-suffixed ISO timestamp; ``None`` when unreadable."""
-
-    if not isinstance(value, str) or not value.strip():
-        return None
-    try:
-        parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
-    except ValueError:
-        return None
-    if parsed.tzinfo is None:
-        return None
-    return parsed
-
-
-def _format_control_timestamp(value: datetime) -> str:
-    """Render a timestamp the way the control store records them."""
-
-    return value.astimezone(UTC).isoformat().replace("+00:00", "Z")
 
 
 def _check_request_id(request_id: object) -> None:

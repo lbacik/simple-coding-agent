@@ -2013,10 +2013,10 @@ def test_quiet_stream_longer_than_operator_wait_still_reaches_terminal(
     ``StopAsyncIteration`` and the run ended with ``infrastructure_error``.
     """
 
-    import simple_coding_agent.model_execution as model_execution_module
+    import simple_coding_agent.operator_handoff as operator_handoff_module
 
     monkeypatch.setattr(
-        model_execution_module, "_OPERATOR_HANDOFF_DELIVERY_WINDOW_SECONDS", 0.05
+        operator_handoff_module, "OPERATOR_HANDOFF_DELIVERY_WINDOW_SECONDS", 0.05
     )
 
     class SlowClient(FakeClient):

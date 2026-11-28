@@ -53,6 +53,14 @@ from simple_coding_agent.token_ledger import (
     hit_rate_of,
     usage_by_category,
 )
+from simple_coding_agent.operator_handoff import (
+    HANDOFF_MODEL_DEADLINE_SECONDS as _OPERATOR_HANDOFF_MODEL_DEADLINE_SECONDS,
+    OperatorHandoff,
+    OperatorHandoffProvider,
+    OperatorHandoffReporter,
+    operator_due_action,
+    operator_stream_wait_seconds,
+)
 
 
 _SKILLS = ["implement", "tdd", "code-review", "codebase-design", "handoff"]
@@ -71,9 +79,6 @@ _HANDOFF_FOLLOWUP_TIMEOUT = 300
 # thread's K-th measured response settles. Observational only.
 PROMPT_CACHE_MIN_MEASURED_RESPONSES = 20
 PROMPT_CACHE_HIT_RATE_THRESHOLD = 0.5
-
-_OPERATOR_HANDOFF_DELIVERY_WINDOW_SECONDS = 60
-_OPERATOR_HANDOFF_MODEL_DEADLINE_SECONDS = 240
 
 #: Operator override that marks the telemetry context window as configured.
 #: When set, the CLI uses it as the context window, so the SDK reading's
@@ -659,20 +664,9 @@ class ModelExecutionStatus(StrEnum):
     OPERATOR_HANDOFF_EXPIRED = "operator_handoff_expired"
 
 
-@dataclass(frozen=True)
-class OperatorHandoff:
-    """An operator ``handoff now`` request the model must observe.
-
-    ``accepted_at`` is the wall-clock acceptance time of the durable command
-    commit; delivery and model-deadline windows are measured from it.
-    """
-
-    request_id: str
-    accepted_at: datetime
-
-
-OperatorHandoffProvider = Callable[[], "OperatorHandoff | None"]
-OperatorHandoffReporter = Callable[[str, str], None]
+# ``OperatorHandoff``, ``OperatorHandoffProvider`` and
+# ``OperatorHandoffReporter`` live in the Operator handoff module (issue #112);
+# they are imported above and re-exported here so existing imports keep working.
 
 #: Commits added by this run, as seen by the driving process. The lifecycle
 #: wires this to the attempt workspace before dispatch; without it the
@@ -1170,23 +1164,24 @@ class ModelExecutor:
             )
 
     def _operator_due_action(self) -> str | None:
-        """Return ``fallback``/``expire`` when an operator boundary is due now."""
+        """Return ``fallback``/``expire`` when an operator boundary is due now.
+
+        Narrow port onto the Operator handoff module: the executor sees
+        only whether a handoff is due, never the deadline arithmetic.
+        """
 
         self._poll_operator_handoff()
         latched = self._operator_handoff
-        if latched is None or self._operator_deadline_expired:
+        if latched is None:
             return None
-        elapsed = (self._clock() - latched.accepted_at).total_seconds()
-        if elapsed >= _OPERATOR_HANDOFF_MODEL_DEADLINE_SECONDS:
-            return "expire"
-        if (
-            not self._operator_fallback_used
-            and not self._operator_context_delivered
-            and not self._operator_begun
-            and elapsed >= _OPERATOR_HANDOFF_DELIVERY_WINDOW_SECONDS
-        ):
-            return "fallback"
-        return None
+        return operator_due_action(
+            accepted_at=latched.accepted_at,
+            now=self._clock(),
+            context_delivered=self._operator_context_delivered,
+            begun=self._operator_begun,
+            fallback_used=self._operator_fallback_used,
+            deadline_expired=self._operator_deadline_expired,
+        )
 
     def _operator_stream_wait(self) -> float | None:
         """How long the stream may wait before the next operator boundary.
@@ -1200,19 +1195,14 @@ class ModelExecutor:
 
         self._poll_operator_handoff()
         latched = self._operator_handoff
-        if latched is None:
-            if self._operator_handoff_provider is None:
-                return None
-            return float(_OPERATOR_HANDOFF_DELIVERY_WINDOW_SECONDS)
-        elapsed = (self._clock() - latched.accepted_at).total_seconds()
-        targets = [_OPERATOR_HANDOFF_MODEL_DEADLINE_SECONDS - elapsed]
-        if (
-            not self._operator_fallback_used
-            and not self._operator_context_delivered
-            and not self._operator_begun
-        ):
-            targets.append(_OPERATOR_HANDOFF_DELIVERY_WINDOW_SECONDS - elapsed)
-        return max(min(targets), 0.0)
+        return operator_stream_wait_seconds(
+            accepted_at=latched.accepted_at if latched is not None else None,
+            now=self._clock(),
+            provider_present=self._operator_handoff_provider is not None,
+            context_delivered=self._operator_context_delivered,
+            begun=self._operator_begun,
+            fallback_used=self._operator_fallback_used,
+        )
 
     def _hard_token_limit_reached(self) -> bool:
         return (
