@@ -298,22 +298,10 @@ class ControlServer:
             return
         operation = request.get("op")
         try:
-            if operation == "stop":
-                self._reply_stop(connection, request)
-            elif operation == "stop_after":
-                self._reply_stop_after(connection, request)
-            elif operation == "next_issue":
-                self._reply_next_issue(connection, request)
-            elif operation == "resume":
-                self._reply_resume(connection, request)
-            elif operation == "handoff":
-                self._reply_handoff(connection, request)
-            elif operation == "recovery_retry":
-                self._reply_recovery_retry(connection, request)
-            elif operation == "recovery_release":
-                self._reply_recovery_release(connection, request)
-            elif operation == "errors_reset":
-                self._reply_errors_reset(connection, request)
+            from simple_coding_agent.control_registry import REGISTERED_OPS
+
+            if operation in REGISTERED_OPS:
+                self._reply_registered(connection, request, operation)
             elif operation == "identity":
                 self._reply_identity(connection)
             elif operation == "status":
@@ -343,155 +331,72 @@ class ControlServer:
             self._log_control_error(f"{operation}: {type(error).__name__}: {error}")
             self._send_failure(connection, error)
 
-    def _reply_stop(self, connection: socket.socket, request: dict) -> None:
-        from simple_coding_agent.control import PayloadMismatchError, RequestIdError
+    def _reply_registered(
+        self, connection: socket.socket, request: dict, operation: str
+    ) -> None:
+        """Reply to one registered mutating command via the command registry.
 
-        _reply_mutating(
-            connection,
-            request,
-            self._control.submit_stop,
-            rejected=(RequestIdError, PayloadMismatchError),
-            repository=self._repository(),
-            check_expect_repo=True,
-            control=self._control,
+        The registry entry carries the payload parser, the rejection errors
+        and the live-surface invocation, so adding a command means adding
+        one entry instead of a new branch plus a new ``_reply_*`` method.
+        Queries stay hand-written: they are read-only snapshots.
+        """
+
+        from simple_coding_agent.control_registry import (
+            get_spec,
+            invoke_registered,
         )
 
-    def _reply_stop_after(self, connection: socket.socket, request: dict) -> None:
-        from simple_coding_agent.control import (
-            PayloadMismatchError,
-            RequestIdError,
-            StopAfterRejectedError,
-        )
-
-        after = request.get("after")
-        _reply_mutating(
-            connection,
-            request,
-            lambda request_id: self._control.submit_stop_after(request_id, after),
-            rejected=(RequestIdError, PayloadMismatchError, StopAfterRejectedError),
-            repository=self._repository(),
-            check_expect_repo=True,
-            control=self._control,
-        )
-
-    def _reply_next_issue(self, connection: socket.socket, request: dict) -> None:
-        from simple_coding_agent.control import (
-            NextIssueRejectedError,
-            PayloadMismatchError,
-            RequestIdError,
-        )
-
-        issue = request.get("issue")
-        _reply_mutating(
-            connection,
-            request,
-            lambda request_id: self._control.submit_next_issue(request_id, issue),
-            rejected=(RequestIdError, PayloadMismatchError, NextIssueRejectedError),
-            repository=self._repository(),
-            check_expect_repo=True,
-            control=self._control,
-        )
-
-    def _reply_resume(self, connection: socket.socket, request: dict) -> None:
-        from simple_coding_agent.control import (
-            PayloadMismatchError,
-            RequestIdError,
-            ResumeBlockedError,
-            ResumeIntakeOpenError,
-        )
-
-        # The operator contract only lets ``resume`` reopen closed intake; the
-        # legacy surface keeps answering an idempotent ``completed`` no-op.
+        spec = get_spec(operation)
+        assert spec is not None  # guarded by REGISTERED_OPS above
         contract_mode = _is_contract_request(request)
 
         def submit(request_id: object) -> object:
-            if contract_mode:
-                return self._control.submit_resume(request_id, reject_open_intake=True)
-            return self._control.submit_resume(request_id)
+            assert isinstance(request_id, str)
+            return invoke_registered(
+                self._control, operation, request_id, request, contract_mode
+            )
 
         _reply_mutating(
             connection,
             request,
             submit,
-            rejected=(
-                RequestIdError,
-                PayloadMismatchError,
-                ResumeBlockedError,
-                ResumeIntakeOpenError,
-            ),
+            rejected=spec.rejected,
             repository=self._repository(),
             check_expect_repo=True,
             control=self._control,
         )
+
+    def _reply_stop(self, connection: socket.socket, request: dict) -> None:
+        self._reply_registered(connection, request, "stop")
+
+    def _reply_stop_after(self, connection: socket.socket, request: dict) -> None:
+        self._reply_registered(connection, request, "stop_after")
+
+
+    def _reply_next_issue(self, connection: socket.socket, request: dict) -> None:
+        self._reply_registered(connection, request, "next_issue")
+
+
+    def _reply_resume(self, connection: socket.socket, request: dict) -> None:
+        self._reply_registered(connection, request, "resume")
+
 
     def _reply_handoff(self, connection: socket.socket, request: dict) -> None:
-        from simple_coding_agent.control import (
-            HandoffRejectedError,
-            PayloadMismatchError,
-            RequestIdError,
-        )
+        self._reply_registered(connection, request, "handoff")
 
-        _reply_mutating(
-            connection,
-            request,
-            self._control.submit_handoff,
-            rejected=(RequestIdError, PayloadMismatchError, HandoffRejectedError),
-            repository=self._repository(),
-            check_expect_repo=True,
-            control=self._control,
-        )
 
     def _reply_recovery_retry(self, connection: socket.socket, request: dict) -> None:
-        from simple_coding_agent.control import PayloadMismatchError, RequestIdError
-        from simple_coding_agent.recovery import RecoveryRejectedError
+        self._reply_registered(connection, request, "recovery_retry")
 
-        attempt_id = request.get("attempt_id")
-        _reply_mutating(
-            connection,
-            request,
-            lambda request_id: self._control.submit_recovery_retry(
-                request_id, attempt_id
-            ),
-            rejected=(RequestIdError, PayloadMismatchError, RecoveryRejectedError),
-            repository=self._repository(),
-            check_expect_repo=True,
-            control=self._control,
-        )
 
     def _reply_recovery_release(self, connection: socket.socket, request: dict) -> None:
-        from simple_coding_agent.control import PayloadMismatchError, RequestIdError
-        from simple_coding_agent.recovery import RecoveryRejectedError
+        self._reply_registered(connection, request, "recovery_release")
 
-        attempt_id = request.get("attempt_id")
-        saved_at = request.get("saved_at")
-        _reply_mutating(
-            connection,
-            request,
-            lambda request_id: self._control.submit_recovery_release(
-                request_id, attempt_id, saved_at
-            ),
-            rejected=(RequestIdError, PayloadMismatchError, RecoveryRejectedError),
-            repository=self._repository(),
-            check_expect_repo=True,
-            control=self._control,
-        )
 
     def _reply_errors_reset(self, connection: socket.socket, request: dict) -> None:
-        from simple_coding_agent.control import (
-            ErrorsResetRejectedError,
-            PayloadMismatchError,
-            RequestIdError,
-        )
+        self._reply_registered(connection, request, "errors_reset")
 
-        _reply_mutating(
-            connection,
-            request,
-            self._control.submit_errors_reset,
-            rejected=(RequestIdError, PayloadMismatchError, ErrorsResetRejectedError),
-            repository=self._repository(),
-            check_expect_repo=True,
-            control=self._control,
-        )
 
     def _reply_identity(self, connection: socket.socket) -> None:
         """Answer one read-only contract ``identity`` request.

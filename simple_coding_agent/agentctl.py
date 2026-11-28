@@ -24,7 +24,7 @@ from simple_coding_agent.control_server import (
     resolve_socket_path,
     send_request,
 )
-from simple_coding_agent.control import StopAfterRejectedError, parse_stop_after
+
 from simple_coding_agent.telemetry import (
     SNAPSHOT_SIZE_LIMIT_BYTES,
     TELEMETRY_TIMEOUT_SECONDS,
@@ -60,14 +60,34 @@ def _with_expect_repo(request: dict, expect_repo: str | None) -> dict:
     return request
 
 
+def run_registered_command(
+    socket_path: Path,
+    op: str,
+    request_id: str,
+    payload: dict | None = None,
+) -> dict:
+    """Submit one registered command once; never present a failure as accepted.
+
+    Generic transport for every entry in the command registry. ``payload``
+    carries the canonical submit kwargs (``after``/``issue``/``attempt_id``/
+    ``saved_at``/``expect_repo``); the socket request is built from the
+    registry so adding a command means adding one entry.
+    """
+
+    from simple_coding_agent.control_registry import build_socket_request
+
+    return send_request(
+        socket_path, build_socket_request(op, request_id, payload or {})
+    )
+
+
 def run_stop(
     socket_path: Path, request_id: str, expect_repo: str | None = None
 ) -> dict:
     """Submit ``stop`` once; never present a failure as accepted."""
 
-    return send_request(
-        socket_path,
-        _with_expect_repo({"op": "stop", "request_id": request_id}, expect_repo),
+    return run_registered_command(
+        socket_path, "stop", request_id, {"expect_repo": expect_repo}
     )
 
 
@@ -79,12 +99,11 @@ def run_stop_after(
 ) -> dict:
     """Submit ``stop --after N`` once; never present a failure as accepted."""
 
-    return send_request(
+    return run_registered_command(
         socket_path,
-        _with_expect_repo(
-            {"op": "stop_after", "request_id": request_id, "after": after},
-            expect_repo,
-        ),
+        "stop_after",
+        request_id,
+        {"after": after, "expect_repo": expect_repo},
     )
 
 
@@ -96,12 +115,11 @@ def run_next_issue(
 ) -> dict:
     """Submit ``next issue`` once; never present a failure as accepted."""
 
-    return send_request(
+    return run_registered_command(
         socket_path,
-        _with_expect_repo(
-            {"op": "next_issue", "request_id": request_id, "issue": issue},
-            expect_repo,
-        ),
+        "next_issue",
+        request_id,
+        {"issue": issue, "expect_repo": expect_repo},
     )
 
 
@@ -110,9 +128,8 @@ def run_resume(
 ) -> dict:
     """Submit ``resume`` once; never present a failure as accepted."""
 
-    return send_request(
-        socket_path,
-        _with_expect_repo({"op": "resume", "request_id": request_id}, expect_repo),
+    return run_registered_command(
+        socket_path, "resume", request_id, {"expect_repo": expect_repo}
     )
 
 
@@ -121,18 +138,16 @@ def run_handoff(
 ) -> dict:
     """Submit ``handoff now`` once; never present a failure as accepted."""
 
-    return send_request(
-        socket_path,
-        _with_expect_repo({"op": "handoff", "request_id": request_id}, expect_repo),
+    return run_registered_command(
+        socket_path, "handoff", request_id, {"expect_repo": expect_repo}
     )
 
 
 def run_recovery_retry(socket_path: Path, request_id: str, attempt_id: str) -> dict:
     """Submit ``recovery retry`` once; never present a failure as accepted."""
 
-    return send_request(
-        socket_path,
-        {"op": "recovery_retry", "request_id": request_id, "attempt_id": attempt_id},
+    return run_registered_command(
+        socket_path, "recovery_retry", request_id, {"attempt_id": attempt_id}
     )
 
 
@@ -141,23 +156,18 @@ def run_recovery_release(
 ) -> dict:
     """Submit ``recovery release`` once; never present a failure as accepted."""
 
-    return send_request(
+    return run_registered_command(
         socket_path,
-        {
-            "op": "recovery_release",
-            "request_id": request_id,
-            "attempt_id": attempt_id,
-            "saved_at": saved_at,
-        },
+        "recovery_release",
+        request_id,
+        {"attempt_id": attempt_id, "saved_at": saved_at},
     )
 
 
 def run_errors_reset(socket_path: Path, request_id: str) -> dict:
     """Submit ``errors reset`` once; never present a failure as accepted."""
 
-    return send_request(
-        socket_path, {"op": "errors_reset", "request_id": request_id}
-    )
+    return run_registered_command(socket_path, "errors_reset", request_id, {})
 
 
 def run_status(socket_path: Path) -> dict:
@@ -487,88 +497,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    stop_parser = subparsers.add_parser("stop", help="Finish the active attempt, then stop intake.")
-    stop_parser.add_argument(
-        "--request-id",
-        dest="request_id",
-        default=None,
-        help="Retry a previously generated request ID with the identical payload.",
-    )
-    stop_parser.add_argument(
-        "--after",
-        dest="after",
-        default=None,
-        help="Stop intake after N fully finalized attempts, counting the active one first.",
-    )
-    stop_parser.add_argument(
-        "--expect-repo",
-        dest="expect_repo",
-        default=None,
-        help="Refuse the command before anything is committed unless this instance targets the given owner/name repository (case-insensitive).",
-    )
+    # Mutating commands are generated from the command registry: adding a
+    # command means adding one registry entry, not editing this parser.
+    # Queries (status, telemetry, command) stay hand-written: they are
+    # read-only snapshots, not commands.
+    from simple_coding_agent.control_registry import add_mutating_parsers
 
-    resume_parser = subparsers.add_parser(
-        "resume", help="Permit issue intake again; replace any pending stop plan."
-    )
-    resume_parser.add_argument(
-        "--request-id",
-        dest="request_id",
-        default=None,
-        help="Retry a previously generated request ID with the identical payload.",
-    )
-    resume_parser.add_argument(
-        "--expect-repo",
-        dest="expect_repo",
-        default=None,
-        help="Refuse the command before anything is committed unless this instance targets the given owner/name repository (case-insensitive).",
-    )
-
-    handoff_parser = subparsers.add_parser(
-        "handoff",
-        help="Hand the active attempt to a human with a published handoff note.",
-    )
-    handoff_subparsers = handoff_parser.add_subparsers(
-        dest="handoff_command", required=True
-    )
-    handoff_now_parser = handoff_subparsers.add_parser(
-        "now",
-        help="Deliver a handoff request to the active attempt at the next safe model boundary.",
-    )
-    handoff_now_parser.add_argument(
-        "--request-id",
-        dest="request_id",
-        default=None,
-        help="Retry a previously generated request ID with the identical payload.",
-    )
-    handoff_now_parser.add_argument(
-        "--expect-repo",
-        dest="expect_repo",
-        default=None,
-        help="Refuse the command before anything is committed unless this instance targets the given owner/name repository (case-insensitive).",
-    )
-
-    next_parser = subparsers.add_parser(
-        "next", help="Prioritize one eligible issue for the next permitted claim."
-    )
-    next_subparsers = next_parser.add_subparsers(dest="next_command", required=True)
-    next_issue_parser = next_subparsers.add_parser(
-        "issue", help="Prioritize one eligible issue for the next permitted claim."
-    )
-    next_issue_parser.add_argument(
-        "issue_number", help="The implementation issue number to prioritize."
-    )
-    next_issue_parser.add_argument(
-        "--request-id",
-        dest="request_id",
-        default=None,
-        help="Retry a previously generated request ID with the identical payload.",
-    )
-    next_issue_parser.add_argument(
-        "--expect-repo",
-        dest="expect_repo",
-        default=None,
-        help="Refuse the command before anything is committed unless this instance targets the given owner/name repository (case-insensitive).",
-    )
+    add_mutating_parsers(subparsers)
 
     subparsers.add_parser("status", help="Show one consistent live status snapshot.")
     telemetry_parser = subparsers.add_parser(
@@ -586,59 +521,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     command_parser.add_argument("request_id", help="The request ID printed at submission.")
 
-    recovery_parser = subparsers.add_parser(
-        "recovery", help="Inspect or resolve a retained implementation attempt."
-    )
-    recovery_subparsers = recovery_parser.add_subparsers(
-        dest="recovery_command", required=True
-    )
-    retry_parser = recovery_subparsers.add_parser(
-        "retry",
-        help="Recheck evidence and retry unconfirmed publication, release, cleanup, and accounting.",
-    )
-    retry_parser.add_argument("attempt_id", help="The stable attempt identity to retry.")
-    retry_parser.add_argument(
-        "--request-id",
-        dest="request_id",
-        default=None,
-        help="Retry a previously generated request ID with the identical payload.",
-    )
-    release_parser = recovery_subparsers.add_parser(
-        "release",
-        help="Abandon a retained attempt after securing its work elsewhere.",
-    )
-    release_parser.add_argument("attempt_id", help="The stable attempt identity to release.")
-    release_parser.add_argument(
-        "--saved-at",
-        dest="saved_at",
-        required=True,
-        help="Path or URL where the retained work was secured.",
-    )
-    release_parser.add_argument(
-        "--request-id",
-        dest="request_id",
-        default=None,
-        help="Retry a previously generated request ID with the identical payload.",
-    )
-
-    errors_parser = subparsers.add_parser(
-        "errors",
-        aliases=["consecutive-errors"],
-        help="Inspect or reset the consecutive-error guard.",
-    )
-    errors_subparsers = errors_parser.add_subparsers(
-        dest="errors_command", required=True
-    )
-    errors_reset_parser = errors_subparsers.add_parser(
-        "reset",
-        help="Reset the consecutive-error counter to 0 through the live process.",
-    )
-    errors_reset_parser.add_argument(
-        "--request-id",
-        dest="request_id",
-        default=None,
-        help="Retry a previously generated request ID with the identical payload.",
-    )
+    # ``recovery`` / ``errors`` parsers are generated from the registry above.
     return parser
 
 
@@ -658,61 +541,21 @@ def main(argv: list[str] | None = None) -> int:
     socket_path = Path(args.socket) if args.socket else default_socket_path()
 
     try:
-        if args.command == "stop":
-            request_id = args.request_id or generate_request_id()
-            expect_repo = args.expect_repo
-            if args.after is not None:
-                try:
-                    after = parse_stop_after(args.after)
-                except StopAfterRejectedError as error:
-                    print(
-                        f"{request_id} rejected — {_rejection_reason(error)}",
-                        file=sys.stderr,
-                    )
-                    return 1
-                return submit_mutating(
-                    socket_path,
-                    f"stop --after {after}",
-                    request_id,
-                    lambda path, rid: run_stop_after(
-                        path, rid, after, expect_repo
-                    ),
-                )
-            return submit_mutating(
-                socket_path,
-                "stop",
-                request_id,
-                lambda path, rid: run_stop(path, rid, expect_repo),
-            )
-        if args.command == "resume":
-            request_id = args.request_id or generate_request_id()
-            expect_repo = args.expect_repo
-            return submit_mutating(
-                socket_path,
-                "resume",
-                request_id,
-                lambda path, rid: run_resume(path, rid, expect_repo),
-            )
-        if args.command == "handoff" and args.handoff_command == "now":
-            request_id = args.request_id or generate_request_id()
-            expect_repo = args.expect_repo
-            return submit_mutating(
-                socket_path,
-                "handoff now",
-                request_id,
-                lambda path, rid: run_handoff(path, rid, expect_repo),
-            )
-        if args.command == "next" and args.next_command == "issue":
-            from simple_coding_agent.control import (
-                NextIssueRejectedError,
-                parse_next_issue,
-            )
+        from simple_coding_agent.control_registry import (
+            cli_label,
+            cli_route_to_op,
+            parse_cli_payload,
+        )
 
+        registered_op = cli_route_to_op(args)
+        if registered_op is not None:
+            # Generic transport for every registered command: the payload
+            # parser lives in the registry entry, so client-side rejections
+            # match the server without a per-command branch here.
             request_id = args.request_id or generate_request_id()
-            expect_repo = args.expect_repo
             try:
-                issue = parse_next_issue(args.issue_number)
-            except NextIssueRejectedError as error:
+                payload = parse_cli_payload(registered_op, args)
+            except Exception as error:
                 print(
                     f"{request_id} rejected — {_rejection_reason(error)}",
                     file=sys.stderr,
@@ -720,9 +563,11 @@ def main(argv: list[str] | None = None) -> int:
                 return 1
             return submit_mutating(
                 socket_path,
-                f"next issue {issue}",
+                cli_label(registered_op, payload),
                 request_id,
-                lambda path, rid: run_next_issue(path, rid, issue, expect_repo),
+                lambda path, rid, _op=registered_op, _payload=payload: run_registered_command(
+                    path, _op, rid, _payload
+                ),
             )
         if args.command == "status":
             print(format_status(run_status(socket_path)))
@@ -757,55 +602,6 @@ def main(argv: list[str] | None = None) -> int:
                 return 1
             print(format_command(record))
             return 0
-        if args.command == "recovery" and args.recovery_command == "retry":
-            from simple_coding_agent.recovery import RecoveryRejectedError, parse_attempt_id
-
-            request_id = args.request_id or generate_request_id()
-            try:
-                attempt_id = parse_attempt_id(args.attempt_id)
-            except RecoveryRejectedError as error:
-                print(
-                    f"{request_id} rejected — {_rejection_reason(error)}",
-                    file=sys.stderr,
-                )
-                return 1
-            return submit_mutating(
-                socket_path,
-                f"recovery retry {attempt_id}",
-                request_id,
-                lambda path, rid: run_recovery_retry(path, rid, attempt_id),
-            )
-        if args.command == "recovery" and args.recovery_command == "release":
-            from simple_coding_agent.recovery import (
-                RecoveryRejectedError,
-                parse_attempt_id,
-                parse_saved_at,
-            )
-
-            request_id = args.request_id or generate_request_id()
-            try:
-                attempt_id = parse_attempt_id(args.attempt_id)
-                saved_at = parse_saved_at(args.saved_at)
-            except RecoveryRejectedError as error:
-                print(
-                    f"{request_id} rejected — {_rejection_reason(error)}",
-                    file=sys.stderr,
-                )
-                return 1
-            return submit_mutating(
-                socket_path,
-                f"recovery release {attempt_id} --saved-at {saved_at}",
-                request_id,
-                lambda path, rid: run_recovery_release(path, rid, attempt_id, saved_at),
-            )
-        if args.command in ("errors", "consecutive-errors") and args.errors_command == "reset":
-            request_id = args.request_id or generate_request_id()
-            return submit_mutating(
-                socket_path,
-                "errors reset",
-                request_id,
-                run_errors_reset,
-            )
     except ControlUnavailableError as error:
         print(f"Cannot connect to the agent process: {error}", file=sys.stderr)
         return 2
