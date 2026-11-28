@@ -1265,6 +1265,79 @@ def infer_conflict_reason(evidence: ConflictEvidence) -> str | None:
     return None
 
 
+@dataclass(frozen=True)
+class SharedRecordEvidence:
+    """Shared-handoff-record evidence for the pre-retry shared-record probe."""
+
+    issue_number: int
+    attempt_id: str
+    repository: str
+    outcome: AttemptOutcome
+    fetch_error: str | None = None
+    record_missing: bool = False
+    record_unreadable: bool = False
+    record_issue_number: int | None = None
+    record_repository: str | None = None
+    record_attempt_id: str | None = None
+
+
+def infer_shared_hold(evidence: SharedRecordEvidence) -> str | None:
+    """Detect a shared handoff record that blocks a recovery retry.
+
+    Pure: fetching and parsing the remote record happen at the call site
+    through the publisher seam and are passed in as plain evidence.
+    Returns a hold reason, or ``None`` when no shared record blocks the
+    retry. An unreadable remote state, an unparseable record, a record
+    naming a different issue or repository, or a record owned by a newer
+    attempt all hold the retry: an older retained checkpoint never
+    overwrites a newer shared record and is never treated as published
+    merely because its own record was superseded. A record naming this
+    attempt while the inferred outcome is not a handoff likewise holds: a
+    confirmed handoff is never changed into another outcome. Anything else
+    (no remote record, or an older record this retry may update) proceeds.
+    """
+
+    if evidence.fetch_error is not None:
+        return (
+            "shared handoff record is ambiguous"
+            f" ({evidence.fetch_error}); the retry must not replay"
+            " a side effect it cannot verify."
+        )
+    if evidence.record_missing:
+        # No remote record: the migration path creates it on republication.
+        return None
+    if evidence.record_unreadable:
+        return (
+            "shared handoff record is unreadable; it is left untouched"
+            " and the retry requires operator repair."
+        )
+    if (
+        evidence.record_issue_number != evidence.issue_number
+        or evidence.record_repository != evidence.repository
+    ):
+        return (
+            "shared handoff record names a different issue or repository;"
+            " the retry requires operator repair."
+        )
+    assert evidence.record_attempt_id is not None  # missing/unreadable return above
+    if attempt_id_greater(evidence.record_attempt_id, evidence.attempt_id):
+        return (
+            "a newer attempt already owns the shared handoff record;"
+            " the older retained attempt must not overwrite it and is"
+            " not treated as published."
+        )
+    if (
+        evidence.record_attempt_id == evidence.attempt_id
+        and evidence.outcome is not AttemptOutcome.HANDOFF
+    ):
+        return (
+            "the shared handoff record already confirms a handoff for"
+            " this attempt; the retry must not change it into another"
+            " outcome and requires operator repair."
+        )
+    return None
+
+
 def publication_progress(
     phase: str,
     *,

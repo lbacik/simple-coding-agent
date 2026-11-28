@@ -13,11 +13,13 @@ from simple_coding_agent.recovery import (
     ConflictEvidence,
     ReleaseEvidence,
     RetryEvidence,
+    SharedRecordEvidence,
     dirty_tree_snapshot,
     final_check_interrupted,
     infer_conflict_reason,
     infer_release_outcome,
     infer_retry_decision,
+    infer_shared_hold,
     publication_progress,
     retained_snapshot,
     startup_unreadable_snapshot,
@@ -288,3 +290,90 @@ def test_startup_and_dirty_snapshots_cover_no_checkpoint() -> None:
     dirty = dirty_tree_snapshot(workspace="/work", reason="dirty")
     assert dirty["workspace_dirty"] is True
     assert dirty["hold_reason"] == "dirty"
+
+
+A1 = "2026-09-20T13:00:00Z"
+A2 = "2026-09-20T14:00:00Z"
+SHARED_REPO = "octo/example"
+
+
+def _shared_evidence(**overrides: object) -> SharedRecordEvidence:
+    params: dict[str, object] = {
+        "issue_number": 24,
+        "attempt_id": A1,
+        "repository": SHARED_REPO,
+        "outcome": AttemptOutcome.HANDOFF,
+    }
+    params.update(overrides)
+    return SharedRecordEvidence(**params)  # type: ignore[arg-type]
+
+
+def test_shared_hold_missing_record_proceeds() -> None:
+    assert infer_shared_hold(_shared_evidence(record_missing=True)) is None
+
+
+def test_shared_hold_fetch_error_is_ambiguous() -> None:
+    hold = infer_shared_hold(_shared_evidence(fetch_error="boom"))
+    assert hold is not None
+    assert "ambiguous" in hold
+
+
+def test_shared_hold_unreadable_record_retains() -> None:
+    hold = infer_shared_hold(_shared_evidence(record_unreadable=True))
+    assert hold is not None
+    assert "unreadable" in hold
+
+
+def test_shared_hold_wrong_issue_or_repo_retains() -> None:
+    hold = infer_shared_hold(
+        _shared_evidence(record_issue_number=25, record_repository=SHARED_REPO,
+                         record_attempt_id=A1)
+    )
+    assert hold is not None
+    assert "different issue or repository" in hold
+
+    hold = infer_shared_hold(
+        _shared_evidence(record_issue_number=24, record_repository="other/repo",
+                         record_attempt_id=A1)
+    )
+    assert hold is not None
+    assert "different issue or repository" in hold
+
+
+def test_shared_hold_newer_attempt_owns_record() -> None:
+    hold = infer_shared_hold(
+        _shared_evidence(record_issue_number=24, record_repository=SHARED_REPO,
+                         record_attempt_id=A2)
+    )
+    assert hold is not None
+    assert "newer attempt" in hold
+
+
+def test_shared_hold_same_attempt_non_handoff_retains() -> None:
+    hold = infer_shared_hold(
+        _shared_evidence(outcome=AttemptOutcome.INCOMPLETE,
+                         record_issue_number=24, record_repository=SHARED_REPO,
+                         record_attempt_id=A1)
+    )
+    assert hold is not None
+    assert "must not change it" in hold
+
+
+def test_shared_hold_same_attempt_handoff_proceeds() -> None:
+    assert (
+        infer_shared_hold(
+            _shared_evidence(record_issue_number=24, record_repository=SHARED_REPO,
+                             record_attempt_id=A1)
+        )
+        is None
+    )
+
+
+def test_shared_hold_older_record_proceeds() -> None:
+    assert (
+        infer_shared_hold(
+            _shared_evidence(attempt_id=A2, record_issue_number=24,
+                             record_repository=SHARED_REPO, record_attempt_id=A1)
+        )
+        is None
+    )

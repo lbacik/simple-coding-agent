@@ -3975,18 +3975,13 @@ class AgentLifecycle:
     ) -> str | None:
         """Detect a shared handoff record that blocks a recovery retry.
 
-        Returns a hold reason, or ``None`` when no shared record blocks the
-        retry. Publishers without the ``find_handoff_record`` seam (older
-        test doubles) skip the check. An unreadable remote state, an
-        unparseable (or unsupported) record, a record naming a different
-        issue or repository, or a record owned by a newer attempt all hold
-        the retry: an older retained checkpoint never overwrites a newer
-        shared record and is never treated as published merely because its
-        own record was superseded. A record naming this attempt while the
-        inferred outcome is not a handoff likewise holds: a confirmed
-        handoff is never changed into another outcome. Anything else (no
-        remote record, or an older record this retry may update) proceeds.
+        Delegates to :func:`recovery.infer_shared_hold`; this method keeps
+        only the publisher-seam fetch and the record parse. Publishers
+        without the ``find_handoff_record`` seam (older test doubles) skip
+        the check.
         """
+
+        from simple_coding_agent.recovery import SharedRecordEvidence, infer_shared_hold
 
         seam = self._shared_record_seam()
         if seam is None:
@@ -3996,42 +3991,49 @@ class AgentLifecycle:
         try:
             existing = find(repository, issue_number)
         except Exception as error:
-            return (
-                "shared handoff record is ambiguous"
-                f" ({_exception_detail(error)}); the retry must not replay"
-                " a side effect it cannot verify."
+            return infer_shared_hold(
+                SharedRecordEvidence(
+                    issue_number=issue_number,
+                    attempt_id=attempt_id,
+                    repository=repository,
+                    outcome=outcome,
+                    fetch_error=_exception_detail(error),
+                )
             )
         if existing is None:
-            # No remote record: the migration path creates it on republication.
-            return None
+            return infer_shared_hold(
+                SharedRecordEvidence(
+                    issue_number=issue_number,
+                    attempt_id=attempt_id,
+                    repository=repository,
+                    outcome=outcome,
+                    record_missing=True,
+                )
+            )
         from simple_coding_agent.handoff_record import parse_handoff_record
 
         parsed = parse_handoff_record(getattr(existing, "body", "") or "")
         if parsed is None:
-            return (
-                "shared handoff record is unreadable; it is left untouched"
-                " and the retry requires operator repair."
+            return infer_shared_hold(
+                SharedRecordEvidence(
+                    issue_number=issue_number,
+                    attempt_id=attempt_id,
+                    repository=repository,
+                    outcome=outcome,
+                    record_unreadable=True,
+                )
             )
-        if parsed.issue_number != issue_number or parsed.repository != repository:
-            return (
-                "shared handoff record names a different issue or repository;"
-                " the retry requires operator repair."
+        return infer_shared_hold(
+            SharedRecordEvidence(
+                issue_number=issue_number,
+                attempt_id=attempt_id,
+                repository=repository,
+                outcome=outcome,
+                record_issue_number=parsed.issue_number,
+                record_repository=parsed.repository,
+                record_attempt_id=parsed.attempt_id,
             )
-        from simple_coding_agent import recovery as recovery_module
-
-        if recovery_module.attempt_id_greater(parsed.attempt_id, attempt_id):
-            return (
-                "a newer attempt already owns the shared handoff record;"
-                " the older retained attempt must not overwrite it and is"
-                " not treated as published."
-            )
-        if parsed.attempt_id == attempt_id and outcome is not AttemptOutcome.HANDOFF:
-            return (
-                "the shared handoff record already confirms a handoff for"
-                " this attempt; the retry must not change it into another"
-                " outcome and requires operator repair."
-            )
-        return None
+        )
 
     def _confirm_shared_handoff_for_retry(
         self, issue_number: int, attempt_id: str, note_sha: str | None = None
