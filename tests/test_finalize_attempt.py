@@ -1,377 +1,387 @@
-"""Table-driven tests for the deep finalize-attempt boundary.
-
-The boundary owns one ordering — hold, release, cleanup, second hold,
-ledger commit, handoff resolution — over injected seams, so these tests
-drive ``finalize_attempt`` directly against real temp-dir completion
-stores with small fakes. No ``AgentLifecycle`` is constructed here.
-"""
+"""Exercise attempt finalization through its interface with real state stores."""
 
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
 
+from simple_coding_agent.attempt_state import AttemptStateStore
 from simple_coding_agent.completion import AttemptOutcome
 from simple_coding_agent.finalization import (
     AttemptCompletionStore,
-    FinalizeReason,
+    AttemptFinalizer,
+    FinalizationEffects,
+    FinalizationMode,
+    FinalizationStage,
+    Finalized,
     FinalizeRequest,
-    FinalizeStatus,
-    commit_recovered_attempt,
-    finalize_attempt,
-    resolve_finalize_branch,
+    Held,
+    HeldReason,
+    PublicationState,
 )
-from simple_coding_agent.git_workspace import DirtyWorkspaceError, GitWorkspaceError
+from simple_coding_agent.git_workspace import DirtyWorkspaceError, PreparedAttempt
+
+STARTED = datetime(2026, 9, 20, 13, tzinfo=UTC)
+PREPARED = PreparedAttempt("agent/issue-24-prepared", "a" * 40)
+CHECKPOINT_BRANCH = "agent/issue-24-restored"
+REQUEST = FinalizeRequest(
+    outcome=AttemptOutcome.COMPLETE,
+    publication=PublicationState(confirmed=True, started_at=STARTED),
+    prepared=PREPARED,
+    base_branch="develop",
+)
 
 
-def _request(**overrides: object) -> FinalizeRequest:
-    base: dict[str, object] = {
-        "issue_number": 24,
-        "attempt_id": "2026-09-20T13:00:00Z",
-        "checkpoint_branch": "agent/issue-24",
-        "prepared_branch": "agent/issue-24",
-        "outcome": AttemptOutcome.COMPLETE,
-        "comment_posted": True,
-        "has_prepared": True,
-        "publication_started_at": datetime(2026, 9, 20, 13, 0, 0, tzinfo=UTC),
-    }
-    base.update(overrides)
-    return FinalizeRequest(**base)  # type: ignore[arg-type]
-
-
-class _Seams:
-    """Small fakes recording call order for one finalize run."""
-
-    def __init__(
-        self,
-        *,
-        first_hold: bool = False,
-        second_hold: bool = False,
-        release_error: Exception | None = None,
-        cleanup_error: Exception | None = None,
-        commit_error: BaseException | None = None,
-        handoff: bool | None = True,
-    ) -> None:
+class Effects:
+    def __init__(self, root: Path) -> None:
+        self.state = AttemptStateStore(root, clock=lambda: STARTED)
+        self.ledger = AttemptCompletionStore(root)
+        self.checkpoint = self.state.start(issue_number=24, branch=CHECKPOINT_BRANCH)
         self.calls: list[str] = []
-        self.first_hold = first_hold
-        self.second_hold = second_hold
-        self.release_error = release_error
-        self.cleanup_error = cleanup_error
-        self.commit_error = commit_error
-        self.handoff = handoff
-        self.committed_branch: str | None = None
-        self.held: list[tuple[FinalizeReason | None, str]] = []
-        self.dirty: list[Exception] = []
+        self.handoff_checks: list[tuple[PreparedAttempt | None, datetime | None]] = []
+        self.handoff_outcomes: list[AttemptOutcome] = []
+        self.control_outcomes: list[AttemptOutcome] = []
+        self.cleanup_args: list[
+            tuple[PreparedAttempt, str, bool, FinalizationMode]
+        ] = []
+        self.held_messages: list[str] = []
+        self.resolution_errors: list[Exception] = []
+        self.hold_before = False
+        self.hold_after = False
+        self.handoff_failed = False
+        self.release_error: Exception | None = None
+        self.cleanup_error: Exception | None = None
+        self.accounting_error: BaseException | None = None
+        self.finish_error: Exception | None = None
+        self.handoff_error: Exception | None = None
 
-    def is_finalized(self, attempt_id: str) -> bool:
-        assert attempt_id == "2026-09-20T13:00:00Z"
-        return False
+    def finalizer(self) -> AttemptFinalizer:
+        return AttemptFinalizer(
+            self.checkpoint,
+            self.ledger,
+            self.state,
+            FinalizationEffects(
+                release=self.release,
+                cleanup=self.cleanup,
+                check_handoff=self.check_handoff,
+                resolve_handoff=self.resolve_handoff,
+                write_outcome=self.write_outcome,
+                finish_completion=self.finish_completion,
+                record_control=self.record_control,
+                handoff_owned=lambda: self.handoff_failed,
+                finish_replay=lambda: self.calls.append("seal after replay"),
+                workspace_held=lambda error, mode: self.calls.append("dirty"),
+                report_hold=self.held_messages.append,
+                resolution_unavailable=self.resolution_errors.append,
+            ),
+        )
 
-    def check_hold(self, *, prepared: bool, check_allowance: bool) -> bool:
-        self.calls.append(f"hold(prepared={prepared},allowance={check_allowance})")
-        if len(self.calls) == 1:
-            assert check_allowance is True
-            return self.first_hold
-        assert check_allowance is False
-        return self.second_hold
-
-    def release(self) -> None:
+    def release(self, outcome: AttemptOutcome, mode: FinalizationMode) -> None:
         self.calls.append("release")
         if self.release_error is not None:
             raise self.release_error
 
-    def cleanup(self) -> None:
+    def cleanup(
+        self,
+        prepared: PreparedAttempt,
+        base_branch: str,
+        retain: bool,
+        mode: FinalizationMode,
+    ) -> None:
         self.calls.append("cleanup")
+        self.cleanup_args.append((prepared, base_branch, retain, mode))
         if self.cleanup_error is not None:
             raise self.cleanup_error
 
-    def commit(self, branch: str) -> None:
-        self.calls.append(f"commit({branch})")
-        self.committed_branch = branch
-        if self.commit_error is not None:
-            raise self.commit_error
+    def check_handoff(
+        self, *, outcome, prepared, publication_started_at, check_allowance
+    ) -> bool:
+        self.calls.append(
+            "pre-release hold" if check_allowance else "post-cleanup hold"
+        )
+        self.handoff_checks.append((prepared, publication_started_at))
+        return self.hold_before if check_allowance else self.hold_after
 
-    def resolve_handoff(self) -> bool | None:
-        self.calls.append("resolve_handoff")
-        return self.handoff
+    def resolve_handoff(
+        self, *, outcome, prepared, publication_started_at, check_allowance
+    ) -> bool:
+        self.calls.append("resolve handoff")
+        self.handoff_outcomes.append(outcome)
+        if self.handoff_error is not None:
+            raise self.handoff_error
+        return not self.handoff_failed
 
-    def on_held(self, reason: FinalizeReason | None, detail: str) -> None:
-        self.held.append((reason, detail))
+    def write_outcome(self, outcome: AttemptOutcome) -> str:
+        self.calls.append("write outcome")
+        assert self.ledger.get(self.checkpoint.started_at) is None
+        if self.accounting_error is not None:
+            raise self.accounting_error
+        return self.checkpoint.started_at
 
-    def on_dirty(self, error: Exception) -> None:
-        self.dirty.append(error)
+    def finish_completion(
+        self, outcome: AttemptOutcome, completed_at: str, released: bool
+    ) -> None:
+        self.calls.append("finish release" if released else "finish completion")
+        assert completed_at == self.checkpoint.started_at
+        assert self.ledger.get(self.checkpoint.started_at).outcome is outcome
+        if self.finish_error is not None:
+            raise self.finish_error
+        self.record_control(outcome)
+        self.state.delete()
 
-
-def _finalize(request: FinalizeRequest, seams: _Seams):
-    return finalize_attempt(
-        request,
-        is_finalized=seams.is_finalized,
-        check_hold=seams.check_hold,
-        release=seams.release,
-        cleanup=seams.cleanup,
-        commit=seams.commit,
-        resolve_handoff=seams.resolve_handoff,
-        on_held=seams.on_held,
-        on_dirty=seams.on_dirty,
-    )
-
-
-def test_finalize_orders_the_full_boundary(tmp_path: Path) -> None:
-    store = AttemptCompletionStore(tmp_path)
-    seams = _Seams()
-
-    result = finalize_attempt(
-        _request(),
-        is_finalized=store.is_finalized,
-        check_hold=seams.check_hold,
-        release=seams.release,
-        cleanup=seams.cleanup,
-        commit=lambda branch: store.record(
-            attempt_id="2026-09-20T13:00:00Z",
-            issue_number=24,
-            branch=branch,
-            outcome=AttemptOutcome.COMPLETE,
-        ),
-        resolve_handoff=seams.resolve_handoff,
-        on_held=seams.on_held,
-        on_dirty=seams.on_dirty,
-    )
-
-    assert result.status is FinalizeStatus.FINALIZED
-    assert result.released is True
-    assert result.cleanup_ok is True
-    assert result.handoff is True
-    assert store.is_finalized("2026-09-20T13:00:00Z") is True
-    assert seams.calls == [
-        "hold(prepared=True,allowance=True)",
-        "release",
-        "cleanup",
-        "hold(prepared=False,allowance=False)",
-        "resolve_handoff",
-    ]
+    def record_control(self, outcome: AttemptOutcome) -> None:
+        self.calls.append("record control")
+        self.control_outcomes.append(outcome)
 
 
-def test_finalize_release_failure_still_cleans_up_then_raises() -> None:
-    seams = _Seams(release_error=RuntimeError("boom"))
-
-    with pytest.raises(RuntimeError, match="boom"):
-        _finalize(_request(), seams)
-
-    assert seams.calls == [
-        "hold(prepared=True,allowance=True)",
-        "release",
-        "cleanup",
-    ]
-    assert len(seams.held) == 1
-    assert seams.held[0][0] is FinalizeReason.RELEASE_UNCONFIRMED
-
-
-def test_finalize_hold_after_cleanup_skips_the_ledger_write(tmp_path: Path) -> None:
-    store = AttemptCompletionStore(tmp_path)
-    seams = _Seams(second_hold=True)
-
-    result = finalize_attempt(
-        _request(),
-        is_finalized=store.is_finalized,
-        check_hold=seams.check_hold,
-        release=seams.release,
-        cleanup=seams.cleanup,
-        commit=lambda branch: store.record(
-            attempt_id="2026-09-20T13:00:00Z",
-            issue_number=24,
-            branch=branch,
-            outcome=AttemptOutcome.COMPLETE,
-        ),
-        resolve_handoff=seams.resolve_handoff,
-        on_held=seams.on_held,
-        on_dirty=seams.on_dirty,
-    )
-
-    assert result.status is FinalizeStatus.HELD
-    assert result.reason is FinalizeReason.HANDOFF_HOLD
-    assert store.read_all() == {}
-    assert "resolve_handoff" not in seams.calls
-
-
-def test_finalize_first_hold_skips_release_and_cleanup() -> None:
-    seams = _Seams(first_hold=True)
-
-    result = _finalize(_request(), seams)
-
-    assert result.status is FinalizeStatus.HELD
-    assert result.reason is FinalizeReason.HANDOFF_HOLD
-    assert result.released is False
-    assert seams.calls == ["hold(prepared=True,allowance=True)"]
-
-
-def test_finalize_unconfirmed_publication_holds_without_commit() -> None:
-    seams = _Seams()
-
-    result = _finalize(_request(comment_posted=False), seams)
-
-    assert result.status is FinalizeStatus.HELD
-    assert result.reason is FinalizeReason.PUBLICATION_UNCONFIRMED
-    # Cleanup still runs (the tree must leave the attempt branch), but the
-    # ledger commit and handoff resolution never happen.
-    assert seams.calls == ["cleanup"]
-    assert seams.committed_branch is None
-
-
-def test_finalize_dirty_cleanup_holds_and_reports_dirty() -> None:
-    seams = _Seams(
-        cleanup_error=DirtyWorkspaceError("tree is dirty"),
-    )
-
-    result = _finalize(_request(), seams)
-
-    assert result.status is FinalizeStatus.HELD
-    assert result.reason is FinalizeReason.CLEANUP_UNCONFIRMED
-    assert len(seams.dirty) == 1
-    assert seams.committed_branch is None
-
-
-def test_finalize_ledger_hit_is_idempotent_without_a_second_release(
+def test_finalizes_in_order_and_checks_only_the_first_publication_allowance(
     tmp_path: Path,
 ) -> None:
-    store = AttemptCompletionStore(tmp_path)
-    store.record(
-        attempt_id="2026-09-20T13:00:00Z",
-        issue_number=24,
-        branch="agent/issue-24",
-        outcome=AttemptOutcome.COMPLETE,
-    )
-    seams = _Seams()
+    effects = Effects(tmp_path)
 
-    result = finalize_attempt(
-        _request(),
-        is_finalized=store.is_finalized,
-        check_hold=seams.check_hold,
-        release=seams.release,
-        cleanup=seams.cleanup,
-        commit=seams.commit,
-        resolve_handoff=seams.resolve_handoff,
-        on_held=seams.on_held,
-        on_dirty=seams.on_dirty,
-    )
+    assert effects.finalizer().finalize(REQUEST) == Finalized(AttemptOutcome.COMPLETE)
 
-    assert result.status is FinalizeStatus.FINALIZED
-    assert result.idempotent is True
-    assert seams.calls == []
-    assert len(store.read_all()) == 1
+    assert effects.calls == [
+        "pre-release hold",
+        "release",
+        "cleanup",
+        "post-cleanup hold",
+        "write outcome",
+        "finish completion",
+        "record control",
+        "resolve handoff",
+    ]
+    assert effects.handoff_checks == [(PREPARED, STARTED), (None, STARTED)]
+    assert effects.cleanup_args == [
+        (PREPARED, "develop", False, FinalizationMode.NORMAL)
+    ]
+    assert effects.ledger.get(effects.checkpoint.started_at).branch == PREPARED.branch
+    assert effects.state.read() is None
 
 
-def test_finalize_uses_checkpoint_branch_when_prepared_is_gone() -> None:
-    seams = _Seams()
-
-    result = _finalize(
-        _request(
-            prepared_branch=None,
-            has_prepared=False,
-            checkpoint_branch="agent/issue-24-restored",
+@pytest.mark.parametrize(
+    ("failure", "reason", "stage", "calls"),
+    [
+        (
+            "hold_before",
+            HeldReason.HANDOFF_NOT_FULFILLED,
+            FinalizationStage.BEFORE_RELEASE,
+            ["pre-release hold"],
         ),
-        seams,
+        (
+            "release_error",
+            HeldReason.RELEASE_FAILED,
+            FinalizationStage.RELEASE,
+            ["pre-release hold", "release", "cleanup"],
+        ),
+        (
+            "cleanup_error",
+            HeldReason.CLEANUP_FAILED,
+            FinalizationStage.CLEANUP,
+            ["pre-release hold", "release", "cleanup", "dirty"],
+        ),
+        (
+            "hold_after",
+            HeldReason.HANDOFF_NOT_FULFILLED,
+            FinalizationStage.AFTER_CLEANUP,
+            ["pre-release hold", "release", "cleanup", "post-cleanup hold"],
+        ),
+        (
+            "accounting_error",
+            HeldReason.ACCOUNTING_FAILED,
+            FinalizationStage.ACCOUNTING,
+            [
+                "pre-release hold",
+                "release",
+                "cleanup",
+                "post-cleanup hold",
+                "write outcome",
+            ],
+        ),
+    ],
+)
+def test_a_hold_preserves_the_checkpoint_and_skips_the_ledger(
+    tmp_path: Path,
+    failure: str,
+    reason: HeldReason,
+    stage: FinalizationStage,
+    calls: list[str],
+) -> None:
+    effects = Effects(tmp_path)
+    failures = {
+        "hold_before": True,
+        "release_error": RuntimeError("release failed"),
+        "cleanup_error": DirtyWorkspaceError("dirty tree"),
+        "hold_after": True,
+        "accounting_error": RuntimeError("accounting unavailable"),
+    }
+    setattr(effects, failure, failures[failure])
+
+    result = effects.finalizer().finalize(REQUEST)
+
+    assert isinstance(result, Held)
+    assert (result.reason, result.stage) == (reason, stage)
+    assert effects.calls == calls
+    assert effects.held_messages
+    assert effects.state.read() == effects.checkpoint
+    assert effects.ledger.read_all() == {}
+
+
+def test_unconfirmed_publication_cleans_up_but_retains_the_branch(
+    tmp_path: Path,
+) -> None:
+    effects = Effects(tmp_path)
+    request = replace(
+        REQUEST, publication=PublicationState(confirmed=False, started_at=STARTED)
     )
 
-    assert result.status is FinalizeStatus.FINALIZED
-    assert seams.committed_branch == "agent/issue-24-restored"
+    result = effects.finalizer().finalize(request)
+
+    assert isinstance(result, Held)
+    assert result.reason is HeldReason.PUBLICATION_UNCONFIRMED
+    assert effects.calls == ["cleanup"]
+    assert effects.cleanup_args == [
+        (PREPARED, "develop", True, FinalizationMode.NORMAL)
+    ]
+    assert effects.state.read() == effects.checkpoint
+    assert effects.ledger.read_all() == {}
 
 
-def test_resolve_finalize_branch_prefers_prepared() -> None:
-    assert (
-        resolve_finalize_branch(
-            prepared_branch="agent/issue-24", checkpoint_branch="agent/issue-24-old"
-        )
-        == "agent/issue-24"
-    )
-    assert (
-        resolve_finalize_branch(
-            prepared_branch=None, checkpoint_branch="agent/issue-24-old"
-        )
-        == "agent/issue-24-old"
-    )
+@pytest.mark.parametrize(
+    ("mode", "retains_branch", "finish"),
+    [
+        (FinalizationMode.RECOVERY_RETRY, False, "finish completion"),
+        (FinalizationMode.RECOVERY_RELEASE, True, "finish release"),
+    ],
+)
+def test_operator_recovery_bypasses_handoff_holds(
+    tmp_path: Path, mode: FinalizationMode, retains_branch: bool, finish: str
+) -> None:
+    effects = Effects(tmp_path)
+    effects.hold_before = effects.hold_after = True
 
-
-def test_commit_recovered_attempt_captures_release_failure() -> None:
-    seams = _Seams(release_error=RuntimeError("release down"))
-
-    result = commit_recovered_attempt(
-        attempt_id="2026-09-20T13:00:00Z",
-        branch="agent/issue-24",
-        is_finalized=seams.is_finalized,
-        release=seams.release,
-        cleanup=seams.cleanup,
-        commit=seams.commit,
-        resolve_handoff=seams.resolve_handoff,
-        on_held=seams.on_held,
-        on_dirty=seams.on_dirty,
+    assert effects.finalizer().finalize(replace(REQUEST, mode=mode)) == Finalized(
+        REQUEST.outcome
     )
 
-    assert result.status is FinalizeStatus.HELD
-    assert result.reason is FinalizeReason.RELEASE_UNCONFIRMED
-    assert "release down" in result.detail
+    assert effects.calls == [
+        "release",
+        "cleanup",
+        "write outcome",
+        finish,
+        "record control",
+        "resolve handoff",
+    ]
+    assert effects.cleanup_args == [(PREPARED, "develop", retains_branch, mode)]
+    assert effects.state.read() is None
 
 
-def test_commit_recovered_attempt_captures_accounting_hold() -> None:
-    seams = _Seams(commit_error=SystemExit(3))
+@pytest.mark.parametrize(
+    "mode", [FinalizationMode.RECOVERY_RETRY, FinalizationMode.RECOVERY_RELEASE]
+)
+def test_operator_release_failure_stops_before_cleanup(
+    tmp_path: Path, mode: FinalizationMode
+) -> None:
+    effects = Effects(tmp_path)
+    effects.release_error = RuntimeError("release failed")
 
-    result = commit_recovered_attempt(
-        attempt_id="2026-09-20T13:00:00Z",
-        branch="agent/issue-24",
-        is_finalized=seams.is_finalized,
-        release=seams.release,
-        cleanup=seams.cleanup,
-        commit=seams.commit,
-        resolve_handoff=seams.resolve_handoff,
-        on_held=seams.on_held,
-        on_dirty=seams.on_dirty,
+    result = effects.finalizer().finalize(replace(REQUEST, mode=mode))
+
+    assert isinstance(result, Held)
+    assert result.reason is HeldReason.RELEASE_FAILED
+    assert effects.calls == ["release"]
+    assert effects.state.read() == effects.checkpoint
+    assert effects.ledger.read_all() == {}
+
+
+def test_no_prepared_workspace_records_the_durable_checkpoint_branch(
+    tmp_path: Path,
+) -> None:
+    effects = Effects(tmp_path)
+    outcome = AttemptOutcome.INCOMPLETE
+    request = replace(
+        REQUEST, prepared=None, outcome=outcome, publication=PublicationState(True)
     )
 
-    assert result.status is FinalizeStatus.HELD
-    assert "accounting" in result.detail
+    assert effects.finalizer().finalize(request) == Finalized(outcome)
+
+    assert "cleanup" not in effects.calls
+    assert effects.handoff_checks == [(None, None), (None, None)]
+    entry = effects.ledger.get(effects.checkpoint.started_at)
+    assert (entry.branch, entry.outcome) == (CHECKPOINT_BRANCH, outcome)
 
 
-def test_commit_recovered_attempt_dirty_cleanup_holds() -> None:
-    seams = _Seams(cleanup_error=DirtyWorkspaceError("dirty"))
+def test_crash_after_ledger_write_replays_only_the_recorded_completion(
+    tmp_path: Path,
+) -> None:
+    effects = Effects(tmp_path)
+    effects.finish_error = RuntimeError("control temporarily unavailable")
+    initial = effects.finalizer().finalize(REQUEST)
+    assert isinstance(initial, Held)
+    assert initial.reason is HeldReason.ACCOUNTING_FAILED
+    entry = effects.ledger.get(effects.checkpoint.started_at)
+    assert entry is not None
+    assert effects.state.read() == effects.checkpoint
+    effects.calls.clear()
+    request = replace(REQUEST, outcome=AttemptOutcome.INFRASTRUCTURE_ERROR)
 
-    result = commit_recovered_attempt(
-        attempt_id="2026-09-20T13:00:00Z",
-        branch="agent/issue-24",
-        is_finalized=seams.is_finalized,
-        release=seams.release,
-        cleanup=seams.cleanup,
-        commit=seams.commit,
-        resolve_handoff=seams.resolve_handoff,
-        on_held=seams.on_held,
-        on_dirty=seams.on_dirty,
+    assert effects.finalizer().finalize(request) == Finalized(REQUEST.outcome)
+
+    assert effects.calls == ["record control", "resolve handoff", "seal after replay"]
+    assert effects.control_outcomes == [REQUEST.outcome]
+    assert effects.handoff_outcomes == [REQUEST.outcome]
+    assert effects.ledger.get(effects.checkpoint.started_at) == entry
+    assert effects.state.read() is None
+
+
+def test_replaying_a_completed_attempt_preserves_the_next_checkpoint(tmp_path: Path) -> None:
+    effects = Effects(tmp_path)
+    finalizer = effects.finalizer()
+    assert finalizer.finalize(REQUEST) == Finalized(REQUEST.outcome)
+    subsequent = effects.state.start(issue_number=25, branch="agent/issue-25")
+    effects.calls.clear()
+
+    assert finalizer.replay() == Finalized(REQUEST.outcome)
+
+    assert effects.calls == []
+    assert effects.state.read() == subsequent
+
+
+def test_replay_preserves_a_checkpoint_owned_by_a_failed_handoff(
+    tmp_path: Path,
+) -> None:
+    effects = Effects(tmp_path)
+    effects.ledger.record(
+        attempt_id=effects.checkpoint.started_at,
+        issue_number=effects.checkpoint.issue_number,
+        branch=CHECKPOINT_BRANCH,
+        outcome=AttemptOutcome.HANDOFF,
+    )
+    effects.handoff_failed = True
+
+    result = effects.finalizer().replay()
+
+    assert isinstance(result, Held)
+    assert result.reason is HeldReason.HANDOFF_NOT_FULFILLED
+    assert result.stage is FinalizationStage.HANDOFF
+    assert effects.calls == ["record control", "resolve handoff"]
+    assert effects.state.read() == effects.checkpoint
+
+
+def test_handoff_resolution_error_does_not_turn_a_completion_into_a_hold(
+    tmp_path: Path,
+) -> None:
+    effects = Effects(tmp_path)
+    effects.handoff_error = RuntimeError("handoff store temporarily unavailable")
+
+    result = effects.finalizer().finalize(
+        replace(REQUEST, mode=FinalizationMode.RECOVERY_RETRY)
     )
 
-    assert result.status is FinalizeStatus.HELD
-    assert result.reason is FinalizeReason.CLEANUP_UNCONFIRMED
-    assert len(seams.dirty) == 1
-    assert seams.committed_branch is None
-
-
-def test_commit_recovered_attempt_finalizes_in_order() -> None:
-    seams = _Seams()
-
-    result = commit_recovered_attempt(
-        attempt_id="2026-09-20T13:00:00Z",
-        branch="agent/issue-24",
-        is_finalized=seams.is_finalized,
-        release=seams.release,
-        cleanup=seams.cleanup,
-        commit=seams.commit,
-        resolve_handoff=seams.resolve_handoff,
-        on_held=seams.on_held,
-        on_dirty=seams.on_dirty,
-    )
-
-    assert result.status is FinalizeStatus.FINALIZED
-    assert seams.calls == ["release", "cleanup", "commit(agent/issue-24)", "resolve_handoff"]
-
-
-def test_git_workspace_error_is_not_a_dirty_hold() -> None:
-    assert not issubclass(GitWorkspaceError, DirtyWorkspaceError)
-    assert issubclass(DirtyWorkspaceError, GitWorkspaceError)
+    assert result == Finalized(REQUEST.outcome)
+    assert effects.resolution_errors == [effects.handoff_error]
+    assert effects.ledger.get(effects.checkpoint.started_at).outcome is REQUEST.outcome
+    assert effects.state.read() is None

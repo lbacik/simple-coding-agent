@@ -14,7 +14,7 @@ import json
 import sys
 import tarfile
 from contextlib import redirect_stderr
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -40,6 +40,12 @@ from simple_coding_agent.completion import (
 )
 from simple_coding_agent.control import ControlStore
 from simple_coding_agent.control_server import ControlServer
+from simple_coding_agent.finalization import (
+    FinalizationMode,
+    Finalized,
+    FinalizeRequest,
+    PublicationState,
+)
 from simple_coding_agent.lifecycle import AgentLifecycle
 from simple_coding_agent.observability import (
     SEALING_FILENAME,
@@ -505,29 +511,21 @@ def test_release_without_a_terminal_outcome_seals_as_released(
     """The recovery-release finalization seals after its last write."""
 
     lifecycle, events = _sealing_lifecycle(tmp_path)
-    started_at = (datetime.now(UTC) - timedelta(minutes=1)).isoformat().replace(
-        "+00:00", "Z"
-    )
+    claim, checkpoint = lifecycle._gated_claim()  # noqa: SLF001 - seed a retained attempt
+    assert claim is not None and checkpoint is not None
+    started_at = checkpoint.started_at
     archive = AttemptArchive(tmp_path, issue_number=7, started_at=started_at)
-    archive.write_attempt(
-        {
-            "started_at": started_at,
-            "issue_number": 7,
-            "issue_title": "Issue 7",
-        }
-    )
-    checkpoint = SimpleNamespace(
-        started_at=started_at, issue_number=7, issue_title="Issue 7"
-    )
 
-    lifecycle._commit_finalization(  # noqa: SLF001 - release finalization seam
-        checkpoint,
-        7,
-        "main",
-        AttemptOutcome.INCOMPLETE,
-        archive,
-        released=True,
+    result = lifecycle._attempt_finalizer(  # noqa: SLF001 - release finalization seam
+        checkpoint, claim=claim, archive=archive
+    ).finalize(
+        FinalizeRequest(
+            outcome=AttemptOutcome.INCOMPLETE,
+            publication=PublicationState(confirmed=True),
+            mode=FinalizationMode.RECOVERY_RELEASE,
+        )
     )
+    assert result == Finalized(AttemptOutcome.INCOMPLETE)
 
     sealing = read_sealing_record(archive.directory)
     assert sealing is not None

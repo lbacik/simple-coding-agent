@@ -5,13 +5,16 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from enum import StrEnum
 import json
 import os
 from pathlib import Path
 import tempfile
+from enum import StrEnum
+from typing import Protocol
 
+from simple_coding_agent.attempt_state import AttemptCheckpoint, AttemptStateStore
 from simple_coding_agent.completion import AttemptOutcome
+from simple_coding_agent.git_workspace import DirtyWorkspaceError, PreparedAttempt
 
 
 @dataclass(frozen=True)
@@ -40,24 +43,40 @@ class AttemptCompletionStore:
     any side effect or accounting.
     """
 
-    def __init__(self, data_dir: Path, *, clock: Callable[[], datetime] | None = None) -> None:
+    def __init__(
+        self, data_dir: Path, *, clock: Callable[[], datetime] | None = None
+    ) -> None:
         self._path = data_dir / "state" / "completed_attempts.json"
         self._clock = clock or (lambda: datetime.now(UTC))
 
     def is_finalized(self, attempt_id: str) -> bool:
         """Return True when this attempt ID already completed its boundary."""
 
-        return attempt_id in self._read()
+        return self.get(attempt_id) is not None
+
+    def get(self, attempt_id: str) -> AttemptCompletion | None:
+        """Read the recorded verdict for a finalized attempt."""
+
+        return self._read().get(attempt_id)
 
     def record(
-        self, *, attempt_id: str, issue_number: int, branch: str, outcome: AttemptOutcome
+        self,
+        *,
+        attempt_id: str,
+        issue_number: int,
+        branch: str,
+        outcome: AttemptOutcome,
     ) -> bool:
         """Record one finalized attempt; return False when it was already recorded."""
 
         records = self._read()
         if attempt_id in records:
             return False
-        if isinstance(issue_number, bool) or not isinstance(issue_number, int) or issue_number <= 0:
+        if (
+            isinstance(issue_number, bool)
+            or not isinstance(issue_number, int)
+            or issue_number <= 0
+        ):
             raise CompletionStoreError("Issue number must be a positive integer")
         if not isinstance(branch, str) or not branch.strip():
             raise CompletionStoreError("Branch must be a non-empty string")
@@ -127,7 +146,9 @@ class AttemptCompletionStore:
                 os.fsync(file.fileno())
             os.replace(temporary, self._path)
         except OSError as error:
-            raise CompletionStoreError("Completion record could not be written") from error
+            raise CompletionStoreError(
+                "Completion record could not be written"
+            ) from error
         finally:
             if temporary is not None:
                 try:
@@ -150,7 +171,11 @@ def _completion_from_json(attempt_id: object, value: object) -> AttemptCompletio
     branch = value["branch"]
     outcome = value["outcome"]
     completed_at = value["completed_at"]
-    if isinstance(issue_number, bool) or not isinstance(issue_number, int) or issue_number <= 0:
+    if (
+        isinstance(issue_number, bool)
+        or not isinstance(issue_number, int)
+        or issue_number <= 0
+    ):
         raise ValueError("invalid issue number")
     if not isinstance(branch, str) or not branch.strip():
         raise ValueError("invalid branch")
@@ -171,305 +196,303 @@ def _timestamp(value: datetime) -> str:
     return value.astimezone(UTC).isoformat().replace("+00:00", "Z")
 
 
-class FinalizeStatus(StrEnum):
-    """Whether the attempt crossed the durable completion boundary."""
+class FinalizationMode(StrEnum):
+    NORMAL = "normal"
+    RECOVERY_RETRY = "recovery_retry"
+    RECOVERY_RELEASE = "recovery_release"
 
-    FINALIZED = "finalized"
-    HELD = "held"
+
+class FinalizationStage(StrEnum):
+    BEFORE_RELEASE = "before_release"
+    RELEASE = "release"
+    CLEANUP = "cleanup"
+    AFTER_CLEANUP = "after_cleanup"
+    ACCOUNTING = "accounting"
+    HANDOFF = "handoff"
 
 
-class FinalizeReason(StrEnum):
-    """Stable machine-readable reason a finalization held.
-
-    The human-readable detail rides alongside in ``FinalizeResult.detail``;
-    match on the reason, show the detail.
-    """
-
+class HeldReason(StrEnum):
     PUBLICATION_UNCONFIRMED = "publication_unconfirmed"
-    HANDOFF_HOLD = "handoff_hold"
-    RELEASE_UNCONFIRMED = "release_unconfirmed"
-    CLEANUP_UNCONFIRMED = "cleanup_unconfirmed"
+    HANDOFF_NOT_FULFILLED = "handoff_not_fulfilled"
+    RELEASE_FAILED = "release_failed"
+    CLEANUP_FAILED = "cleanup_failed"
+    ACCOUNTING_FAILED = "accounting_failed"
+
+
+@dataclass(frozen=True)
+class PublicationState:
+    confirmed: bool
+    started_at: datetime | None = None
 
 
 @dataclass(frozen=True)
 class FinalizeRequest:
-    """Everything the boundary needs that callers already have.
-
-    Callers differ only in how they arrived at the outcome (live model run,
-    startup republication, recovery retry, recovery release); the boundary
-    owns everything after that. ``checkpoint_branch`` is the durable branch
-    identity; ``prepared_branch`` is ``None`` once the tree is cleaned up.
-    """
-
-    issue_number: int
-    attempt_id: str
-    checkpoint_branch: str
-    prepared_branch: str | None
     outcome: AttemptOutcome
-    comment_posted: bool
-    has_prepared: bool
-    publication_started_at: datetime | None = None
+    publication: PublicationState
+    prepared: PreparedAttempt | None = None
+    base_branch: str = "main"
+    retain_branch: bool = False
+    mode: FinalizationMode = FinalizationMode.NORMAL
 
 
 @dataclass(frozen=True)
-class FinalizeResult:
-    """The boundary's verdict: finalized, or held with a reason."""
+class Finalized:
+    outcome: AttemptOutcome
 
-    status: FinalizeStatus
-    reason: FinalizeReason | None
+
+@dataclass(frozen=True)
+class Held:
+    reason: HeldReason
+    stage: FinalizationStage
     detail: str
-    released: bool
-    cleanup_ok: bool
-    handoff: bool | None = None
-    idempotent: bool = False
-    failed_step: str | None = None
-
-    @property
-    def finalized(self) -> bool:
-        """True when the attempt crossed the durable completion boundary."""
-
-        return self.status is FinalizeStatus.FINALIZED
+    error: BaseException | None = None
 
 
-def resolve_finalize_branch(
-    *, prepared_branch: str | None, checkpoint_branch: str
-) -> str:
-    """Resolve the branch the ledger commit records.
-
-    The prepared branch wins while the tree is still on it; once cleanup
-    returned the tree to the base, the checkpoint's durable identity wins.
-    Reconstructing ``agent/issue-N`` from the issue number is never correct
-    here: it drops the restoration suffixes a retained checkpoint carries.
-    """
-
-    if prepared_branch:
-        return prepared_branch
-    return checkpoint_branch
+class HandoffPolicy(Protocol):
+    def __call__(
+        self,
+        *,
+        outcome: AttemptOutcome,
+        prepared: PreparedAttempt | None,
+        publication_started_at: datetime | None,
+        check_allowance: bool,
+    ) -> bool | None: ...
 
 
-_HELD_DETAIL = (
-    "Publication, release, or cleanup is unconfirmed, or a failed"
-    " operator handoff owns this attempt; the branch, checkpoint, and"
-    " working tree are preserved for recovery."
-)
+@dataclass(frozen=True)
+class FinalizationEffects:
+    release: Callable[[AttemptOutcome, FinalizationMode], None]
+    cleanup: Callable[[PreparedAttempt, str, bool, FinalizationMode], None]
+    check_handoff: HandoffPolicy
+    resolve_handoff: HandoffPolicy
+    write_outcome: Callable[[AttemptOutcome], str]
+    finish_completion: Callable[[AttemptOutcome, str, bool], None]
+    record_control: Callable[[AttemptOutcome], None]
+    handoff_owned: Callable[[], bool]
+    finish_replay: Callable[[], None]
+    workspace_held: Callable[[DirtyWorkspaceError, FinalizationMode], None]
+    report_hold: Callable[[str], None]
+    resolution_unavailable: Callable[[Exception], None]
 
 
-def finalize_attempt(
-    request: FinalizeRequest,
-    *,
-    is_finalized: Callable[[str], bool],
-    check_hold: Callable[..., bool],
-    release: Callable[[], None],
-    cleanup: Callable[[], None],
-    commit: Callable[[str], None],
-    resolve_handoff: Callable[[], bool | None],
-    on_held: Callable[[FinalizeReason | None, str], None] | None = None,
-    on_dirty: Callable[[Exception], None] | None = None,
-) -> FinalizeResult:
-    """Run the durable completion boundary in its one fixed order.
+@dataclass(frozen=True)
+class AttemptFinalizer:
+    """Close one attempt using its checkpoint and the verdict publication supplied."""
 
-    The order is hold check, release, workspace cleanup, second hold check
-    (``check_allowance=False``), ledger commit, handoff resolution. The
-    second check runs only when publication, release, and cleanup all went
-    durable, mirroring the pre-commit recheck after a confirmed publication.
+    checkpoint: AttemptCheckpoint
+    ledger: AttemptCompletionStore | None
+    attempt_state: AttemptStateStore
+    effects: FinalizationEffects
 
-    Release, cleanup, and commit failures propagate to the caller after the
-    held outcome is reported (``try/finally`` semantics), except a dirty
-    workspace, which holds via ``on_dirty`` instead of raising. A ledger
-    that already holds the attempt short-circuits to finalized without
-    replaying any side effect.
-    """
+    def finalize(self, request: FinalizeRequest) -> Finalized | Held:
+        replayed = self.replay()
+        if replayed is not None:
+            return replayed
 
-    if is_finalized(request.attempt_id):
-        return FinalizeResult(
-            status=FinalizeStatus.FINALIZED,
-            reason=None,
-            detail="attempt already finalized; no side effect replayed",
-            released=False,
-            cleanup_ok=False,
-            handoff=None,
-            idempotent=True,
-        )
-    hold = request.comment_posted and bool(
-        check_hold(prepared=request.has_prepared, check_allowance=True)
-    )
-    released = False
-    release_error: BaseException | None = None
-    try:
-        if request.comment_posted and not hold:
-            release()
-            released = True
-    except BaseException as error:
-        # The held outcome is still reported below (cleanup runs first);
-        # the failure then propagates exactly as the inline boundary did.
-        release_error = error
-    cleanup_ok = not request.has_prepared
-    cleanup_error: BaseException | None = None
-    if request.has_prepared and not hold:
-        try:
-            cleanup()
-            cleanup_ok = True
-        except BaseException as error:
-            from simple_coding_agent.git_workspace import DirtyWorkspaceError
-
-            if isinstance(error, DirtyWorkspaceError):
-                if on_dirty is not None:
-                    on_dirty(error)
-            else:
-                cleanup_error = error
-    if request.comment_posted and released and cleanup_ok and not hold:
-        hold = bool(check_hold(prepared=False, check_allowance=False))
-    if request.comment_posted and released and cleanup_ok and not hold:
-        commit(
-            resolve_finalize_branch(
-                prepared_branch=request.prepared_branch,
-                checkpoint_branch=request.checkpoint_branch,
+        normal = request.mode is FinalizationMode.NORMAL
+        publication = request.publication
+        if (
+            normal
+            and publication.confirmed
+            and self.effects.check_handoff(
+                outcome=request.outcome,
+                prepared=request.prepared,
+                publication_started_at=publication.started_at,
+                check_allowance=True,
             )
+        ):
+            return self._hold(
+                request,
+                HeldReason.HANDOFF_NOT_FULFILLED,
+                FinalizationStage.BEFORE_RELEASE,
+                "an operator handoff requires recovery",
+            )
+
+        release_error: BaseException | None = None
+        if publication.confirmed:
+            try:
+                self.effects.release(request.outcome, request.mode)
+            except BaseException as error:
+                release_error = error
+                if not normal:
+                    if not isinstance(error, Exception):
+                        raise
+                    return self._release_failed(request, error)
+
+        if request.prepared is not None:
+            try:
+                self.effects.cleanup(
+                    request.prepared,
+                    request.base_branch,
+                    request.retain_branch
+                    or not publication.confirmed
+                    or request.mode is FinalizationMode.RECOVERY_RELEASE,
+                    request.mode,
+                )
+            except DirtyWorkspaceError as error:
+                self.effects.workspace_held(error, request.mode)
+                return self._hold(
+                    request,
+                    HeldReason.CLEANUP_FAILED,
+                    FinalizationStage.CLEANUP,
+                    f"local cleanup failed ({_error_detail(error)})",
+                    release_error if normal else None,
+                )
+            except BaseException as error:
+                if not normal and not isinstance(error, Exception):
+                    raise
+                return self._hold(
+                    request,
+                    HeldReason.CLEANUP_FAILED,
+                    FinalizationStage.CLEANUP,
+                    f"local cleanup failed ({_error_detail(error)})",
+                    error,
+                )
+
+        if release_error is not None:
+            return self._release_failed(request, release_error)
+        if not publication.confirmed:
+            return self._hold(
+                request,
+                HeldReason.PUBLICATION_UNCONFIRMED,
+                FinalizationStage.BEFORE_RELEASE,
+                "publication is unconfirmed",
+            )
+        if normal and self.effects.check_handoff(
+            outcome=request.outcome,
+            prepared=None,
+            publication_started_at=publication.started_at,
+            check_allowance=False,
+        ):
+            return self._hold(
+                request,
+                HeldReason.HANDOFF_NOT_FULFILLED,
+                FinalizationStage.AFTER_CLEANUP,
+                "an operator handoff failed after cleanup",
+            )
+
+        branch = (
+            request.prepared.branch
+            if request.prepared is not None
+            else self.checkpoint.branch
         )
-        handoff = resolve_handoff()
-        return FinalizeResult(
-            status=FinalizeStatus.FINALIZED,
-            reason=None,
-            detail="attempt finalized",
-            released=True,
-            cleanup_ok=True,
-            handoff=handoff,
+        try:
+            # Write the outcome first. A ledger entry then proves release and
+            # cleanup finished, so a restart only replays idempotent bookkeeping.
+            completed_at = self.effects.write_outcome(request.outcome)
+            if self.ledger is not None:
+                self.ledger.record(
+                    attempt_id=self.checkpoint.started_at,
+                    issue_number=self.checkpoint.issue_number,
+                    branch=branch,
+                    outcome=request.outcome,
+                )
+            self.effects.finish_completion(
+                request.outcome,
+                completed_at,
+                request.mode is FinalizationMode.RECOVERY_RELEASE,
+            )
+        except SystemExit as error:
+            if normal:
+                raise
+            return self._hold(
+                request,
+                HeldReason.ACCOUNTING_FAILED,
+                FinalizationStage.ACCOUNTING,
+                f"accounting is held ({_error_detail(error)})",
+                error,
+            )
+        except Exception as error:
+            return self._hold(
+                request,
+                HeldReason.ACCOUNTING_FAILED,
+                FinalizationStage.ACCOUNTING,
+                f"accounting failed ({_error_detail(error)})",
+                error,
+            )
+        self._resolve_handoff(
+            request.outcome,
+            prepared=None if normal else request.prepared,
+            started_at=publication.started_at,
+            check_allowance=not normal,
         )
-    reason = _held_reason(request, hold, released, cleanup_ok)
-    _report_hold(on_held, reason)
-    held = FinalizeResult(
-        status=FinalizeStatus.HELD,
-        reason=reason,
-        detail=_HELD_DETAIL,
-        released=released,
-        cleanup_ok=cleanup_ok,
-        handoff=None,
-    )
-    if cleanup_error is not None:
-        raise cleanup_error
-    if release_error is not None:
-        raise release_error
-    return held
+        return Finalized(request.outcome)
 
+    def replay(self) -> Finalized | Held | None:
+        """Settle an already recorded attempt without replaying its remote effects."""
 
-def commit_recovered_attempt(
-    *,
-    attempt_id: str,
-    branch: str,
-    is_finalized: Callable[[str], bool],
-    release: Callable[[], None],
-    cleanup: Callable[[], None],
-    commit: Callable[[str], None],
-    resolve_handoff: Callable[[], bool | None],
-    on_held: Callable[[FinalizeReason | None, str], None] | None = None,
-    on_dirty: Callable[[Exception], None] | None = None,
-) -> FinalizeResult:
-    """Run the recovery tail (release, cleanup, commit, handoff) in order.
-
-    Recovery republication already confirmed the outcome, so unlike
-    :func:`finalize_attempt` there is no handoff hold check here — the
-    handoff is still resolved after the commit, at most once. Failures
-    never propagate: they are captured into a held result (with the
-    failing step named) so operator commands can report them and keep
-    the hold.
-    """
-    if is_finalized(attempt_id):
-        return FinalizeResult(
-            status=FinalizeStatus.FINALIZED,
-            reason=None,
-            detail="attempt already finalized; no side effect replayed",
-            released=False,
-            cleanup_ok=False,
-            handoff=None,
-            idempotent=True,
+        previous = (
+            self.ledger.get(self.checkpoint.started_at)
+            if self.ledger is not None
+            else None
         )
-    try:
-        release()
-    except Exception as error:
-        detail = f"issue release failed ({type(error).__name__}: {error})"
-        _report_hold(on_held, FinalizeReason.RELEASE_UNCONFIRMED)
-        return FinalizeResult(
-            status=FinalizeStatus.HELD,
-            reason=FinalizeReason.RELEASE_UNCONFIRMED,
-            detail=detail,
-            released=False,
-            cleanup_ok=False,
-            handoff=None,
-            failed_step="release",
+        if previous is None:
+            return None
+
+        retained = self.attempt_state.read()
+        if retained is None or retained.started_at != previous.attempt_id:
+            return Finalized(previous.outcome)
+
+        self.effects.record_control(previous.outcome)
+        resolved = self._resolve_handoff(previous.outcome)
+        if resolved is False and self.effects.handoff_owned():
+            detail = (
+                "A failed operator handoff owns this attempt; the branch, "
+                "checkpoint, and working tree are preserved for recovery."
+            )
+            self.effects.report_hold(detail)
+            return Held(
+                HeldReason.HANDOFF_NOT_FULFILLED, FinalizationStage.HANDOFF, detail
+            )
+
+        self.attempt_state.delete()
+        self.effects.finish_replay()
+        return Finalized(previous.outcome)
+
+    def _resolve_handoff(
+        self,
+        outcome: AttemptOutcome,
+        *,
+        prepared: PreparedAttempt | None = None,
+        started_at: datetime | None = None,
+        check_allowance: bool = False,
+    ) -> bool | None:
+        try:
+            return self.effects.resolve_handoff(
+                outcome=outcome,
+                prepared=prepared,
+                publication_started_at=started_at,
+                check_allowance=check_allowance,
+            )
+        except Exception as error:
+            self.effects.resolution_unavailable(error)
+            return None
+
+    def _release_failed(self, request: FinalizeRequest, error: BaseException) -> Held:
+        return self._hold(
+            request,
+            HeldReason.RELEASE_FAILED,
+            FinalizationStage.RELEASE,
+            f"issue release failed ({_error_detail(error)})",
+            error,
         )
-    try:
-        cleanup()
-    except Exception as error:
-        from simple_coding_agent.git_workspace import DirtyWorkspaceError
 
-        if isinstance(error, DirtyWorkspaceError) and on_dirty is not None:
-            on_dirty(error)
-        detail = f"local cleanup failed ({type(error).__name__}: {error})"
-        _report_hold(on_held, FinalizeReason.CLEANUP_UNCONFIRMED)
-        return FinalizeResult(
-            status=FinalizeStatus.HELD,
-            reason=FinalizeReason.CLEANUP_UNCONFIRMED,
-            detail=detail,
-            released=True,
-            cleanup_ok=False,
-            handoff=None,
-            failed_step="cleanup",
-        )
-    try:
-        commit(branch)
-        handoff = resolve_handoff()
-    except SystemExit as error:
-        detail = f"accounting is held ({type(error).__name__}: {error})"
-        _report_hold(on_held, None)
-        return FinalizeResult(
-            status=FinalizeStatus.HELD,
-            reason=None,
-            detail=detail,
-            released=True,
-            cleanup_ok=True,
-            handoff=None,
-            failed_step="commit",
-        )
-    except Exception as error:
-        detail = f"accounting failed ({type(error).__name__}: {error})"
-        _report_hold(on_held, None)
-        return FinalizeResult(
-            status=FinalizeStatus.HELD,
-            reason=None,
-            detail=detail,
-            released=True,
-            cleanup_ok=True,
-            handoff=None,
-            failed_step="commit",
-        )
-    return FinalizeResult(
-        status=FinalizeStatus.FINALIZED,
-        reason=None,
-        detail="attempt finalized",
-        released=True,
-        cleanup_ok=True,
-        handoff=handoff,
-    )
+    def _hold(
+        self,
+        request: FinalizeRequest,
+        reason: HeldReason,
+        stage: FinalizationStage,
+        detail: str,
+        error: BaseException | None = None,
+    ) -> Held:
+        if request.mode is FinalizationMode.NORMAL:
+            self.effects.report_hold(
+                "Publication, release, or cleanup is unconfirmed, or a failed"
+                " operator handoff owns this attempt; the branch, checkpoint, "
+                "and working tree are preserved for recovery."
+            )
+        return Held(reason, stage, detail, error)
 
 
-def _held_reason(
-    request: FinalizeRequest | None, hold: bool, released: bool, cleanup_ok: bool
-) -> FinalizeReason:
-    if request is not None and not request.comment_posted:
-        return FinalizeReason.PUBLICATION_UNCONFIRMED
-    if hold:
-        return FinalizeReason.HANDOFF_HOLD
-    if not released:
-        return FinalizeReason.RELEASE_UNCONFIRMED
-    if not cleanup_ok:
-        return FinalizeReason.CLEANUP_UNCONFIRMED
-    return FinalizeReason.HANDOFF_HOLD
-
-
-def _report_hold(
-    on_held: Callable[[FinalizeReason | None, str], None] | None,
-    reason: FinalizeReason | None,
-) -> None:
-    if on_held is None:
-        return
-    on_held(reason, _HELD_DETAIL)
+def _error_detail(error: BaseException) -> str:
+    return f"{type(error).__name__}: {error}" if str(error) else type(error).__name__

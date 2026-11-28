@@ -8,6 +8,7 @@ import copy
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from enum import StrEnum
+from functools import partial
 import os
 from pathlib import Path
 import random
@@ -60,12 +61,13 @@ from simple_coding_agent.completion import (
 from simple_coding_agent.config import RepositoryProfile
 from simple_coding_agent.finalization import (
     AttemptCompletionStore,
+    AttemptFinalizer,
     CompletionStoreError,
+    FinalizationEffects,
+    FinalizationMode,
     FinalizeRequest,
-    FinalizeResult,
-    FinalizeStatus,
-    commit_recovered_attempt,
-    finalize_attempt,
+    Held,
+    PublicationState,
 )
 from simple_coding_agent.unpushed_revision import (
     RECOVERY_ALREADY_PUBLISHED,
@@ -3388,72 +3390,35 @@ class AgentLifecycle:
                 " handoff record could not be verified); the hold remains."
                 f" {hold_suffix}"
             )
-        # The recovery tail (release, cleanup, ledger commit, handoff
-        # resolution) lives in ``simple_coding_agent.finalization``; only
-        # the republication and outcome above are retry-specific.
-        retain_branch_value = bool(
+        retain_branch = (
             getattr(published, "branch_url", None) is None
+            and has_commits
             and (
-                has_commits
-                and (
-                    outcome is AttemptOutcome.INFRASTRUCTURE_ERROR
-                    or (
-                        outcome is AttemptOutcome.INCOMPLETE
-                        and decision.publication_path is PublicationPath.PARTIAL
-                    )
+                outcome is AttemptOutcome.INFRASTRUCTURE_ERROR
+                or (
+                    outcome is AttemptOutcome.INCOMPLETE
+                    and decision.publication_path is PublicationPath.PARTIAL
                 )
             )
         )
-
-        def _retry_cleanup() -> None:
-            self._workspace.cleanup(
-                base_branch=profile.base_branch,
-                prepared=prepared,
-                # comment_posted is True here (the unconfirmed path returned
-                # above), so only genuinely unpublished work retains.
-                retain_branch=retain_branch_value,
-                issue_number=claim.issue.number,
-                attempt_id=attempt_id,
-            )
-            self._observe_and_remember_workspace_dirty(attempt_id)
-
-        retry_archive = self._archive_for(claim.issue.number, attempt_id)
-
-        def _retry_commit(commit_branch: str) -> None:
-            self._commit_finalization(
-                checkpoint, claim.issue.number, commit_branch, outcome, retry_archive
-            )
-
-        def _retry_resolve() -> bool | None:
-            return self._resolve_pending_handoff(
-                issue_number=claim.issue.number,
-                attempt_id=attempt_id,
+        result = self._attempt_finalizer(checkpoint, claim=claim).finalize(
+            FinalizeRequest(
                 outcome=outcome,
+                publication=PublicationState(confirmed=True),
                 prepared=prepared,
+                base_branch=profile.base_branch,
+                retain_branch=retain_branch,
+                mode=FinalizationMode.RECOVERY_RETRY,
             )
-
-        retry_finalized = commit_recovered_attempt(
-            attempt_id=attempt_id,
-            branch=prepared.branch,
-            is_finalized=self._is_attempt_finalized,
-            release=lambda: self._release(claim, outcome, checkpoint),
-            cleanup=_retry_cleanup,
-            commit=_retry_commit,
-            resolve_handoff=_retry_resolve,
-            on_dirty=lambda error: self._emit_workspace_hold(claim.issue.number, error),  # type: ignore[arg-type]
         )
-        if retry_finalized.idempotent:
-            self._clear_already_finalized_checkpoint(claim.issue.number, attempt_id)
-        elif retry_finalized.status is not FinalizeStatus.FINALIZED:
+        if isinstance(result, Held):
             return False, (
                 f"recovery retry for attempt {attempt_id} not fulfilled:"
-                f" {retry_finalized.detail};"
-                " the hold remains."
-                f" {hold_suffix}"
+                f" {result.detail}; the hold remains. {hold_suffix}"
             )
         return True, (
             f"recovery retry for attempt {attempt_id} completed;"
-            f" issue #{issue_number} finalized with outcome {outcome.value};"
+            f" issue #{issue_number} finalized with outcome {result.outcome.value};"
             " the hold is cleared"
         )
 
@@ -3607,67 +3572,23 @@ class AgentLifecycle:
                 " the result comment could not be confirmed on GitHub;"
                 " the hold remains and no work was discarded."
             )
-        # The recovery tail (release, cleanup, ledger commit, handoff
-        # resolution) lives in ``simple_coding_agent.finalization``; only
-        # the confirmed comment and inferred outcome above are
-        # release-specific.
-        def _abandon_release() -> None:
-            # Plain release only: never add ``round-finished`` here, so the
-            # release never claims a successful handoff. The comment above
-            # already states the actual outcome and the failure.
-            self._tracker.release_attempt(
-                claim.issue.number, "ready-for-agent", claim.assignment.assignee_id
-            )
-
-        def _abandon_cleanup() -> None:
-            self._workspace.cleanup(
-                base_branch=profile.base_branch,
-                prepared=prepared,
-                retain_branch=True,
-                issue_number=claim.issue.number,
-                attempt_id=attempt_id,
-            )
-
-        abandon_archive = self._archive_for(claim.issue.number, attempt_id)
-
-        def _abandon_commit(commit_branch: str) -> None:
-            self._commit_finalization(
-                checkpoint,
-                claim.issue.number,
-                commit_branch,
-                actual_outcome,
-                abandon_archive,
-                released=True,
-            )
-
-        def _abandon_resolve() -> bool | None:
-            return self._resolve_pending_handoff(
-                issue_number=claim.issue.number,
-                attempt_id=attempt_id,
+        result = self._attempt_finalizer(checkpoint, claim=claim).finalize(
+            FinalizeRequest(
                 outcome=actual_outcome,
+                publication=PublicationState(confirmed=True),
                 prepared=prepared,
+                base_branch=profile.base_branch,
+                mode=FinalizationMode.RECOVERY_RELEASE,
             )
-
-        abandon_finalized = commit_recovered_attempt(
-            attempt_id=attempt_id,
-            branch=branch,
-            is_finalized=self._is_attempt_finalized,
-            release=_abandon_release,
-            cleanup=_abandon_cleanup,
-            commit=_abandon_commit,
-            resolve_handoff=_abandon_resolve,
         )
-        if abandon_finalized.idempotent:
-            self._clear_already_finalized_checkpoint(claim.issue.number, attempt_id)
-        elif abandon_finalized.status is not FinalizeStatus.FINALIZED:
+        if isinstance(result, Held):
             return False, (
                 f"recovery release for attempt {attempt_id} not fulfilled:"
-                f" {abandon_finalized.detail};"
-                " the hold remains and no work was discarded."
+                f" {result.detail}; the hold remains and no work was discarded."
             )
         return True, (
             f"recovery release for attempt {attempt_id} completed;"
-            f" issue #{issue_number} released with outcome {actual_outcome.value};"
+            f" issue #{issue_number} released with outcome {result.outcome.value};"
             f" retained work secured at {saved_at}; the hold is cleared"
         )
 
@@ -5709,11 +5630,6 @@ class AgentLifecycle:
                 publication_started_at=publication_started_at,
                 archive=archive,
             )
-            # The attempt's processing is finished (finalized or held
-            # for recovery); a later resume sees a retained checkpoint
-            # here instead of an active attempt.
-            with self._control_lock:
-                self._attempt_processing = False
         self._active_issue_number = None
         return LifecycleResult(LifecycleStatus.ATTEMPTED, outcome)
 
@@ -6621,167 +6537,132 @@ class AgentLifecycle:
         profile: RepositoryProfile | None,
         publication_started_at: datetime | None,
         archive: AttemptArchive | None,
-    ) -> FinalizeResult:
-        """Run the one durable completion boundary for a live attempt.
-
-        ``run_once`` and startup reconciliation arrive at their outcomes
-        differently, then both finish here: first handoff hold check,
-        issue release, workspace cleanup, second hold check
-        (``check_allowance=False``), ledger commit, handoff resolution.
-        The ledger branch always falls back to the checkpoint's durable
-        identity once the tree is cleaned up.
-        """
-
-        checkpoint_branch = checkpoint.branch
-        prepared_branch = prepared.branch if prepared is not None else None
-        prepared_object = prepared
-        store = self._completion_store
-
-        def _is_finalized(attempt_id: str) -> bool:
-            return store is not None and store.is_finalized(attempt_id)
-
-        def _check_hold(*, prepared: bool, check_allowance: bool) -> bool:
-            return self._hold_failed_handoff(
-                issue_number=claim.issue.number,
-                attempt_id=checkpoint.started_at,
-                outcome=outcome,
-                prepared=prepared_object if prepared else None,
-                publication_started_at=publication_started_at,
-                check_allowance=check_allowance,
-            )
-
-        def _release() -> None:
-            self._release(claim, outcome, checkpoint)
-
-        def _cleanup() -> None:
-            assert prepared is not None
-            self._workspace.cleanup(
-                base_branch=profile.base_branch if profile is not None else "main",
-                prepared=prepared,
-                retain_branch=retain_branch or not comment_posted,
-                issue_number=claim.issue.number,
-                attempt_id=checkpoint.started_at,
-            )
-            self._observe_and_remember_workspace_dirty(checkpoint.started_at)
-
-        def _commit(branch: str) -> None:
-            self._commit_finalization(
-                checkpoint, claim.issue.number, branch, outcome, archive
-            )
-
-        def _resolve() -> bool | None:
-            return self._resolve_pending_handoff(
-                issue_number=claim.issue.number,
-                attempt_id=checkpoint.started_at,
-                outcome=outcome,
-                prepared=None,  # tree already cleaned up
-                publication_started_at=publication_started_at,
-                check_allowance=False,
-            )
-
-        def _on_held(reason: object, detail: str) -> None:
-            _ = (reason, detail)
-            self._event_log(
-                "attempt_finalization_held",
-                "Publication, release, or cleanup is unconfirmed, or a failed"
-                " operator handoff owns this attempt; the branch, "
-                "checkpoint, and working tree are preserved for recovery.",
-                level="WARNING",
-                issue_number=claim.issue.number,
-            )
-
-        def _on_dirty(error: Exception) -> None:
-            self._hold_dirty_workspace(claim.issue.number, error)  # type: ignore[arg-type]
-
-        return finalize_attempt(
-            FinalizeRequest(
-                issue_number=claim.issue.number,
-                attempt_id=checkpoint.started_at,
-                checkpoint_branch=checkpoint_branch,
-                prepared_branch=prepared_branch,
-                outcome=outcome,
-                comment_posted=comment_posted,
-                has_prepared=prepared is not None,
-                publication_started_at=publication_started_at,
-            ),
-            is_finalized=_is_finalized,
-            check_hold=_check_hold,
-            release=_release,
-            cleanup=_cleanup,
-            commit=_commit,
-            resolve_handoff=_resolve,
-            on_held=_on_held,
-            on_dirty=_on_dirty,
-        )
-
-    def _is_attempt_finalized(self, attempt_id: str) -> bool:
-        """Whether the completion ledger already holds this attempt ID."""
-
-        store = self._completion_store
-        return store is not None and store.is_finalized(attempt_id)
-
-    def _clear_already_finalized_checkpoint(
-        self, issue_number: int, attempt_id: str
     ) -> None:
-        """Drop the leftover checkpoint for an already-finalized attempt.
+        try:
+            result = self._attempt_finalizer(checkpoint, claim=claim, archive=archive).finalize(
+                FinalizeRequest(
+                    outcome=outcome,
+                    publication=PublicationState(comment_posted, publication_started_at),
+                    prepared=prepared,
+                    base_branch=profile.base_branch if profile is not None else "main",
+                    retain_branch=retain_branch,
+                )
+            )
+            if isinstance(result, Held) and result.error is not None:
+                raise result.error
+        finally:
+            with self._control_lock:
+                self._attempt_processing = False
 
-        Every boundary step is durable (the ledger proves it); only the
-        checkpoint removal and its seal remain.
-        """
+    def _attempt_finalizer(
+        self,
+        checkpoint: AttemptCheckpoint,
+        *,
+        claim: Claim | None = None,
+        archive: AttemptArchive | None = None,
+    ) -> AttemptFinalizer:
+        issue_number = checkpoint.issue_number
+        attempt_id = checkpoint.started_at
 
-        self._attempt_state.delete()
-        self._seal_archive_and_emit(
-            self._archive_for(issue_number, attempt_id),
-            attempt_id,
-            issue_number=issue_number,
+        def release(outcome: AttemptOutcome, mode: FinalizationMode) -> None:
+            assert claim is not None
+            if mode is FinalizationMode.RECOVERY_RELEASE:
+                # Plain release does not advertise a successful handoff.
+                self._tracker.release_attempt(
+                    issue_number, "ready-for-agent", claim.assignment.assignee_id
+                )
+            else:
+                self._release(claim, outcome, checkpoint)
+
+        def cleanup(
+            prepared: PreparedAttempt, base_branch: str, retain_branch: bool, mode: FinalizationMode
+        ) -> None:
+            self._workspace.cleanup(
+                base_branch=base_branch,
+                prepared=prepared,
+                retain_branch=retain_branch,
+                issue_number=issue_number,
+                attempt_id=attempt_id,
+            )
+            if mode is not FinalizationMode.RECOVERY_RELEASE:
+                self._observe_and_remember_workspace_dirty(attempt_id)
+
+        def workspace_held(error: DirtyWorkspaceError, mode: FinalizationMode) -> None:
+            if mode is FinalizationMode.NORMAL:
+                self._hold_dirty_workspace(issue_number, error)
+            elif mode is FinalizationMode.RECOVERY_RETRY:
+                self._emit_workspace_hold(issue_number, error)
+
+        def write_outcome(outcome: AttemptOutcome) -> str:
+            nonlocal archive
+            if archive is None:
+                archive = self._archive_for(issue_number, attempt_id)
+            self._record_terminal_outcome(outcome, attempt_id, issue_number=issue_number)
+            completed_at = self._write_outcome(
+                archive, outcome, attempt_id,
+                issue_number=issue_number,
+                issue_title=checkpoint.issue_title,
+            )
+            self._backfill_archived_pull_request(archive, attempt_id)
+            return completed_at
+
+        def finish_completion(outcome: AttemptOutcome, completed_at: str, released: bool) -> None:
+            self._finish_attempt_completion(
+                checkpoint, outcome, archive, completed_at, released=released
+            )
+
+        def finish_replay() -> None:
+            self._seal_archive_and_emit(
+                self._archive_for(issue_number, attempt_id), attempt_id, issue_number=issue_number
+            )
+            self._telemetry_finish()
+
+        return AttemptFinalizer(
+            checkpoint=checkpoint,
+            ledger=self._completion_store,
+            attempt_state=self._attempt_state,
+            effects=FinalizationEffects(
+                release=release,
+                cleanup=cleanup,
+                check_handoff=partial(
+                    self._hold_failed_handoff, issue_number=issue_number, attempt_id=attempt_id
+                ),
+                resolve_handoff=partial(
+                    self._resolve_pending_handoff, issue_number=issue_number, attempt_id=attempt_id
+                ),
+                write_outcome=write_outcome,
+                finish_completion=finish_completion,
+                record_control=partial(self._record_control_finalization, attempt_id),
+                handoff_owned=partial(self._handoff_owned_by_attempt, attempt_id),
+                finish_replay=finish_replay,
+                workspace_held=workspace_held,
+                report_hold=partial(
+                    self._event_log, "attempt_finalization_held",
+                    level="WARNING", issue_number=issue_number,
+                ),
+                resolution_unavailable=lambda error: self._event_log(
+                    "operator_handoff_resolution_unavailable",
+                    f"{_exception_detail(error)} The pending handoff keeps waiting;",
+                    level="ERROR",
+                    issue_number=issue_number,
+                ),
+            ),
         )
 
-    def _commit_finalization(
+    def _finish_attempt_completion(
         self,
-        checkpoint: object,
-        issue_number: int,
-        branch: str,
+        checkpoint: AttemptCheckpoint,
         outcome: AttemptOutcome,
         archive: AttemptArchive | None,
-        released: bool = False,
+        completed_at: str,
+        *,
+        released: bool,
     ) -> None:
-        """Record the durable completion boundary, then remove the checkpoint.
-
-        Accounting and the outcome archive precede the ledger entry, which is
-        written immediately before the control accounting transaction. The
-        at-most-once stop-plan decrement, the ``stopped`` transition, and the
-        stop-command completion commit in one control transaction keyed by
-        the stable attempt ID, immediately before checkpoint removal. A crash
-        before the ledger entry replays safely on restart: publication is
-        deduplicated by the attempt marker, release re-reads remote state
-        before mutating, and accounting is keyed by the stable attempt ID. A
-        crash between the ledger entry or the control transaction and
-        checkpoint removal is reconciled as "already finalized, only count
-        once and delete" instead of replaying the result comment, the issue
-        release, or the accounting. Checkpoint deletion alone is never
-        evidence of completion.
-        """
-
+        # The completion ledger already covers publication, release, and
+        # cleanup. Record control accounting before deleting the checkpoint,
+        # then seal the archive after its final write.
         attempt_id = checkpoint.started_at
-        self._record_terminal_outcome(outcome, attempt_id, issue_number=issue_number)
-        issue_title = getattr(checkpoint, "issue_title", None)
-        if not isinstance(issue_title, str) or not issue_title:
-            issue_title = None
-        completed_at = self._write_outcome(
-            archive,
-            outcome,
-            attempt_id,
-            issue_number=issue_number,
-            issue_title=issue_title,
-        )
-        self._backfill_archived_pull_request(archive, attempt_id)
-        if self._completion_store is not None:
-            self._completion_store.record(
-                attempt_id=attempt_id,
-                issue_number=issue_number,
-                branch=branch,
-                outcome=outcome,
-            )
+        issue_number = checkpoint.issue_number
         if not self._verdict_already_announced(checkpoint, attempt_id):
             # No verdict was recorded at publication (an attempt interrupted
             # before publication returned, or an older checkpoint): the
@@ -6814,7 +6695,7 @@ class AgentLifecycle:
             self._last_finished_summary(
                 attempt_id,
                 issue_number,
-                issue_title,
+                checkpoint.issue_title,
                 outcome,
                 completed_at,
                 archive,
@@ -7102,10 +6983,7 @@ class AgentLifecycle:
         if checkpoint is None:
             return None
         try:
-            finalized = (
-                self._completion_store is not None
-                and self._completion_store.is_finalized(checkpoint.started_at)
-            )
+            finalized = self._attempt_finalizer(checkpoint).replay()
         except CompletionStoreError as error:
             # An unreadable completion ledger is operator-repairable like
             # an unreadable checkpoint: hold without exiting rather than
@@ -7128,56 +7006,7 @@ class AgentLifecycle:
             )
             self._active_issue_number = None
             return None
-        if finalized:
-            # The previous process finalized every boundary step and recorded
-            # the attempt, then crashed before removing the checkpoint.
-            # Replaying any side effect here would duplicate the result
-            # comment, the issue release, or the completed-attempt accounting,
-            # so the saved accounting is applied at most once and only the
-            # leftover checkpoint is removed. A stop plan that waited for
-            # this attempt completes here: its whole boundary is durable.
-            if self._completion_store is not None:
-                completions = self._completion_store.read_all()
-                terminal = completions.get(checkpoint.started_at)
-                if terminal is not None:
-                    self._record_control_finalization(
-                        checkpoint.started_at, terminal.outcome
-                    )
-                    # The previous process recorded every boundary but may
-                    # have crashed before resolving the handoff it waited
-                    # for; without a prepared tree prior validation stands.
-                    handoff_failed = self._resolve_pending_handoff(
-                        issue_number=checkpoint.issue_number,
-                        attempt_id=checkpoint.started_at,
-                        outcome=terminal.outcome,
-                        prepared=None,
-                    )
-                    if handoff_failed is False and self._handoff_owned_by_attempt(
-                        checkpoint.started_at
-                    ):
-                        # The handoff failed for this attempt: keep the
-                        # leftover checkpoint for operator recovery instead
-                        # of deleting the last handle on the retained work.
-                        self._event_log(
-                            "attempt_finalization_held",
-                            "A failed operator handoff owns this attempt; the branch, "
-                            "checkpoint, and working tree are preserved for recovery.",
-                            level="WARNING",
-                            issue_number=checkpoint.issue_number,
-                        )
-                        self._active_issue_number = None
-                        return None
-            self._attempt_state.delete()
-            # The previous process may have crashed between the checkpoint
-            # removal and the seal: finish the archive boundary now when the
-            # archive is still unsealed. An already Sealed archive is left
-            # untouched, so recovering it writes nothing.
-            self._seal_archive_and_emit(
-                self._archive_for(checkpoint.issue_number, checkpoint.started_at),
-                checkpoint.started_at,
-                issue_number=checkpoint.issue_number,
-            )
-            self._telemetry_finish()
+        if finalized is not None:
             self._active_issue_number = None
             return None
         # The attempt was interrupted before its durable boundary, so a
@@ -7606,11 +7435,6 @@ class AgentLifecycle:
                 publication_started_at=publication_started_at,
                 archive=archive,
             )
-            # Reconciliation is finished (finalized or held); a later
-            # resume sees a retained checkpoint here, not an active
-            # attempt.
-            with self._control_lock:
-                self._attempt_processing = False
         self._active_issue_number = None
         return outcome
 
