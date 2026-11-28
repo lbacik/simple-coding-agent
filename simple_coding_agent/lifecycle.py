@@ -56,6 +56,7 @@ from simple_coding_agent.completion import (
     _select_failed_command,
     deferred_baseline_failed_reason,
     final_check_dirty_reason,
+    parse_review_findings,
 )
 from simple_coding_agent.config import RepositoryProfile
 from simple_coding_agent.finalization import AttemptCompletionStore, CompletionStoreError
@@ -932,7 +933,7 @@ class ModelAttemptRunner:
             for event in execution.skill_events
         )
         review_cycles = max(0, review_count - 1)
-        review = ReviewEvidence((), review_cycles)
+        review = _collect_review_evidence(execution, review_count, review_cycles)
         final_check = None
         if execution.status is ModelExecutionStatus.SUCCEEDED and commits and deferred_baseline is None:
             try:
@@ -8894,20 +8895,43 @@ def _published_pull_request_value(published: object) -> dict | None:
     return {"number": number, "url": url}
 
 
+def _collect_review_evidence(
+    execution: object, review_count: int, review_cycles: int
+) -> ReviewEvidence:
+    """Build review evidence from the collected ``review-findings`` block.
+
+    Findings come from the main thread's final aggregation (its last
+    assistant text) in the fenced ``review-findings`` format the starting
+    prompt requires. The skill invocation count still gates collection: with
+    no ``code-review`` invocation nothing ran, and with an invocation but no
+    parseable block nothing was collected. An explicit ``none`` block is a
+    collected all-clear.
+    """
+
+    if review_count <= 0:
+        return ReviewEvidence((), review_cycles)
+    parsed = parse_review_findings(getattr(execution, "last_assistant_text", None))
+    if parsed is None:
+        return ReviewEvidence((), review_cycles)
+    return ReviewEvidence(parsed, review_cycles, True)
+
+
 def _review_findings_text(review: ReviewEvidence, review_count: int) -> str:
     """Render the published "Review findings" line without claiming uncollected work.
 
-    Findings are never parsed out of the ``code-review`` skill output (tracked
-    separately), so an empty tuple must not read as ``all clear``: when the
-    skill was invoked its findings were not collected, and when it was never
-    invoked no review ran.
+    A collected ``review-findings`` block decides the line: its summaries, or
+    ``none`` for an explicit all-clear. An empty tuple without a collected
+    block must not read as ``all clear``: when the skill was invoked its
+    findings were not collected, and when it was never invoked no review ran.
     """
 
     if review.findings:
         return "; ".join(finding.summary for finding in review.findings)
-    if review_count > 0:
-        return "not collected"
-    return "not run"
+    if review_count <= 0:
+        return "not run"
+    if getattr(review, "collected", False):
+        return "none"
+    return "not collected"
 
 
 def _execute_model(
@@ -9174,6 +9198,14 @@ def _gate_section(
             "an attempt with commits but no `code-review` invocation in this run "
             "is classified as incomplete, even when the checks pass and the "
             "change is small (for example formatting).",
+            "After the review, report its final findings in your last message as "
+            "a fenced `review-findings` block, one finding per line as "
+            "`- <severity>: <summary>` with severity `must-fix` for issues "
+            "that must block completion and `suggestion` for advisory notes "
+            "(for example: `- must-fix: data race in the token ledger`). "
+            "When the review found nothing, write a block containing only "
+            "`none`. Only this block is collected as review evidence; "
+            "findings written anywhere else are not collected.",
         ]
     if profile.env:
         names = ", ".join(profile.env.keys())
